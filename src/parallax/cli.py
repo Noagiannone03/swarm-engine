@@ -231,15 +231,44 @@ def join_command(args, passthrough_args: list[str] | None = None):
     # Build the command to run the launch.py script
     passthrough_args = passthrough_args or []
 
+    # Default limits for the worker. Upstream pinned these at 4096/7168/8/32,
+    # which causes prompts above ~4k tokens (typical for an agentic CLI with a
+    # large system prompt + tool catalogue + history) to either stall on the
+    # second prefill micro-batch or be truncated. Bump the defaults to values
+    # that comfortably accommodate real-world agent workloads, and let
+    # operators tune per-host via env when the model or hardware demands it.
+    #
+    #   PARALLAX_MAX_NUM_TOKENS_PER_BATCH  (upstream 4096, here 16384)
+    #   PARALLAX_MAX_SEQUENCE_LENGTH       (upstream 7168, here 32768)
+    #   PARALLAX_MAX_BATCH_SIZE            (upstream 8,    here 8)
+    #   PARALLAX_KV_BLOCK_SIZE             (upstream 32,   here 32)
+    #
+    # Explicit passthrough flags still win over env, which still wins over
+    # these defaults — same precedence order as the rest of the CLI.
+    def _arg_default(env_key: str, fallback: str) -> str:
+        return os.environ.get(env_key, "").strip() or fallback
+
     cmd = [sys.executable, str(launch_script)]
     if not _flag_present(passthrough_args, ["--max-num-tokens-per-batch"]):
-        cmd.extend(["--max-num-tokens-per-batch", "4096"])
+        cmd.extend([
+            "--max-num-tokens-per-batch",
+            _arg_default("PARALLAX_MAX_NUM_TOKENS_PER_BATCH", "16384"),
+        ])
     if not _flag_present(passthrough_args, ["--max-sequence-length"]):
-        cmd.extend(["--max-sequence-length", "7168"])
+        cmd.extend([
+            "--max-sequence-length",
+            _arg_default("PARALLAX_MAX_SEQUENCE_LENGTH", "32768"),
+        ])
     if not _flag_present(passthrough_args, ["--max-batch-size"]):
-        cmd.extend(["--max-batch-size", "8"])
+        cmd.extend([
+            "--max-batch-size",
+            _arg_default("PARALLAX_MAX_BATCH_SIZE", "8"),
+        ])
     if not _flag_present(passthrough_args, ["--kv-block-size"]):
-        cmd.extend(["--kv-block-size", "32"])
+        cmd.extend([
+            "--kv-block-size",
+            _arg_default("PARALLAX_KV_BLOCK_SIZE", "32"),
+        ])
 
     # The scheduler address is now taken directly from the parsed arguments.
     cmd.extend(["--scheduler-addr", args.scheduler_addr])
