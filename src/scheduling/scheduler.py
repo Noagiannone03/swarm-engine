@@ -167,13 +167,20 @@ class Scheduler:
             if self._bootstrapped_event.is_set():
                 logger.info("[Scheduler] Already bootstrapped, returning Success")
                 return True
-        # Check if we have enough nodes for bootstraping
+        # Check if we have enough nodes for bootstraping. Use the standby
+        # count rather than the total: ACTIVE nodes that have not been
+        # successfully placed (e.g. ghosts left over from a previous run
+        # that still pass heartbeat) inflate num_nodes without contributing
+        # to a full pipeline, which masks the threshold and makes
+        # allocate_from_standby() fail anyway. need_more_nodes() and
+        # _process_joins() already key off num_standby_nodes; aligning here
+        # keeps the recruiting story consistent across the codebase.
         if (
-            self.node_manager.num_nodes < self.min_nodes_bootstrapping
+            self.node_manager.num_standby_nodes < self.min_nodes_bootstrapping
             and not overide_min_node_check
         ):
             logger.info(
-                f"[Scheduler] Bootstrap deferred: have {self.node_manager.num_nodes} nodes; need >= {self.min_nodes_bootstrapping}"
+                f"[Scheduler] Bootstrap deferred: have {self.node_manager.num_standby_nodes} standby nodes; need >= {self.min_nodes_bootstrapping}"
             )
             return False
 
