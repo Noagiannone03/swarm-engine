@@ -63,6 +63,13 @@ class SchedulerManage:
         logger.debug(
             f"SchedulerManage starting: model_name={model_name}, init_nodes_num={init_nodes_num}"
         )
+        is_local_network = bool(is_local_network)
+        if self.initial_peers or self.relay_servers:
+            # If the operator has explicitly configured initial peers or
+            # relay servers, the swarm is by definition not a local-only
+            # cluster. Tolerate is_local_network=True being passed by an
+            # older API caller and force the consistent state.
+            is_local_network = False
         self.is_local_network = is_local_network
         if not is_local_network and not self.initial_peers and not self.relay_servers:
             logger.debug("Using public relay servers")
