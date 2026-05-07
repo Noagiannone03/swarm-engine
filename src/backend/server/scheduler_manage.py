@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from typing import List
@@ -14,6 +15,42 @@ from scheduling.node import RequestSignal
 from scheduling.scheduler import Scheduler
 
 logger = get_logger(__name__)
+
+
+def _scheduler_runtime_overrides() -> dict:
+    """Read Scheduler() kwargs that should be tunable in deployment.
+
+    These are exposed as environment variables so an operator running the
+    scheduler in a container or systemd unit can change behavior without
+    forking the source. Bad/empty values fall back to the Scheduler default.
+
+    Recognized vars:
+        PARALLAX_STRATEGY                "greedy" | "dp"
+        PARALLAX_HEARTBEAT_TIMEOUT       float seconds, e.g. 20
+    """
+    overrides: dict = {}
+
+    strategy = os.environ.get("PARALLAX_STRATEGY", "").strip().lower()
+    if strategy in ("greedy", "dp"):
+        overrides["strategy"] = strategy
+    elif strategy:
+        logger.warning(
+            "Ignoring PARALLAX_STRATEGY=%r (expected 'greedy' or 'dp')", strategy
+        )
+
+    raw_timeout = os.environ.get("PARALLAX_HEARTBEAT_TIMEOUT", "").strip()
+    if raw_timeout:
+        try:
+            timeout = float(raw_timeout)
+            if timeout <= 0:
+                raise ValueError("must be > 0")
+            overrides["heartbeat_timeout"] = timeout
+        except ValueError as exc:
+            logger.warning(
+                "Ignoring PARALLAX_HEARTBEAT_TIMEOUT=%r (%s)", raw_timeout, exc
+            )
+
+    return overrides
 
 
 class SchedulerManage:
@@ -189,12 +226,14 @@ class SchedulerManage:
         self.init_nodes_num = init_nodes_num
 
         model_info = get_model_info(model_name, self.use_hfcache)
+        scheduler_kwargs = _scheduler_runtime_overrides()
         self.scheduler = Scheduler(
             model_info,
             [],
             min_nodes_bootstrapping=init_nodes_num,
             enable_weight_refit=self.enable_weight_refit,
             weight_refit_mode=self.weight_refit_mode,
+            **scheduler_kwargs,
         )
 
         # Run the scheduler's event/dispatch loops in background so the process
