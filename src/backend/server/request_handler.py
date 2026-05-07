@@ -14,6 +14,41 @@ logger = get_logger(__name__)
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
+# Hard cap for the synchronous lattica `response.cancel()`. When the upstream
+# worker drops mid-stream, libp2p teardown waits for an ACK that never comes
+# and `cancel()` blocks forever — freezing the scheduler's asyncio loop and,
+# transitively, every other client request. We run the call in a worker thread
+# and abandon it after this many seconds.
+UPSTREAM_CANCEL_TIMEOUT_SEC = 2.0
+
+
+async def _safe_cancel_upstream(response, request_id: str) -> None:
+    """Cancel a lattica streaming response without blocking the event loop.
+
+    The lattica RPC iterator's `.cancel()` is synchronous and can hang
+    indefinitely when the remote peer has already disappeared. Run it in a
+    thread with a timeout; log and move on if it doesn't return in time.
+    """
+    if response is None:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(response.cancel),
+            timeout=UPSTREAM_CANCEL_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Timeout cancelling upstream response for %s after %.1fs; abandoning",
+            request_id,
+            UPSTREAM_CANCEL_TIMEOUT_SEC,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to cancel upstream response for %s: %s",
+            request_id,
+            exc,
+        )
+
 
 class RequestHandler:
     """HTTP request forwarder with scheduler-aware routing and retry logic.
@@ -101,6 +136,7 @@ class RequestHandler:
             request_data["routing_table"] = routing_table
             stub = self.get_stub(routing_table[0])
             is_stream = request_data.get("stream", False)
+            response = None
             try:
                 if is_stream:
                     response = stub.chat_completion(request_data)
@@ -112,9 +148,16 @@ class RequestHandler:
                         or first_chunk_text == "Not found."
                         or first_chunk_text.startswith('{"detail":"Not Found"')
                     ):
+                        # Worker accepted the connection but its inner HTTP
+                        # server is not ready (model still loading) — release
+                        # the upstream stream before retrying with another peer.
+                        await _safe_cancel_upstream(response, request_id)
+                        response = None
                         raise RuntimeError(
                             f"upstream worker returned invalid stream response: {first_chunk_text}"
                         )
+
+                    streamed_response = response
 
                     async def stream_generator():
                         first_token_time = None
@@ -146,14 +189,11 @@ class RequestHandler:
                                         f"Request ID: {request_id} | TPS: {tps:.2f} |  TTFT: {ttft} ms | Output tokens: {output_tokens} | Input tokens: {input_tokens}"
                                     )
                             logger.debug(f"client disconnected for {request_id}")
-                            try:
-                                response.cancel()
-                            except Exception as exc:
-                                logger.warning(
-                                    "Failed to cancel upstream response for %s: %s",
-                                    request_id,
-                                    exc,
-                                )
+                            await _safe_cancel_upstream(streamed_response, request_id)
+
+                    # Ownership of the upstream stream is now transferred to
+                    # the generator's finally block.
+                    response = None
 
                     resp = StreamingResponse(
                         stream_generator(),
@@ -173,6 +213,11 @@ class RequestHandler:
                     logger.debug(f"Non-stream response completed for {request_id}")
                     return Response(content=content, media_type="application/json")
             except Exception as e:
+                # If we still hold the upstream stream (early failure before
+                # ownership was transferred to stream_generator), release it.
+                if response is not None:
+                    await _safe_cancel_upstream(response, request_id)
+                    response = None
                 forward_attempts += 1
                 if forward_attempts < self.MAX_FORWARD_RETRY:
                     # small async delay before re-forwarding
