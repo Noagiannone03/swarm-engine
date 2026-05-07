@@ -75,6 +75,36 @@ class ServerInfo:
     error_message: Optional[str] = None
 
 
+def _resolve_heartbeat_interval(default: float = 10.0) -> float:
+    """Read PARALLAX_HEARTBEAT_INTERVAL with sane bounds.
+
+    The interval is clamped to [1.0, 60.0] seconds. Sub-second pings would
+    flood the scheduler RPC for no benefit; intervals longer than a minute
+    interact poorly with most heartbeat_timeout values.
+    """
+    raw = os.environ.get("PARALLAX_HEARTBEAT_INTERVAL", "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring PARALLAX_HEARTBEAT_INTERVAL=%r (not a number)", raw
+        )
+        return default
+    if value < 1.0:
+        logger.warning(
+            "PARALLAX_HEARTBEAT_INTERVAL=%s clamped to 1.0s minimum", value
+        )
+        return 1.0
+    if value > 60.0:
+        logger.warning(
+            "PARALLAX_HEARTBEAT_INTERVAL=%s clamped to 60.0s maximum", value
+        )
+        return 60.0
+    return value
+
+
 def send_notify(notify_url, block_start_index, block_end_index, request, status):
     payload = [
         {
@@ -745,6 +775,13 @@ class GradientServer:
     def start_node_announcer(self):
         """Start a thread that regularly announces this module's presence on DHT"""
 
+        # Heartbeat cadence is read from the environment so an operator can
+        # tune ghost-detection latency without recompiling. The scheduler's
+        # heartbeat_timeout default is 30s; pinging every 10s leaves three
+        # full intervals of slack which is conservative on stable LAN. Drop
+        # to 5s when running fewer ghosts is preferable to a few extra RPCs.
+        interval = _resolve_heartbeat_interval(default=10.0)
+
         def _announcer_thread():
             try:
                 while not self.stop_event.is_set():
@@ -850,7 +887,7 @@ class GradientServer:
                             exc_info=True,
                         )
 
-                    time.sleep(10)
+                    time.sleep(interval)
             except Exception as e:
                 logger.exception(f"Module announcer thread error: {e}")
 
