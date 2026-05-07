@@ -645,5 +645,5 @@ class Scheduler:
     def need_more_nodes(self):
         return (
             not self._bootstrapped_event.is_set()
-            and self.node_manager.num_standby_nodes >= self.min_nodes_bootstrapping
+            and self.node_manager.num_standby_nodes < self.min_nodes_bootstrapping
         )
