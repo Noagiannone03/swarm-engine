@@ -282,10 +282,24 @@ class SchedulerManage:
                 logger.debug("Created connection handler with existing Lattica")
             return
 
+        # The historical debug log claimed `mdns=False` but no `with_mdns`
+        # call was made; Lattica defaults to mDNS=True. For a public swarm
+        # (relays + bootstraps gradient.network) mDNS hurts: it lets a
+        # peer on the operator's LAN advertise itself ahead of the public
+        # bootstrap and locks the swarm in a private mini-DHT. Turn it off
+        # explicitly; opt back in via `PARALLAX_ENABLE_MDNS=1` for
+        # genuinely LAN-only deployments.
+        mdns_enabled = os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() == "1"
         logger.debug(
-            f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns=False, dht_prefix={self.dht_prefix}"
+            f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns={mdns_enabled}, dht_prefix={self.dht_prefix}"
         )
-        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(".")
+        self.lattica = (
+            Lattica.builder()
+            .with_listen_addrs(self.host_maddrs)
+            .with_key_path(".")
+        )
+        if not mdns_enabled:
+            self.lattica.with_mdns(False)
 
         if len(self.relay_servers) > 0:
             logger.info(f"Using relay servers: {self.relay_servers}")

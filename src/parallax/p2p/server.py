@@ -466,6 +466,16 @@ class GradientServer:
     def build_lattica(self):
         self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs)
 
+        # mDNS LAN discovery is on by default in Lattica. For a public swarm
+        # (the common case — `--use-relay` + bootstraps gradient.network)
+        # mDNS only causes harm: another machine on the same LAN running
+        # parallax announces itself, the worker prefers the LAN peer over
+        # the public bootstrap, and ends up stuck in a 2-node mini-DHT
+        # that has never heard of the real scheduler. Default it off; opt
+        # in via `PARALLAX_ENABLE_MDNS=1` for genuine LAN-only swarms.
+        if os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() != "1":
+            self.lattica.with_mdns(False)
+
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":
             if self.scheduler_addr.startswith("/"):
                 logger.info(f"Using scheduler addr: {self.scheduler_addr}")
