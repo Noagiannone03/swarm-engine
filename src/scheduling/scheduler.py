@@ -167,13 +167,20 @@ class Scheduler:
             if self._bootstrapped_event.is_set():
                 logger.info("[Scheduler] Already bootstrapped, returning Success")
                 return True
-        # Check if we have enough nodes for bootstraping
+        # Check if we have enough nodes for bootstraping. Use the standby
+        # count rather than the total: ACTIVE nodes that have not been
+        # successfully placed (e.g. ghosts left over from a previous run
+        # that still pass heartbeat) inflate num_nodes without contributing
+        # to a full pipeline, which masks the threshold and makes
+        # allocate_from_standby() fail anyway. need_more_nodes() and
+        # _process_joins() already key off num_standby_nodes; aligning here
+        # keeps the recruiting story consistent across the codebase.
         if (
-            self.node_manager.num_nodes < self.min_nodes_bootstrapping
+            self.node_manager.num_standby_nodes < self.min_nodes_bootstrapping
             and not overide_min_node_check
         ):
             logger.info(
-                f"[Scheduler] Bootstrap deferred: have {self.node_manager.num_nodes} nodes; need >= {self.min_nodes_bootstrapping}"
+                f"[Scheduler] Bootstrap deferred: have {self.node_manager.num_standby_nodes} standby nodes; need >= {self.min_nodes_bootstrapping}"
             )
             return False
 
@@ -278,6 +285,15 @@ class Scheduler:
     def join(self, node: Node) -> None:
         """Add a node to allocation and refresh plan and materialized nodes."""
         bootstrapped = self._bootstrapped_event.is_set()
+        if not node.manual_layer_assignment:
+            # A worker may reconnect after a scheduler restart while still
+            # advertising its previous layer range. Fresh automatic joins
+            # are inserted as STANDBY first, so leftover allocations would
+            # make the layer allocator try to deallocate a non-ACTIVE node
+            # and abort bootstrap. Clearing the allocation here keeps the
+            # scheduler-side state consistent with the worker being newly
+            # observed in this scheduler lifetime.
+            node.clear_layer_allocation()
         logger.info(
             "Joining node %s (kv_ratio=%.2f, param_ratio=%.2f, manual_assignment=%s, bootstrapped=%s)",
             node.node_id,
@@ -296,6 +312,14 @@ class Scheduler:
                     self.request_router.expand_pipelines()
                 except NotImplementedError:
                     pass
+                except Exception:
+                    # expand_pipelines is best-effort optimization on a hot
+                    # path. Anything raised beyond NotImplementedError used
+                    # to take down join() and leave the swarm half-attached.
+                    logger.warning(
+                        "Failed to expand pipelines after node join; keeping existing pipelines",
+                        exc_info=True,
+                    )
 
         # Manual layer assignment bypasses bootstrap waiting
         if node.manual_layer_assignment:
@@ -567,9 +591,14 @@ class Scheduler:
                         logger.debug(
                             "Bootstrap attempt after join did not produce a full pipeline; will retry on future joins"
                         )
-                except Exception as exc:
-                    logger.debug(
-                        f"Bootstrap attempt after join failed: {exc}; will retry on future joins"
+                except Exception:
+                    # Bootstrap failures here used to be hidden at debug
+                    # level. In production this turned every recurring
+                    # failure into a silent symptom (swarm appears to have
+                    # enough nodes but never serves traffic). Surface them.
+                    logger.warning(
+                        "Bootstrap attempt after join failed; will retry on future joins",
+                        exc_info=True,
                     )
             else:
                 logger.debug(
@@ -645,5 +674,5 @@ class Scheduler:
     def need_more_nodes(self):
         return (
             not self._bootstrapped_event.is_set()
-            and self.node_manager.num_standby_nodes >= self.min_nodes_bootstrapping
+            and self.node_manager.num_standby_nodes < self.min_nodes_bootstrapping
         )

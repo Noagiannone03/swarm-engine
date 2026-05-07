@@ -4,6 +4,8 @@ ServerInfo that will be announce to DHT and used for client's routing.
 We haven't used other info, will wait until DHT implemented.
 """
 
+import logging
+import os
 import platform
 import subprocess
 from dataclasses import asdict, dataclass
@@ -23,6 +25,78 @@ try:
     import psutil
 except ImportError:
     psutil = None
+
+logger = logging.getLogger(__name__)
+
+
+# Default headroom kept for the OS, GUI, and other userland processes on
+# machines with unified memory (Apple silicon) or CPU-only Linux nodes.
+# 6 GB is what a typical macOS desktop uses with a browser + IDE + the
+# usual background services; servers can lower it via env.
+_DEFAULT_SYSTEM_RESERVE_GB = 6.0
+
+# Cap on the fraction of physical memory we ever report as usable, even
+# after subtracting the reserve. Activations and transient buffers grow
+# beyond what the param/kvcache ratios account for; staying below 70% of
+# physical leaves room for them and avoids paging.
+_DEFAULT_USABLE_MEMORY_FRACTION = 0.7
+
+
+def _read_env_float(
+    key: str,
+    default: float,
+    *,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring %s=%r (not a number)", key, raw)
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning("%s=%s clamped to %s minimum", key, value, minimum)
+        return minimum
+    if maximum is not None and value > maximum:
+        logger.warning("%s=%s clamped to %s maximum", key, value, maximum)
+        return maximum
+    return value
+
+
+def _resolve_usable_memory_gb(total_gb: float) -> float:
+    """Convert a raw "physical memory" reading into what we should report
+    to the scheduler as memory_gb on shared-memory hosts.
+
+    The scheduler currently treats memory_gb as if the worker owned the
+    machine: it allocates param_mem_ratio + kvcache_mem_ratio (defaults
+    0.65 + 0.25 = 0.9) of that figure to model weights and KV cache. On a
+    laptop or developer workstation that assumption causes the worker to
+    swap out the OS, freeze the desktop, and trip the OOM killer. We
+    adjust by:
+
+      1. Subtracting a fixed reserve for the OS (PARALLAX_SYSTEM_RESERVE_GB)
+      2. Capping by a usable fraction (PARALLAX_USABLE_MEMORY_FRACTION)
+      3. Clamping to a 1 GB floor so we never report nonsense
+
+    Operators dedicating a machine to Parallax should set the reserve to
+    a small value (e.g. 1) and bump the fraction towards 1.0.
+    """
+    reserve_gb = _read_env_float(
+        "PARALLAX_SYSTEM_RESERVE_GB", _DEFAULT_SYSTEM_RESERVE_GB, minimum=0.0
+    )
+    fraction = _read_env_float(
+        "PARALLAX_USABLE_MEMORY_FRACTION",
+        _DEFAULT_USABLE_MEMORY_FRACTION,
+        minimum=0.05,
+        maximum=1.0,
+    )
+    after_reserve = total_gb - reserve_gb
+    capped = total_gb * fraction
+    usable = min(after_reserve, capped)
+    return max(1.0, usable)
 
 
 @dataclass
@@ -80,9 +154,26 @@ class AppleSiliconHardwareInfo(HardwareInfo):
     @classmethod
     def detect(cls) -> "AppleSiliconHardwareInfo":
         if psutil:
-            total_gb = psutil.virtual_memory().total / 2**30
+            physical_gb = psutil.virtual_memory().total / 2**30
         else:
-            total_gb = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 2**30
+            physical_gb = (
+                int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 2**30
+            )
+
+        # Apple silicon shares one pool of RAM between the CPU, the GPU,
+        # the OS, and every userland process. Reporting the raw physical
+        # total to the scheduler causes it to allocate weights + KV cache
+        # at ~90% of total memory, which on a personal Mac (browser +
+        # IDE + system services) reliably swaps the machine to a freeze.
+        # _resolve_usable_memory_gb() applies a configurable headroom.
+        total_gb = _resolve_usable_memory_gb(physical_gb)
+        if total_gb < physical_gb:
+            logger.info(
+                "Apple silicon: reporting %.1f GB usable out of %.1f GB physical "
+                "(set PARALLAX_SYSTEM_RESERVE_GB / PARALLAX_USABLE_MEMORY_FRACTION to tune)",
+                total_gb,
+                physical_gb,
+            )
 
         chip = subprocess.check_output(
             ["sysctl", "-n", "machdep.cpu.brand_string"], text=True
@@ -179,13 +270,34 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
     try:
         hw = HardwareInfo.detect()
     except NotImplementedError:
-        # Fallback to a conservative default
+        # Fallback for hosts the dispatcher doesn't recognize (typically
+        # Linux without CUDA). Upstream hardcoded 16 GB here, which lied
+        # to the scheduler on machines with less RAM and produced OOM
+        # kills the operator could not diagnose. Use psutil when
+        # available and apply the usable-memory adjustment so the
+        # scheduler never asks for more than the box can actually give.
+        if psutil:
+            physical_gb = psutil.virtual_memory().total / 2**30
+            memory_gb = _resolve_usable_memory_gb(physical_gb)
+            logger.info(
+                "Unknown hardware fallback: reporting %.1f GB usable out of %.1f GB physical",
+                memory_gb,
+                physical_gb,
+            )
+        else:
+            memory_gb = 8.0
+            logger.warning(
+                "Unknown hardware and psutil unavailable; reporting %.1f GB by default. "
+                "Install psutil or set PARALLAX_SYSTEM_RESERVE_GB / "
+                "PARALLAX_USABLE_MEMORY_FRACTION to control allocation.",
+                memory_gb,
+            )
         return {
             "node_id": node_id,
             "num_gpus": 1,
             "tflops_fp16": 50.0,
             "gpu_name": "Unknown",
-            "memory_gb": 16.0,
+            "memory_gb": memory_gb,
             "memory_bandwidth_gbps": 100.0,
             "device": "Unknown",
         }
