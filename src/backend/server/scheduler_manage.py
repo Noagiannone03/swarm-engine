@@ -8,7 +8,7 @@ from lattica import Lattica
 from backend.server.constants import NODE_STATUS_AVAILABLE, NODE_STATUS_WAITING
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 from backend.server.static_config import get_model_info, get_node_join_command
-from parallax.cli import PUBLIC_INITIAL_PEERS, PUBLIC_RELAY_SERVERS
+from parallax.cli import get_public_initial_peers, get_public_relay_servers
 from parallax.p2p.server import TransformerConnectionHandler
 from parallax_utils.logging_config import get_logger
 from scheduling.node import RequestSignal
@@ -123,8 +123,8 @@ class SchedulerManage:
         self.is_local_network = is_local_network
         if not is_local_network and not self.initial_peers and not self.relay_servers:
             logger.debug("Using public relay servers")
-            self.initial_peers = PUBLIC_INITIAL_PEERS
-            self.relay_servers = PUBLIC_RELAY_SERVERS
+            self.initial_peers = get_public_initial_peers()
+            self.relay_servers = get_public_relay_servers()
 
         self._start_scheduler(model_name, init_nodes_num)
         self._start_lattica()

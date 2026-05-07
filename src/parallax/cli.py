@@ -23,23 +23,56 @@ from parallax_utils.version_check import get_current_version
 
 logger = get_logger("parallax.cli")
 
+# Bootstraps Gradient publics. Lattica les essaie en série au démarrage et
+# attend ~75s de timeout SYN_SENT par adresse injoignable avant de passer à
+# la suivante — quand l'asie est down (cas vécu en mai 2026, alicloud HK
+# `bootstrap-lattica.gradient.network` 8.219.131.51 = Connection refused),
+# un worker mettait 2-3 min à se brancher au lieu de quelques secondes.
+# Ordre choisi : EU et US (durables en pratique) → ASIA (fallback). Si
+# Gradient ajoute des régions, mets les plus fiables en tête.
+# Override complet possible via `PARALLAX_INITIAL_PEERS` (CSV ou newline).
 PUBLIC_INITIAL_PEERS = [
-    "/dns4/bootstrap-lattica.gradient.network/udp/18080/quic-v1/p2p/12D3KooWJHXvu8TWkFn6hmSwaxdCLy4ZzFwr4u5mvF9Fe2rMmFXb",
-    "/dns4/bootstrap-lattica.gradient.network/tcp/18080/p2p/12D3KooWJHXvu8TWkFn6hmSwaxdCLy4ZzFwr4u5mvF9Fe2rMmFXb",
-    "/dns4/bootstrap-lattica-us.gradient.network/udp/18080/quic-v1/p2p/12D3KooWFD8NoyHfmVxLVCocvXJBjwgE9RZ2bgm2p5WAWQax4FoQ",
-    "/dns4/bootstrap-lattica-us.gradient.network/tcp/18080/p2p/12D3KooWFD8NoyHfmVxLVCocvXJBjwgE9RZ2bgm2p5WAWQax4FoQ",
     "/dns4/bootstrap-lattica-eu.gradient.network/udp/18080/quic-v1/p2p/12D3KooWCNuEF4ro95VA4Lgq4NvjdWfJFoTcvWsBA7Z6VkBByPtN",
     "/dns4/bootstrap-lattica-eu.gradient.network/tcp/18080/p2p/12D3KooWCNuEF4ro95VA4Lgq4NvjdWfJFoTcvWsBA7Z6VkBByPtN",
+    "/dns4/bootstrap-lattica-us.gradient.network/udp/18080/quic-v1/p2p/12D3KooWFD8NoyHfmVxLVCocvXJBjwgE9RZ2bgm2p5WAWQax4FoQ",
+    "/dns4/bootstrap-lattica-us.gradient.network/tcp/18080/p2p/12D3KooWFD8NoyHfmVxLVCocvXJBjwgE9RZ2bgm2p5WAWQax4FoQ",
+    "/dns4/bootstrap-lattica.gradient.network/udp/18080/quic-v1/p2p/12D3KooWJHXvu8TWkFn6hmSwaxdCLy4ZzFwr4u5mvF9Fe2rMmFXb",
+    "/dns4/bootstrap-lattica.gradient.network/tcp/18080/p2p/12D3KooWJHXvu8TWkFn6hmSwaxdCLy4ZzFwr4u5mvF9Fe2rMmFXb",
 ]
 
+# Relays publics (NAT traversal). Même tri que les bootstraps : EU/US en
+# tête. Override via `PARALLAX_RELAY_SERVERS`.
 PUBLIC_RELAY_SERVERS = [
-    "/dns4/relay-lattica.gradient.network/udp/18080/quic-v1/p2p/12D3KooWDaqDAsFupYvffBDxjHHuWmEAJE4sMDCXiuZiB8aG8rjf",
-    "/dns4/relay-lattica.gradient.network/tcp/18080/p2p/12D3KooWDaqDAsFupYvffBDxjHHuWmEAJE4sMDCXiuZiB8aG8rjf",
-    "/dns4/relay-lattica-us.gradient.network/udp/18080/quic-v1/p2p/12D3KooWHMXi6SCfaQzLcFt6Th545EgRt4JNzxqmDeLs1PgGm3LU",
-    "/dns4/relay-lattica-us.gradient.network/tcp/18080/p2p/12D3KooWHMXi6SCfaQzLcFt6Th545EgRt4JNzxqmDeLs1PgGm3LU",
     "/dns4/relay-lattica-eu.gradient.network/udp/18080/quic-v1/p2p/12D3KooWRAuR7rMNA7Yd4S1vgKS6akiJfQoRNNexTtzWxYPiWfG5",
     "/dns4/relay-lattica-eu.gradient.network/tcp/18080/p2p/12D3KooWRAuR7rMNA7Yd4S1vgKS6akiJfQoRNNexTtzWxYPiWfG5",
+    "/dns4/relay-lattica-us.gradient.network/udp/18080/quic-v1/p2p/12D3KooWHMXi6SCfaQzLcFt6Th545EgRt4JNzxqmDeLs1PgGm3LU",
+    "/dns4/relay-lattica-us.gradient.network/tcp/18080/p2p/12D3KooWHMXi6SCfaQzLcFt6Th545EgRt4JNzxqmDeLs1PgGm3LU",
+    "/dns4/relay-lattica.gradient.network/udp/18080/quic-v1/p2p/12D3KooWDaqDAsFupYvffBDxjHHuWmEAJE4sMDCXiuZiB8aG8rjf",
+    "/dns4/relay-lattica.gradient.network/tcp/18080/p2p/12D3KooWDaqDAsFupYvffBDxjHHuWmEAJE4sMDCXiuZiB8aG8rjf",
 ]
+
+
+def _peer_list_from_env(env_key: str, default: list) -> list:
+    """Read a peer list from an env var, falling back to `default` if unset.
+
+    Accepts comma- or newline-separated multiaddrs. Whitespace and empty
+    entries are ignored. Useful when an operator wants to point all
+    workers at a private bootstrap or skip a regional cluster that's
+    flaky on a given day.
+    """
+    raw = os.environ.get(env_key, "")
+    if not raw or not raw.strip():
+        return default
+    parts = [p.strip() for chunk in raw.split(",") for p in chunk.split("\n")]
+    return [p for p in parts if p]
+
+
+def get_public_initial_peers() -> list:
+    return _peer_list_from_env("PARALLAX_INITIAL_PEERS", PUBLIC_INITIAL_PEERS)
+
+
+def get_public_relay_servers() -> list:
+    return _peer_list_from_env("PARALLAX_RELAY_SERVERS", PUBLIC_RELAY_SERVERS)
 
 
 def check_python_version():
@@ -166,9 +199,9 @@ def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None =
 def _get_relay_params():
     return [
         "--relay-servers",
-        *PUBLIC_RELAY_SERVERS,
+        *get_public_relay_servers(),
         "--initial-peers",
-        *PUBLIC_INITIAL_PEERS,
+        *get_public_initial_peers(),
     ]
 
 
