@@ -16,6 +16,19 @@ from scheduling.scheduler import Scheduler
 
 logger = get_logger(__name__)
 
+# How often we re-`lattica.store("scheduler_peer_id", ...)` to keep the entry
+# alive in the DHT. Kademlia keys live "until expiration" *only as long as
+# some peer still caches them* — when DHT peers churn (which happens within
+# hours on a small swarm) the key vanishes, and new workers calling
+# `lattica.get("scheduler_peer_id")` get nothing back. Upstream stores the
+# key once at boot with a 1-year expiration and never refreshes, so after
+# ~1–2h of uptime the scheduler becomes invisible to fresh workers even
+# though the process is still running. Petals/Hivemind solve this by
+# re-announcing every 30–60s; we do it every 5min, which is conservative
+# enough to never spam the DHT yet keeps the entry warm well below the
+# typical Kademlia replication window.
+SCHEDULER_PEER_ID_REANNOUNCE_SEC = 5 * 60
+
 
 def _scheduler_runtime_overrides() -> dict:
     """Read Scheduler() kwargs that should be tunable in deployment.
@@ -323,12 +336,69 @@ class SchedulerManage:
             logger.error("Failed to store scheduler peer id, after 10 times")
             exit(1)
 
+        # Keep the DHT entry warm. Without this, the key drops out of the
+        # Kademlia cache after ~1-2h and workers can no longer discover the
+        # scheduler — see comment on SCHEDULER_PEER_ID_REANNOUNCE_SEC.
+        self._start_peer_id_reannouncer()
+
         self.connection_handler = RPCConnectionHandler(
             lattica=self.lattica,
             scheduler=self.scheduler,
             http_port=self.http_port,
         )
         logger.debug("RPCConnectionHandler initialized")
+
+    def _start_peer_id_reannouncer(self):
+        """Background daemon that re-stores the scheduler peer ID in the DHT.
+
+        Idempotent: if a thread is already running, do nothing. The thread
+        exits silently when `self.lattica` is set to None (e.g. on shutdown).
+        """
+        if getattr(self, "_peer_id_reannouncer_started", False):
+            return
+        self._peer_id_reannouncer_started = True
+
+        def _loop():
+            while True:
+                try:
+                    time.sleep(SCHEDULER_PEER_ID_REANNOUNCE_SEC)
+                except Exception:
+                    return
+                lattica = self.lattica
+                if lattica is None:
+                    logger.debug("Lattica is gone, stopping peer-id reannouncer")
+                    return
+                try:
+                    if lattica.store(
+                        "scheduler_peer_id",
+                        lattica.peer_id(),
+                        expiration_time=time.time() + 365 * 24 * 60 * 60,
+                    ):
+                        logger.debug(
+                            "Re-stored scheduler peer id in DHT: %s",
+                            lattica.peer_id(),
+                        )
+                    else:
+                        logger.warning(
+                            "Re-store of scheduler peer id returned False; will retry in %ds",
+                            SCHEDULER_PEER_ID_REANNOUNCE_SEC,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Re-store of scheduler peer id raised: %s; will retry in %ds",
+                        exc,
+                        SCHEDULER_PEER_ID_REANNOUNCE_SEC,
+                    )
+
+        threading.Thread(
+            target=_loop,
+            name="SchedulerPeerIdReannouncer",
+            daemon=True,
+        ).start()
+        logger.info(
+            "Scheduler peer-id DHT re-announcer started (every %ds)",
+            SCHEDULER_PEER_ID_REANNOUNCE_SEC,
+        )
 
     def get_routing_table(self, request_id, received_ts):
         """Block briefly until the scheduler assigns a routing path for the request.
