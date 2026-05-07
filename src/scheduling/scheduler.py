@@ -278,6 +278,15 @@ class Scheduler:
     def join(self, node: Node) -> None:
         """Add a node to allocation and refresh plan and materialized nodes."""
         bootstrapped = self._bootstrapped_event.is_set()
+        if not node.manual_layer_assignment:
+            # A worker may reconnect after a scheduler restart while still
+            # advertising its previous layer range. Fresh automatic joins
+            # are inserted as STANDBY first, so leftover allocations would
+            # make the layer allocator try to deallocate a non-ACTIVE node
+            # and abort bootstrap. Clearing the allocation here keeps the
+            # scheduler-side state consistent with the worker being newly
+            # observed in this scheduler lifetime.
+            node.clear_layer_allocation()
         logger.info(
             "Joining node %s (kv_ratio=%.2f, param_ratio=%.2f, manual_assignment=%s, bootstrapped=%s)",
             node.node_id,
