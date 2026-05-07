@@ -312,6 +312,14 @@ class Scheduler:
                     self.request_router.expand_pipelines()
                 except NotImplementedError:
                     pass
+                except Exception:
+                    # expand_pipelines is best-effort optimization on a hot
+                    # path. Anything raised beyond NotImplementedError used
+                    # to take down join() and leave the swarm half-attached.
+                    logger.warning(
+                        "Failed to expand pipelines after node join; keeping existing pipelines",
+                        exc_info=True,
+                    )
 
         # Manual layer assignment bypasses bootstrap waiting
         if node.manual_layer_assignment:
@@ -583,9 +591,14 @@ class Scheduler:
                         logger.debug(
                             "Bootstrap attempt after join did not produce a full pipeline; will retry on future joins"
                         )
-                except Exception as exc:
-                    logger.debug(
-                        f"Bootstrap attempt after join failed: {exc}; will retry on future joins"
+                except Exception:
+                    # Bootstrap failures here used to be hidden at debug
+                    # level. In production this turned every recurring
+                    # failure into a silent symptom (swarm appears to have
+                    # enough nodes but never serves traffic). Surface them.
+                    logger.warning(
+                        "Bootstrap attempt after join failed; will retry on future joins",
+                        exc_info=True,
                     )
             else:
                 logger.debug(
