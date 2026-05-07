@@ -103,14 +103,25 @@ class RequestHandler:
             is_stream = request_data.get("stream", False)
             try:
                 if is_stream:
+                    response = stub.chat_completion(request_data)
+                    iterator = iterate_in_threadpool(response)
+                    first_chunk = await anext(iterator)
+                    first_chunk_text = first_chunk.decode("utf-8", errors="replace").strip()
+                    if (
+                        first_chunk_text == "internal server error"
+                        or first_chunk_text == "Not found."
+                        or first_chunk_text.startswith('{"detail":"Not Found"')
+                    ):
+                        raise RuntimeError(
+                            f"upstream worker returned invalid stream response: {first_chunk_text}"
+                        )
 
                     async def stream_generator():
-                        response = stub.chat_completion(request_data)
                         first_token_time = None
-                        last_chunk = None
+                        last_chunk = first_chunk
                         last_token_time = None
                         try:
-                            iterator = iterate_in_threadpool(response)
+                            yield first_chunk
                             async for chunk in iterator:
                                 last_token_time = time.time()
                                 if first_token_time is None:
@@ -135,7 +146,14 @@ class RequestHandler:
                                         f"Request ID: {request_id} | TPS: {tps:.2f} |  TTFT: {ttft} ms | Output tokens: {output_tokens} | Input tokens: {input_tokens}"
                                     )
                             logger.debug(f"client disconnected for {request_id}")
-                            response.cancel()
+                            try:
+                                response.cancel()
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to cancel upstream response for %s: %s",
+                                    request_id,
+                                    exc,
+                                )
 
                     resp = StreamingResponse(
                         stream_generator(),
@@ -150,6 +168,8 @@ class RequestHandler:
                 else:
                     response = stub.chat_completion(request_data)
                     content = (await anext(iterate_in_threadpool(response))).decode()
+                    if content.strip() == "internal server error":
+                        raise RuntimeError("upstream worker returned internal server error")
                     logger.debug(f"Non-stream response completed for {request_id}")
                     return Response(content=content, media_type="application/json")
             except Exception as e:
