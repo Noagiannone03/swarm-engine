@@ -269,8 +269,16 @@ class RequestRoutingStrategy(ABC):
             return
 
         for n in standby:
-            lat = n.layer_latency_ms
-            lat_str = "inf" if lat == float("inf") else f"{lat:.2f}"
+            # layer_latency_ms divides by num_current_layers under the hood
+            # (see Node.roofline_layer_latency_ms). A node that just joined
+            # and hasn't been allocated layers yet has num_current_layers=0,
+            # which raises ZeroDivisionError when this snapshot is logged
+            # mid-bootstrap. Skip the latency for that case.
+            if n.num_current_layers == 0:
+                lat_str = "n/a"
+            else:
+                lat = n.layer_latency_ms
+                lat_str = "inf" if lat == float("inf") else f"{lat:.2f}"
             lines.append(
                 "  %-16s | load %3d/%-3d | latency %7s ms | ready %s"
                 % (
