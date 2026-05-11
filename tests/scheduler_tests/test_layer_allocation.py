@@ -25,6 +25,17 @@ from scheduling.node_management import NodeState
 from .test_utils import build_model_info, build_node_management
 
 
+class _TinyModel:
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self.embedding_io_bytes = 100_000_000
+        self.tie_embedding = False
+        self.mlx_bit_factor = 1
+
+    def decoder_layer_io_bytes(self, roofline: bool = False, **_: object) -> int:
+        return 100_000_000
+
+
 def _build_node(gpu_type: str, model: ModelInfo, id_suffix: str = "") -> Node:
     hw_map = {
         "a100-80g": NodeHardwareInfo("a100-80g" + id_suffix, 1, 312.0, "", 80.0, 2039.0, "cuda"),
@@ -34,6 +45,11 @@ def _build_node(gpu_type: str, model: ModelInfo, id_suffix: str = "") -> Node:
     }
     hw = hw_map[gpu_type]
     return Node(node_id=hw.node_id, hardware=hw, model_info=model)
+
+
+def _build_mlx_node(node_id: str, model: _TinyModel, memory_gb: float) -> Node:
+    hw = NodeHardwareInfo(node_id, 1, 7.1, "Apple M3", memory_gb, 100.0, "mlx")
+    return Node(node_id=node_id, hardware=hw, model_info=model)
 
 
 def test_capacity_sanity_check():
@@ -51,6 +67,27 @@ def test_capacity_sanity_check():
         capacity = node.get_decoder_layer_capacity()
         capacity_with_embed = node.get_decoder_layer_capacity(include_input_embed=True)
         assert capacity_with_embed <= capacity
+
+
+def test_greedy_mlx_pipeline_uses_memory_weighted_partitioning():
+    """MLX pipelines should follow Exo-style memory weighting.
+
+    The larger shared-memory peer should receive more layers even when compute
+    is identical, because RAM is the scarce resource on Apple Silicon.
+    """
+    model = _TinyModel(num_layers=10)
+    small = _build_mlx_node("small-mac", model, memory_gb=1.0)
+    large = _build_mlx_node("large-mac", model, memory_gb=2.0)
+
+    node_management = build_node_management([small, large])
+    allocator = GreedyLayerAllocator(
+        model_info=model, node_management=node_management, trim_layers_on_turning_points=False
+    )
+
+    assert allocator.allocate_from_standby() is True
+    assert node_management.has_full_pipeline(model.num_layers)
+    assert large.start_layer == 0
+    assert large.end_layer - large.start_layer > small.end_layer - small.start_layer
 
 
 @pytest.mark.parametrize(
