@@ -1,0 +1,57 @@
+from parallax.server.server_info import _resolve_usable_memory_gb
+from parallax_utils.utils import derive_max_batch_size
+from scheduling.node import Node, NodeHardwareInfo
+
+from .test_utils import build_model_info
+
+
+def test_shared_memory_budget_shrinks_under_pressure(monkeypatch):
+    monkeypatch.delenv("PARALLAX_WORKER_MEMORY_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_SYSTEM_RESERVE_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_USABLE_MEMORY_FRACTION", raising=False)
+    monkeypatch.delenv("PARALLAX_AVAILABLE_RESERVE_GB", raising=False)
+
+    idle_budget = _resolve_usable_memory_gb(16, available_gb=10, recommended_gb=14)
+    pressured_budget = _resolve_usable_memory_gb(16, available_gb=3, recommended_gb=14)
+
+    assert idle_budget == 8.0
+    assert pressured_budget < idle_budget
+    assert pressured_budget <= 1.0
+
+
+def test_explicit_worker_memory_override_wins(monkeypatch):
+    monkeypatch.setenv("PARALLAX_WORKER_MEMORY_GB", "5")
+
+    assert _resolve_usable_memory_gb(16, available_gb=1, recommended_gb=14) == 5.0
+
+
+def test_derive_max_batch_size_treats_zero_cache_as_capacity_limit():
+    assert derive_max_batch_size(
+        requested_max_batch_size=8,
+        max_sequence_len=32768,
+        max_tokens_in_cache=0,
+    ) == 1
+
+
+def test_node_max_requests_is_clamped_by_kv_capacity():
+    model = build_model_info(36)
+    hardware = NodeHardwareInfo(
+        node_id="tiny",
+        num_gpus=1,
+        tflops_fp16=8.0,
+        gpu_name="tiny",
+        memory_gb=1.0,
+        memory_bandwidth_gbps=100.0,
+        device="mlx",
+    )
+    node = Node(
+        node_id="tiny",
+        hardware=hardware,
+        model_info=model,
+        max_concurrent_requests=8,
+        max_sequence_length=32768,
+        kvcache_mem_ratio=0.25,
+    )
+    node.set_layer_allocation(0, 36)
+
+    assert node.max_requests == 1

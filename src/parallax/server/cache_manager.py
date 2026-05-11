@@ -249,8 +249,8 @@ class CacheManager:
         num_gpu_blocks = int(available_for_kv // total_block_bytes)
 
         if num_gpu_blocks <= 0:
-            logger.warning("Not enough memory for KV cache. Defaulting to 16 blocks.")
-            num_gpu_blocks = 16
+            logger.warning("Not enough memory for KV cache within the Parallax memory budget.")
+            return 0
 
         logger.info(
             f"KV cache will use {num_gpu_blocks * total_block_bytes / 1024**3:.2f} GB "

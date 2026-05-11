@@ -1,6 +1,9 @@
 from typing import Optional
 
-import torch
+try:
+    import torch
+except Exception:  # pragma: no cover - torch is optional outside CUDA/server envs
+    torch = None
 
 from parallax.server.server_info import HardwareInfo
 from parallax_utils.logging_config import get_logger
@@ -17,7 +20,7 @@ def bytes_per_element(dtype) -> int:
 
     if dtype is None:
         return 2
-    if dtype in (
+    if torch is not None and dtype in (
         getattr(torch, "float32", None),
         getattr(torch, "bfloat16", None),
         getattr(torch, "float16", None),
@@ -56,6 +59,8 @@ def compute_max_tokens_in_cache(
     if available_cache_bytes is not None:
         available_cache_size = int(available_cache_bytes)
     elif device == "cuda":
+        if torch is None:
+            raise RuntimeError("torch is required to inspect CUDA memory")
         free_bytes, _ = torch.cuda.mem_get_info(torch.cuda.current_device())
         available_cache_size = int(free_bytes * kv_cache_memory_fraction)
     else:
@@ -80,7 +85,7 @@ def derive_max_batch_size(
 ) -> int:
     """Derive final max_batch_size clamped by KV capacity if sequence length known."""
     max_batch_capacity: Optional[int] = None
-    if max_sequence_len and max_tokens_in_cache:
+    if max_sequence_len is not None and max_tokens_in_cache is not None:
         max_batch_capacity = max(1, max_tokens_in_cache // int(max_sequence_len))
     if requested_max_batch_size is None:
         if max_batch_capacity is None:
