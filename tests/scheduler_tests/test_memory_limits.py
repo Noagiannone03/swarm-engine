@@ -14,9 +14,18 @@ def test_shared_memory_budget_shrinks_under_pressure(monkeypatch):
     idle_budget = _resolve_usable_memory_gb(16, available_gb=10, recommended_gb=14)
     pressured_budget = _resolve_usable_memory_gb(16, available_gb=3, recommended_gb=14)
 
-    assert idle_budget == 8.0
+    assert idle_budget == 6.3
     assert pressured_budget < idle_budget
-    assert pressured_budget <= 1.0
+    assert pressured_budget == 4.0
+
+
+def test_shared_memory_budget_backs_off_under_severe_pressure(monkeypatch):
+    monkeypatch.delenv("PARALLAX_WORKER_MEMORY_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_SYSTEM_RESERVE_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_USABLE_MEMORY_FRACTION", raising=False)
+    monkeypatch.delenv("PARALLAX_AVAILABLE_RESERVE_GB", raising=False)
+
+    assert _resolve_usable_memory_gb(16, available_gb=2, recommended_gb=14) == 2.0
 
 
 def test_explicit_worker_memory_override_wins(monkeypatch):

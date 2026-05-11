@@ -45,7 +45,7 @@ _DEFAULT_AVAILABLE_RESERVE_GB = 2.0
 # Cap on the fraction of physical memory we ever report as usable, even after
 # subtracting the reserve. Activations and transient buffers grow beyond what
 # the scheduler's param/kvcache ratios account for.
-_DEFAULT_USABLE_MEMORY_FRACTION = 0.65
+_DEFAULT_USABLE_MEMORY_FRACTION = 0.45
 
 # MLX should not wire every byte we report as schedulable. This limit is
 # applied to the Metal working-set limit, leaving room for Python, tokenizers,
@@ -96,6 +96,27 @@ def _dynamic_system_reserve_gb(total_gb: float) -> float:
     return _read_env_float("PARALLAX_SYSTEM_RESERVE_GB", env_default, minimum=0.0)
 
 
+def _minimum_interactive_budget_gb(total_gb: float, available_gb: Optional[float]) -> float:
+    """Lower bound for useful contribution on personal shared-memory hosts.
+
+    The scheduler interprets memory_gb as the whole worker budget, then spends
+    only param_mem_ratio + kvcache_mem_ratio of it. Reporting 1 GB makes a
+    connected Mac effectively useless and can prevent pipeline formation. Keep
+    a small but useful floor on 16 GB Macs, while still backing off if the OS is
+    already under severe memory pressure.
+    """
+    ratio = (available_gb / total_gb) if available_gb is not None and total_gb > 0 else 1.0
+    if ratio < 0.15:
+        return 2.0
+    if total_gb <= 18:
+        return 4.0
+    if total_gb <= 36:
+        return 6.0
+    if total_gb <= 72:
+        return 8.0
+    return 10.0
+
+
 def _memory_pressure_cap_gb(total_gb: float, available_gb: Optional[float]) -> Optional[float]:
     """Estimate a cap from currently available memory.
 
@@ -124,7 +145,7 @@ def _memory_pressure_cap_gb(total_gb: float, available_gb: Optional[float]) -> O
     elif ratio < 0.40:
         cap *= 0.75
 
-    return max(0.5, cap)
+    return max(_minimum_interactive_budget_gb(total_gb, available_gb), cap)
 
 
 def _resolve_usable_memory_gb(
@@ -145,10 +166,11 @@ def _resolve_usable_memory_gb(
 
       1. Honoring PARALLAX_WORKER_MEMORY_GB when explicitly set
       2. Subtracting a reserve for the OS (PARALLAX_SYSTEM_RESERVE_GB)
-      2. Capping by a usable fraction (PARALLAX_USABLE_MEMORY_FRACTION)
-      3. Capping by currently available memory when psutil is available
-      4. Capping by Metal's recommended working set when available
-      5. Clamping to a 1 GB floor so we never report nonsense
+      3. Capping by a usable fraction (PARALLAX_USABLE_MEMORY_FRACTION)
+      4. Capping by current memory pressure when psutil is available, with
+         a useful floor for interactive shared-memory Macs
+      5. Capping by Metal's recommended working set when available
+      6. Clamping to a 1 GB floor so we never report nonsense
 
     Operators dedicating a machine to Parallax should set the reserve to
     a small value (e.g. 1) and bump the fraction towards 1.0.
