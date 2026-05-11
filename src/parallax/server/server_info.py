@@ -11,10 +11,16 @@ import subprocess
 from dataclasses import asdict, dataclass
 from typing import Any, ClassVar, Dict, Optional
 
-import mlx.core as mx
-from mlx import nn
-from mlx.utils import tree_reduce
-from mlx_lm.tuner.utils import get_total_parameters
+try:
+    import mlx.core as mx
+    from mlx import nn
+    from mlx.utils import tree_reduce
+    from mlx_lm.tuner.utils import get_total_parameters
+except Exception:  # pragma: no cover - MLX is optional on non-Apple hosts
+    mx = None
+    nn = None
+    tree_reduce = None
+    get_total_parameters = None
 
 try:
     import torch
@@ -31,15 +37,20 @@ logger = logging.getLogger(__name__)
 
 # Default headroom kept for the OS, GUI, and other userland processes on
 # machines with unified memory (Apple silicon) or CPU-only Linux nodes.
-# 6 GB is what a typical macOS desktop uses with a browser + IDE + the
-# usual background services; servers can lower it via env.
+# macOS memory pressure depends on swap/wired/cache, not only free RAM; a
+# fixed reserve plus an "available now" check keeps personal machines usable.
 _DEFAULT_SYSTEM_RESERVE_GB = 6.0
+_DEFAULT_AVAILABLE_RESERVE_GB = 2.0
 
-# Cap on the fraction of physical memory we ever report as usable, even
-# after subtracting the reserve. Activations and transient buffers grow
-# beyond what the param/kvcache ratios account for; staying below 70% of
-# physical leaves room for them and avoids paging.
-_DEFAULT_USABLE_MEMORY_FRACTION = 0.7
+# Cap on the fraction of physical memory we ever report as usable, even after
+# subtracting the reserve. Activations and transient buffers grow beyond what
+# the scheduler's param/kvcache ratios account for.
+_DEFAULT_USABLE_MEMORY_FRACTION = 0.65
+
+# MLX should not wire every byte we report as schedulable. This limit is
+# applied to the Metal working-set limit, leaving room for Python, tokenizers,
+# networking, UI apps, and transient allocations.
+_DEFAULT_MLX_WIRED_MEMORY_FRACTION = 0.9
 
 
 def _read_env_float(
@@ -66,7 +77,62 @@ def _read_env_float(
     return value
 
 
-def _resolve_usable_memory_gb(total_gb: float) -> float:
+def _dynamic_system_reserve_gb(total_gb: float) -> float:
+    """Return a sane reserve for interactive machines.
+
+    The env value remains the default, but the reserve scales up on bigger
+    Apple Silicon machines where users are likely to run browsers/IDEs
+    alongside Fabi. Dedicated nodes can set PARALLAX_SYSTEM_RESERVE_GB lower.
+    """
+    env_default = _DEFAULT_SYSTEM_RESERVE_GB
+    if total_gb <= 18:
+        env_default = 5.0
+    elif total_gb <= 36:
+        env_default = 7.0
+    elif total_gb <= 72:
+        env_default = 10.0
+    else:
+        env_default = 14.0
+    return _read_env_float("PARALLAX_SYSTEM_RESERVE_GB", env_default, minimum=0.0)
+
+
+def _memory_pressure_cap_gb(total_gb: float, available_gb: Optional[float]) -> Optional[float]:
+    """Estimate a cap from currently available memory.
+
+    psutil's available memory is the best portable signal we have from Python:
+    on macOS it accounts for reclaimable memory better than "free" memory.
+    When the machine is already under pressure we shrink the advertised budget
+    aggressively instead of letting the worker push the OS into swap.
+    """
+    if available_gb is None:
+        return None
+
+    reserve = _read_env_float(
+        "PARALLAX_AVAILABLE_RESERVE_GB",
+        _DEFAULT_AVAILABLE_RESERVE_GB,
+        minimum=0.0,
+    )
+    ratio = available_gb / total_gb if total_gb > 0 else 0.0
+    cap = available_gb - reserve
+
+    # Approximate Activity Monitor's yellow/red pressure behavior: as
+    # available memory shrinks, preserve a larger portion for the OS.
+    if ratio < 0.15:
+        cap *= 0.35
+    elif ratio < 0.25:
+        cap *= 0.55
+    elif ratio < 0.40:
+        cap *= 0.75
+
+    return max(0.5, cap)
+
+
+def _resolve_usable_memory_gb(
+    total_gb: float,
+    *,
+    available_gb: Optional[float] = None,
+    recommended_gb: Optional[float] = None,
+) -> float:
     """Convert a raw "physical memory" reading into what we should report
     to the scheduler as memory_gb on shared-memory hosts.
 
@@ -77,26 +143,109 @@ def _resolve_usable_memory_gb(total_gb: float) -> float:
     swap out the OS, freeze the desktop, and trip the OOM killer. We
     adjust by:
 
-      1. Subtracting a fixed reserve for the OS (PARALLAX_SYSTEM_RESERVE_GB)
+      1. Honoring PARALLAX_WORKER_MEMORY_GB when explicitly set
+      2. Subtracting a reserve for the OS (PARALLAX_SYSTEM_RESERVE_GB)
       2. Capping by a usable fraction (PARALLAX_USABLE_MEMORY_FRACTION)
-      3. Clamping to a 1 GB floor so we never report nonsense
+      3. Capping by currently available memory when psutil is available
+      4. Capping by Metal's recommended working set when available
+      5. Clamping to a 1 GB floor so we never report nonsense
 
     Operators dedicating a machine to Parallax should set the reserve to
     a small value (e.g. 1) and bump the fraction towards 1.0.
     """
-    reserve_gb = _read_env_float(
-        "PARALLAX_SYSTEM_RESERVE_GB", _DEFAULT_SYSTEM_RESERVE_GB, minimum=0.0
-    )
+    explicit = os.environ.get("PARALLAX_WORKER_MEMORY_GB", "").strip()
+    if explicit:
+        return _read_env_float(
+            "PARALLAX_WORKER_MEMORY_GB",
+            default=max(1.0, total_gb * 0.5),
+            minimum=1.0,
+            maximum=max(1.0, total_gb),
+        )
+
+    reserve_gb = _dynamic_system_reserve_gb(total_gb)
     fraction = _read_env_float(
         "PARALLAX_USABLE_MEMORY_FRACTION",
         _DEFAULT_USABLE_MEMORY_FRACTION,
         minimum=0.05,
         maximum=1.0,
     )
-    after_reserve = total_gb - reserve_gb
-    capped = total_gb * fraction
-    usable = min(after_reserve, capped)
-    return max(1.0, usable)
+    candidates = [
+        total_gb - reserve_gb,
+        total_gb * fraction,
+    ]
+    pressure_cap = _memory_pressure_cap_gb(total_gb, available_gb)
+    if pressure_cap is not None:
+        candidates.append(pressure_cap)
+    if recommended_gb is not None and recommended_gb > 0:
+        candidates.append(recommended_gb * fraction)
+
+    usable = min(candidates)
+    return round(max(1.0, usable), 2)
+
+
+def _recommended_metal_memory_gb() -> Optional[float]:
+    if mx is None:
+        return None
+    try:
+        info = mx.metal.device_info()
+        value = info.get("max_recommended_working_set_size")
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value) / 2**30
+    except Exception:
+        return None
+    return None
+
+
+def resolve_mlx_wired_limit_bytes(total_gb: Optional[float] = None) -> int:
+    """Return the MLX wired-memory limit in bytes.
+
+    MLX docs expose set_wired_limit() for macOS and recommend keeping it below
+    total memory. We set it to the same conservative budget advertised to the
+    scheduler, optionally multiplied by PARALLAX_MLX_WIRED_MEMORY_FRACTION.
+    """
+    if total_gb is None:
+        if psutil:
+            vm = psutil.virtual_memory()
+            total_gb = vm.total / 2**30
+            available_gb = vm.available / 2**30
+        else:
+            total_gb = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 2**30
+            available_gb = None
+    else:
+        available_gb = None
+
+    explicit = os.environ.get("PARALLAX_MLX_WIRED_LIMIT_GB", "").strip()
+    if explicit:
+        limit_gb = _read_env_float(
+            "PARALLAX_MLX_WIRED_LIMIT_GB",
+            default=max(1.0, total_gb * 0.5),
+            minimum=1.0,
+            maximum=max(1.0, total_gb - 0.5),
+        )
+    else:
+        usable_gb = _resolve_usable_memory_gb(
+            total_gb,
+            available_gb=available_gb,
+            recommended_gb=_recommended_metal_memory_gb(),
+        )
+        fraction = _read_env_float(
+            "PARALLAX_MLX_WIRED_MEMORY_FRACTION",
+            _DEFAULT_MLX_WIRED_MEMORY_FRACTION,
+            minimum=0.1,
+            maximum=1.0,
+        )
+        limit_gb = usable_gb * fraction
+
+    # MLX requires a wired limit strictly smaller than total memory.
+    limit_gb = min(limit_gb, max(1.0, total_gb - 0.5))
+    return int(max(1.0, limit_gb) * 2**30)
+
+
+def resolve_mlx_budget_bytes(total_gb: Optional[float] = None) -> int:
+    """Memory budget to use for MLX cache sizing."""
+    if total_gb is None and psutil:
+        total_gb = psutil.virtual_memory().total / 2**30
+    return resolve_mlx_wired_limit_bytes(total_gb)
 
 
 @dataclass
@@ -154,11 +303,14 @@ class AppleSiliconHardwareInfo(HardwareInfo):
     @classmethod
     def detect(cls) -> "AppleSiliconHardwareInfo":
         if psutil:
-            physical_gb = psutil.virtual_memory().total / 2**30
+            vm = psutil.virtual_memory()
+            physical_gb = vm.total / 2**30
+            available_gb = vm.available / 2**30
         else:
             physical_gb = (
                 int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 2**30
             )
+            available_gb = None
 
         # Apple silicon shares one pool of RAM between the CPU, the GPU,
         # the OS, and every userland process. Reporting the raw physical
@@ -166,13 +318,19 @@ class AppleSiliconHardwareInfo(HardwareInfo):
         # at ~90% of total memory, which on a personal Mac (browser +
         # IDE + system services) reliably swaps the machine to a freeze.
         # _resolve_usable_memory_gb() applies a configurable headroom.
-        total_gb = _resolve_usable_memory_gb(physical_gb)
+        total_gb = _resolve_usable_memory_gb(
+            physical_gb,
+            available_gb=available_gb,
+            recommended_gb=_recommended_metal_memory_gb(),
+        )
         if total_gb < physical_gb:
             logger.info(
                 "Apple silicon: reporting %.1f GB usable out of %.1f GB physical "
-                "(set PARALLAX_SYSTEM_RESERVE_GB / PARALLAX_USABLE_MEMORY_FRACTION to tune)",
+                "(available=%s GB; set PARALLAX_WORKER_MEMORY_GB, "
+                "PARALLAX_SYSTEM_RESERVE_GB, or PARALLAX_USABLE_MEMORY_FRACTION to tune)",
                 total_gb,
                 physical_gb,
+                f"{available_gb:.1f}" if available_gb is not None else "unknown",
             )
 
         chip = subprocess.check_output(
@@ -277,12 +435,19 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
         # available and apply the usable-memory adjustment so the
         # scheduler never asks for more than the box can actually give.
         if psutil:
-            physical_gb = psutil.virtual_memory().total / 2**30
-            memory_gb = _resolve_usable_memory_gb(physical_gb)
+            vm = psutil.virtual_memory()
+            physical_gb = vm.total / 2**30
+            available_gb = vm.available / 2**30
+            memory_gb = _resolve_usable_memory_gb(
+                physical_gb,
+                available_gb=available_gb,
+            )
             logger.info(
-                "Unknown hardware fallback: reporting %.1f GB usable out of %.1f GB physical",
+                "Unknown hardware fallback: reporting %.1f GB usable out of %.1f GB physical "
+                "(available=%.1f GB)",
                 memory_gb,
                 physical_gb,
+                available_gb,
             )
         else:
             memory_gb = 8.0
@@ -360,12 +525,15 @@ class ShardedModelInfo:
 
     @classmethod
     def from_sharded_model(
-        cls, sharded_model_instance: nn.Module  # Instance of your ShardedModel
+        cls, sharded_model_instance: Any  # Instance of your ShardedModel
     ) -> "ShardedModelInfo":
         """
         Constructs ShardedModelInfo from a loaded ShardedModel instance.
         Assumes sharded_model_instance has start_layer, end_layer, and model_id_original attributes.
         """
+        if mx is None or tree_reduce is None or get_total_parameters is None:
+            raise RuntimeError("MLX is required to inspect sharded model memory")
+
         # Calculate parameter count
         count = get_total_parameters(sharded_model_instance)
 

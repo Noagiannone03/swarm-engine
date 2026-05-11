@@ -19,6 +19,7 @@ from parallax.server.request import (
     RequestStatus,
 )
 from parallax.server.sampling.sampler import SamplingBatchInfo
+from parallax.server.server_info import resolve_mlx_wired_limit_bytes
 from parallax.server.shard_loader import MLXModelLoader
 from parallax.utils.utils import (
     combine_padding_and_causal_masks,
@@ -103,9 +104,15 @@ class MLXExecutor(BaseExecutor):
         )
 
         try:
-            mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+            wired_limit = resolve_mlx_wired_limit_bytes()
+            previous_limit = mx.set_wired_limit(wired_limit)
+            logger.info(
+                "MLX wired memory limit set to %.2f GB (previous %.2f GB)",
+                wired_limit / 1024**3,
+                previous_limit / 1024**3 if previous_limit else 0.0,
+            )
         except Exception:
-            logger.warning(f"Using mlx without metal backend.")
+            logger.warning("Using mlx without configurable metal wired limit.", exc_info=True)
 
         self.shard_loader = MLXModelLoader(
             model_repo,

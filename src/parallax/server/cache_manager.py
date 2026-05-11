@@ -8,6 +8,7 @@ from parallax.server.cache.base import BaseCache
 from parallax.server.cache.dsa_cache import DeepSeekSparseCache
 from parallax.server.cache.kv_cache import KVCachePacked
 from parallax.server.cache.linear_cache import LinearCache
+from parallax.server.server_info import resolve_mlx_budget_bytes
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -213,10 +214,9 @@ class CacheManager:
         return total_bytes
 
     def _calculate_num_blocks(self, cache_memory_fraction: float, dtype: mx.Dtype) -> int:
-        device_info = mx.metal.device_info()
-        total_mem = device_info["max_recommended_working_set_size"]
+        total_mem = resolve_mlx_budget_bytes()
         current_mem = mx.get_active_memory()
-        free_mem = total_mem - current_mem
+        free_mem = max(0, total_mem - current_mem)
         available_for_cache = free_mem * cache_memory_fraction
 
         dtype_size = 2 if dtype in [mx.float16, mx.bfloat16] else 4
