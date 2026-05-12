@@ -499,6 +499,27 @@ class GradientServer:
 
         self.lattica.build()
 
+        # Expose our peer_id so the spawning Fabi CLI can identify *which* node
+        # in /cluster/status_json is local — without parsing logs. When
+        # FABI_PEER_ID_FILE is set, write the peer_id there atomically (tmp +
+        # rename) so the CLI can read it as soon as it appears. Always log it
+        # at INFO so operators running parallax directly can see it too.
+        try:
+            my_peer_id = self.lattica.peer_id()
+        except Exception:
+            my_peer_id = None
+        if my_peer_id:
+            logger.info(f"Lattica peer_id: {my_peer_id}")
+            peer_id_file = os.environ.get("FABI_PEER_ID_FILE", "").strip()
+            if peer_id_file:
+                try:
+                    tmp = peer_id_file + ".tmp"
+                    with open(tmp, "w") as f:
+                        f.write(my_peer_id + "\n")
+                    os.replace(tmp, peer_id_file)
+                except Exception as e:
+                    logger.warning(f"Failed to write FABI_PEER_ID_FILE={peer_id_file}: {e}")
+
         if len(self.relay_servers) > 0:
             try:
                 is_symmetric_nat = self.lattica.is_symmetric_nat()
