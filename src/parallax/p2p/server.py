@@ -500,25 +500,18 @@ class GradientServer:
         self.lattica.build()
 
         # Expose our peer_id so the spawning Fabi CLI can identify *which* node
-        # in /cluster/status_json is local — without parsing logs. When
-        # FABI_PEER_ID_FILE is set, write the peer_id there atomically (tmp +
-        # rename) so the CLI can read it as soon as it appears. Always log it
-        # at INFO so operators running parallax directly can see it too.
+        # in /cluster/status_json is local — without parsing logs. We emit a
+        # structured `[FABI] {...}` event on stdout (consumed by the Node-side
+        # parser) and also log at INFO so operators running parallax directly
+        # can see it.
         try:
             my_peer_id = self.lattica.peer_id()
         except Exception:
             my_peer_id = None
         if my_peer_id:
             logger.info(f"Lattica peer_id: {my_peer_id}")
-            peer_id_file = os.environ.get("FABI_PEER_ID_FILE", "").strip()
-            if peer_id_file:
-                try:
-                    tmp = peer_id_file + ".tmp"
-                    with open(tmp, "w") as f:
-                        f.write(my_peer_id + "\n")
-                    os.replace(tmp, peer_id_file)
-                except Exception as e:
-                    logger.warning(f"Failed to write FABI_PEER_ID_FILE={peer_id_file}: {e}")
+            from parallax_utils.fabi_events import emit as fabi_emit
+            fabi_emit("peer_id", peer_id=my_peer_id)
 
         if len(self.relay_servers) > 0:
             try:
@@ -577,13 +570,27 @@ class GradientServer:
                 if self.manual_layer_assignment:
                     node_info["manual_layer_assignment"] = True
 
+                from parallax_utils.fabi_events import emit as fabi_emit
+                fabi_emit("joining_scheduler", scheduler_peer_id=self.scheduler_peer_id)
                 response = self.scheduler_stub.node_join(node_info)
                 response = response.result(timeout=300)
                 if response == {}:
+                    # Scheduler returned empty after the 300s wait_layer_allocation:
+                    # either bootstrap failed for capacity reasons or we never
+                    # got picked up. Emit before exiting so the CLI shows the
+                    # right state instead of guessing from the abrupt exit.
+                    fabi_emit("alloc_timeout")
                     logger.error("Failed to join scheduler")
                     exit(1)
 
                 logger.info(f"Join scheduler response: {response}")
+                fabi_emit(
+                    "allocated",
+                    start_layer=response.get("start_layer"),
+                    end_layer=response.get("end_layer"),
+                    model_name=response.get("model_name"),
+                    tp_size=response.get("tp_size"),
+                )
 
                 if not self.manual_layer_assignment:
                     self.block_start_index = response.get("start_layer")

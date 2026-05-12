@@ -323,9 +323,33 @@ class MLXModelLoader:
         shard_weights = {}
         layer_key_prefix = "model.layers"  # Common prefix
 
+        # Coarse progress signal for the Fabi CLI: one event when we start the
+        # weights pass, one per file (already on disk after selective_download),
+        # one when the pass is done. Real download progress is more granular
+        # but happens in selective_download upstream of this loop; this captures
+        # the "loading into MLX memory" step which is the most visible to the
+        # user (the model is on disk by now but mx.load() takes seconds-to-tens-
+        # of-seconds per file on smaller machines).
+        try:
+            from parallax_utils.fabi_events import emit as _fabi_emit
+        except Exception:
+            _fabi_emit = lambda *a, **k: None  # noqa: E731 — fail-open
+        _fabi_emit(
+            "weights_load_start",
+            files_total=len(weight_files),
+            start_layer=current_start_layer,
+            end_layer=current_end_layer,
+        )
+
         for file_idx, wf in enumerate(weight_files):
             logger.debug(
                 f"Scanning weight file {file_idx + 1}/{len(weight_files)}: {pathlib.Path(wf).name}"
+            )
+            _fabi_emit(
+                "weights_load_progress",
+                files_done=file_idx,
+                files_total=len(weight_files),
+                file_name=pathlib.Path(wf).name,
             )
 
             f = mx.load(wf)
@@ -445,6 +469,13 @@ class MLXModelLoader:
             current_start_layer,
             current_end_layer,
             mx.get_active_memory() / 1024**3,
+        )
+        _fabi_emit(
+            "weights_load_done",
+            files_total=len(weight_files),
+            start_layer=current_start_layer,
+            end_layer=current_end_layer,
+            memory_gb=round(mx.get_active_memory() / 1024**3, 3),
         )
         return model_shard, config, tokenizer
 
