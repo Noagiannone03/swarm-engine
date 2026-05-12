@@ -192,6 +192,16 @@ class SchedulerManage:
         return self.scheduler.need_more_nodes() if self.scheduler else False
 
     def get_cluster_status(self):
+        # Bootstrap result/timestamp are exposed verbatim so clients can detect
+        # "failed_capacity" (allocation tried, can't fit) vs "pending" (still
+        # running) without polling intervals. Falls back to None when the
+        # scheduler hasn't been initialized yet (model not set).
+        last_bootstrap_result = (
+            self.scheduler.last_bootstrap_result if self.scheduler else None
+        )
+        last_bootstrap_attempt_ts = (
+            self.scheduler.last_bootstrap_attempt_ts if self.scheduler else 0.0
+        )
         return {
             "type": "cluster_status",
             "data": {
@@ -203,6 +213,8 @@ class SchedulerManage:
                 ),
                 "node_list": self.get_node_list(),
                 "need_more_nodes": self.need_more_nodes(),
+                "last_bootstrap_result": last_bootstrap_result,
+                "last_bootstrap_attempt_ts": last_bootstrap_attempt_ts,
                 "max_running_request": (
                     self.scheduler.report_pipeline_capacity()[1] if self.scheduler else 0
                 ),
@@ -216,9 +228,23 @@ class SchedulerManage:
         return [self.build_node_info(node) for node in self.scheduler.node_manager.nodes]
 
     def build_node_info(self, node):
+        # Per-node state for richer UI feedback. The scheduler's `state_of()`
+        # tells us if the node is in an active pipeline (ACTIVE) or held in
+        # reserve (STANDBY); `loading_phase` is the worker-reported lifecycle
+        # ("joining" / "initializing" / "ready" / ...). Together they let the
+        # CLI distinguish "downloading model" from "standby for redundancy"
+        # from "ready to serve" without parsing logs.
+        node_state = None
+        if self.scheduler is not None:
+            state_obj = self.scheduler.node_manager.state_of(node.node_id)
+            node_state = state_obj.value if state_obj is not None else None
         return {
             "node_id": node.node_id,
             "status": NODE_STATUS_AVAILABLE if node.is_active else NODE_STATUS_WAITING,
+            "node_state": node_state,
+            "loading_phase": node.loading_phase,
+            "start_layer": node.start_layer,
+            "end_layer": node.end_layer,
             "gpu_num": node.hardware.num_gpus,
             "gpu_name": node.hardware.gpu_name,
             "gpu_memory": node.hardware.memory_gb,

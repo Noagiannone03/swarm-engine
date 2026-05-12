@@ -190,6 +190,12 @@ class Node:
 
     # todo upload is_active
     is_active: bool = True
+    # Worker-reported lifecycle state ("joining" | "initializing" | "ready" |
+    # "offline" | "error"). Mirrors `parallax.p2p.server.ServerState`. Until
+    # the worker reports otherwise we assume "joining" (Lattica handshake in
+    # progress). The UI uses this to distinguish "node connected but still
+    # downloading model" from "node is in standby for redundancy".
+    loading_phase: str = "joining"
     last_heartbeat: float = 0.0
     # Will be updated by node broadcasting
     # otherwise, use roofline performance model to estimate

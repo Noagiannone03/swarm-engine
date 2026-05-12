@@ -101,7 +101,7 @@ class Scheduler:
         # Event queues for main loop orchestration (thread-safe)
         self._pending_joins: "queue.Queue[Node]" = queue.Queue()
         self._pending_leaves: "queue.Queue[str]" = queue.Queue()
-        self._pending_node_updates: "queue.Queue[Tuple[str, Optional[int], Optional[float], Optional[Dict[str, float]], Optional[bool], Optional[bool]]]" = (queue.Queue())
+        self._pending_node_updates: "queue.Queue[Tuple[str, Optional[int], Optional[float], Optional[Dict[str, float]], Optional[bool], Optional[float], Optional[str]]]" = (queue.Queue())
 
         # Concurrency controls
         self._stop_event: threading.Event = threading.Event()
@@ -116,6 +116,14 @@ class Scheduler:
         self.alloc_log_snapshot: str = ""
         # Avoid spamming: only emit the "all nodes active" INFO log on transitions.
         self._all_nodes_active_logged: bool = False
+        # Result of the most recent bootstrap attempt — exposed via the API so
+        # the CLI can show a precise message instead of a timer-based heuristic.
+        # Values: None (never attempted), "pending" (running), "success",
+        # "failed_capacity" (had enough nodes but allocation didn't fit),
+        # "deferred_not_enough_nodes" (below min_nodes_bootstrapping).
+        # Timestamp lets the UI ignore stale results after a node leave/rejoin.
+        self.last_bootstrap_result: Optional[str] = None
+        self.last_bootstrap_attempt_ts: float = 0.0
         logger.info(
             f"Scheduler initialized, min_nodes_bootstrapping {self.min_nodes_bootstrapping}, "
             f"Layer allocations trategy {strategy}, Request routing strategy {routing_strategy}."
@@ -154,6 +162,8 @@ class Scheduler:
     def bootstrap(self, reboot: bool = False) -> bool:
         """Initial Node Allocation Assignment."""
         logger.info("[Scheduler] Starting Bootstrap")
+        self.last_bootstrap_attempt_ts = time.time()
+        self.last_bootstrap_result = "pending"
         overide_min_node_check = False
         if reboot:
             # Clear any fixed pipeline registrations; they are no longer valid.
@@ -182,6 +192,7 @@ class Scheduler:
             logger.info(
                 f"[Scheduler] Bootstrap deferred: have {self.node_manager.num_standby_nodes} standby nodes; need >= {self.min_nodes_bootstrapping}"
             )
+            self.last_bootstrap_result = "deferred_not_enough_nodes"
             return False
 
         # Perform global allocation
@@ -190,6 +201,7 @@ class Scheduler:
             logger.warning("Global allocation failed to produce a full pipeline")
             # Stay un-bootstrapped so future joins can retry bootstrap.
             self._bootstrapped_event.clear()
+            self.last_bootstrap_result = "failed_capacity"
             return False
 
         assignments = self.node_manager.list_node_allocations(self.num_layers)
@@ -197,6 +209,7 @@ class Scheduler:
 
         self.request_router.bootstrap()
         self._bootstrapped_event.set()
+        self.last_bootstrap_result = "success"
         # Snapshot at INFO after bootstrap since allocations/pipelines may have materially changed.
         self.emit_alloc_log_snapshot(reason="Post Bootstrap")
         return True
@@ -224,6 +237,7 @@ class Scheduler:
         new_rtt_to_nodes: Optional[Dict[str, float]] = None,
         is_active: Optional[bool] = None,
         last_refit_time: Optional[float] = 0.0,
+        loading_phase: Optional[str] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
@@ -236,6 +250,8 @@ class Scheduler:
             node.is_active = is_active
         if last_refit_time > 0.0:
             node.last_refit_time = last_refit_time
+        if loading_phase is not None:
+            node.loading_phase = loading_phase
         node.last_heartbeat = time.time()
 
     # Async-style event enqueuers for main loop
@@ -259,6 +275,7 @@ class Scheduler:
         new_rtt_to_nodes: Optional[Dict[str, float]] = None,
         is_active: Optional[bool] = None,
         last_refit_time: Optional[float] = 0.0,
+        loading_phase: Optional[str] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -269,6 +286,7 @@ class Scheduler:
                 new_rtt_to_nodes,
                 is_active,
                 last_refit_time,
+                loading_phase,
             )
         )
         self._wake_event.set()
@@ -543,7 +561,7 @@ class Scheduler:
         """Apply pending node stats updates from the queue."""
         while True:
             try:
-                node_id, cur, lat, rtts, is_active, last_refit_time = (
+                node_id, cur, lat, rtts, is_active, last_refit_time, loading_phase = (
                     self._pending_node_updates.get_nowait()
                 )
             except queue.Empty:
@@ -559,6 +577,7 @@ class Scheduler:
                 new_rtt_to_nodes=rtts,
                 is_active=is_active,
                 last_refit_time=last_refit_time,
+                loading_phase=loading_phase,
             )
 
     def _process_joins(self) -> None:

@@ -99,6 +99,7 @@ class RPCConnectionHandler(ConnectionHandler):
                 new_rtt_to_nodes=node.rtt_to_nodes,
                 is_active=node.is_active,
                 last_refit_time=node.last_refit_time,
+                loading_phase=node.loading_phase,
             )
             # Return current layer allocation to node
             layer_allocation = self.get_layer_allocation(node.node_id)
@@ -194,6 +195,10 @@ class RPCConnectionHandler(ConnectionHandler):
             max_concurrent_requests=node_json.get("max_concurrent_requests"),
             max_sequence_length=node_json.get("max_sequence_length"),
             is_active=node_json.get("is_active", True),
+            # Worker sends its ServerState as "status" — store it in
+            # `loading_phase` so the UI can show "downloading" vs "ready" vs
+            # "joining" instead of just the binary is_active flag.
+            loading_phase=node_json.get("status", "joining"),
             manual_layer_assignment=node_json.get("manual_layer_assignment", False),
             last_refit_time=node_json.get("last_refit_time", 0.0),
         )
