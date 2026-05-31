@@ -9,6 +9,7 @@ Scheduling primitives for distributed LLM inference.
   latency tracking, and RTT cache for network-aware request routing
 """
 
+import os
 import time
 from dataclasses import dataclass, field
 from math import floor
@@ -19,6 +20,34 @@ from parallax_utils.utils import bytes_per_element, compute_max_batch_size
 from scheduling.model_info import ModelInfo
 
 logger = get_logger(__name__)
+
+
+def _env_float(key: str, default: float, *, minimum: Optional[float] = None) -> float:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring %s=%r (not a number)", key, raw)
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
+# --- Peer reliability backoff -------------------------------------------------
+# Faithful port of hivemind.dht.node.Blacklist (used by Petals' routing): a peer
+# that fails/errors is temporarily excluded from routing, and each successive ban
+# episode lasts longer (base * rate**streak). The scheduler otherwise only learns
+# a node is unhealthy via the heartbeat timeout (tens of seconds), so without this
+# a reachable-but-failing peer keeps getting routed to and stalls requests.
+#
+# Tunable per-deployment via env (dedicated inference clusters may want longer
+# bans; flaky home swarms shorter ones).
+PEER_BAN_BASE_SEC = _env_float("PARALLAX_PEER_BAN_BASE_SEC", 5.0, minimum=0.0)
+PEER_BAN_BACKOFF_RATE = _env_float("PARALLAX_PEER_BAN_BACKOFF_RATE", 2.0, minimum=1.0)
+PEER_BAN_MAX_SEC = _env_float("PARALLAX_PEER_BAN_MAX_SEC", 300.0, minimum=0.0)
 
 
 @dataclass
@@ -204,6 +233,16 @@ class Node:
 
     rtt_to_nodes: Optional[Dict[str, float]] = None
 
+    # --- Peer reliability (Blacklist-style backoff) ---
+    # Number of *successive* ban episodes so far (hivemind's ban_counter): the
+    # exponent for the next ban duration. Reset to 0 on a success.
+    failure_streak: int = 0
+    # Wall-clock epoch until which this node is excluded from routing. 0.0 = not
+    # banned. Routing treats `is_banned()` like `is_overloaded` (unavailable),
+    # but — unlike overload — it is deliberately kept OUT of `layer_latency_ms`
+    # so bans only affect routing, never (re)allocation/placement.
+    banned_until: float = 0.0
+
     _force_max_concurrent_requests: bool = False
 
     def __post_init__(self):
@@ -272,6 +311,52 @@ class Node:
     def is_overloaded(self) -> bool:
         """Check if node is at capacity for requests."""
         return self.current_requests >= self.max_requests
+
+    def is_banned(self, now: Optional[float] = None) -> bool:
+        """True while this peer is temporarily excluded from routing after failures."""
+        if self.banned_until <= 0.0:
+            return False
+        return (now if now is not None else time.time()) < self.banned_until
+
+    def record_request_failure(
+        self,
+        *,
+        now: Optional[float] = None,
+        base_sec: float = PEER_BAN_BASE_SEC,
+        backoff_rate: float = PEER_BAN_BACKOFF_RATE,
+        max_sec: float = PEER_BAN_MAX_SEC,
+    ) -> None:
+        """Temporarily ban this peer from routing, with exponential backoff.
+
+        Faithful port of ``hivemind.dht.node.Blacklist.register_failure``: an
+        already-banned peer is left untouched (no extension), and ``failure_streak``
+        only advances per *new* ban episode, so each successive ban lasts
+        ``base_sec * backoff_rate ** failure_streak`` — a chronically flaky peer is
+        shed for longer while a one-off blip recovers quickly. Capped at ``max_sec``.
+        """
+        if base_sec <= 0.0:
+            return
+        t = now if now is not None else time.time()
+        if self.is_banned(t):
+            return  # don't extend an active ban (matches hivemind)
+        ban_duration = base_sec * (backoff_rate**self.failure_streak)
+        if max_sec > 0.0:
+            ban_duration = min(ban_duration, max_sec)
+        self.banned_until = t + ban_duration
+        self.failure_streak += 1
+        logger.info(
+            "Peer %s banned from routing for %.1fs (episode #%d)",
+            self.node_id,
+            ban_duration,
+            self.failure_streak,
+        )
+
+    def record_request_success(self) -> None:
+        """Clear any ban and reset the backoff (matches ``Blacklist.register_success``)."""
+        if self.banned_until > 0.0 or self.failure_streak > 0:
+            logger.debug("Peer %s reliability reset (success)", self.node_id)
+        self.banned_until = 0.0
+        self.failure_streak = 0
 
     def get_decoder_layer_capacity(
         self, include_input_embed: bool = False, include_lm_head: bool = False

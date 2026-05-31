@@ -46,6 +46,7 @@ final node path and total latency.
 """
 
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
@@ -58,17 +59,28 @@ logger = get_logger(__name__)
 
 
 def estimate_pipeline_latency(
-    pipeline_node_ids: List[str], *, id_to_node: Dict[str, Node]
+    pipeline_node_ids: List[str],
+    *,
+    id_to_node: Dict[str, Node],
+    ignore_banned: bool = False,
+    now: Optional[float] = None,
 ) -> float:
     """Estimate end-to-end latency for a node-id pipeline.
 
-    Returns `inf` if any node is missing, overloaded, or if any required RTT is missing.
+    Returns `inf` if any node is missing, overloaded, temporarily banned (unless
+    ``ignore_banned``), or if any required RTT is missing.
+
+    ``ignore_banned`` is the "all peers blacklisted → allow them anyway" escape
+    valve (same idea as Petals' routing): serving prefers healthy peers, but falls
+    back to a flaky one rather than failing the request outright.
     """
     total = 0.0
     prev: Optional[Node] = None
     for nid in pipeline_node_ids:
         n = id_to_node.get(nid)
         if n is None or n.is_overloaded:
+            return float("inf")
+        if not ignore_banned and n.is_banned(now):
             return float("inf")
         node_lat = float(n.layer_latency_ms)
         if node_lat == float("inf"):
@@ -821,40 +833,65 @@ class RoundRobinOverFixedPipelinesRouting(RequestRoutingStrategy):
         # Build lookup from the latest node snapshot.
         id_to_node: Dict[str, Node] = {n.node_id: n for n in self.node_manager.nodes}
 
-        attempts = 0
         pipelines_list = [pipelines[k] for k in sorted(pipelines.keys())]
         total_pipelines = len(pipelines_list)
-        while attempts < total_pipelines:
-            pid = self._rr_cursor % total_pipelines
-            candidate_pipeline = pipelines_list[pid]
-            candidate = list(candidate_pipeline.node_ids)
-            self._rr_cursor += 1
-            attempts += 1
+        if total_pipelines == 0:
+            return [], float("inf")
 
-            # If any stage is not ready, skip quickly.
-            if not candidate_pipeline.is_ready:
-                logger.warning(f"Pipeline {candidate} is not ready, skipping")
-                continue
+        # Snapshot `now` once so every ban check in this dispatch is consistent.
+        now = time.time()
 
-            latency = estimate_pipeline_latency(candidate, id_to_node=id_to_node)
-            for nid in candidate:
-                if nid not in id_to_node:
-                    raise ValueError(
-                        f"To be dispatched node {nid} in pipeline {candidate} not found in node manager!"
-                    )
-                if not id_to_node[nid].is_active:
-                    # If node is not active, skip the pipeline
-                    logger.warning(f"Pipeline {candidate} is not active, skipping")
-                    latency = float("inf")
-                if (
-                    last_refit_time is not None
-                    and id_to_node[nid].last_refit_time < last_refit_time
-                ):
-                    # If node holds an older version of weight, skip the pipeline
-                    logger.warning(f"Pipeline {candidate} holds an old version of weight, skipping")
-                    latency = float("inf")
+        def _scan(ignore_banned: bool) -> Tuple[List[str], float]:
+            """One round-robin sweep over registered pipelines."""
+            attempts = 0
+            while attempts < total_pipelines:
+                pid = self._rr_cursor % total_pipelines
+                candidate_pipeline = pipelines_list[pid]
+                candidate = list(candidate_pipeline.node_ids)
+                self._rr_cursor += 1
+                attempts += 1
 
-            if latency != float("inf"):
-                return list(candidate), float(latency)
+                # If any stage is not ready, skip quickly.
+                if not candidate_pipeline.is_ready:
+                    logger.warning(f"Pipeline {candidate} is not ready, skipping")
+                    continue
 
-        return [], float("inf")
+                latency = estimate_pipeline_latency(
+                    candidate, id_to_node=id_to_node, ignore_banned=ignore_banned, now=now
+                )
+                for nid in candidate:
+                    if nid not in id_to_node:
+                        raise ValueError(
+                            f"To be dispatched node {nid} in pipeline {candidate} not found in node manager!"
+                        )
+                    if not id_to_node[nid].is_active:
+                        # If node is not active, skip the pipeline
+                        logger.warning(f"Pipeline {candidate} is not active, skipping")
+                        latency = float("inf")
+                    if (
+                        last_refit_time is not None
+                        and id_to_node[nid].last_refit_time < last_refit_time
+                    ):
+                        # If node holds an older version of weight, skip the pipeline
+                        logger.warning(
+                            f"Pipeline {candidate} holds an old version of weight, skipping"
+                        )
+                        latency = float("inf")
+
+                if latency != float("inf"):
+                    return list(candidate), float(latency)
+            return [], float("inf")
+
+        # First sweep avoids temporarily-banned peers. If that finds nothing, the
+        # banned peers may be the only ones covering some layers — fall back to a
+        # sweep that ignores bans rather than failing the request (Petals' "all
+        # blacklisted → allow them" escape valve). A pipeline still blocked by a
+        # genuinely overloaded/not-ready/stale node stays `inf` in both sweeps.
+        path, latency = _scan(ignore_banned=False)
+        if not path:
+            path, latency = _scan(ignore_banned=True)
+            if path:
+                logger.warning(
+                    "All viable pipelines contained banned peers; dispatching to %s anyway", path
+                )
+        return path, latency

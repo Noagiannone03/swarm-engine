@@ -252,6 +252,21 @@ class Scheduler:
             node.last_refit_time = last_refit_time
         if loading_phase is not None:
             node.loading_phase = loading_phase
+            # Feed the peer-reliability backoff from the worker's self-reported
+            # health. A node stuck in "error" is shed from routing immediately
+            # (with exponential backoff via Node.record_request_failure) instead
+            # of lingering until the heartbeat timeout; "ready" rehabilitates it.
+            # record_request_failure no-ops while a ban is still active, so a node
+            # that keeps reporting "error" only escalates once per ban episode.
+            # NOTE: this is currently the only reliability signal; a per-request
+            # failure hook (serving layer) can call the same Node API later.
+            # String literals (not an import of parallax.p2p.server.ServerState)
+            # to avoid a circular dependency — the server already depends on
+            # scheduling. These mirror ServerState.ERROR / ServerState.READY.
+            if loading_phase == "error":
+                node.record_request_failure()
+            elif loading_phase == "ready":
+                node.record_request_success()
         node.last_heartbeat = time.time()
 
     # Async-style event enqueuers for main loop
