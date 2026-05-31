@@ -29,6 +29,7 @@ from parallax.server.server_args import parse_args
 from parallax.utils.shared_state import SharedState
 from parallax.utils.utils import fetch_model_from_hf, initialize_nccl_port
 from parallax_utils.ascii_anime import display_parallax_join
+from parallax_utils.cuda_memory import configure_torch_cuda_memory_limit
 from parallax_utils.logging_config import get_logger, set_log_level
 from parallax_utils.version_check import check_latest_release
 
@@ -96,6 +97,7 @@ if __name__ == "__main__":
     try:
         args = parse_args()
         set_log_level(args.log_level)
+        configure_torch_cuda_memory_limit()
         logger.debug(f"args: {args}")
         args.recv_from_peer_addr = f"ipc://{tempfile.NamedTemporaryFile().name}"
         args.send_to_peer_addr = f"ipc://{tempfile.NamedTemporaryFile().name}"

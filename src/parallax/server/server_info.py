@@ -11,6 +11,11 @@ import subprocess
 from dataclasses import asdict, dataclass
 from typing import Any, ClassVar, Dict, Optional
 
+from parallax_utils.cuda_memory import (
+    configure_torch_cuda_memory_limit,
+    resolve_cuda_memory_budget,
+)
+
 try:
     import mlx.core as mx
     from mlx import nn
@@ -415,11 +420,29 @@ class NvidiaHardwareInfo(HardwareInfo):
         if torch is None or not torch.cuda.is_available():
             raise RuntimeError("CUDA not available; cannot detect NVIDIA hardware")
 
+        budgets = configure_torch_cuda_memory_limit(torch)
         device_count = torch.cuda.device_count()
         device_index = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device_index)
         name = getattr(props, "name", f"cuda:{device_index}")
         total_vram_gb = round(props.total_memory / (1024**3), 1)
+        free_vram_gb = None
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(device_index)
+            free_vram_gb = free_bytes / (1024**3)
+        except Exception:
+            pass
+        if budgets:
+            current_budget = next(
+                (b for b in budgets if b.device_index == device_index),
+                budgets[0],
+            )
+        else:
+            current_budget = resolve_cuda_memory_budget(
+                device_index=device_index,
+                total_gb=total_vram_gb,
+                free_gb=free_vram_gb,
+            )
 
         # Host RAM (for completeness)
         if psutil:
@@ -428,12 +451,20 @@ class NvidiaHardwareInfo(HardwareInfo):
             total_gb = 0.0
 
         spec = cls._match_gpu_specs(name, total_vram_gb)
+        if current_budget.usable_gb < total_vram_gb:
+            logger.info(
+                "CUDA: reporting %.1f GB usable out of %.1f GB VRAM on %s "
+                "(set PARALLAX_WORKER_MEMORY_GB or PARALLAX_CUDA_USABLE_MEMORY_FRACTION to tune)",
+                current_budget.usable_gb,
+                total_vram_gb,
+                name,
+            )
         return cls(
             num_gpus=device_count,
             total_ram_gb=round(total_gb, 1),
             chip=name,
             tflops_fp16=float(spec["tflops_fp16"]),
-            vram_gb=total_vram_gb,
+            vram_gb=current_budget.usable_gb,
             memory_bandwidth_gbps=float(spec["bandwidth_gbps"]),
         )
 

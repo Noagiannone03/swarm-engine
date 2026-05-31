@@ -1,4 +1,5 @@
 from parallax.server.server_info import _resolve_usable_memory_gb
+from parallax_utils.cuda_memory import resolve_cuda_memory_budget
 from parallax_utils.utils import derive_max_batch_size
 from scheduling.node import Node, NodeHardwareInfo
 
@@ -32,6 +33,42 @@ def test_explicit_worker_memory_override_wins(monkeypatch):
     monkeypatch.setenv("PARALLAX_WORKER_MEMORY_GB", "5")
 
     assert _resolve_usable_memory_gb(16, available_gb=1, recommended_gb=14) == 5.0
+
+
+def test_cuda_budget_reserves_vram_for_desktop_hosts(monkeypatch):
+    monkeypatch.delenv("PARALLAX_WORKER_MEMORY_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_CUDA_SYSTEM_RESERVE_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_CUDA_AVAILABLE_RESERVE_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_CUDA_USABLE_MEMORY_FRACTION", raising=False)
+    monkeypatch.delenv("PARALLAX_CUDA_ALLOCATOR_FRACTION", raising=False)
+
+    budget = resolve_cuda_memory_budget(total_gb=24, free_gb=22)
+
+    assert budget.usable_gb == 19.68
+    assert round(budget.allocator_fraction, 2) == 0.82
+
+
+def test_cuda_budget_backs_off_when_vram_is_already_used(monkeypatch):
+    monkeypatch.delenv("PARALLAX_WORKER_MEMORY_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_CUDA_SYSTEM_RESERVE_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_CUDA_AVAILABLE_RESERVE_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_CUDA_USABLE_MEMORY_FRACTION", raising=False)
+    monkeypatch.delenv("PARALLAX_CUDA_ALLOCATOR_FRACTION", raising=False)
+
+    budget = resolve_cuda_memory_budget(total_gb=24, free_gb=8)
+
+    assert budget.usable_gb == 7.25
+    assert round(budget.allocator_fraction, 2) == 0.30
+
+
+def test_explicit_worker_memory_override_also_controls_cuda(monkeypatch):
+    monkeypatch.setenv("PARALLAX_WORKER_MEMORY_GB", "10")
+    monkeypatch.delenv("PARALLAX_CUDA_ALLOCATOR_FRACTION", raising=False)
+
+    budget = resolve_cuda_memory_budget(total_gb=24, free_gb=4)
+
+    assert budget.usable_gb == 10
+    assert round(budget.allocator_fraction, 2) == 0.42
 
 
 def test_derive_max_batch_size_treats_zero_cache_as_capacity_limit():

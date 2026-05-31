@@ -245,4 +245,9 @@ if __name__ == "__main__":
     host = args.host
     port = args.port
 
-    uvicorn.run(app, host=host, port=port, log_level="info", loop="uvloop")
+    uvicorn_loop = "uvloop"
+    try:
+        import uvloop  # noqa: F401
+    except ImportError:
+        uvicorn_loop = "auto"
+    uvicorn.run(app, host=host, port=port, log_level="info", loop=uvicorn_loop)

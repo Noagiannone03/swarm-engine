@@ -28,7 +28,7 @@ dependencies = [
   "httpx[socks]>=0.26.0",
   "aiohttp",
   "uvicorn",
-  "uvloop",
+  "uvloop; sys_platform != 'win32'",
   "fastapi",
   "pydantic",
   "protobuf==6.31.1",

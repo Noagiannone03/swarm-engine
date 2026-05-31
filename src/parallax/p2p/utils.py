@@ -10,17 +10,21 @@ from concurrent.futures import Future
 from threading import Thread
 from typing import Awaitable
 
-import uvloop
+try:
+    import uvloop
+except ImportError:  # pragma: no cover - uvloop is not available on Windows
+    uvloop = None
 
 
 def switch_to_uvloop() -> asyncio.AbstractEventLoop:
-    """stop any running event loops; install uvloop; then create, set and return a new event loop"""
+    """Stop any running event loop, then create and set a fresh loop."""
     try:
         # if we're in jupyter, get rid of its built-in event loop
         asyncio.get_event_loop().stop()
     except RuntimeError:
         pass  # this allows running DHT from background threads with no event loop
-    uvloop.install()
+    if uvloop is not None:
+        uvloop.install()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     return loop

@@ -22,6 +22,23 @@ cd parallax
 pip install -e '.[gpu]'
 ```
 
+Parallax reports a conservative CUDA memory budget to the scheduler and applies
+the same budget to PyTorch's CUDA caching allocator. This keeps Windows WSL and
+desktop Linux machines responsive while they contribute to a swarm.
+
+Useful overrides for dedicated inference nodes:
+
+```sh
+# Hard cap reported to the scheduler and used for PyTorch allocator limits.
+export PARALLAX_WORKER_MEMORY_GB=20
+
+# Or tune the automatic budget.
+export PARALLAX_CUDA_SYSTEM_RESERVE_GB=2
+export PARALLAX_CUDA_AVAILABLE_RESERVE_GB=1
+export PARALLAX_CUDA_USABLE_MEMORY_FRACTION=0.85
+export PARALLAX_CUDA_ALLOCATOR_FRACTION=0.85
+```
+
 #### For macOS (Apple silicon):
 
 We recommend macOS users to create an isolated Python virtual environment before installation.
