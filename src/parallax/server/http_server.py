@@ -29,10 +29,15 @@ import uvicorn
 import zmq
 import zmq.asyncio
 from fastapi.responses import ORJSONResponse, StreamingResponse
-from mlx_lm.tokenizer_utils import StreamingDetokenizer
-from mlx_lm.utils import load_config
 from pydantic import BaseModel
 from starlette.datastructures import State
+
+try:
+    # mlx_lm pulls mlx.core (no Windows build); fall back to the vendored copy.
+    from mlx_lm.tokenizer_utils import StreamingDetokenizer
+except ImportError:  # pragma: no cover - exercised on Windows
+    from parallax.utils._mlx_tokenizer_vendor import StreamingDetokenizer
+from parallax.utils.utils import load_config
 
 from parallax.utils.selective_download import download_metadata_only
 from parallax.utils.tokenizer_utils import (

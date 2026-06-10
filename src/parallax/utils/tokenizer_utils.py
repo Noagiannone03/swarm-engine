@@ -9,15 +9,29 @@ from functools import partial
 from json import JSONDecodeError
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from mlx_lm.tokenizer_utils import (
-    BPEStreamingDetokenizer,
-    NaiveStreamingDetokenizer,
-    SPMStreamingDetokenizer,
-    _is_bpe_decoder,
-    _is_spm_decoder,
-    _is_spm_decoder_no_space,
-)
-from mlx_lm.tokenizer_utils import load as _mlx_load_tokenizer
+try:
+    # On Mac/Linux mlx_lm is present — use it directly (no behaviour change).
+    from mlx_lm.tokenizer_utils import (
+        BPEStreamingDetokenizer,
+        NaiveStreamingDetokenizer,
+        SPMStreamingDetokenizer,
+        _is_bpe_decoder,
+        _is_spm_decoder,
+        _is_spm_decoder_no_space,
+    )
+    from mlx_lm.tokenizer_utils import load as _mlx_load_tokenizer
+except ImportError:  # pragma: no cover - exercised on Windows (mlx absent)
+    # mlx_lm transitively imports mlx.core, which has no Windows build. Fall back
+    # to the vendored verbatim copy (pure Python, identical behaviour).
+    from parallax.utils._mlx_tokenizer_vendor import (
+        BPEStreamingDetokenizer,
+        NaiveStreamingDetokenizer,
+        SPMStreamingDetokenizer,
+        _is_bpe_decoder,
+        _is_spm_decoder,
+        _is_spm_decoder_no_space,
+    )
+    from parallax.utils._mlx_tokenizer_vendor import load as _mlx_load_tokenizer
 
 
 class ParallaxNaiveStreamingDetokenizer(NaiveStreamingDetokenizer):

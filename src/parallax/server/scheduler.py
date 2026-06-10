@@ -19,11 +19,20 @@ We use an explicit 2-Phase approach:
 Our scheduler also handles tokenization and pre-processing for the First Peer's requests.
 """
 
+from __future__ import annotations
+
 import time
 from collections import OrderedDict, deque
 from typing import Deque, Dict, List, Optional
 
-from parallax.server.cache_manager import CacheManager
+try:
+    # CacheManager is the MLX KV-cache manager (pulls the mlx-based cache
+    # subsystem). The scheduler only uses it when a cache_manager instance is
+    # passed (mlx device path); on the vLLM/CUDA path it is None. Guard so a
+    # missing mlx (e.g. Windows) does not break import.
+    from parallax.server.cache_manager import CacheManager
+except ImportError:  # pragma: no cover - exercised on Windows
+    CacheManager = None
 from parallax.server.request import InitialRequest, Request, RequestStatus
 from parallax.utils.shared_state import SharedState
 from parallax_utils.logging_config import get_logger

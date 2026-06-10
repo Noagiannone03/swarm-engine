@@ -1,17 +1,47 @@
 """Utility functions."""
 
+from __future__ import annotations
+
+import json
 import random
 import socket
+from pathlib import Path
 from typing import List
 
-import mlx.core as mx
 import numpy as np
 import psutil
 import torch
 import zmq
-from mlx_lm.utils import _download, load_config
+
+try:
+    # mlx is Apple-Silicon / Linux-only and is absent on Windows. The vLLM (CUDA)
+    # path never calls the mx-based helpers below, so a missing mlx must not break
+    # import. Same pattern Parallax already uses for uvloop.
+    import mlx.core as mx
+except ImportError:  # pragma: no cover - exercised on Windows
+    mx = None
 
 from parallax.utils.selective_download import download_metadata_only
+
+
+def load_config(model_path) -> dict:
+    """Read a model's ``config.json`` from a local path.
+
+    Portable replacement for ``mlx_lm.utils.load_config`` (no mlx dependency) so
+    the shared/vLLM code path works on platforms without mlx (e.g. Windows).
+    """
+    with open(Path(model_path) / "config.json", "r", encoding="utf-8") as fid:
+        return json.load(fid)
+
+
+def _download(name: str) -> Path:
+    """Download a HF model repo and return its local path.
+
+    Portable replacement for ``mlx_lm.utils._download`` using ``huggingface_hub``.
+    """
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(name))
 
 
 def is_cuda_available():
@@ -117,8 +147,8 @@ def get_infinite_value_by_dtype(dtype: mx.Dtype):
 
 
 def pad_prefix_caches(
-    cache: List, input_lengths: List, dtype: mx.Dtype = mx.bfloat16
-) -> tuple[mx.array, mx.array]:
+    cache: List, input_lengths: List, dtype: "mx.Dtype" = None
+) -> tuple["mx.array", "mx.array"]:
     """
     Pads prefix kv caches.
 
@@ -126,6 +156,8 @@ def pad_prefix_caches(
         - mx.array: The padded batch of caches with a shape of [B, max_input_seq_len].
         - mx.array: The corresponding 4D k mask with a shape of [B, 1, 1, max_output_seq_len].
     """
+    if dtype is None:
+        dtype = mx.bfloat16
     caches_mx = [mx.array(i) if isinstance(i, np.ndarray) else i for i in cache]
 
     seq_len_axis = 2
@@ -159,8 +191,8 @@ def pad_prefix_caches(
 
 
 def pad_inputs(
-    pad_value: int, inputs: List, dtype: mx.Dtype = mx.bfloat16
-) -> tuple[mx.array, mx.array]:
+    pad_value: int, inputs: List, dtype: "mx.Dtype" = None
+) -> tuple["mx.array", "mx.array"]:
     """
     Pads a list of sequences (token ID lists or hidden state arrays) to the same length.
     # TODO: refactor this allow cumstomized dim.
@@ -177,6 +209,8 @@ def pad_inputs(
         - mx.array: The padded batch of inputs.
         - mx.array: The corresponding 4D attention mask.
     """
+    if dtype is None:
+        dtype = mx.bfloat16
     if not inputs:
         return mx.array([]), mx.array([])
 
@@ -238,7 +272,7 @@ def pad_inputs(
     return padded_batch, attention_mask
 
 
-def create_causal_mask(seq_len: int, total_len: int, dtype=mx.bfloat16) -> mx.array:
+def create_causal_mask(seq_len: int, total_len: int, dtype=None) -> "mx.array":
     """
     Creates a causal attention mask of shape (input_seq, total_seq).
 
@@ -253,6 +287,8 @@ def create_causal_mask(seq_len: int, total_len: int, dtype=mx.bfloat16) -> mx.ar
     assert (
         total_len >= seq_len
     ), f"Total lengths {total_len} should be no less than input sequence {seq_len}."
+    if dtype is None:
+        dtype = mx.bfloat16
     inf_value = get_infinite_value_by_dtype(dtype)
     mask = mx.triu(mx.full((seq_len, seq_len), -inf_value, dtype), k=1)
     if total_len == seq_len:
@@ -264,8 +300,8 @@ def create_causal_mask(seq_len: int, total_len: int, dtype=mx.bfloat16) -> mx.ar
 
 
 def combine_padding_and_causal_masks(
-    padding_mask: mx.array, causal_mask: mx.array, dtype=mx.bfloat16
-) -> mx.array:
+    padding_mask: "mx.array", causal_mask: "mx.array", dtype=None
+) -> "mx.array":
     """
     Combines a padding mask and a causal mask.
 
@@ -278,6 +314,8 @@ def combine_padding_and_causal_masks(
     Returns:
         mx.array: A combined attention mask, typically of shape (B, 1, input_seq, total_seq).
     """
+    if dtype is None:
+        dtype = mx.bfloat16
     inf_value = get_infinite_value_by_dtype(dtype)
     padding_mask_float = (padding_mask - 1) * inf_value
     padding_mask_float = padding_mask_float.astype(dtype)

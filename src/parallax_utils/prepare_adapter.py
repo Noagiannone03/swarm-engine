@@ -4,7 +4,12 @@ import os
 import shutil
 from pathlib import Path
 
-import mlx.core as mx
+try:
+    # Only the mlx LoRA-adapter conversion helpers below use mx; the vLLM path
+    # (download_adapter_config) does not. Guard so a missing mlx (Windows) is OK.
+    import mlx.core as mx
+except ImportError:  # pragma: no cover - exercised on Windows
+    mx = None
 import transformers
 from huggingface_hub import hf_hub_download, snapshot_download
 

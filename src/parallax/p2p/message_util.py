@@ -8,7 +8,13 @@ between the P2P server and the executor.
 import io
 from typing import Any, List, Optional
 
-import mlx.core as mx
+try:
+    # mlx is only used on the mlx (Apple) device branch of tensor (de)serialization
+    # below; the cuda/vLLM path uses safetensors.torch. Guard so a missing mlx
+    # (e.g. Windows) does not break import.
+    import mlx.core as mx
+except ImportError:  # pragma: no cover - exercised on Windows
+    mx = None
 
 from parallax.p2p.proto import forward_pb2
 from parallax.server.request import IntermediateRequest, Request, RequestStatus

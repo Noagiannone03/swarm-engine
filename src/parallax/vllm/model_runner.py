@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed
 import vllm.distributed.parallel_state as parallel_state
-from mlx_lm.utils import load_config
+from parallax.utils.utils import load_config
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
