@@ -293,7 +293,9 @@ class NodeChatHttpServer:
             host=self.host,
             port=self.port,
             timeout_keep_alive=5,
-            loop="uvloop",
+            # "auto" → uvloop quand présent (Unix), asyncio en fallback (Windows,
+            # où uvloop n'existe pas). Évite un crash au démarrage du serveur.
+            loop="auto",
         )
         server = uvicorn.Server(config)
         await server.serve()
