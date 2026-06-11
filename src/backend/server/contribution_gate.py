@@ -14,9 +14,11 @@ Conception (cf. docs/fabi-contribution-gate-plan.md) :
 - Le bail est une clé à TTL (300 s par défaut). Un worker évincé (timeout
   heartbeat, blacklist backoff) cesse d'être rafraîchi → le bail expire seul →
   la porte se referme. Aucun code de révocation.
-- Store : Redis si disponible (partagé entre les schedulers par-modèle → un
-  worker sur un swarm débloque tous les modèles) ; sinon fallback dict en
-  mémoire (porte par-process — dégradation documentée).
+- Store : par défaut, dict EN MÉMOIRE par scheduler (= par modèle). C'est le bon
+  modèle : un utilisateur contribue toujours au swarm du modèle qu'il consomme
+  (changer de modèle = quitter un swarm et rejoindre l'autre), donc le bail
+  par-modèle suffit. Redis est OPTIONNEL (FABI_GATE_REDIS_URL) et ne sert qu'à un
+  éventuel déblocage cross-modèle (contribuer à X, consommer Y) — non requis.
 - Le token de compte n'est jamais stocké en clair : on n'indexe que son SHA-256.
 
 Activation : `FABI_GATE=on` (défaut `off` → comportement historique inchangé,
@@ -65,15 +67,22 @@ class ContributionGate:
         self._lock = threading.Lock()
         self._mem: Dict[str, float] = {}  # token_hash -> expiry (time.time())
         self._redis = None
-        self._redis_url = os.environ.get("FABI_GATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+        # Redis est OPTIONNEL et opt-in. Par défaut (URL non définie) → store
+        # mémoire PAR SCHEDULER. C'est le bon choix : un utilisateur contribue
+        # toujours au swarm du modèle qu'il consomme (changer de modèle = changer
+        # de swarm), donc le bail par-modèle suffit — pas besoin de partager les
+        # baux entre les 5 schedulers. Définir FABI_GATE_REDIS_URL UNIQUEMENT si
+        # l'on veut un déblocage cross-modèle (contribuer à X, consommer Y).
+        self._redis_url = os.environ.get("FABI_GATE_REDIS_URL") or None
 
         if self.enabled:
-            self._init_redis()
+            if self._redis_url:
+                self._init_redis()
             logger.info(
                 "ContributionGate ENABLED (mode=%s, lease=%ss, store=%s, allowlist=%d)",
                 self.mode,
                 self.lease_s,
-                "redis" if self._redis is not None else "memory",
+                "redis(cross-model)" if self._redis is not None else "memory(per-model)",
                 len(self._allow_hashes),
             )
         else:
