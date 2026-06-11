@@ -182,6 +182,18 @@ async def cluster_status_json() -> JSONResponse:
 
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
+    # Contribution gate (no-op when FABI_GATE=off): only an account with a live
+    # worker lease in the swarm may consume. The account token is passed as the
+    # OpenAI-style bearer key. The lease is written elsewhere (node_update), only
+    # by the scheduler from its active-node table — clients never self-declare.
+    from backend.server.contribution_gate import get_gate
+
+    gate = get_gate()
+    if gate.enabled:
+        auth = raw_request.headers.get("authorization", "") or ""
+        token = auth[7:].strip() if auth[:7].lower() == "bearer " else None
+        if not gate.is_allowed(token):
+            return JSONResponse(status_code=402, content=gate.denial_payload())
     request_data = await raw_request.json()
     request_id = uuid.uuid4()
     received_ts = time.time()

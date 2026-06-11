@@ -78,6 +78,19 @@ class RPCConnectionHandler(ConnectionHandler):
         logger.debug(f"receive node_update request: {message}")
         try:
             node = self.build_node(message)
+            # Contribution gate: this node is heartbeating into the swarm over the
+            # scheduler's own RPC channel → refresh its account lease. Only the
+            # scheduler ever writes leases (clients never self-declare), so there
+            # is nothing for a consumer to forge. No-op when FABI_GATE=off.
+            try:
+                from backend.server.contribution_gate import get_gate
+
+                model_name = getattr(self.scheduler.model_info, "model_name", None) or getattr(
+                    self.scheduler.model_info, "mlx_model_name", None
+                )
+                get_gate().refresh(message.get("account_token"), node.node_id, model_name)
+            except Exception:
+                logger.debug("contribution gate refresh skipped", exc_info=True)
             # Check if node exists in scheduler
             if self.scheduler.get_node(node.node_id) is None:
                 # Node not found, automatically join it (e.g., after model switch)

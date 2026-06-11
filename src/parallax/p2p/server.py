@@ -424,6 +424,11 @@ class GradientServer:
         self.status = ServerState.JOINING
         self.manual_layer_assignment = block_end_index is not None and block_start_index is not None
         self.conn = conn
+        # Fabi contribution gate: account token sent in heartbeats so the
+        # scheduler can refresh this account's consumption lease. Set via
+        # `parallax join --account-token <T>` (exports FABI_ACCOUNT_TOKEN) or the
+        # env directly. None → the gate (if enabled) won't grant this worker.
+        self.account_token = os.environ.get("FABI_ACCOUNT_TOKEN") or None
 
         self.scheduler_stub = None
         self.scheduler_peer_id = None
@@ -994,6 +999,10 @@ class GradientServer:
             "status": self._get_status(),
             "is_active": self._get_status() == ServerState.READY.value,
             "last_refit_time": self.last_refit_time,
+            # Fabi contribution gate: account token so the scheduler can refresh
+            # this account's consumption lease. None when not configured (sent
+            # over the encrypted lattica RPC channel). No-op if FABI_GATE=off.
+            "account_token": self.account_token,
         }
 
         # For manual layer assignment, always include start_layer and end_layer
