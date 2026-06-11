@@ -252,7 +252,19 @@ class Scheduler:
 
         Pushes admitted requests directly into the running set.
         """
-        while self._wait_queue and len(self._running_requests) < self.max_batch_size:
+        # Fabi memory governor — palier 0 (gratuit) : sous pression mémoire le
+        # worker publie une `admission_scale` < 1 dans l'état partagé → on réduit
+        # la capacité admise SANS recharger le modèle (0.0 = on n'admet plus rien,
+        # les requêtes en cours se terminent). No-op par défaut (1.0).
+        cap = self.max_batch_size
+        if self.shared_state is not None:
+            try:
+                scale = float(self.shared_state.get("admission_scale", 1.0))
+                if scale < 1.0:
+                    cap = 0 if scale <= 0.0 else max(1, int(self.max_batch_size * scale))
+            except Exception:
+                cap = self.max_batch_size
+        while self._wait_queue and len(self._running_requests) < cap:
             req = self._wait_queue.popleft()
             rid = req.request_id
             if rid in self._running_requests:

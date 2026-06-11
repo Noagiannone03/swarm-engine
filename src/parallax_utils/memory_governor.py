@@ -205,6 +205,18 @@ class MemoryGovernor:
         }
 
 
+_governor_singleton: Optional[MemoryGovernor] = None
+
+
+def get_governor() -> MemoryGovernor:
+    """Process-wide singleton — l'état (EMA, streaks, dwell) DOIT persister entre
+    les heartbeats, donc on réutilise la même instance."""
+    global _governor_singleton
+    if _governor_singleton is None:
+        _governor_singleton = MemoryGovernor()
+    return _governor_singleton
+
+
 def read_psi_memory_avg10() -> Optional[float]:
     """Linux Pressure Stall Information (avg10 sur la ligne `some`).
 

@@ -951,6 +951,66 @@ class GradientServer:
         # When running in same process, use local status
         return self.status.value
 
+    def _govern_hardware(self, hardware: dict) -> dict:
+        """Lisse le budget mémoire annoncé (anti yo-yo) + calcule le palier de
+        pression et l'échelle d'admission. Entièrement tolérant aux pannes : si
+        quoi que ce soit échoue, on renvoie le hardware brut — le heartbeat ne
+        doit jamais casser à cause du gouverneur. No-op si gouverneur désactivé."""
+        try:
+            from parallax_utils.memory_governor import get_governor, read_psi_memory_avg10
+
+            gov = get_governor()
+            if not gov.enabled:
+                return hardware
+            raw = float(hardware.get("memory_gb") or 0.0)
+            if raw <= 0.0:
+                return hardware
+
+            available_ratio = None
+            psi = None
+            # Mémoire unifiée/système (Apple, CPU) → la pression RAM système est le
+            # bon signal. CUDA : le budget reflète déjà la VRAM libre vive
+            # (resolve_cuda_memory_budget) → on ne superpose pas un signal RAM
+            # système trompeur, on se contente de lisser le budget.
+            if hardware.get("device") != "cuda":
+                try:
+                    import psutil
+
+                    vm = psutil.virtual_memory()
+                    available_ratio = (vm.available / vm.total) if vm.total else None
+                except Exception:
+                    available_ratio = None
+                psi = read_psi_memory_avg10()
+
+            decision = gov.observe(raw, available_ratio=available_ratio, psi_avg10=psi)
+            hardware["memory_gb"] = decision.advertised_gb
+            hardware["pressure"] = decision.pressure
+
+            # Palier 0 (gratuit) : transmet l'échelle d'admission à l'executor via
+            # l'état partagé ; le scheduler local réduit le batch admis sans reload.
+            if getattr(self, "_shared_state", None) is not None:
+                try:
+                    self._shared_state.set("admission_scale", decision.admission_scale)
+                except Exception:
+                    pass
+
+            if decision.changed or decision.pressure != "NORMAL":
+                try:
+                    from parallax_utils.fabi_events import emit as fabi_emit
+
+                    fabi_emit(
+                        "pressure",
+                        level=decision.pressure,
+                        advertised_gb=decision.advertised_gb,
+                        admission_scale=decision.admission_scale,
+                    )
+                except Exception:
+                    pass
+            return hardware
+        except Exception:
+            logger.debug("memory governor skipped", exc_info=True)
+            return hardware
+
     def get_node_info(self, is_update: bool = False):
         # update rtt to nodes
         if time.time() - self.rtt_last_update > self.rtt_update_interval:
@@ -988,7 +1048,7 @@ class GradientServer:
 
         info = {
             "node_id": self.lattica.peer_id(),
-            "hardware": detect_node_hardware(self.lattica.peer_id()),
+            "hardware": self._govern_hardware(detect_node_hardware(self.lattica.peer_id())),
             "kvcache_mem_ratio": self.kvcache_mem_ratio,
             "param_mem_ratio": self.param_mem_ratio,
             "max_concurrent_requests": self.max_batch_size,
