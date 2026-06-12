@@ -85,12 +85,18 @@ class RPCConnectionHandler(ConnectionHandler):
             try:
                 from backend.server.contribution_gate import get_gate
 
-                model_name = getattr(self.scheduler.model_info, "model_name", None) or getattr(
-                    self.scheduler.model_info, "mlx_model_name", None
+                # Garde : pendant un redémarrage/switch de modèle, self.scheduler
+                # peut être None un court instant. Sans cette garde, accéder à
+                # .model_info levait une AttributeError silencieuse (catchée en
+                # DEBUG) qui SAUTAIT le refresh du bail → 402 pour un contributeur
+                # pourtant actif. On rafraîchit avec model=None plutôt que rien.
+                model_info = self.scheduler.model_info if self.scheduler is not None else None
+                model_name = getattr(model_info, "model_name", None) or getattr(
+                    model_info, "mlx_model_name", None
                 )
                 get_gate().refresh(message.get("account_token"), node.node_id, model_name)
             except Exception:
-                logger.debug("contribution gate refresh skipped", exc_info=True)
+                logger.warning("contribution gate refresh skipped", exc_info=True)
             # Check if node exists in scheduler
             if self.scheduler.get_node(node.node_id) is None:
                 # Node not found, automatically join it (e.g., after model switch)

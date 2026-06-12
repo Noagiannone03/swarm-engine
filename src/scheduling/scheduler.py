@@ -307,10 +307,20 @@ class Scheduler:
         self._wake_event.set()
 
     def checking_node_heartbeat(self) -> None:
-        """Check the heartbeat of all nodes."""
+        """Check the heartbeat of all nodes.
+
+        Un nœud encore en chargement de son shard (loading_phase joining/
+        initializing) peut manquer des heartbeats pendant un gros download/
+        chargement de poids. On lui laisse une marge plus large (6×) pour ne pas
+        l'évincer en plein chargement — une éviction déclencherait un rebootstrap
+        global qui casse le service. Un nœud READY garde le timeout normal.
+        """
+        now = time.time()
         for node in self.node_manager.active_nodes:
-            if time.time() - node.last_heartbeat > self.heartbeat_timeout:
-                logger.debug(f"Node {node.node_id} heartbeat timeout")
+            loading = getattr(node, "loading_phase", None) in ("joining", "initializing")
+            timeout = self.heartbeat_timeout * 6 if loading else self.heartbeat_timeout
+            if now - node.last_heartbeat > timeout:
+                logger.debug(f"Node {node.node_id} heartbeat timeout (loading={loading})")
                 # Route leave through the event loop so global rebalance/reboot is serialized.
                 self.enqueue_leave(node.node_id)
 

@@ -117,11 +117,16 @@ class ContributionGate:
         if self._redis is not None:
             try:
                 self._redis.setex(_LEASE_PREFIX + h, self.lease_s, payload)
+                logger.info("[gate] lease refreshed (redis) token=%s… model=%s", h[:8], model)
                 return
             except Exception as exc:  # pragma: no cover - transient redis error
                 logger.warning("ContributionGate: redis setex failed (%s); using memory", exc)
         with self._lock:
             self._mem[h] = time.time() + self.lease_s
+            n = len(self._mem)
+        # Diagnostic : gate=id permet de détecter un éventuel double-singleton
+        # (refresh et is_allowed doivent loguer le MÊME gate=...).
+        logger.info("[gate] lease refreshed (mem) token=%s… model=%s mem=%d gate=%x", h[:8], model, n, id(self))
 
     # ----- read side (HTTP handler) ----------------------------------------
 
@@ -132,20 +137,23 @@ class ContributionGate:
             return False
         h = _hash_token(account_token)
         if h in self._allow_hashes:
+            logger.info("[gate] is_allowed token=%s… -> allowlist", h[:8])
             return True
         if self._redis is not None:
             try:
-                return bool(self._redis.exists(_LEASE_PREFIX + h))
+                ok = bool(self._redis.exists(_LEASE_PREFIX + h))
+                logger.info("[gate] is_allowed token=%s… -> redis lease=%s", h[:8], ok)
+                return ok
             except Exception as exc:  # pragma: no cover - transient redis error
                 logger.warning("ContributionGate: redis exists failed (%s); using memory", exc)
         with self._lock:
             expiry = self._mem.get(h)
-            if expiry is None:
-                return False
-            if expiry <= time.time():
+            n = len(self._mem)
+            alive = expiry is not None and expiry > time.time()
+            if expiry is not None and not alive:
                 self._mem.pop(h, None)
-                return False
-            return True
+        logger.info("[gate] is_allowed token=%s… -> mem lease=%s mem=%d gate=%x", h[:8], alive, n, id(self))
+        return alive
 
     # ----- denial payload (HTTP 402) ---------------------------------------
 

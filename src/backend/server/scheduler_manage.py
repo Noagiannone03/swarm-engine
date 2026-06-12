@@ -40,6 +40,7 @@ def _scheduler_runtime_overrides() -> dict:
     Recognized vars:
         PARALLAX_STRATEGY                "greedy" | "dp"
         PARALLAX_HEARTBEAT_TIMEOUT       float seconds, e.g. 20
+        PARALLAX_ROUTING_STRATEGY        "rr" | "dp" (dp = redundant joins + LB)
     """
     overrides: dict = {}
 
@@ -49,6 +50,23 @@ def _scheduler_runtime_overrides() -> dict:
     elif strategy:
         logger.warning(
             "Ignoring PARALLAX_STRATEGY=%r (expected 'greedy' or 'dp')", strategy
+        )
+
+    # Request-router mode. "rr" (round-robin over fixed, node-disjoint pipelines)
+    # is the upstream default; "dp" (dynamic-programming per-request routing) is
+    # the mode that:
+    #   - allocates a JOINING node to the lightest layers (dynamic_join) so extra
+    #     contributors become ACTIVE replicas instead of idling in STANDBY,
+    #   - routes each request across replicas by live latency (load balancing),
+    #   - handles joins incrementally (no full re-bootstrap churn).
+    # On a sparse swarm this is what lets a 2nd+ node actually contribute (and
+    # thus earn a consumption lease). See scheduler.py dynamic_pipelines_router.
+    routing = os.environ.get("PARALLAX_ROUTING_STRATEGY", "").strip().lower()
+    if routing in ("rr", "dp"):
+        overrides["routing_strategy"] = routing
+    elif routing:
+        logger.warning(
+            "Ignoring PARALLAX_ROUTING_STRATEGY=%r (expected 'rr' or 'dp')", routing
         )
 
     raw_timeout = os.environ.get("PARALLAX_HEARTBEAT_TIMEOUT", "").strip()
