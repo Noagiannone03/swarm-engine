@@ -99,6 +99,17 @@ def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None =
     logger.info(f"Running command: {' '.join(cmd)}")
 
     sub_process = None
+    # L IDE / Docker arretent le worker avec SIGTERM (pas SIGINT). Sans ce
+    # handler, SIGTERM tue le process sans declencher le nettoyage gracieux
+    # (except KeyboardInterrupt ci-dessous) -> le node_leave n est jamais envoye
+    # au scheduler -> noeud fantome. On convertit SIGTERM en KeyboardInterrupt
+    # pour reutiliser exactement le meme chemin propre.
+    def _sigterm_to_kbi(signum, frame):
+        raise KeyboardInterrupt()
+    try:
+        signal.signal(signal.SIGTERM, _sigterm_to_kbi)
+    except Exception:
+        pass
     try:
         # Start in a new session so we can signal the entire process group
         sub_process = subprocess.Popen(cmd, env=env, start_new_session=True)
