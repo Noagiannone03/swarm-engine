@@ -1137,6 +1137,17 @@ def _run_p2p_server_process(
     # Set log level in subprocess (spawn mode doesn't inherit log configuration)
     set_log_level(log_level)
     server = None
+    # SIGTERM (arret pilote par l IDE / .terminate() / docker stop) doit
+    # declencher le meme arret gracieux que Ctrl-C : sinon le finally
+    # server.shutdown() (qui envoie node_leave au scheduler) est saute ->
+    # noeud fantome cote scheduler.
+    import signal as _signal
+    def _sigterm_to_kbi(signum, frame):
+        raise KeyboardInterrupt()
+    try:
+        _signal.signal(_signal.SIGTERM, _sigterm_to_kbi)
+    except Exception:
+        pass
     try:
         server = GradientServer(
             recv_from_peer_addr=recv_from_peer_addr,
