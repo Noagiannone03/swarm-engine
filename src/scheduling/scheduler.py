@@ -610,6 +610,26 @@ class Scheduler:
                 loading_phase=loading_phase,
             )
 
+        # Re-enregistrement des pipelines de routage quand des noeuds deviennent
+        # ACTIVE. Le routeur RR enregistre ses pipelines au bootstrap (search ->
+        # register) a partir des noeuds ACTIVE ; or un noeud ne devient ACTIVE
+        # qu'apres avoir charge ses poids et envoye is_active=True ICI -- donc
+        # APRES le bootstrap initial (ou active_nodes etait encore vide -> 0
+        # pipeline enregistre -> 503 'routing pipelines not ready'). On re-
+        # enregistre des qu'on est bootstrappe mais que le routage n'a pas (encore)
+        # de pipeline pret. No-op une fois un pipeline pret enregistre.
+        if self._bootstrapped_event.is_set():
+            try:
+                if not self.request_router.routing_ready():
+                    self.request_router.bootstrap()
+                    logger.info(
+                        '[Scheduler] Routing pipelines (re)registered after node(s) became active'
+                    )
+            except Exception:
+                logger.warning(
+                    'Re-register routing pipelines after node update failed', exc_info=True
+                )
+
     def _process_joins(self) -> None:
         """Handle pending join events, honoring bootstrap state for assignment."""
         joined_any = False
