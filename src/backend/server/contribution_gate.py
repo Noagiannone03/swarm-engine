@@ -1,15 +1,15 @@
 """Contribution gate — « tu contribues = tu consommes ».
 
 Porte binaire (pas de comptabilité de points) : un compte dont un worker est
-actif dans le swarm peut consommer l'API sans limite ; sans worker actif, l'API
-de complétion répond 402.
+connecté au swarm (actif OU standby) peut consommer l'API sans limite ; sans
+worker connecté, l'API de complétion répond 402.
 
 Conception (cf. docs/fabi-contribution-gate-plan.md) :
 
-- Le scheduler est juge ET témoin : il assigne les couches, reçoit les
-  heartbeats et route les requêtes. Le client ne déclare jamais rien → rien à
-  falsifier. Le bail (« lease ») n'est rafraîchi QUE par le scheduler, depuis sa
-  propre table de nœuds actifs (hook dans node_update), jamais sur demande d'un
+- Le scheduler est juge ET témoin : il accepte les joins, assigne les couches,
+  reçoit les heartbeats et route les requêtes. Le client ne déclare jamais rien
+  → rien à falsifier. Le bail (« lease ») n'est rafraîchi QUE par le scheduler,
+  lors d'un node_join accepté puis par les node_update, jamais sur demande d'un
   client.
 - Le bail est une clé à TTL (300 s par défaut). Un worker évincé (timeout
   heartbeat, blacklist backoff) cesse d'être rafraîchi → le bail expire seul →
@@ -108,8 +108,12 @@ class ContributionGate:
     # ----- write side (scheduler only) -------------------------------------
 
     def refresh(self, account_token: Optional[str], node_id: str, model: Optional[str]) -> None:
-        """Refresh the contribution lease for an account. Called by the
-        scheduler from node_update, ONLY for a node it considers active."""
+        """Refresh the contribution lease for an account.
+
+        Called by the scheduler for accepted node_join and node_update messages.
+        Standby nodes refresh leases too: they are connected contributors waiting
+        to be promoted if the active pipeline loses capacity.
+        """
         if not self.enabled or not account_token:
             return
         h = _hash_token(account_token)
@@ -126,7 +130,13 @@ class ContributionGate:
             n = len(self._mem)
         # Diagnostic : gate=id permet de détecter un éventuel double-singleton
         # (refresh et is_allowed doivent loguer le MÊME gate=...).
-        logger.info("[gate] lease refreshed (mem) token=%s… model=%s mem=%d gate=%x", h[:8], model, n, id(self))
+        logger.info(
+            "[gate] lease refreshed (mem) token=%s… model=%s mem=%d gate=%x",
+            h[:8],
+            model,
+            n,
+            id(self),
+        )
 
     # ----- read side (HTTP handler) ----------------------------------------
 

@@ -580,30 +580,47 @@ class GradientServer:
                 response = self.scheduler_stub.node_join(node_info)
                 response = response.result(timeout=300)
                 if response == {}:
-                    # Scheduler returned empty after the 300s wait_layer_allocation:
-                    # either bootstrap failed for capacity reasons or we never
-                    # got picked up. Emit before exiting so the CLI shows the
-                    # right state instead of guessing from the abrupt exit.
                     fabi_emit("alloc_timeout")
                     logger.error("Failed to join scheduler")
                     exit(1)
 
                 logger.info(f"Join scheduler response: {response}")
-                fabi_emit(
-                    "allocated",
-                    start_layer=response.get("start_layer"),
-                    end_layer=response.get("end_layer"),
-                    model_name=response.get("model_name"),
-                    tp_size=response.get("tp_size"),
-                )
+                start_layer = response.get("start_layer")
+                end_layer = response.get("end_layer")
+                model_name = response.get("model_name")
+                if start_layer is not None and end_layer is not None:
+                    fabi_emit(
+                        "allocated",
+                        start_layer=start_layer,
+                        end_layer=end_layer,
+                        model_name=model_name,
+                        tp_size=response.get("tp_size"),
+                    )
 
-                if not self.manual_layer_assignment:
-                    self.block_start_index = response.get("start_layer")
-                    self.block_end_index = response.get("end_layer")
-                self.model_name = response.get("model_name")
-                self.tp_size = response.get("tp_size")
-                self.enable_weight_refit = response.get("enable_weight_refit")
-                self.weight_refit_mode = response.get("weight_refit_mode")
+                    if not self.manual_layer_assignment:
+                        self.block_start_index = start_layer
+                        self.block_end_index = end_layer
+                    self.model_name = model_name
+                    self.tp_size = response.get("tp_size")
+                elif response.get("standby"):
+                    # A scheduler can accept this node as standby when the model
+                    # is already fully covered. That still counts as contribution:
+                    # start the heartbeat loop below and wait for a future
+                    # node_update response to carry a real layer allocation.
+                    logger.info(
+                        "Joined scheduler as standby; waiting for layer allocation via heartbeat"
+                    )
+                    if model_name:
+                        self.model_name = model_name
+                    self.status = ServerState.JOINING
+                else:
+                    fabi_emit("alloc_timeout")
+                    logger.error("Scheduler join response did not include layers or standby ack")
+                    exit(1)
+                self.enable_weight_refit = response.get(
+                    "enable_weight_refit", self.enable_weight_refit
+                )
+                self.weight_refit_mode = response.get("weight_refit_mode", self.weight_refit_mode)
 
                 # Sync to shared state if available
                 self._sync_to_shared_state()

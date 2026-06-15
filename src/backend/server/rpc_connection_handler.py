@@ -1,3 +1,4 @@
+import os
 import time
 
 from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stream_iter
@@ -11,6 +12,24 @@ logger = get_logger(__name__)
 import json
 
 import httpx
+
+
+def _node_join_allocation_wait_seconds() -> float:
+    """Short wait for a synchronous layer assignment during node_join.
+
+    A node may legitimately join as standby when the current pipeline is already
+    covered by larger workers. In that case node_join must return promptly so
+    the worker can start its node_update heartbeat and keep its contribution
+    lease alive. Longer waits belong in the worker process, not in the scheduler
+    RPC handler.
+    """
+    raw = os.environ.get("PARALLAX_NODE_JOIN_ALLOCATION_WAIT_S", "5").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring PARALLAX_NODE_JOIN_ALLOCATION_WAIT_S=%r", raw)
+        return 5.0
+    return min(60.0, max(0.0, value))
 
 
 class RPCConnectionHandler(ConnectionHandler):
@@ -48,9 +67,14 @@ class RPCConnectionHandler(ConnectionHandler):
         logger.info(f"receive node_join request: {message}")
         try:
             node = self.build_node(message)
+            self._refresh_contribution_lease(message, node, source="node_join")
             self.scheduler.enqueue_join(node)
 
-            response = self.wait_layer_allocation(node.node_id, wait_seconds=300)
+            response = self.wait_layer_allocation(
+                node.node_id, wait_seconds=_node_join_allocation_wait_seconds()
+            )
+            if not response:
+                response = self.standby_join_response(node)
             logger.debug(f"node_join response: {response}")
             return response
         except Exception as e:
@@ -82,21 +106,7 @@ class RPCConnectionHandler(ConnectionHandler):
             # scheduler's own RPC channel → refresh its account lease. Only the
             # scheduler ever writes leases (clients never self-declare), so there
             # is nothing for a consumer to forge. No-op when FABI_GATE=off.
-            try:
-                from backend.server.contribution_gate import get_gate
-
-                # Garde : pendant un redémarrage/switch de modèle, self.scheduler
-                # peut être None un court instant. Sans cette garde, accéder à
-                # .model_info levait une AttributeError silencieuse (catchée en
-                # DEBUG) qui SAUTAIT le refresh du bail → 402 pour un contributeur
-                # pourtant actif. On rafraîchit avec model=None plutôt que rien.
-                model_info = self.scheduler.model_info if self.scheduler is not None else None
-                model_name = getattr(model_info, "model_name", None) or getattr(
-                    model_info, "mlx_model_name", None
-                )
-                get_gate().refresh(message.get("account_token"), node.node_id, model_name)
-            except Exception:
-                logger.warning("contribution gate refresh skipped", exc_info=True)
+            self._refresh_contribution_lease(message, node, source="node_update")
             # Check if node exists in scheduler
             if self.scheduler.get_node(node.node_id) is None:
                 # Node not found, automatically join it (e.g., after model switch)
@@ -108,7 +118,7 @@ class RPCConnectionHandler(ConnectionHandler):
                 time.sleep(0.1)
                 # Return layer allocation after join
                 layer_allocation = self.wait_layer_allocation(node.node_id, wait_seconds=5)
-                return layer_allocation, {}
+                return layer_allocation or self.standby_join_response(node), {}
 
             # Node exists, update its info
             self.scheduler.enqueue_node_update(
@@ -131,6 +141,48 @@ class RPCConnectionHandler(ConnectionHandler):
         except Exception as e:
             logger.exception(f"node_update error: {e}")
             return {}, {}
+
+    def _model_name_for_node(self, node: Node):
+        model_info = self.scheduler.model_info if self.scheduler is not None else node.model_info
+        if model_info is None:
+            return None
+        if getattr(node.hardware, "device", None) == "mlx":
+            return getattr(model_info, "mlx_model_name", None) or getattr(
+                model_info, "model_name", None
+            )
+        return getattr(model_info, "model_name", None) or getattr(
+            model_info, "mlx_model_name", None
+        )
+
+    def _refresh_contribution_lease(self, message, node: Node, *, source: str) -> None:
+        try:
+            from backend.server.contribution_gate import get_gate
+
+            get_gate().refresh(
+                message.get("account_token"),
+                node.node_id,
+                self._model_name_for_node(node),
+            )
+        except Exception:
+            logger.warning("contribution gate refresh skipped during %s", source, exc_info=True)
+
+    def standby_join_response(self, node: Node) -> dict:
+        """ACK a valid join even when no layers are currently assigned.
+
+        Standby nodes are real contributors: they are connected, visible to the
+        scheduler, and may be promoted later when the allocation changes. Returning
+        an explicit standby ACK lets the worker start heartbeats immediately
+        instead of timing out before node_update can refresh its contribution
+        lease.
+        """
+        return {
+            "node_id": node.node_id,
+            "model_name": self._model_name_for_node(node),
+            "status": "standby",
+            "standby": True,
+            "enable_weight_refit": self.scheduler.enable_weight_refit,
+            "weight_refit_mode": self.scheduler.weight_refit_mode,
+        }
 
     @rpc_stream_iter
     def chat_completion(

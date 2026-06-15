@@ -84,6 +84,47 @@ def _wait_executors_check_layer_change(shared_state: SharedState, executor_subpr
     return shared_state.get_layer_allocation_changed()
 
 
+def _wait_for_initial_layer_allocation(
+    shared_state: SharedState,
+    p2p_server_process: multiprocessing.Process,
+    *,
+    max_wait_time: float = 300,
+) -> None:
+    """Wait for initial layers while allowing a valid standby join.
+
+    In scheduler mode, a worker can be accepted as STANDBY when an existing
+    pipeline already covers the model. That is not a launch failure: the P2P
+    process must remain alive and send node_update heartbeats until the scheduler
+    later assigns layers. It is still an error if the P2P process exits, because
+    then no future allocation can arrive.
+    """
+    logger.debug("Waiting for layer allocation from scheduler...")
+    wait_start = time.time()
+    standby_reported = False
+    while True:
+        model_info = shared_state.get_model_info()
+        if (
+            model_info["block_start_index"] is not None
+            and model_info["block_end_index"] is not None
+            and model_info["model_name"] is not None
+        ):
+            return
+        if p2p_server_process is not None and not p2p_server_process.is_alive():
+            raise RuntimeError(
+                "P2P server exited before layer allocation "
+                f"(exitcode={p2p_server_process.exitcode})"
+            )
+        if time.time() - wait_start > max_wait_time:
+            if not standby_reported:
+                logger.info(
+                    "No layer allocation after %ss; staying online as a standby contributor",
+                    max_wait_time,
+                )
+                standby_reported = True
+            wait_start = time.time()
+        time.sleep(1)
+
+
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
 
@@ -217,22 +258,10 @@ if __name__ == "__main__":
                 conn=conn_main,
             )
 
-            # Wait for layer allocation from scheduler (via shared state)
-            logger.debug("Waiting for layer allocation from scheduler...")
-            max_wait_time = 300  # 5 minutes
-            wait_start = time.time()
-            while True:
-                model_info = shared_state.get_model_info()
-                if (
-                    model_info["block_start_index"] is not None
-                    and model_info["block_end_index"] is not None
-                    and model_info["model_name"] is not None
-                ):
-                    break
-                if time.time() - wait_start > max_wait_time:
-                    logger.error("Timeout waiting for layer allocation from scheduler")
-                    raise RuntimeError("Failed to get layer allocation from scheduler")
-                time.sleep(1)
+            # Wait for layer allocation from scheduler (via shared state). If the
+            # scheduler accepted us as standby, keep this process alive until a
+            # later node_update carries real layers.
+            _wait_for_initial_layer_allocation(shared_state, p2p_server_process)
 
             # Get layer allocation from shared state
             _update_args_from_shared_state(args, shared_state, force_update=False)
