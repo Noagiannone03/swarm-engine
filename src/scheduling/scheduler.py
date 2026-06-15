@@ -316,11 +316,16 @@ class Scheduler:
         global qui casse le service. Un nœud READY garde le timeout normal.
         """
         now = time.time()
-        for node in self.node_manager.active_nodes:
+        # ACTIFS + STANDBY : un noeud standby deconnecte (client qui ferme l app
+        # pendant le handshake, ou worker mort) n est jamais retire si on ne le
+        # verifie pas -> fantome permanent qui gonfle le pool standby et fait
+        # echouer allocate_from_standby (failed_capacity). On l evince au meme
+        # titre, avec la meme marge 6x pour un noeud encore en chargement.
+        for node in [*self.node_manager.active_nodes, *self.node_manager.standby_nodes]:
             loading = getattr(node, "loading_phase", None) in ("joining", "initializing")
             timeout = self.heartbeat_timeout * 6 if loading else self.heartbeat_timeout
             if now - node.last_heartbeat > timeout:
-                logger.debug(f"Node {node.node_id} heartbeat timeout (loading={loading})")
+                logger.info(f"Node {node.node_id} heartbeat timeout (loading={loading}) -> eviction")
                 # Route leave through the event loop so global rebalance/reboot is serialized.
                 self.enqueue_leave(node.node_id)
 
