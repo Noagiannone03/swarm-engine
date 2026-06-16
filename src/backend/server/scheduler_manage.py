@@ -209,6 +209,67 @@ class SchedulerManage:
     def need_more_nodes(self):
         return self.scheduler.need_more_nodes() if self.scheduler else False
 
+    def get_pipeline_readiness(self):
+        """Pipeline/routing readiness, exposed to clients (registry → IDE → SSE).
+
+        The IDE GATES the Fabi model on these fields: it only declares the model
+        to the chat once a request can ACTUALLY be routed (``pipeline_ready``).
+        Without this signal the client may send a completion before any pipeline
+        finished loading and hit "Routing pipelines not ready" (503).
+
+        ``routing_ready`` is authoritative — "a request can be dispatched right
+        now" — and works for every router (DP path-finding AND RR fixed
+        pipelines). The remaining fields describe the fixed-pipeline registry
+        used by RR and degrade gracefully to 0 for routers without one (e.g. DP),
+        where ``routing_ready`` alone decides. Every probe is best-effort:
+        ``self.scheduler`` can be None during a model switch/restart, and a probe
+        failing must NOT take down the health endpoint.
+        """
+        if self.scheduler is None:
+            return {
+                "pipeline_count": 0,
+                "pipeline_ready_count": 0,
+                "pipeline_ready": False,
+                "routing_ready": False,
+                "pipeline_capacity_total": 0,
+                "pipeline_capacity_current": 0,
+            }
+
+        routing_ready = False
+        try:
+            routing_ready = bool(self.scheduler.request_router.routing_ready())
+        except Exception:
+            logger.debug("get_pipeline_readiness: routing_ready() failed", exc_info=True)
+
+        pipeline_count = 0
+        pipeline_ready_count = 0
+        try:
+            pipelines = self.scheduler.node_manager.get_registered_pipelines()
+            pipeline_count = len(pipelines)
+            pipeline_ready_count = sum(1 for p in pipelines.values() if p.is_ready)
+        except Exception:
+            logger.debug("get_pipeline_readiness: get_registered_pipelines() failed", exc_info=True)
+
+        total_capacity = 0
+        cur_capacity = 0
+        try:
+            _, total_capacity, cur_capacity = self.scheduler.report_pipeline_capacity(
+                ready_only=True
+            )
+        except Exception:
+            logger.debug("get_pipeline_readiness: report_pipeline_capacity() failed", exc_info=True)
+
+        return {
+            "pipeline_count": int(pipeline_count or 0),
+            "pipeline_ready_count": int(pipeline_ready_count or 0),
+            # pipeline_ready mirrors routing_ready so clients reading either name
+            # agree on the single truth "can a request be routed now?".
+            "pipeline_ready": routing_ready,
+            "routing_ready": routing_ready,
+            "pipeline_capacity_total": int(total_capacity or 0),
+            "pipeline_capacity_current": int(cur_capacity or 0),
+        }
+
     def get_cluster_status(self):
         # Bootstrap result/timestamp are exposed verbatim so clients can detect
         # "failed_capacity" (allocation tried, can't fit) vs "pending" (still
@@ -236,6 +297,9 @@ class SchedulerManage:
                 "max_running_request": (
                     self.scheduler.report_pipeline_capacity()[1] if self.scheduler else 0
                 ),
+                # Pipeline/routing readiness — the IDE gates the Fabi model on
+                # these (registry republishes them, pushed to clients over SSE).
+                **self.get_pipeline_readiness(),
             },
         }
 
