@@ -626,8 +626,17 @@ class Scheduler:
         # churn de routage inutiles. Avec la garde : pas de pipeline complete ->
         # on ne fait rien ; pipeline complete mais routage pas encore enregistre
         # -> on enregistre UNE fois et on ne logue qu'au succes reel.
+        #
+        # MODE-SPECIFIC : ce ré-enregistrement n'a de sens qu'en routage RR, qui
+        # s'appuie sur un REGISTRE de pipelines fixes construit au bootstrap. Le
+        # routeur DP ne maintient aucun registre — il calcule la route par
+        # requête (find_optimal_path), donc routing_ready()=DP n'a rien à
+        # ré-enregistrer et bootstrap()=DP est un no-op. On garde donc ce bloc
+        # STRICTEMENT côté RR : zéro machinerie RR ne tourne en mode DP, et RR
+        # conserve son correctif 503. (Les deux modes restent fonctionnels.)
         if (
-            self._bootstrapped_event.is_set()
+            self.routing_strategy == "rr"
+            and self._bootstrapped_event.is_set()
             and not self.request_router.routing_ready()
             and self.has_full_pipeline()
         ):
