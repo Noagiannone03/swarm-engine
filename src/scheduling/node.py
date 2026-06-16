@@ -181,10 +181,21 @@ class RooflinePerformanceModel:
 
         compute_time_ms = self.get_compute_roofline_latency_ms(flops)
         io_time_ms = self.get_io_roofline_latency_ms(io_bytes)
+        # A node can heartbeat (node_update) while still in STANDBY with no layers
+        # assigned yet (num_current_layers == 0) — a state our "keep standby
+        # contributors alive" change introduced. Upstream never reaches it: node_join
+        # blocks until layers are allocated, so this method was only ever called with
+        # num_current_layers >= 1, and the division below was safe by invariant. Now
+        # that the invariant no longer holds, guard it: a layer count below 1 is
+        # meaningless for a *per-layer* latency, so clamp the divisor to 1. For a
+        # standby node (no embedding/lm_head) this yields exactly the single
+        # decoder-layer roofline latency — a sound estimate of the node's per-layer
+        # speed, which is what the scheduler wants for allocation. No-op for >= 1.
+        effective_layers = max(1, num_current_layers)
         return (
-            num_current_layers * max(decoder_layer_compute_latency, decoder_layer_io_latency)
+            effective_layers * max(decoder_layer_compute_latency, decoder_layer_io_latency)
             + max(compute_time_ms, io_time_ms)
-        ) / num_current_layers
+        ) / effective_layers
 
 
 @dataclass
