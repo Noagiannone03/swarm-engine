@@ -85,7 +85,13 @@ def finish_reason(obj: dict) -> Optional[str]:
         return None
 
 
-def _synth_chunk(template: dict, *, content: Optional[str], keep_finish: bool) -> bytes:
+def _synth_chunk(
+    template: dict,
+    *,
+    content: Optional[str],
+    keep_finish: bool,
+    finish_reason_override: Optional[str] = None,
+) -> bytes:
     """Re-serialize a chunk from ``template`` carrying only ``content`` as the tail.
 
     Preserves id/model/created/usage so downstream metrics keep working. ``role``
@@ -98,10 +104,35 @@ def _synth_chunk(template: dict, *, content: Optional[str], keep_finish: bool) -
     choice["delta"] = {"role": None, "content": content}
     choice.pop("probs", None)
     choice.pop("token_ids", None)
-    if not keep_finish:
+    if finish_reason_override is not None:
+        choice["finish_reason"] = finish_reason_override
+    elif not keep_finish:
         choice["finish_reason"] = None
     obj["choices"] = [choice]
     return f"data: {json.dumps(obj, separators=(',', ':'))}\n\n".encode()
+
+
+def terminal_chunk_from(chunk: bytes, *, finish_reason: str = "length") -> Optional[bytes]:
+    """Build a final OpenAI SSE chunk from the latest data event in ``chunk``.
+
+    ``data: [DONE]`` alone is not enough for strict OpenAI clients. They expect a
+    final ``chat.completion.chunk`` whose first choice has a non-null
+    ``finish_reason`` before the sentinel. When a worker dies mid-stream and all
+    resume attempts fail, this helper closes the already-partial answer with a
+    protocol-valid terminal chunk.
+    """
+    template: Optional[dict] = None
+    for kind, obj in iter_sse_events(chunk):
+        if kind == "data" and obj is not None:
+            template = obj
+    if template is None:
+        return None
+    return _synth_chunk(
+        template,
+        content=None,
+        keep_finish=True,
+        finish_reason_override=finish_reason,
+    )
 
 
 class ResumableSSEStream:

@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.server.request_handler import RequestHandler
+from backend.server.openai_compat import openai_error_response
 from backend.server.scheduler_manage import SchedulerManage
 from backend.server.server_args import parse_args
 from backend.server.static_config import (
@@ -194,7 +195,22 @@ async def openai_v1_chat_completions(raw_request: Request):
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else None
         if not gate.is_allowed(token):
             return JSONResponse(status_code=402, content=gate.denial_payload())
-    request_data = await raw_request.json()
+    try:
+        request_data = await raw_request.json()
+    except Exception:
+        return openai_error_response(
+            "Invalid request body",
+            status_code=400,
+            err_type="invalid_request_error",
+            code="invalid_request_error",
+        )
+    if not isinstance(request_data, dict):
+        return openai_error_response(
+            "Request body must be a JSON object",
+            status_code=400,
+            err_type="invalid_request_error",
+            code="invalid_request_error",
+        )
     request_id = uuid.uuid4()
     received_ts = time.time()
     return await request_handler.v1_chat_completions(request_data, request_id, received_ts)

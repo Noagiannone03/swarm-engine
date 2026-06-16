@@ -54,8 +54,9 @@ def _install_stubs():
 
 _install_stubs()
 
+import backend.server.request_handler as request_handler_module  # noqa: E402
 from backend.server.request_handler import RequestHandler  # noqa: E402
-from parallax_utils.stream_resume import delta_content, iter_sse_events  # noqa: E402
+from parallax_utils.stream_resume import delta_content, finish_reason, iter_sse_events  # noqa: E402
 
 
 def _chunk(content=None, *, role=None, fr=None) -> bytes:
@@ -180,3 +181,44 @@ def test_resilient_stream_passthrough_when_no_break():
     assert _text(emitted) == "Hello world"
     assert emitted[-1] == b"data: [DONE]\n\n"
     assert stub.calls == 0  # no resume happened
+
+
+def test_resilient_stream_closes_incomplete_stream_with_terminal_chunk():
+    stub = _Stub([])  # never reopened; failover disabled below
+    handler = _make_handler(stub)
+    first_chunk = _chunk("partial", role="assistant")
+    old_max_resumes = request_handler_module.MAX_STREAM_RESUMES
+    request_handler_module.MAX_STREAM_RESUMES = 0
+
+    async def run():
+        from starlette.concurrency import iterate_in_threadpool
+
+        def broken_rest():
+            raise ConnectionError("peer dropped before finish")
+            yield b""  # pragma: no cover
+
+        agen = handler._resilient_stream(
+            request_data={"stream": True},
+            request_id="rid",
+            received_ts=0,
+            start_time=0.0,
+            response=object(),
+            iterator=iterate_in_threadpool(broken_rest()),
+            first_chunk=first_chunk,
+        )
+        return await _collect(agen)
+
+    try:
+        emitted = asyncio.run(run())
+    finally:
+        request_handler_module.MAX_STREAM_RESUMES = old_max_resumes
+
+    assert emitted[-1] == b"data: [DONE]\n\n"
+    terminal_events = [
+        obj
+        for kind, obj in iter_sse_events(emitted[-2])
+        if kind == "data"
+    ]
+    assert terminal_events
+    assert finish_reason(terminal_events[0]) == "length"
+    assert _text(emitted) == "partial"

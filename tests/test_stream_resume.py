@@ -8,6 +8,7 @@ from parallax_utils.stream_resume import (
     finish_reason,
     has_tool_calls,
     iter_sse_events,
+    terminal_chunk_from,
 )
 
 
@@ -54,6 +55,17 @@ def test_delta_and_finish_and_tool_helpers():
     assert has_tool_calls(obj) is False
     tobj = json.loads(chunk(None, tool_calls=[{"id": "t"}]).split(b"data: ")[1])
     assert has_tool_calls(tobj) is True
+
+
+def test_terminal_chunk_from_last_data_chunk():
+    terminal = terminal_chunk_from(chunk("partial", role="assistant"), finish_reason="length")
+    assert terminal is not None
+    events = [(k, o) for k, o in iter_sse_events(terminal)]
+    assert len(events) == 1
+    kind, obj = events[0]
+    assert kind == "data"
+    assert delta_content(obj) == ""
+    assert finish_reason(obj) == "length"
 
 
 # --------------------------------------------------------------------------- #

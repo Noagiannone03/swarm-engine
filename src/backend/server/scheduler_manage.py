@@ -209,6 +209,49 @@ class SchedulerManage:
     def need_more_nodes(self):
         return self.scheduler.need_more_nodes() if self.scheduler else False
 
+    def _pipeline_health(self) -> dict:
+        if self.scheduler is None:
+            return {
+                "pipeline_count": 0,
+                "pipeline_ready_count": 0,
+                "pipeline_ready": False,
+                "routing_ready": False,
+                "pipeline_capacity_total": 0,
+                "pipeline_capacity_current": 0,
+                "pipeline_capacity_by_id": None,
+            }
+
+        pipeline_count = self.scheduler.node_manager.num_full_pipelines(
+            self.scheduler.num_layers,
+            ready_only=False,
+        )
+        pipeline_ready_count = self.scheduler.node_manager.num_full_pipelines(
+            self.scheduler.num_layers,
+            ready_only=True,
+        )
+        try:
+            routing_ready = bool(self.scheduler.request_router.routing_ready())
+        except Exception:
+            logger.warning("Failed to compute routing readiness", exc_info=True)
+            routing_ready = False
+        try:
+            by_id, total_capacity, current_capacity = self.scheduler.report_pipeline_capacity(
+                ready_only=True,
+            )
+        except Exception:
+            logger.warning("Failed to compute pipeline capacity", exc_info=True)
+            by_id, total_capacity, current_capacity = None, 0, 0
+
+        return {
+            "pipeline_count": int(pipeline_count),
+            "pipeline_ready_count": int(pipeline_ready_count),
+            "pipeline_ready": bool(pipeline_ready_count > 0 and routing_ready),
+            "routing_ready": routing_ready,
+            "pipeline_capacity_total": int(total_capacity),
+            "pipeline_capacity_current": int(current_capacity),
+            "pipeline_capacity_by_id": by_id,
+        }
+
     def get_cluster_status(self):
         # Bootstrap result/timestamp are exposed verbatim so clients can detect
         # "failed_capacity" (allocation tried, can't fit) vs "pending" (still
@@ -220,6 +263,7 @@ class SchedulerManage:
         last_bootstrap_attempt_ts = (
             self.scheduler.last_bootstrap_attempt_ts if self.scheduler else 0.0
         )
+        pipeline_health = self._pipeline_health()
         return {
             "type": "cluster_status",
             "data": {
@@ -233,9 +277,8 @@ class SchedulerManage:
                 "need_more_nodes": self.need_more_nodes(),
                 "last_bootstrap_result": last_bootstrap_result,
                 "last_bootstrap_attempt_ts": last_bootstrap_attempt_ts,
-                "max_running_request": (
-                    self.scheduler.report_pipeline_capacity()[1] if self.scheduler else 0
-                ),
+                "max_running_request": pipeline_health["pipeline_capacity_total"],
+                **pipeline_health,
             },
         }
 
@@ -494,10 +537,7 @@ class SchedulerManage:
             logger.debug("SchedulerManage status queried: waiting (scheduler not initialized)")
             return NODE_STATUS_WAITING
 
-        # todo rebalance status
-        status = (
-            NODE_STATUS_AVAILABLE if self.scheduler.has_full_pipeline() else NODE_STATUS_WAITING
-        )
+        status = NODE_STATUS_AVAILABLE if self._pipeline_health()["pipeline_ready"] else NODE_STATUS_WAITING
         logger.debug(f"SchedulerManage status queried: {status}")
         return status
 

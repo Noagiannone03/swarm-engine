@@ -8,9 +8,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool
 
 from backend.server.constants import NODE_STATUS_AVAILABLE
+from backend.server.openai_compat import openai_error_payload, openai_error_response
 from parallax_utils.logging_config import get_logger
 from parallax_utils.request_metrics import get_request_metrics
-from parallax_utils.stream_resume import ResumableSSEStream
+from parallax_utils.stream_resume import DONE_BYTES, ResumableSSEStream, terminal_chunk_from
 
 logger = get_logger(__name__)
 
@@ -65,13 +66,26 @@ MAX_STREAM_RESUMES = _env_int("PARALLAX_STREAM_MAX_RESUMES", 3)
 # Brief pause before re-routing a resume, to let the failure propagate (peer
 # ban / heartbeat) so we don't immediately re-pick the same broken pipeline.
 RESUME_DELAY_SEC = _env_float("PARALLAX_STREAM_RESUME_DELAY_SEC", 1.0)
+_VALID_INCOMPLETE_FINISH_REASONS = {"stop", "length", "content_filter"}
+INCOMPLETE_STREAM_FINISH_REASON = (
+    os.environ.get("PARALLAX_INCOMPLETE_STREAM_FINISH_REASON", "length").strip() or "length"
+)
+if INCOMPLETE_STREAM_FINISH_REASON not in _VALID_INCOMPLETE_FINISH_REASONS:
+    logger.warning(
+        "Ignoring PARALLAX_INCOMPLETE_STREAM_FINISH_REASON=%r; using 'length'",
+        INCOMPLETE_STREAM_FINISH_REASON,
+    )
+    INCOMPLETE_STREAM_FINISH_REASON = "length"
 
 
 class _NoRoute(Exception):
     """No routable pipeline — carries the HTTP response to return to the client."""
 
     def __init__(self, status_code: int, content: dict):
-        super().__init__(content.get("error", "no route"))
+        error = content.get("error", "no route")
+        if isinstance(error, dict):
+            error = error.get("message", "no route")
+        super().__init__(error)
         self.status_code = status_code
         self.content = content
 
@@ -150,21 +164,42 @@ class RequestHandler:
                 routing_table = self.scheduler_manage.get_routing_table(request_id, received_ts)
             except Exception as e:
                 logger.exception(f"get_routing_table error: {e}")
-                raise _NoRoute(500, {"error": "Get routing table error"})
+                raise _NoRoute(
+                    500,
+                    openai_error_payload(
+                        "Get routing table error",
+                        err_type="server_error",
+                        code="routing_table_error",
+                    ),
+                )
             logger.debug(
                 f"get_routing_table for request {request_id} return: {routing_table} "
                 f"(attempt {attempts + 1})"
             )
             # None -> scheduler has not set yet; treat as hard error (no waiting here)
             if routing_table is None:
-                raise _NoRoute(503, {"error": "Routing pipelines not ready"})
+                raise _NoRoute(
+                    503,
+                    openai_error_payload(
+                        "Routing pipelines not ready",
+                        err_type="server_unavailable",
+                        code="routing_not_ready",
+                    ),
+                )
             if len(routing_table) > 0:
                 return routing_table
             # Empty list -> capacity full now, retry after short delay
             attempts += 1
             if attempts < limit:
                 await asyncio.sleep(self.RETRY_DELAY_SEC)
-        raise _NoRoute(429, {"error": "All pipelines are busy or not ready. Please retry later."})
+        raise _NoRoute(
+            429,
+            openai_error_payload(
+                "All pipelines are busy or not ready. Please retry later.",
+                err_type="rate_limit_error",
+                code="rate_limit_exceeded",
+            ),
+        )
 
     async def _open_stream(
         self, request_data: Dict, request_id: str, received_ts: int, *, routing_max_attempts=None
@@ -203,9 +238,11 @@ class RequestHandler:
             self.scheduler_manage is None
             or not self.scheduler_manage.get_schedule_status() == NODE_STATUS_AVAILABLE
         ):
-            return JSONResponse(
-                content={"error": "Server is not ready"},
-                status_code=500,
+            return openai_error_response(
+                "Server is not ready",
+                status_code=503,
+                err_type="server_unavailable",
+                code="server_not_ready",
             )
 
         is_stream = request_data.get("stream", False)
@@ -266,9 +303,11 @@ class RequestHandler:
                     await asyncio.sleep(self.FORWARD_DELAY_SEC)
                 logger.warning(f"Error in _forward_request: {e}. Retry attempts {forward_attempts}")
 
-        return JSONResponse(
-            content={"error": "Internal server error"},
-            status_code=500,
+        return openai_error_response(
+            "Downstream request failed",
+            status_code=502,
+            err_type="upstream_error",
+            code="upstream_error",
         )
 
     async def _resilient_stream(
@@ -335,10 +374,11 @@ class RequestHandler:
                 if resumable.completed:
                     break
                 if not (resumable.should_resume() and resumes_left > 0):
-                    if stream_error is not None:
-                        logger.warning(
-                            "stream for %s ended unrecovered: %s", request_id, stream_error
-                        )
+                    logger.warning(
+                        "stream for %s ended unrecovered: %s",
+                        request_id,
+                        stream_error if stream_error is not None else "EOF before completion",
+                    )
                     break
 
                 # --- mid-generation failover (Petals-style resume) ---
@@ -365,7 +405,18 @@ class RequestHandler:
 
             # If we exited without ever forwarding a terminator, close cleanly.
             if not resumable.completed:
-                yield b"data: [DONE]\n\n"
+                terminal = terminal_chunk_from(
+                    last_chunk,
+                    finish_reason=INCOMPLETE_STREAM_FINISH_REASON,
+                ) if last_chunk is not None else None
+                if terminal is not None:
+                    yield terminal
+                else:
+                    logger.warning(
+                        "stream for %s ended incomplete without a JSON chunk template",
+                        request_id,
+                    )
+                yield DONE_BYTES
         finally:
             if last_chunk is not None:
                 tps, ttft, input_tokens, output_tokens = get_request_metrics(
