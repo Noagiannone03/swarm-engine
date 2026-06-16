@@ -615,15 +615,27 @@ class Scheduler:
         # register) a partir des noeuds ACTIVE ; or un noeud ne devient ACTIVE
         # qu'apres avoir charge ses poids et envoye is_active=True ICI -- donc
         # APRES le bootstrap initial (ou active_nodes etait encore vide -> 0
-        # pipeline enregistre -> 503 'routing pipelines not ready'). On re-
-        # enregistre des qu'on est bootstrappe mais que le routage n'a pas (encore)
-        # de pipeline pret. No-op une fois un pipeline pret enregistre.
-        if self._bootstrapped_event.is_set():
+        # pipeline enregistre -> 503 'routing pipelines not ready').
+        #
+        # IMPORTANT : on ne tente le ré-enregistrement QUE s'il existe deja une
+        # pipeline complete parmi les noeuds ACTIVE. Sans cette garde, quand le
+        # swarm n'a pas (ou pas encore) de pipeline complete -- p.ex. un seul
+        # contributeur dont la capacite ne couvre pas toutes les couches --
+        # routing_ready() reste False en permanence, et on rappelait bootstrap()
+        # + on logguait a CHAQUE node_update (toutes les ~50 ms) : du bruit et du
+        # churn de routage inutiles. Avec la garde : pas de pipeline complete ->
+        # on ne fait rien ; pipeline complete mais routage pas encore enregistre
+        # -> on enregistre UNE fois et on ne logue qu'au succes reel.
+        if (
+            self._bootstrapped_event.is_set()
+            and not self.request_router.routing_ready()
+            and self.has_full_pipeline()
+        ):
             try:
-                if not self.request_router.routing_ready():
-                    self.request_router.bootstrap()
+                self.request_router.bootstrap()
+                if self.request_router.routing_ready():
                     logger.info(
-                        '[Scheduler] Routing pipelines (re)registered after node(s) became active'
+                        '[Scheduler] Routing pipelines registered after node(s) became active'
                     )
             except Exception:
                 logger.warning(
