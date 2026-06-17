@@ -122,10 +122,17 @@ class RequestHandler:
     MAX_ROUTING_RETRY = 20
     FORWARD_DELAY_SEC = 10
     RETRY_DELAY_SEC = 5
+    # Tokens to reserve for the answer when the client doesn't set max_tokens, so
+    # the context check accounts for generation, not just the prompt.
+    DEFAULT_GENERATION_RESERVE = 512
 
     def __init__(self):
         self.scheduler_manage = None
         self.stubs = {}
+        # Lazy, cached model tokenizer for context-aware routing (counts request
+        # tokens). None if it can't be loaded -> context routing simply disabled.
+        self._tokenizer = None
+        self._tokenizer_loaded = False
 
     def set_scheduler_manage(self, scheduler_manage):
         self.scheduler_manage = scheduler_manage
@@ -135,19 +142,86 @@ class RequestHandler:
             self.stubs[node_id] = self.scheduler_manage.completion_handler.get_stub(node_id)
         return self.stubs[node_id]
 
+    def _get_tokenizer(self):
+        """Lazy-load and cache the model's tokenizer (for counting request tokens).
+
+        Uses the standard HF tokenizer of the served model — exact for its chat
+        template, no home-made heuristic. Loaded once; if it fails (offline, etc.)
+        we cache None and context-aware routing degrades gracefully to off.
+        """
+        if self._tokenizer_loaded:
+            return self._tokenizer
+        self._tokenizer_loaded = True
+        try:
+            model_name = getattr(self.scheduler_manage, "model_name", None)
+            if not model_name:
+                return None
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            logger.info("Context-aware routing: loaded tokenizer for %s", model_name)
+        except Exception:
+            logger.warning(
+                "Context-aware routing disabled: could not load tokenizer", exc_info=True
+            )
+            self._tokenizer = None
+        return self._tokenizer
+
+    def _count_context_tokens(self, request_data: Dict) -> Optional[int]:
+        """Total sequence budget of a request = prompt tokens + generation reserve.
+
+        Returns None if it can't be measured (no tokenizer / unexpected payload) —
+        callers then route without any context filter (never block on a count we
+        couldn't take). Uses `apply_chat_template` so the count matches exactly what
+        the worker will feed the model.
+        """
+        tok = self._get_tokenizer()
+        if tok is None:
+            return None
+        try:
+            messages = request_data.get("messages")
+            if messages:
+                ids = tok.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True
+                )
+                prompt_tokens = len(ids)
+            elif request_data.get("prompt") is not None:
+                prompt_tokens = len(tok.encode(str(request_data["prompt"])))
+            else:
+                return None
+        except Exception:
+            logger.debug("context token count failed", exc_info=True)
+            return None
+        try:
+            gen = int(request_data.get("max_tokens") or 0)
+        except (TypeError, ValueError):
+            gen = 0
+        if gen <= 0:
+            gen = self.DEFAULT_GENERATION_RESERVE
+        return prompt_tokens + gen
+
     async def _resolve_routing(
-        self, request_id: str, received_ts: int, *, max_attempts: Optional[int] = None
+        self,
+        request_id: str,
+        received_ts: int,
+        *,
+        max_attempts: Optional[int] = None,
+        context_tokens: Optional[int] = None,
     ) -> List[str]:
         """Resolve a non-empty routing table, retrying while pipelines are full.
 
         Raises `_NoRoute` (carrying the client-facing response) when the scheduler
         has no route: None -> 503, repeated empties -> 429, lookup error -> 500.
+        `context_tokens` is forwarded so the router only picks a pipeline able to
+        hold this request's context.
         """
         limit = self.MAX_ROUTING_RETRY if max_attempts is None else max_attempts
         attempts = 0
         while attempts < limit:
             try:
-                routing_table = self.scheduler_manage.get_routing_table(request_id, received_ts)
+                routing_table = self.scheduler_manage.get_routing_table(
+                    request_id, received_ts, context_tokens=context_tokens
+                )
             except Exception as e:
                 logger.exception(f"get_routing_table error: {e}")
                 raise _NoRoute(500, {"error": "Get routing table error"})
@@ -167,7 +241,13 @@ class RequestHandler:
         raise _NoRoute(429, {"error": "All pipelines are busy or not ready. Please retry later."})
 
     async def _open_stream(
-        self, request_data: Dict, request_id: str, received_ts: int, *, routing_max_attempts=None
+        self,
+        request_data: Dict,
+        request_id: str,
+        received_ts: int,
+        *,
+        routing_max_attempts=None,
+        context_tokens: Optional[int] = None,
     ) -> Tuple[object, object, bytes]:
         """Resolve a route, open the upstream stream, and read a valid first chunk.
 
@@ -175,7 +255,7 @@ class RequestHandler:
         and must cancel it. Raises on any failure (so retry/resume loops re-route).
         """
         routing_table = await self._resolve_routing(
-            request_id, received_ts, max_attempts=routing_max_attempts
+            request_id, received_ts, max_attempts=routing_max_attempts, context_tokens=context_tokens
         )
         request_data["rid"] = str(request_id)
         request_data["routing_table"] = routing_table
@@ -208,6 +288,37 @@ class RequestHandler:
                 status_code=500,
             )
 
+        # --- Context-aware routing ---
+        # Measure the request's sequence budget once, up front. If it exceeds what
+        # ANY complete pipeline can physically serve, reject clearly (413) instead
+        # of letting a worker silently truncate the prompt. cap == 0 means
+        # "unknown" -> never reject. context_tokens is then forwarded so the router
+        # only picks a pipeline whose nodes can all hold this context.
+        context_tokens = self._count_context_tokens(request_data)
+        if context_tokens is not None:
+            capacity = self.scheduler_manage.max_context_capacity()
+            if capacity and context_tokens > capacity:
+                logger.info(
+                    "Rejecting request %s: context %d > swarm capacity %d",
+                    request_id, context_tokens, capacity,
+                )
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "error": {
+                            "message": (
+                                f"Contexte trop long pour les contributeurs actuels : "
+                                f"cette requête demande ~{context_tokens} tokens, le swarm "
+                                f"peut en servir au plus {capacity}. Réduis le contexte, ou "
+                                f"utilise un modèle / des contributeurs à plus grande fenêtre."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "context_length_exceeded",
+                            "param": "messages",
+                        }
+                    },
+                )
+
         is_stream = request_data.get("stream", False)
 
         forward_attempts = 0
@@ -216,7 +327,7 @@ class RequestHandler:
             try:
                 if is_stream:
                     response, iterator, first_chunk = await self._open_stream(
-                        request_data, request_id, received_ts
+                        request_data, request_id, received_ts, context_tokens=context_tokens
                     )
                     # Ownership of `response` transfers to the streaming generator.
                     resp = StreamingResponse(
@@ -239,7 +350,9 @@ class RequestHandler:
                     return resp
 
                 # Non-streaming path.
-                routing_table = await self._resolve_routing(request_id, received_ts)
+                routing_table = await self._resolve_routing(
+                    request_id, received_ts, context_tokens=context_tokens
+                )
                 request_data["rid"] = str(request_id)
                 request_data["routing_table"] = routing_table
                 stub = self.get_stub(routing_table[0])
@@ -303,8 +416,13 @@ class RequestHandler:
             streamed_response = None
             if RESUME_DELAY_SEC > 0:
                 await asyncio.sleep(RESUME_DELAY_SEC)
+            # Mid-stream re-route must also land on a context-capable pipeline.
             new_resp, new_iter, new_first = await self._open_stream(
-                request_data, request_id, received_ts, routing_max_attempts=3
+                request_data,
+                request_id,
+                received_ts,
+                routing_max_attempts=3,
+                context_tokens=self._count_context_tokens(request_data),
             )
             streamed_response = new_resp
             resumable.begin_resume()

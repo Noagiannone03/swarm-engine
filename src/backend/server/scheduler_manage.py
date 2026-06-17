@@ -522,16 +522,24 @@ class SchedulerManage:
             SCHEDULER_PEER_ID_REANNOUNCE_SEC,
         )
 
-    def get_routing_table(self, request_id, received_ts):
+    def max_context_capacity(self) -> int:
+        """Largest request context (tokens) a complete pipeline can serve now.
+        0 = unknown (caller must not reject on it). Used for graceful 413."""
+        return self.scheduler.max_context_capacity() if self.scheduler else 0
+
+    def get_routing_table(self, request_id, received_ts, context_tokens=None):
         """Block briefly until the scheduler assigns a routing path for the request.
 
         Distinguish three states via `RequestSignal.routing_table`:
         - None: not yet decided, keep waiting up to timeout
         - []: decided but no capacity (pipelines full), return immediately
         - [..]: valid routing path, return immediately
+
+        `context_tokens` (prompt + expected generation) flows into the RequestSignal
+        so the router only picks a pipeline that can hold this request's context.
         """
         logger.debug(f"Routing table requested for request_id={request_id}")
-        request = RequestSignal(request_id, received_ts)
+        request = RequestSignal(request_id, received_ts, context_tokens=context_tokens)
         self.scheduler.receive_request(request)
 
         # Wait up to 5 seconds, but return immediately if the routing table is set (including an empty list)

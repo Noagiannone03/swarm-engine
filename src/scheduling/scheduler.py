@@ -152,6 +152,18 @@ class Scheduler:
         """Check if there is a full pipeline among ACTIVE nodes."""
         return self.node_manager.has_full_pipeline(self.num_layers)
 
+    def max_context_capacity(self) -> int:
+        """Largest request context (tokens) a complete pipeline can serve now.
+
+        Delegates to the router (which knows per-node context capacity). 0 means
+        "unknown" — callers must not reject a request on a 0. Best-effort.
+        """
+        try:
+            return self.request_router.max_context_capacity()
+        except Exception:
+            logger.debug("max_context_capacity() failed", exc_info=True)
+            return 0
+
     def report_pipeline_capacity(
         self,
         ready_only: bool = True,
@@ -455,7 +467,11 @@ class Scheduler:
             )
         except queue.Empty:
             return None
-        path, latency = self.request_router.find_optimal_path(self.last_refit_time)
+        # Pass the request's context budget so the router only picks a pipeline
+        # whose nodes can all hold it (context-aware routing). None -> no filter.
+        path, latency = self.request_router.find_optimal_path(
+            self.last_refit_time, context_tokens=req.context_tokens
+        )
         req.routing_table = path
         # Update simple load counters
         for node_id in path:

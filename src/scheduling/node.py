@@ -16,7 +16,11 @@ from math import floor
 from typing import Dict, List, Optional
 
 from parallax_utils.logging_config import get_logger
-from parallax_utils.utils import bytes_per_element, compute_max_batch_size
+from parallax_utils.utils import (
+    bytes_per_element,
+    compute_max_batch_size,
+    compute_max_tokens_in_cache,
+)
 from scheduling.model_info import ModelInfo
 
 logger = get_logger(__name__)
@@ -77,11 +81,17 @@ class RequestSignal:
     - received_ts: UNIX timestamp (seconds) when the request was received
     - routing_table: Set by the scheduler when a path is assigned. Semantics:
         None -> not assigned yet; [] -> all pipelines full at the moment; [..] -> route
+    - context_tokens: Total sequence budget for this request (prompt tokens +
+        expected generation). Used for context-aware routing: a path is only
+        eligible if every node on it can hold this many tokens. None = unknown
+        (caller couldn't tokenize) -> routing falls back to the load/latency-only
+        behaviour, so we never block a request just because counting failed.
     """
 
     request_id: str
     received_ts: float = field(default_factory=time.time)
     routing_table: Optional[List[str]] = None
+    context_tokens: Optional[int] = None
 
 
 class RooflinePerformanceModel:
@@ -305,6 +315,53 @@ class Node:
         return self.end_layer - self.start_layer
 
     @property
+    def max_context_tokens(self) -> int:
+        """Max total sequence length (prompt + generation) this node can serve for
+        a SINGLE request — the unit used by context-aware routing.
+
+        Two ceilings, we take the min:
+          1. ``max_sequence_length`` — the worker's configured cap; its executor
+             truncates anything longer (this is what bites today at 16384).
+          2. The KV budget for the node's currently-assigned layers, via the SAME
+             helper the batch-size logic uses (``compute_max_tokens_in_cache``) and
+             the SAME memory accounting as ``max_requests`` — so routing/admission
+             never disagree. Fewer layers => more KV per layer => bigger context.
+
+        Before any layer is assigned (num_current_layers == 0) only the configured
+        cap is known, so we return that.
+        """
+        cap = self.max_sequence_length or 0
+        if self.start_layer is None or self.end_layer is None or self.num_current_layers <= 0:
+            return cap
+        try:
+            elem_bytes = bytes_per_element(
+                getattr(self.model_info, "cache_bytes_per_element", None)
+            )
+        except Exception:
+            elem_bytes = 2
+        try:
+            kv_tokens = compute_max_tokens_in_cache(
+                device="",
+                kv_cache_memory_fraction=self.kvcache_mem_ratio,
+                num_shard_layers=self.num_current_layers,
+                num_key_value_heads=self.model_info.num_kv_heads,
+                head_dim_k=self.model_info.head_size_k,
+                head_dim_v=self.model_info.head_size_v,
+                elem_bytes=elem_bytes,
+                # Same accounting as compute_max_batch_size (single-GPU budget):
+                # memory_gb * 1GiB * kv_fraction. Keeps max_context_tokens and
+                # max_requests strictly consistent.
+                available_cache_bytes=int(
+                    self.hardware.memory_gb * 1024**3 * self.kvcache_mem_ratio
+                ),
+            )
+        except Exception:
+            return cap
+        if kv_tokens <= 0:
+            return cap
+        return min(cap, kv_tokens) if cap > 0 else kv_tokens
+
+    @property
     def has_embedding(self) -> bool:
         """Check if this node hosts the embedding layer (layer 0)."""
         if self.start_layer is None:
@@ -372,9 +429,17 @@ class Node:
     def get_decoder_layer_capacity(
         self, include_input_embed: bool = False, include_lm_head: bool = False
     ) -> int:
-        """Return how many decoder layers this node can store for parameters.
+        """Return how many decoder layers this node can store.
 
-        Capacity is measured using the parameter memory budget on the device.
+        Base: the parameter memory budget (how many layers' WEIGHTS fit).
+
+        When context-aware allocation is enabled (env PARALLAX_CONTEXT_AWARE_ALLOC),
+        we ALSO cap by KV headroom: a node must not be given so many layers that it
+        can no longer hold ``max_sequence_length`` tokens of KV for them. This is
+        the exo-style "weak machines take fewer layers" idea — it keeps each node's
+        advertised context honest (no silent truncation / OOM) and frees small
+        machines to offer a larger context. Off by default → allocation behaviour
+        is unchanged unless explicitly enabled.
         """
         available_memory_bytes = floor(
             self.hardware.num_gpus
@@ -392,7 +457,7 @@ class Node:
 
         if self.hardware.device == "mlx":
             # For mlx, consider mlx bit factor
-            return floor(
+            param_cap = floor(
                 available_memory_bytes
                 / (
                     self.model_info.decoder_layer_io_bytes(roofline=False)
@@ -400,9 +465,50 @@ class Node:
                 )
             )
         else:
-            return floor(
+            param_cap = floor(
                 available_memory_bytes / self.model_info.decoder_layer_io_bytes(roofline=False)
             )
+
+        if os.environ.get("PARALLAX_CONTEXT_AWARE_ALLOC", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            kv_cap = self._kv_headroom_layer_capacity()
+            if kv_cap is not None and kv_cap >= 1:
+                return max(1, min(param_cap, kv_cap))
+        return param_cap
+
+    def _kv_headroom_layer_capacity(self) -> Optional[int]:
+        """Max layers this node can host while STILL holding ``max_sequence_length``
+        tokens of KV for them.
+
+        Inverts the KV-cache formula (the same constants as
+        ``compute_max_tokens_in_cache``): with a KV budget of
+        ``memory_gb * 1GiB * kvcache_mem_ratio`` and ``per_token_per_layer =
+        num_kv_heads * (head_dim_k + head_dim_v) * elem_bytes``, requiring the pool
+        to hold ``max_sequence_length`` tokens across ``N`` layers gives
+        ``N <= budget / (seq_len * per_token_per_layer)``. Returns None when not
+        computable (no seq len / zero heads) so callers fall back to the param cap.
+        """
+        seq = self.max_sequence_length or 0
+        if seq <= 0:
+            return None
+        try:
+            elem_bytes = bytes_per_element(
+                getattr(self.model_info, "cache_bytes_per_element", None)
+            )
+        except Exception:
+            elem_bytes = 2
+        per_token_per_layer = (
+            self.model_info.num_kv_heads
+            * (self.model_info.head_size_k + self.model_info.head_size_v)
+            * elem_bytes
+        )
+        if per_token_per_layer <= 0:
+            return None
+        kv_budget = self.hardware.memory_gb * 1024**3 * self.kvcache_mem_ratio
+        return max(1, floor(kv_budget / (seq * per_token_per_layer)))
 
     @property
     def per_decoder_layer_kv_cache_memory(self) -> Optional[int]:

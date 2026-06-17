@@ -200,11 +200,15 @@ class RequestRoutingStrategy(ABC):
     def find_optimal_path(
         self,
         last_refit_time: Optional[float] = None,
+        context_tokens: Optional[int] = None,
     ) -> Tuple[List[str], float]:
         """Return the chosen node-id path and its estimated latency.
 
         Args:
             last_refit_time: Last refit time for weight refit
+            context_tokens: Total sequence budget of the request (prompt + expected
+                generation). When set, the route must only use nodes that can hold
+                that context. None = no context filtering (legacy behaviour).
 
         Returns:
             (node_ids, latency_ms). If no valid route exists, returns ([], inf).
@@ -218,6 +222,14 @@ class RequestRoutingStrategy(ABC):
     def routing_ready(self) -> bool:
         """Return True iff the router can dispatch requests right now."""
         return True
+
+    def max_context_capacity(self) -> int:
+        """Largest request context (tokens) a complete pipeline can serve now.
+
+        0 means "unknown / not computed" — callers must treat 0 as "don't reject".
+        Overridden by routers that track per-node context capacity (DP).
+        """
+        return 0
 
     def expand_pipelines(self) -> None:
         """Opportunistically expand pipelines for fixed-pipeline routers.
@@ -320,6 +332,7 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
     def find_optimal_path(
         self,
         last_refit_time: Optional[float] = None,
+        context_tokens: Optional[int] = None,
     ) -> Tuple[List[str], float]:
         """Compute a minimum-latency node-id path using shard-level DP.
 
@@ -328,8 +341,13 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
         where the next starts (contiguous cover). Vertex cost is `layer_latency_ms`;
         edge cost is RTT via `get_rtt_to`.
 
-        Returns ([], inf) if no full cover `[0, num_layers)` exists or if any
-        required RTT is missing.
+        When ``context_tokens`` is provided (context-aware routing), a node is only
+        usable if it can hold that many tokens (``max_context_tokens``) — so a
+        request only routes through a pipeline that can actually serve its context.
+        ``None`` keeps the previous behaviour (no context filtering).
+
+        Returns ([], inf) if no full cover `[0, num_layers)` exists (none, or none
+        big enough for the context) or if any required RTT is missing.
         """
         nodes = self.node_manager.active_nodes
         num_layers = self.total_layers
@@ -337,24 +355,27 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
         if num_layers <= 0 or not nodes:
             return [], 0.0
 
-        # Collect vertices from nodes with valid layer ranges
+        def _eligible(n) -> bool:
+            if n.start_layer is None or n.end_layer is None or n.is_active is False:
+                return False
+            if context_tokens is not None and n.max_context_tokens < context_tokens:
+                return False
+            return True
+
+        # Collect vertices from eligible nodes (valid range, active, big enough)
         starts: Dict[int, List[int]] = {}
         ends: Dict[int, List[int]] = {}
         for idx, n in enumerate(nodes):
-            if n.start_layer is None or n.end_layer is None or n.is_active is False:
+            if not _eligible(n):
                 continue
             starts.setdefault(n.start_layer, []).append(idx)
             ends.setdefault(n.end_layer, []).append(idx)
 
-        # DP over vertices sorted by (start, end)
+        # DP over eligible vertices sorted by (start, end)
         order = [
             i
             for i, n in sorted(
-                [
-                    (i, n)
-                    for i, n in enumerate(nodes)
-                    if n.start_layer is not None and n.end_layer is not None
-                ],
+                [(i, n) for i, n in enumerate(nodes) if _eligible(n)],
                 key=lambda p: (p[1].start_layer, p[1].end_layer),
             )
         ]
@@ -472,6 +493,42 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
                     progressed = True
         return reach >= num_layers
 
+    def max_context_capacity(self) -> int:
+        """Largest context (in tokens) any complete pipeline of ACTIVE nodes can
+        serve right now: the WIDEST-BOTTLENECK contiguous cover of
+        ``[0, total_layers)``, where a node's "width" is ``max_context_tokens``.
+
+        Used to reject a request (413) whose context exceeds anything the swarm
+        can physically serve — instead of silently truncating it. Like
+        ``routing_ready``, it is load-independent (it's about capacity, not free
+        capacity right now). Returns 0 if no complete pipeline exists (so callers
+        treat 0 as "unknown" and never reject on it).
+        """
+        num_layers = self.total_layers
+        if num_layers <= 0:
+            return 0
+        segments = [
+            (n.start_layer, n.end_layer, n.max_context_tokens)
+            for n in self.node_manager.active_nodes
+            if n.start_layer is not None and n.end_layer is not None and n.is_active
+        ]
+        if not segments:
+            return 0
+        # best[layer] = max achievable bottleneck capacity to reach `layer` from 0.
+        # Relax until stable (DAG over increasing layer indices -> terminates).
+        best: Dict[int, float] = {0: float("inf")}
+        changed = True
+        while changed:
+            changed = False
+            for start, end, cap in segments:
+                if start in best:
+                    cand = min(best[start], cap)
+                    if cand > best.get(end, -1.0):
+                        best[end] = cand
+                        changed = True
+        reached = best.get(num_layers, 0.0)
+        return 0 if reached == float("inf") else int(max(0.0, reached))
+
     def expand_pipelines(self) -> None:
         return None
 
@@ -571,6 +628,7 @@ class RandomizedOverDynamicPipelinesRouting(RequestRoutingStrategy):
         nodes: Optional[List[Node]] = None,
         num_layers: Optional[int] = None,
         last_refit_time: Optional[float] = None,
+        context_tokens: Optional[int] = None,
     ) -> Tuple[List[str], float]:
         """Randomly choose among cached complete pipelines, skipping overloaded ones.
 
@@ -849,6 +907,7 @@ class RoundRobinOverFixedPipelinesRouting(RequestRoutingStrategy):
         nodes: Optional[List[Node]] = None,
         num_layers: Optional[int] = None,
         last_refit_time: Optional[float] = None,
+        context_tokens: Optional[int] = None,
     ) -> Tuple[List[str], float]:
         """Return the next viable *registered* pipeline in round-robin order.
 
