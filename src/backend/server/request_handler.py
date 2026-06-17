@@ -125,6 +125,9 @@ class RequestHandler:
     # Tokens to reserve for the answer when the client doesn't set max_tokens, so
     # the context check accounts for generation, not just the prompt.
     DEFAULT_GENERATION_RESERVE = 512
+    # Hard cap on counting work (tokenizer load + tokenize) so it can NEVER stall
+    # the async server; on timeout we route without the context filter.
+    CONTEXT_COUNT_TIMEOUT_SEC = 12
 
     def __init__(self):
         self.scheduler_manage = None
@@ -167,7 +170,26 @@ class RequestHandler:
             self._tokenizer = None
         return self._tokenizer
 
-    def _count_context_tokens(self, request_data: Dict) -> Optional[int]:
+    async def _count_context_tokens(self, request_data: Dict) -> Optional[int]:
+        """Async wrapper: count tokens OFF the event loop, with a hard timeout.
+
+        Loading the HF tokenizer (first call) and tokenizing a huge prompt are
+        blocking/CPU work; running them inline would freeze the whole async server
+        (and a slow HF fetch would hang every request). We offload to a thread and
+        bound it — on timeout/error we return None, so routing just proceeds
+        without the context filter. Never blocks serving on counting.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, self._count_context_tokens_sync, request_data),
+                timeout=self.CONTEXT_COUNT_TIMEOUT_SEC,
+            )
+        except Exception:
+            logger.debug("context token count timed out / failed", exc_info=True)
+            return None
+
+    def _count_context_tokens_sync(self, request_data: Dict) -> Optional[int]:
         """Total sequence budget of a request = prompt tokens + generation reserve.
 
         Returns None if it can't be measured (no tokenizer / unexpected payload) —
@@ -294,7 +316,7 @@ class RequestHandler:
         # of letting a worker silently truncate the prompt. cap == 0 means
         # "unknown" -> never reject. context_tokens is then forwarded so the router
         # only picks a pipeline whose nodes can all hold this context.
-        context_tokens = self._count_context_tokens(request_data)
+        context_tokens = await self._count_context_tokens(request_data)
         if context_tokens is not None:
             capacity = self.scheduler_manage.max_context_capacity()
             if capacity and context_tokens > capacity:
@@ -339,6 +361,7 @@ class RequestHandler:
                             response,
                             iterator,
                             first_chunk,
+                            context_tokens,
                         ),
                         media_type="text/event-stream",
                         headers={
@@ -393,6 +416,7 @@ class RequestHandler:
         response,
         iterator,
         first_chunk: bytes,
+        context_tokens: Optional[int] = None,
     ):
         """Stream the answer, transparently re-routing if the pipeline drops mid-generation.
 
@@ -422,7 +446,7 @@ class RequestHandler:
                 request_id,
                 received_ts,
                 routing_max_attempts=3,
-                context_tokens=self._count_context_tokens(request_data),
+                context_tokens=context_tokens,
             )
             streamed_response = new_resp
             resumable.begin_resume()
