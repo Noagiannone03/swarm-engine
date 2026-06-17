@@ -438,9 +438,39 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
         return "\n".join(lines)
 
     def routing_ready(self) -> bool:
-        """Return True iff DP routing can find a finite-latency path right now."""
-        node_ids, lat = self.find_optimal_path()
-        return bool(node_ids) and lat != float("inf")
+        """True iff active, ready nodes STRUCTURALLY cover ``[0, total_layers)``.
+
+        This is a structural readiness check — "a complete pipeline of loaded
+        nodes exists" — DELIBERATELY independent of current load. The previous
+        implementation delegated to ``find_optimal_path()``, whose vertex cost is
+        ``layer_latency_ms``, and that returns ``inf`` for an OVERLOADED node
+        (``current_requests >= max``). So a single in-flight request flipped
+        ``routing_ready()`` to ``False`` even though the swarm could serve — which
+        made clients believe the pipeline disappeared after every prompt. Whether
+        there is spare capacity *right now* is a request-time concern (retry /
+        429), not a readiness one; routing-ready must reflect structure only.
+
+        Greedy interval cover (jump-game): from layer 0, repeatedly extend the
+        reached layer by the furthest end among ready segments that start at or
+        before the current reach. Covered iff we reach ``total_layers``.
+        """
+        num_layers = self.total_layers
+        if num_layers <= 0:
+            return False
+        segments = [
+            (n.start_layer, n.end_layer)
+            for n in self.node_manager.active_nodes
+            if n.start_layer is not None and n.end_layer is not None and n.is_active
+        ]
+        reach = 0
+        progressed = True
+        while progressed and reach < num_layers:
+            progressed = False
+            for start, end in segments:
+                if start <= reach and end > reach:
+                    reach = end
+                    progressed = True
+        return reach >= num_layers
 
     def expand_pipelines(self) -> None:
         return None
