@@ -434,21 +434,27 @@ class Node:
         Base: the parameter memory budget (how many layers' WEIGHTS fit).
 
         When context-aware allocation is enabled (env PARALLAX_CONTEXT_AWARE_ALLOC),
-        we ALSO cap by KV headroom: a node must not be given so many layers that it
-        can no longer hold ``max_sequence_length`` tokens of KV for them. This is
-        the exo-style "weak machines take fewer layers" idea — it keeps each node's
-        advertised context honest (no silent truncation / OOM) and frees small
-        machines to offer a larger context. Off by default → allocation behaviour
-        is unchanged unless explicitly enabled.
+        the estimate is made REALISTIC for heterogeneous hardware in two ways:
+          1. Reserve a FIXED non-weight GPU footprint (CUDA context + attention/JIT
+             workspace + activations) before the weight budget. The plain estimate
+             counts only raw weight bytes, so it over-allocates small cards — a
+             24 GB GPU was told it could hold 34 layers of an 8B model and OOM'd on
+             load. That overhead is a big fraction of a small card and negligible
+             on a big one, so reserving it is exactly what makes the split honest.
+          2. Cap by KV headroom: never assign so many layers that the node can't
+             hold ``max_sequence_length`` tokens of KV for them (exo-style "weak
+             machines take fewer layers").
+        Off by default → allocation behaviour is unchanged unless enabled.
         """
-        available_memory_bytes = floor(
-            self.hardware.num_gpus
-            * self.hardware.memory_gb
-            * 1024
-            * 1024
-            * 1024
-            * self.param_mem_ratio
+        ctx_aware = os.environ.get("PARALLAX_CONTEXT_AWARE_ALLOC", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
         )
+        total_bytes = float(self.hardware.num_gpus * self.hardware.memory_gb * 1024**3)
+        if ctx_aware:
+            total_bytes = max(0.0, total_bytes - self._gpu_overhead_bytes())
+        available_memory_bytes = floor(total_bytes * self.param_mem_ratio)
         if include_input_embed:
             available_memory_bytes -= self.model_info.embedding_io_bytes
         if include_lm_head:
@@ -469,15 +475,25 @@ class Node:
                 available_memory_bytes / self.model_info.decoder_layer_io_bytes(roofline=False)
             )
 
-        if os.environ.get("PARALLAX_CONTEXT_AWARE_ALLOC", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        ):
+        if ctx_aware:
             kv_cap = self._kv_headroom_layer_capacity()
             if kv_cap is not None and kv_cap >= 1:
                 return max(1, min(param_cap, kv_cap))
-        return param_cap
+        return max(1, param_cap) if ctx_aware else param_cap
+
+    def _gpu_overhead_bytes(self) -> float:
+        """Fixed non-weight GPU memory to reserve before the weight budget: CUDA
+        context + attention/JIT workspace (e.g. flashinfer) + activation buffers.
+        Larger on CUDA backends, small on MLX. Tunable via PARALLAX_GPU_OVERHEAD_GB.
+        """
+        env = os.environ.get("PARALLAX_GPU_OVERHEAD_GB", "").strip()
+        if env:
+            try:
+                return max(0.0, float(env)) * 1024**3
+            except ValueError:
+                pass
+        default_gb = 1.5 if self.hardware.device == "mlx" else 4.0
+        return default_gb * 1024**3
 
     def _kv_headroom_layer_capacity(self) -> Optional[int]:
         """Max layers this node can host while STILL holding ``max_sequence_length``
