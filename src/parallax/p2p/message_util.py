@@ -6,6 +6,8 @@ between the P2P server and the executor.
 """
 
 import io
+import struct
+import zlib
 from typing import Any, List, Optional
 
 try:
@@ -16,9 +18,52 @@ try:
 except ImportError:  # pragma: no cover - exercised on Windows
     mx = None
 
+from parallax_utils.logging_config import get_logger
+
 from parallax.p2p.proto import forward_pb2
 from parallax.server.request import IntermediateRequest, Request, RequestStatus
 from parallax.server.sampling.sampling_params import SamplingParams
+
+logger = get_logger(__name__)
+
+# --- Activation integrity (cross-stage hidden-state transport) ----------------
+# Pipeline stages live on different volunteer machines reached over a P2P relay.
+# Unlike NCCL in a datacenter, that path is not guaranteed in-order/uncorrupted,
+# and a single flipped byte in a hidden-state tensor propagates silently to the
+# end of the pipeline and produces a plausible-but-wrong token with NO error.
+# We wrap every serialized tensor in a tiny self-describing envelope carrying a
+# CRC32 of the payload, verified on receive. zlib.crc32 is stdlib and ~GB/s, so
+# the cost is negligible next to the network hop. The envelope lives INSIDE the
+# opaque proto bytes field, so no schema change / pb2 regen is needed, and decode
+# stays backward compatible: a payload without the magic is parsed as-is (so a
+# legacy, un-wrapping peer still interoperates during a rolling upgrade).
+_TENSOR_MAGIC = b"PXC1"
+_TENSOR_HEADER = struct.Struct(">4sI")  # magic, crc32  (big-endian)
+
+
+def _wrap_tensor_payload(payload: bytes) -> bytes:
+    """Prefix a serialized tensor with magic + CRC32 of the payload."""
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    return _TENSOR_HEADER.pack(_TENSOR_MAGIC, crc) + payload
+
+
+def _unwrap_tensor_payload(data: bytes) -> bytes:
+    """Strip + verify the integrity envelope. Raises ValueError on CRC mismatch.
+
+    Backward compatible: data that does not start with the magic is returned
+    unchanged (a peer that hasn't been upgraded yet sends a bare payload).
+    """
+    if len(data) >= _TENSOR_HEADER.size and data[: len(_TENSOR_MAGIC)] == _TENSOR_MAGIC:
+        _magic, crc = _TENSOR_HEADER.unpack(data[: _TENSOR_HEADER.size])
+        payload = data[_TENSOR_HEADER.size :]
+        actual = zlib.crc32(payload) & 0xFFFFFFFF
+        if actual != crc:
+            raise ValueError(
+                f"hidden-state checksum mismatch (got {actual:#010x}, expected {crc:#010x}, "
+                f"{len(payload)} bytes) — corrupted activation on the wire"
+            )
+        return payload
+    return data
 
 
 def request_to_proto(
@@ -217,19 +262,25 @@ def tensor_to_bytes(tensor: Any, device: Optional[str] = "mlx") -> bytes:
             cpu_tensor = tensor
         # Store buffer using safetensor (dtype and size are automatically preserved)
         serialized_data = save({"tensor": cpu_tensor.contiguous()})
-        return serialized_data
+        return _wrap_tensor_payload(serialized_data)
     else:
         assert tensor.size > 0, "Tensor must have size > 0"
         buffer = io.BytesIO()
         mx.save_safetensors(buffer, {"tensor": tensor})
-        return buffer.getvalue()
+        return _wrap_tensor_payload(buffer.getvalue())
 
 
 def bytes_to_tensor(
     tensor: bytes,
     device: Optional[str] = "mlx",
 ) -> Any:
-    """Convert bytes (safetensor format) to tensor."""
+    """Convert bytes (safetensor format) to tensor.
+
+    Verifies the integrity envelope first; a CRC mismatch raises ValueError so
+    the caller can fail/abort this request instead of decoding a corrupted
+    activation into a silently-wrong result.
+    """
+    tensor = _unwrap_tensor_payload(tensor)
     if device is not None and device.startswith("cuda"):
         from safetensors.torch import load
 

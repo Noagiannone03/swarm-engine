@@ -505,11 +505,27 @@ def initialize_vllm_model_runner(
         enable_return_routed_experts=enable_return_routed_experts,
     )
 
+    # KV-cache dtype. Default "auto" (model dtype, unchanged behaviour). fp8
+    # halves KV memory — the single highest-leverage knob for fitting longer
+    # context / more concurrency on small volunteer GPUs — but needs an
+    # fp8-capable attention backend (Ada/Hopper for e4m3, Ampere for e5m2) and
+    # shifts accuracy, so it is strictly opt-in via PARALLAX_KV_CACHE_DTYPE and
+    # must be validated on the target GPU before enabling in a deployment.
+    _kv_cache_dtype = os.environ.get("PARALLAX_KV_CACHE_DTYPE", "auto").strip().lower()
+    if _kv_cache_dtype not in ("auto", "fp8", "fp8_e5m2", "fp8_e4m3"):
+        logger.warning(
+            "Ignoring PARALLAX_KV_CACHE_DTYPE=%r (expected auto|fp8|fp8_e5m2|fp8_e4m3)",
+            _kv_cache_dtype,
+        )
+        _kv_cache_dtype = "auto"
+    if _kv_cache_dtype != "auto":
+        logger.info("KV cache quantization enabled: cache_dtype=%s", _kv_cache_dtype)
+
     cache_config = CacheConfig(
         block_size=kv_block_size,
         gpu_memory_utilization=kv_cache_memory_fraction,
         swap_space=0,
-        cache_dtype="auto",
+        cache_dtype=_kv_cache_dtype,
     )
 
     parallel_config = ParallelConfig(

@@ -16,6 +16,7 @@ Two classes that handles a post request from the frontend service:
 import asyncio
 import json
 import multiprocessing as mp
+import os
 import sys
 import time
 import traceback
@@ -49,6 +50,34 @@ from parallax.utils.utils import get_zmq_socket
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def _env_float(key: str, default: float, *, minimum: Optional[float] = None) -> float:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring %s=%r (not a number)", key, raw)
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
+def _env_int(key: str, default: int, *, minimum: Optional[int] = None) -> int:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring %s=%r (not an integer)", key, raw)
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
 
 
 def get_exception_traceback():
@@ -127,6 +156,22 @@ class HTTPHandler:
         self.send_to_executor = get_zmq_socket(context, zmq.PUSH, executor_input_ipc_name, True)
         self.recv_from_executor = get_zmq_socket(context, zmq.PULL, executor_output_ipc_name, True)
         self.processing_requests: Dict[str, HTTPRequestInfo] = {}
+
+        # --- Load-shedding & fast-fail (good-citizen serving on volunteer nodes) -
+        # This node is the entry of the pipeline. Two protections, both off the
+        # mature local stacks (Ollama returns 503 at OLLAMA_MAX_QUEUE; vLLM bounds
+        # in-flight by max_num_seqs):
+        #   * max_inflight — admit at most N concurrent requests, else 503 (shed
+        #     load instead of growing an unbounded queue that just times out).
+        #   * idle_timeout — if a request makes NO progress (no token) for this
+        #     long, fail it fast. This is how a dead downstream pipeline stage is
+        #     surfaced to the client in seconds instead of stalling until the
+        #     multi-minute request timeout (a stage on a volunteer's machine can
+        #     vanish mid-request). 0 disables.
+        self.max_inflight = _env_int("PARALLAX_MAX_INFLIGHT_REQUESTS", 256, minimum=1)
+        self.request_idle_timeout = _env_float(
+            "PARALLAX_REQUEST_IDLE_TIMEOUT_S", 120.0, minimum=0.0
+        )
 
         # Load tokenizer for separate detokenizers.
         # Important: avoid triggering full weight downloads here.
@@ -285,8 +330,31 @@ class HTTPHandler:
         if not request_info or not request_info.stream:
             return
 
+        idle = self.request_idle_timeout
         while True:
-            token = await request_info.token_queue.get()
+            try:
+                if idle > 0:
+                    token = await asyncio.wait_for(request_info.token_queue.get(), timeout=idle)
+                else:
+                    token = await request_info.token_queue.get()
+            except asyncio.TimeoutError:
+                # No token within the idle window → a pipeline stage is likely
+                # dead. Surface it to the client fast and abort, rather than
+                # hanging the stream open indefinitely.
+                logger.warning(
+                    "Streaming request %s stalled (no token for %.0fs) — aborting", rid, idle
+                )
+                self.abort_request(rid)
+                request_info.finish_reason = "error"
+                request_info.is_finish = True
+                yield self._generate_error_stream_chunk(
+                    rid,
+                    {
+                        "message": "Request stalled (no progress); a pipeline node may be unavailable",
+                        "type": "GatewayTimeoutError",
+                    },
+                )
+                break
             if token is None:  # End of stream sentinel
                 break
             if isinstance(token, dict) and token.get("type") == "error":
@@ -505,6 +573,22 @@ async def v1_chat_completions(raw_request: fastapi.Request):
         request_id = str(uuid.uuid4())
         request_json["rid"] = request_id
 
+    # Load-shedding: shed instead of growing an unbounded queue. A volunteer node
+    # at capacity should say so (503) so the caller can retry elsewhere, rather
+    # than admit work it will only stall on.
+    handler = app.state.http_handler
+    if len(handler.processing_requests) >= handler.max_inflight:
+        logger.warning(
+            "Rejecting request %s: at capacity (%d in flight)",
+            request_id,
+            handler.max_inflight,
+        )
+        return create_error_response(
+            "Server busy, please retry",
+            "ServiceUnavailableError",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
     app.state.http_handler.create_request(request_json)
     app.state.http_handler.send_request(request_json)
     req = app.state.http_handler.processing_requests.get(request_id)
@@ -542,6 +626,23 @@ async def v1_chat_completions(raw_request: fastapi.Request):
                 is_finish = req.is_finish
                 if is_finish:
                     break
+                # Fast-fail: no token produced within the idle window → a stage on
+                # the path is likely dead. Abort now instead of blocking the caller
+                # until the multi-minute request timeout.
+                idle = app.state.http_handler.request_idle_timeout
+                if idle > 0 and (time.time() - req.update_time) > idle:
+                    logger.warning(
+                        "Request %s stalled (no progress for %.0fs) — aborting",
+                        request_id,
+                        idle,
+                    )
+                    app.state.http_handler.abort_request(request_id)
+                    app.state.http_handler.release_request(request_id)
+                    return create_error_response(
+                        "Request stalled (no progress); a pipeline node may be unavailable",
+                        "GatewayTimeoutError",
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    )
             if req.error_message:
                 response = create_error_response(
                     req.error_message,

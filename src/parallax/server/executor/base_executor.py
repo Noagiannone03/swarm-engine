@@ -293,7 +293,35 @@ class BaseExecutor:
                         # Create a new ForwardRequest instance and parse from bytes
                         forward_request = forward_pb2.ForwardRequest()
                         forward_request.ParseFromString(recv_req[1])
-                        recv_req = proto_to_request(forward_request, self.device)
+                        try:
+                            recv_req = proto_to_request(forward_request, self.device)
+                        except Exception as deser_err:
+                            # A hidden-state failed to deserialize — almost always a
+                            # checksum mismatch (corrupted activation on the P2P wire,
+                            # see message_util._unwrap_tensor_payload). Do NOT silently
+                            # drop it: that strands the request until the multi-minute
+                            # request timeout. Convert it into an ABORT for exactly the
+                            # affected rids so the pipeline tears the request down fast
+                            # and the client gets a prompt error (and, under dp routing,
+                            # can retry on a healthy path).
+                            rids = [r.rid for r in forward_request.reqs]
+                            logger.error(
+                                "Dropping corrupted forward batch (%s): aborting rids %s",
+                                deser_err,
+                                rids,
+                            )
+                            aborted = []
+                            for r in forward_request.reqs:
+                                ireq = IntermediateRequest(
+                                    request_id=r.rid,
+                                    current_position=0,
+                                    status=RequestStatus.FINISHED_ABORT,
+                                    routing_table=list(r.routing_table),
+                                )
+                                ireq.abort = True
+                                aborted.append(ireq)
+                            recv_reqs.extend(aborted)
+                            continue
 
                         # Convert hidden_states dtype if necessary
                         if recv_req is not None and len(recv_req) > 0:
