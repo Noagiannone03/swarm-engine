@@ -1000,6 +1000,13 @@ class GradientServer:
                 psi = read_psi_memory_avg10()
 
             decision = gov.observe(raw, available_ratio=available_ratio, psi_avg10=psi)
+            # Keep the measured budget consistent with the smoothed memory_gb:
+            # the scheduler sizes layers from usable_memory_bytes, so scale it by
+            # the same factor the governor applied (else capacity would ignore
+            # back-pressure). Bounded ratio keeps it a no-op when unchanged.
+            if raw > 0 and hardware.get("usable_memory_bytes"):
+                scale = decision.advertised_gb / raw
+                hardware["usable_memory_bytes"] = float(hardware["usable_memory_bytes"]) * scale
             hardware["memory_gb"] = decision.advertised_gb
             hardware["pressure"] = decision.pressure
 

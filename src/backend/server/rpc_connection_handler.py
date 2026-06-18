@@ -301,4 +301,8 @@ class RPCConnectionHandler(ConnectionHandler):
             memory_gb=memory_gb,
             memory_bandwidth_gbps=memory_bandwidth_gbps,
             device=device,
+            # Worker-measured, worker-enforced budget for weights+KV. Absent on
+            # legacy workers → capacity helper falls back to memory_gb.
+            usable_memory_bytes=hardware_json.get("usable_memory_bytes"),
+            total_memory_bytes=hardware_json.get("total_memory_bytes"),
         )

@@ -389,6 +389,12 @@ class NvidiaHardwareInfo(HardwareInfo):
 
     vram_gb: float = 0.0
     memory_bandwidth_gbps: float = 0.0
+    # Worker-ENFORCED budget for weights+KV (bytes, summed across GPUs) and the
+    # raw device total. ``usable_vram_bytes`` is the same ceiling the worker
+    # installs via torch.cuda.set_per_process_memory_fraction, so the scheduler
+    # can size layer counts against the exact limit the allocator will admit.
+    usable_vram_bytes: float = 0.0
+    total_vram_bytes: float = 0.0
 
     # Best-effort device database; can be extended as needed
     _GPU_DB: ClassVar[Dict[str, Dict[str, float]]] = {
@@ -466,6 +472,11 @@ class NvidiaHardwareInfo(HardwareInfo):
             tflops_fp16=float(spec["tflops_fp16"]),
             vram_gb=current_budget.usable_gb,
             memory_bandwidth_gbps=float(spec["bandwidth_gbps"]),
+            # Summed across GPUs: the scheduler treats memory as a single budget.
+            # Assumes homogeneous devices (the common multi-GPU case); the
+            # current-device budget is representative.
+            usable_vram_bytes=current_budget.usable_gb * device_count * 1024**3,
+            total_vram_bytes=current_budget.total_gb * device_count * 1024**3,
         )
 
 
@@ -518,6 +529,9 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
             "memory_gb": memory_gb,
             "memory_bandwidth_gbps": 100.0,
             "device": "Unknown",
+            # No GPU: the usable budget IS the (already overhead-adjusted) RAM.
+            "usable_memory_bytes": memory_gb * 1024**3,
+            "total_memory_bytes": memory_gb * 1024**3,
         }
 
     if isinstance(hw, NvidiaHardwareInfo):
@@ -529,10 +543,19 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
             "memory_gb": hw.vram_gb,
             "memory_bandwidth_gbps": hw.memory_bandwidth_gbps,
             "device": "cuda",
+            # The same per-process VRAM ceiling the worker enforces at load.
+            "usable_memory_bytes": hw.usable_vram_bytes,
+            "total_memory_bytes": hw.total_vram_bytes,
         }
     if isinstance(hw, AppleSiliconHardwareInfo):
         # Use unified memory size as memory_gb; bandwidth rough estimate per family
         est_bandwidth = 100.0
+        # The MLX wired-memory limit is the budget the worker actually enforces
+        # for model + KV — sized below total RAM to leave room for the OS/apps.
+        try:
+            usable_bytes = float(resolve_mlx_wired_limit_bytes(hw.total_ram_gb))
+        except Exception:
+            usable_bytes = hw.total_ram_gb * 1024**3
         return {
             "node_id": node_id,
             "num_gpus": hw.num_gpus,
@@ -541,6 +564,8 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
             "memory_gb": hw.total_ram_gb,
             "memory_bandwidth_gbps": est_bandwidth,
             "device": "mlx",
+            "usable_memory_bytes": usable_bytes,
+            "total_memory_bytes": hw.total_ram_gb * 1024**3,
         }
     # Generic fallback
     return {
@@ -551,6 +576,8 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
         "memory_gb": 16.0,
         "memory_bandwidth_gbps": 100.0,
         "device": "Unknown",
+        "usable_memory_bytes": 16.0 * 1024**3,
+        "total_memory_bytes": 16.0 * 1024**3,
     }
 
 

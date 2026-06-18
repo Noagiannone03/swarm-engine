@@ -71,6 +71,17 @@ class NodeHardwareInfo:
     memory_bandwidth_gbps: float
     device: str
 
+    # Measured, worker-ENFORCED memory budget for the model (weights + KV), in
+    # bytes, summed across this node's GPUs. This is the SAME ceiling the worker
+    # installs at load time (torch.cuda.set_per_process_memory_fraction on CUDA,
+    # the MLX wired limit on Apple). The scheduler sizes layer counts against
+    # exactly that ceiling, so its estimate can never exceed what the worker's
+    # own allocator will admit — which is what removes the over-allocation OOM.
+    # None for legacy workers that don't report it → the capacity helper falls
+    # back to the advertised ``memory_gb`` parameter budget.
+    usable_memory_bytes: Optional[float] = None
+    total_memory_bytes: Optional[float] = None
+
 
 @dataclass
 class RequestSignal:
@@ -429,87 +440,102 @@ class Node:
     def get_decoder_layer_capacity(
         self, include_input_embed: bool = False, include_lm_head: bool = False
     ) -> int:
-        """Return how many decoder layers this node can store.
+        """Return how many decoder layers this node can host for the current model.
 
-        Base: the parameter memory budget (how many layers' WEIGHTS fit).
+        The budget is the node's **measured, worker-enforced** memory ceiling
+        (``hardware.usable_memory_bytes`` — the same per-process allocator cap
+        the worker installs at load time). Sizing against the exact limit the
+        worker enforces is what removes the estimate-vs-reality gap that used to
+        OOM small cards on load: the scheduler can no longer hand a node more
+        layers than the worker's own allocator will admit.
 
-        When context-aware allocation is enabled (env PARALLAX_CONTEXT_AWARE_ALLOC),
-        the estimate is made REALISTIC for heterogeneous hardware in two ways:
-          1. Reserve a FIXED non-weight GPU footprint (CUDA context + attention/JIT
-             workspace + activations) before the weight budget. The plain estimate
-             counts only raw weight bytes, so it over-allocates small cards — a
-             24 GB GPU was told it could hold 34 layers of an 8B model and OOM'd on
-             load. That overhead is a big fraction of a small card and negligible
-             on a big one, so reserving it is exactly what makes the split honest.
-          2. Cap by KV headroom: never assign so many layers that the node can't
-             hold ``max_sequence_length`` tokens of KV for them (exo-style "weak
-             machines take fewer layers").
-        Off by default → allocation behaviour is unchanged unless enabled.
+        This mirrors how every mature local-inference stack assigns work — the
+        process that loads the model owns the memory budget (vLLM's
+        ``determine_available_memory``, Ollama's per-device budget, llama.cpp
+        ``--fit``, Petals' ``_choose_num_blocks``). The scheduler only divides
+        that measured budget by the per-layer cost it already knows from
+        ``ModelInfo``.
+
+        Per hosted layer we charge the decoder-layer WEIGHTS plus a KV slice big
+        enough for ONE request at ``max_sequence_length`` (so a node is never
+        handed more layers than it can serve a single full-context request on).
+        Concurrency beyond one request is elastic — the worker sizes the KV pool
+        from whatever memory is left after weights load — so it is not reserved
+        here. A fixed runtime workspace (attention/JIT global buffer +
+        CUDA-graph scratch, e.g. flashinfer) is reserved up front, and endpoint
+        nodes additionally pay for the input-embedding / lm-head weights.
+
+        Legacy fallback: a node that does not report ``usable_memory_bytes``
+        (older worker / generic host) is sized from the parameter-memory budget
+        derived from the advertised ``memory_gb`` — the original heuristic, kept
+        only for backward compatibility.
         """
-        ctx_aware = os.environ.get("PARALLAX_CONTEXT_AWARE_ALLOC", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
+        usable = getattr(self.hardware, "usable_memory_bytes", None)
+        if usable and usable > 0:
+            budget = float(usable) - self._runtime_workspace_bytes()
+            if include_input_embed:
+                budget -= self.model_info.embedding_io_bytes
+            if include_lm_head and not (
+                include_input_embed and self.model_info.tie_embedding
+            ):
+                budget -= self.model_info.embedding_io_bytes
+            per_layer = self.model_info.decoder_layer_io_bytes(roofline=False)
+            if self.hardware.device == "mlx":
+                per_layer *= self.model_info.mlx_bit_factor
+            per_layer += self._per_layer_kv_floor_bytes()
+            if per_layer <= 0 or budget <= 0:
+                return 1
+            return max(1, floor(budget / per_layer))
+
+        # --- Legacy fallback: advertised parameter-memory budget -------------
+        available_memory_bytes = floor(
+            self.hardware.num_gpus * self.hardware.memory_gb * 1024**3 * self.param_mem_ratio
         )
-        total_bytes = float(self.hardware.num_gpus * self.hardware.memory_gb * 1024**3)
-        if ctx_aware:
-            total_bytes = max(0.0, total_bytes - self._gpu_overhead_bytes())
-        available_memory_bytes = floor(total_bytes * self.param_mem_ratio)
         if include_input_embed:
             available_memory_bytes -= self.model_info.embedding_io_bytes
         if include_lm_head:
             if not (include_input_embed and self.model_info.tie_embedding):
                 available_memory_bytes -= self.model_info.embedding_io_bytes
-
         if self.hardware.device == "mlx":
-            # For mlx, consider mlx bit factor
-            param_cap = floor(
+            return floor(
                 available_memory_bytes
                 / (
                     self.model_info.decoder_layer_io_bytes(roofline=False)
                     * self.model_info.mlx_bit_factor
                 )
             )
-        else:
-            param_cap = floor(
-                available_memory_bytes / self.model_info.decoder_layer_io_bytes(roofline=False)
-            )
+        return floor(
+            available_memory_bytes / self.model_info.decoder_layer_io_bytes(roofline=False)
+        )
 
-        if ctx_aware:
-            kv_cap = self._kv_headroom_layer_capacity()
-            if kv_cap is not None and kv_cap >= 1:
-                return max(1, min(param_cap, kv_cap))
-        return max(1, param_cap) if ctx_aware else param_cap
-
-    def _gpu_overhead_bytes(self) -> float:
-        """Fixed non-weight GPU memory to reserve before the weight budget: CUDA
-        context + attention/JIT workspace (e.g. flashinfer) + activation buffers.
-        Larger on CUDA backends, small on MLX. Tunable via PARALLAX_GPU_OVERHEAD_GB.
+    def _runtime_workspace_bytes(self) -> float:
+        """Non-weight, non-KV runtime GPU buffers to reserve before counting
+        layers: the attention/JIT global workspace (flashinfer allocates a fixed
+        ``global_workspace_buffer``; vLLM defaults it to ~0.4 GiB) plus the
+        CUDA-graph capture scratch. Small on MLX (unified memory, no flashinfer).
+        Tunable via ``PARALLAX_GPU_RUNTIME_WORKSPACE_GB``.
         """
-        env = os.environ.get("PARALLAX_GPU_OVERHEAD_GB", "").strip()
+        env = os.environ.get("PARALLAX_GPU_RUNTIME_WORKSPACE_GB", "").strip()
         if env:
             try:
                 return max(0.0, float(env)) * 1024**3
             except ValueError:
                 pass
-        default_gb = 1.5 if self.hardware.device == "mlx" else 4.0
+        default_gb = 0.25 if self.hardware.device == "mlx" else 0.75
         return default_gb * 1024**3
 
-    def _kv_headroom_layer_capacity(self) -> Optional[int]:
-        """Max layers this node can host while STILL holding ``max_sequence_length``
-        tokens of KV for them.
+    def _per_layer_kv_floor_bytes(self) -> float:
+        """KV-cache bytes per layer for ONE request at ``max_sequence_length``.
 
-        Inverts the KV-cache formula (the same constants as
-        ``compute_max_tokens_in_cache``): with a KV budget of
-        ``memory_gb * 1GiB * kvcache_mem_ratio`` and ``per_token_per_layer =
-        num_kv_heads * (head_dim_k + head_dim_v) * elem_bytes``, requiring the pool
-        to hold ``max_sequence_length`` tokens across ``N`` layers gives
-        ``N <= budget / (seq_len * per_token_per_layer)``. Returns None when not
-        computable (no seq len / zero heads) so callers fall back to the param cap.
+        Charged on top of each layer's weights so a node is never handed more
+        layers than it can serve a single full-context request on. Uses the same
+        KV accounting as ``compute_max_tokens_in_cache`` /
+        ``per_token_per_layer_kv_size``. Returns 0 when not computable (no seq
+        len / zero heads) so the per-layer cost degrades to weights-only.
         """
         seq = self.max_sequence_length or 0
         if seq <= 0:
-            return None
+            return 0.0
         try:
             elem_bytes = bytes_per_element(
                 getattr(self.model_info, "cache_bytes_per_element", None)
@@ -522,9 +548,8 @@ class Node:
             * elem_bytes
         )
         if per_token_per_layer <= 0:
-            return None
-        kv_budget = self.hardware.memory_gb * 1024**3 * self.kvcache_mem_ratio
-        return max(1, floor(kv_budget / (seq * per_token_per_layer)))
+            return 0.0
+        return float(per_token_per_layer * seq)
 
     @property
     def per_decoder_layer_kv_cache_memory(self) -> Optional[int]:

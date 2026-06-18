@@ -37,7 +37,11 @@ class Scheduler:
         enable_weight_refit: bool = False,
         weight_refit_mode: str = "disk",
         strategy: Literal["greedy", "dp"] = "dp",
-        routing_strategy: Literal["rr", "dp"] = "rr",
+        # dp routing places spare/standby nodes on the lightest layers (redundant
+        # coverage) and routes per-request by live latency, so losing one node
+        # degrades gracefully instead of holing the pipeline and forcing a global
+        # re-bootstrap (the rr failure mode). Redundancy is the safe default.
+        routing_strategy: Literal["rr", "dp"] = "dp",
         *,
         request_arrival_horizon_sec: float = 600.0,
         rebalance_threshold: float = float("inf"),
