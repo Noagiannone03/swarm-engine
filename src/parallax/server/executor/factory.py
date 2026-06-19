@@ -75,6 +75,53 @@ def create_executor_config(args: argparse.Namespace, shared_state=None, conn=Non
     return config
 
 
+def _build_cuda_backend(backend: str, config: dict):
+    """Instantiate one CUDA executor backend. Import is lazy and may raise
+    ModuleNotFoundError when the backend's heavy deps aren't installed."""
+    if backend == "sglang":
+        from parallax.server.executor.sglang_executor import SGLExecutor
+
+        return SGLExecutor(**config)
+    if backend == "vllm":
+        from parallax.server.executor.vllm_executor import VLLMExecutor
+
+        return VLLMExecutor(**config)
+    raise ValueError(f"Unsupported GPU backend type: {backend}")
+
+
+def _create_cuda_executor(preferred: str, config: dict):
+    """Build the preferred CUDA backend, falling back to the other one if the
+    preferred backend's dependencies aren't installed.
+
+    The default backend is "sglang", but a node may have been provisioned with
+    only the vLLM extra installed (or vice versa). Hard-failing on a missing
+    optional dependency makes the whole worker crash on startup and leave the
+    swarm — which a single node should never do over a transient/config gap.
+    Trying the other backend keeps the contributor online instead.
+    """
+    order = [preferred] + [b for b in ("vllm", "sglang") if b != preferred]
+    last_err: Optional[Exception] = None
+    for backend in order:
+        try:
+            executor = _build_cuda_backend(backend, config)
+            if backend != preferred:
+                logger.warning(
+                    "GPU backend %r unavailable; using %r instead. Install the "
+                    "%r extra to silence this.",
+                    preferred,
+                    backend,
+                    preferred,
+                )
+            return executor
+        except (ModuleNotFoundError, ImportError) as exc:
+            logger.warning("GPU backend %r not importable (%s); trying next.", backend, exc)
+            last_err = exc
+    raise RuntimeError(
+        "No usable CUDA executor backend. Install one of the 'vllm' or 'gpu' "
+        f"(sglang) extras. Last import error: {last_err}"
+    )
+
+
 def create_from_args(
     args,
     shared_state: Optional[dict] = None,
@@ -89,16 +136,7 @@ def create_from_args(
     if device is None:
         device = get_current_device()
     if device is not None and device.startswith("cuda"):
-        if args.gpu_backend == "sglang":
-            from parallax.server.executor.sglang_executor import SGLExecutor
-
-            executor = SGLExecutor(**config)
-        elif args.gpu_backend == "vllm":
-            from parallax.server.executor.vllm_executor import VLLMExecutor
-
-            executor = VLLMExecutor(**config)
-        else:
-            raise ValueError(f"Unsupported GPU backend type: {args.gpu_backend}")
+        executor = _create_cuda_executor(args.gpu_backend, config)
     elif device == "mlx":
         from parallax.server.executor.mlx_executor import MLXExecutor
 
