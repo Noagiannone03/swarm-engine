@@ -525,13 +525,23 @@ class Node:
         return default_gb * 1024**3
 
     def _per_layer_kv_floor_bytes(self) -> float:
-        """KV-cache bytes per layer for ONE request at ``max_sequence_length``.
+        """KV-cache bytes to reserve PER LAYER so the node can actually serve its
+        committed load — ``kv_reserve_requests`` concurrent requests at
+        ``max_sequence_length`` — for every layer it hosts.
 
-        Charged on top of each layer's weights so a node is never handed more
-        layers than it can serve a single full-context request on. Uses the same
-        KV accounting as ``compute_max_tokens_in_cache`` /
-        ``per_token_per_layer_kv_size``. Returns 0 when not computable (no seq
-        len / zero heads) so the per-layer cost degrades to weights-only.
+        This is the lever that makes the scheduler SPREAD rather than cram. By
+        charging the *real* KV each layer will need, a node is handed only as
+        many layers as it can truly serve at full context + concurrency. So a
+        bigger context (or more concurrency) ⇒ fewer layers per node ⇒ more nodes
+        in the pipeline ⇒ each node keeps the headroom for huge contexts — which
+        is exactly the goal. It also makes the runtime KV pool fit by
+        construction: a node can never be assigned so many layers that serving
+        its batch at max length OOMs (the failure mode we hit at 32k × batch 8).
+
+        Reserve count defaults to the node's own ``max_concurrent_requests`` (the
+        concurrency it advertised it will serve); override with
+        ``PARALLAX_KV_RESERVE_REQUESTS`` (e.g. 1 to pack more layers/throughput,
+        higher to spread thinner for context). Returns 0 when not computable.
         """
         seq = self.max_sequence_length or 0
         if seq <= 0:
@@ -549,7 +559,15 @@ class Node:
         )
         if per_token_per_layer <= 0:
             return 0.0
-        return float(per_token_per_layer * seq)
+        reserve_requests = self.max_concurrent_requests or 1
+        env = os.environ.get("PARALLAX_KV_RESERVE_REQUESTS", "").strip()
+        if env:
+            try:
+                reserve_requests = int(env)
+            except ValueError:
+                pass
+        reserve_requests = max(1, reserve_requests)
+        return float(per_token_per_layer * seq * reserve_requests)
 
     @property
     def per_decoder_layer_kv_cache_memory(self) -> Optional[int]:
