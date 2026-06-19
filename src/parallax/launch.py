@@ -84,6 +84,16 @@ def _wait_executors_check_layer_change(shared_state: SharedState, executor_subpr
     return shared_state.get_layer_allocation_changed()
 
 
+def _executors_crashed(executor_subprocs) -> bool:
+    """True if any executor process exited abnormally (non-zero/​signal).
+
+    exitcode 0 = clean exit; None = still running (shouldn't happen post-join);
+    anything else (including negative = killed by signal, e.g. OOM-killer) is a
+    crash. Used to retry a transient crash instead of leaving the swarm.
+    """
+    return any(proc.exitcode not in (0, None) for proc in executor_subprocs)
+
+
 def _wait_for_initial_layer_allocation(
     shared_state: SharedState,
     p2p_server_process: multiprocessing.Process,
@@ -276,6 +286,11 @@ if __name__ == "__main__":
             check_latest_release()
 
             # Main execution loop with layer reallocation support
+            executor_crash_count = 0
+            try:
+                max_executor_retries = max(0, int(os.environ.get("PARALLAX_EXECUTOR_MAX_RETRIES", "2")))
+            except ValueError:
+                max_executor_retries = 2
             while True:
                 try:
                     # only launch http server on head node
@@ -320,6 +335,45 @@ if __name__ == "__main__":
                         logger.info(
                             f"Reloading executor with layers [{args.start_layer}, {args.end_layer})"
                         )
+                        continue
+
+                    # Executors exited WITHOUT a layer-allocation change. Tell a
+                    # genuine crash (OOM, transient CUDA error -> non-zero exit)
+                    # from a clean shutdown. A single node hitting a transient
+                    # crash must NOT tear itself out of the swarm: leaving forces
+                    # a global re-bootstrap that, on a small no-surplus cluster,
+                    # collapses the whole pipeline. Instead report ERROR (the
+                    # scheduler stops routing to us but keeps the node) and retry
+                    # a bounded number of times before finally giving up.
+                    if _executors_crashed(executor_subprocs):
+                        if p2p_server_process is not None and not p2p_server_process.is_alive():
+                            logger.error("P2P server is gone; not retrying executor.")
+                            break
+                        executor_crash_count += 1
+                        codes = [p.exitcode for p in executor_subprocs]
+                        _stop_executor_processes(executor_subprocs)
+                        if http_server_process is not None:
+                            stop_http_server(http_server_process)
+                            http_server_process = None
+                        if executor_crash_count > max_executor_retries:
+                            logger.error(
+                                "Executor crashed %d times (exitcodes=%s); giving up and leaving.",
+                                executor_crash_count,
+                                codes,
+                            )
+                            break
+                        shared_state.set_status(ServerState.ERROR.value)
+                        backoff = min(30.0, 3.0 * executor_crash_count)
+                        logger.error(
+                            "Executor(s) crashed (exitcodes=%s), retry %d/%d in %.0fs; "
+                            "staying in the swarm as ERROR so we don't trigger a global re-bootstrap.",
+                            codes,
+                            executor_crash_count,
+                            max_executor_retries,
+                            backoff,
+                        )
+                        time.sleep(backoff)
+                        _update_args_from_shared_state(args, shared_state, force_update=True)
                         continue
 
                     # All processes exited normally
