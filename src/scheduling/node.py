@@ -19,7 +19,6 @@ from parallax_utils.logging_config import get_logger
 from parallax_utils.utils import (
     bytes_per_element,
     compute_max_batch_size,
-    compute_max_tokens_in_cache,
 )
 from scheduling.model_info import ModelInfo
 
@@ -327,22 +326,28 @@ class Node:
 
     @property
     def max_context_tokens(self) -> int:
-        """Max total sequence length (prompt + generation) this node can serve for
-        a SINGLE request — the unit used by context-aware routing.
+        """Max context (prompt + generation) this node can serve for a SINGLE
+        request, given its ACTUAL layer allocation and MEASURED memory budget.
 
-        Two ceilings, we take the min:
-          1. ``max_sequence_length`` — the worker's configured cap; its executor
-             truncates anything longer (this is what bites today at 16384).
-          2. The KV budget for the node's currently-assigned layers, via the SAME
-             helper the batch-size logic uses (``compute_max_tokens_in_cache``) and
-             the SAME memory accounting as ``max_requests`` — so routing/admission
-             never disagree. Fewer layers => more KV per layer => bigger context.
+        This is the per-node figure context-aware routing matches against each
+        request's token count, so the scheduler knows exactly which workers can
+        hold a given request. It is the min of:
+          1. ``max_sequence_length`` — the worker's configured hard cap; its
+             executor truncates anything longer.
+          2. The REAL KV headroom: (measured budget − this node's weights −
+             runtime workspace) ÷ (hosted layers × KV bytes per token per layer).
 
-        Before any layer is assigned (num_current_layers == 0) only the configured
-        cap is known, so we return that.
+        Fewer hosted layers ⇒ a larger leftover KV pool AND fewer layers to fill
+        ⇒ a much bigger servable context. So as the swarm spreads thinner (more
+        nodes, fewer layers each) big contexts become routable — dynamically,
+        with no fixed cap baked into allocation. Consistent with
+        ``get_decoder_layer_capacity`` (same measured budget + weights).
+
+        Before any layer is assigned only the configured cap is known.
         """
         cap = self.max_sequence_length or 0
-        if self.start_layer is None or self.end_layer is None or self.num_current_layers <= 0:
+        layers = self.num_current_layers
+        if self.start_layer is None or self.end_layer is None or layers <= 0:
             return cap
         try:
             elem_bytes = bytes_per_element(
@@ -350,24 +355,37 @@ class Node:
             )
         except Exception:
             elem_bytes = 2
-        try:
-            kv_tokens = compute_max_tokens_in_cache(
-                device="",
-                kv_cache_memory_fraction=self.kvcache_mem_ratio,
-                num_shard_layers=self.num_current_layers,
-                num_key_value_heads=self.model_info.num_kv_heads,
-                head_dim_k=self.model_info.head_size_k,
-                head_dim_v=self.model_info.head_size_v,
-                elem_bytes=elem_bytes,
-                # Same accounting as compute_max_batch_size (single-GPU budget):
-                # memory_gb * 1GiB * kv_fraction. Keeps max_context_tokens and
-                # max_requests strictly consistent.
-                available_cache_bytes=int(
-                    self.hardware.memory_gb * 1024**3 * self.kvcache_mem_ratio
-                ),
-            )
-        except Exception:
+        per_token_per_layer = (
+            self.model_info.num_kv_heads
+            * (self.model_info.head_size_k + self.model_info.head_size_v)
+            * elem_bytes
+        )
+        if per_token_per_layer <= 0:
             return cap
+
+        # KV pool actually left on this node = budget − its resident weights.
+        usable = getattr(self.hardware, "usable_memory_bytes", None)
+        weight_per_layer = self.model_info.decoder_layer_io_bytes(roofline=False)
+        if self.hardware.device == "mlx":
+            weight_per_layer *= self.model_info.mlx_bit_factor
+        if usable and usable > 0:
+            weights = layers * weight_per_layer
+            if self.has_embedding:
+                weights += self.model_info.embedding_io_bytes
+            if self.has_lm_head and not (self.has_embedding and self.model_info.tie_embedding):
+                weights += self.model_info.embedding_io_bytes
+            kv_pool = float(usable) - self._runtime_workspace_bytes() - weights
+        else:
+            # Legacy fallback (no measured budget): kvcache_mem_ratio of raw VRAM.
+            kv_pool = (
+                self.hardware.num_gpus
+                * self.hardware.memory_gb
+                * 1024**3
+                * self.kvcache_mem_ratio
+            )
+        if kv_pool <= 0:
+            return cap
+        kv_tokens = floor(kv_pool / (layers * per_token_per_layer))
         if kv_tokens <= 0:
             return cap
         return min(cap, kv_tokens) if cap > 0 else kv_tokens
@@ -473,19 +491,28 @@ class Node:
         usable = getattr(self.hardware, "usable_memory_bytes", None)
         if usable and usable > 0:
             budget = float(usable) - self._runtime_workspace_bytes()
+            # Reserve a share of the measured budget for the KV-cache pool; only
+            # the rest (``param_mem_ratio``) holds weights. This does two things:
+            #   * leaves every node a real KV pool, so the runtime never OOMs
+            #     sizing its cache (the 32k×batch8 failure), and so the node has
+            #     genuine context headroom;
+            #   * the actual servable context is NOT fixed here — it is reported
+            #     dynamically per node by ``max_context_tokens`` (leftover KV ÷
+            #     hosted layers) and matched per request by context-aware
+            #     routing. Fewer layers (more spread) ⇒ bigger servable context.
+            weight_budget = budget * self.param_mem_ratio
             if include_input_embed:
-                budget -= self.model_info.embedding_io_bytes
+                weight_budget -= self.model_info.embedding_io_bytes
             if include_lm_head and not (
                 include_input_embed and self.model_info.tie_embedding
             ):
-                budget -= self.model_info.embedding_io_bytes
+                weight_budget -= self.model_info.embedding_io_bytes
             per_layer = self.model_info.decoder_layer_io_bytes(roofline=False)
             if self.hardware.device == "mlx":
                 per_layer *= self.model_info.mlx_bit_factor
-            per_layer += self._per_layer_kv_floor_bytes()
-            if per_layer <= 0 or budget <= 0:
+            if per_layer <= 0 or weight_budget <= 0:
                 return 1
-            return max(1, floor(budget / per_layer))
+            return max(1, floor(weight_budget / per_layer))
 
         # --- Legacy fallback: advertised parameter-memory budget -------------
         available_memory_bytes = floor(
@@ -523,51 +550,6 @@ class Node:
                 pass
         default_gb = 0.25 if self.hardware.device == "mlx" else 0.75
         return default_gb * 1024**3
-
-    def _per_layer_kv_floor_bytes(self) -> float:
-        """KV-cache bytes to reserve PER LAYER so the node can actually serve its
-        committed load — ``kv_reserve_requests`` concurrent requests at
-        ``max_sequence_length`` — for every layer it hosts.
-
-        This is the lever that makes the scheduler SPREAD rather than cram. By
-        charging the *real* KV each layer will need, a node is handed only as
-        many layers as it can truly serve at full context + concurrency. So a
-        bigger context (or more concurrency) ⇒ fewer layers per node ⇒ more nodes
-        in the pipeline ⇒ each node keeps the headroom for huge contexts — which
-        is exactly the goal. It also makes the runtime KV pool fit by
-        construction: a node can never be assigned so many layers that serving
-        its batch at max length OOMs (the failure mode we hit at 32k × batch 8).
-
-        Reserve count defaults to the node's own ``max_concurrent_requests`` (the
-        concurrency it advertised it will serve); override with
-        ``PARALLAX_KV_RESERVE_REQUESTS`` (e.g. 1 to pack more layers/throughput,
-        higher to spread thinner for context). Returns 0 when not computable.
-        """
-        seq = self.max_sequence_length or 0
-        if seq <= 0:
-            return 0.0
-        try:
-            elem_bytes = bytes_per_element(
-                getattr(self.model_info, "cache_bytes_per_element", None)
-            )
-        except Exception:
-            elem_bytes = 2
-        per_token_per_layer = (
-            self.model_info.num_kv_heads
-            * (self.model_info.head_size_k + self.model_info.head_size_v)
-            * elem_bytes
-        )
-        if per_token_per_layer <= 0:
-            return 0.0
-        reserve_requests = self.max_concurrent_requests or 1
-        env = os.environ.get("PARALLAX_KV_RESERVE_REQUESTS", "").strip()
-        if env:
-            try:
-                reserve_requests = int(env)
-            except ValueError:
-                pass
-        reserve_requests = max(1, reserve_requests)
-        return float(per_token_per_layer * seq * reserve_requests)
 
     @property
     def per_decoder_layer_kv_cache_memory(self) -> Optional[int]:
