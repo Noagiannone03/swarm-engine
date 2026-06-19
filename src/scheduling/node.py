@@ -245,6 +245,12 @@ class Node:
     end_layer: Optional[int] = None  # exclusive
     current_requests: int = 0
 
+    # Live KV-cache headroom in TOKENS reported by the worker each heartbeat
+    # (free blocks × block size). When set, context-aware routing uses THIS as
+    # the node's real servable context instead of the static measured-budget
+    # estimate — so routing reflects current occupancy. None until reported.
+    reported_kv_free_tokens: Optional[int] = None
+
     # Runtime weight refit for RL
     last_refit_time: float = 0.0
 
@@ -343,9 +349,18 @@ class Node:
         with no fixed cap baked into allocation. Consistent with
         ``get_decoder_layer_capacity`` (same measured budget + weights).
 
+        If the worker reports its LIVE KV headroom (``reported_kv_free_tokens``,
+        free blocks × block size) we use that — it reflects the node's actual
+        current occupancy, so routing never sends a 50k request to a node whose
+        cache is already full. Otherwise we fall back to the measured-budget
+        estimate below (accurate at low/zero concurrency).
+
         Before any layer is assigned only the configured cap is known.
         """
         cap = self.max_sequence_length or 0
+        live = self.reported_kv_free_tokens
+        if live is not None and live > 0:
+            return min(cap, int(live)) if cap > 0 else int(live)
         layers = self.num_current_layers
         if self.start_layer is None or self.end_layer is None or layers <= 0:
             return cap

@@ -254,10 +254,13 @@ class Scheduler:
         is_active: Optional[bool] = None,
         last_refit_time: Optional[float] = 0.0,
         loading_phase: Optional[str] = None,
+        kv_free_tokens: Optional[int] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
             node.current_requests = current_requests
+        if kv_free_tokens is not None:
+            node.reported_kv_free_tokens = kv_free_tokens
         if layer_latency_ms is not None:
             node.set_layer_latency_ms(layer_latency_ms)
         if new_rtt_to_nodes is not None:
@@ -307,6 +310,7 @@ class Scheduler:
         is_active: Optional[bool] = None,
         last_refit_time: Optional[float] = 0.0,
         loading_phase: Optional[str] = None,
+        kv_free_tokens: Optional[int] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -318,6 +322,7 @@ class Scheduler:
                 is_active,
                 last_refit_time,
                 loading_phase,
+                kv_free_tokens,
             )
         )
         self._wake_event.set()
@@ -611,7 +616,7 @@ class Scheduler:
         """Apply pending node stats updates from the queue."""
         while True:
             try:
-                node_id, cur, lat, rtts, is_active, last_refit_time, loading_phase = (
+                node_id, cur, lat, rtts, is_active, last_refit_time, loading_phase, kv_free = (
                     self._pending_node_updates.get_nowait()
                 )
             except queue.Empty:
@@ -628,6 +633,7 @@ class Scheduler:
                 is_active=is_active,
                 last_refit_time=last_refit_time,
                 loading_phase=loading_phase,
+                kv_free_tokens=kv_free,
             )
 
         # Re-enregistrement des pipelines de routage quand des noeuds deviennent

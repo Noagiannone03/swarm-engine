@@ -557,6 +557,36 @@ class VLLMExecutor(BaseExecutor):
             return
         self.routed_experts_reader = reader
 
+    def _kv_free_tokens(self) -> Optional[int]:
+        """Live KV headroom in tokens for this node's layers, read from the vLLM
+        paged KV pool: free blocks × block size. Falls back to the pool's TOTAL
+        token capacity if the live free-block count isn't reachable, and to None
+        if even that fails — so a vLLM-version change can only degrade this to
+        the scheduler's budget estimate, never crash serving.
+        """
+        try:
+            mr = self.model_runner
+            block_size = int(mr.cache_config.block_size)
+            kvc = getattr(mr, "kv_cache_config", None)
+            num_groups = 1
+            total_blocks = None
+            if kvc is not None:
+                groups = getattr(kvc, "kv_cache_groups", None)
+                if groups:
+                    num_groups = max(1, len(groups))
+                total_blocks = getattr(kvc, "num_blocks", None)
+            mgr = getattr(mr, "kv_cache_manager", None)
+            pool = getattr(mgr, "block_pool", None) if mgr is not None else None
+            free_blocks = None
+            if pool is not None and hasattr(pool, "get_num_free_blocks"):
+                free_blocks = pool.get_num_free_blocks()
+            blocks = free_blocks if free_blocks is not None else total_blocks
+            if blocks is None:
+                return None
+            return int((int(blocks) // num_groups) * block_size)
+        except Exception:
+            return None
+
     def _get_routed_experts_for_request(self, request: Request) -> Optional[List]:
         if not self.enable_return_routed_experts or self.routed_experts_reader is None:
             return None

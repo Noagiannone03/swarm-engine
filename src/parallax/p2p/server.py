@@ -1106,6 +1106,10 @@ class GradientServer:
             info["current_requests"] = metrics.get("current_requests", 0)
             if metrics.get("layer_latency_ms") is not None:
                 info["layer_latency_ms"] = metrics.get("layer_latency_ms")
+            # Live KV headroom (tokens) so the scheduler routes by real per-node
+            # servable context. Omitted when unknown → scheduler estimates it.
+            if metrics.get("kv_free_tokens") is not None:
+                info["kv_free_tokens"] = metrics.get("kv_free_tokens")
             # In update mode, always include current allocation
             if not self.manual_layer_assignment:
                 info["start_layer"] = self.block_start_index

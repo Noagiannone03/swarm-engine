@@ -83,6 +83,7 @@ class SharedState:
         *,
         current_requests: Optional[int] = None,
         layer_latency_ms_sample: Optional[float] = None,
+        kv_free_tokens: Optional[int] = None,
         ewma_alpha: float = 0.2,
     ) -> None:
         """Update metrics with optional fields and EWMA smoothing for latency.
@@ -99,6 +100,8 @@ class SharedState:
         # Update metrics
         if current_requests is not None:
             metrics_dict["current_requests"] = int(current_requests)
+        if kv_free_tokens is not None:
+            metrics_dict["kv_free_tokens"] = int(kv_free_tokens)
         if layer_latency_ms_sample is not None:
             prev = metrics_dict.get("layer_latency_ms")
             if prev is None:
@@ -157,6 +160,11 @@ class SharedState:
         shared_dict["metrics"] = manager.dict()
         shared_dict["metrics"]["current_requests"] = 0
         shared_dict["metrics"]["layer_latency_ms"] = None
+        # Live KV-cache headroom in TOKENS (free blocks × block size). The
+        # scheduler uses it as the node's real servable context for routing.
+        # None until the executor reports it (then routing falls back to its
+        # measured-budget estimate).
+        shared_dict["metrics"]["kv_free_tokens"] = None
         shared_dict["metrics"]["_last_update_ts"] = 0.0
 
         return cls(shared_dict)

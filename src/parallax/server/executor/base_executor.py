@@ -196,6 +196,13 @@ class BaseExecutor:
                 )
         if self.shared_state is not None:
             self.shared_state.set_status(ServerState.READY.value)
+            # Publish initial (empty-pool) KV headroom so the scheduler knows
+            # this node's real servable context immediately, before any decode
+            # step has reported a live value.
+            try:
+                self.shared_state.update_metrics(kv_free_tokens=self._kv_free_tokens())
+            except Exception:
+                pass
 
         # store max_sequence_length
         self.max_sequence_length = max_sequence_length
@@ -374,6 +381,15 @@ class BaseExecutor:
             recv_reqs = []
 
         return recv_reqs, refit_weight_path
+
+    def _kv_free_tokens(self) -> Optional[int]:
+        """Live KV-cache headroom in TOKENS (free blocks × block size) for this
+        node's layers — what the scheduler routes against (a request of C tokens
+        fits only if C ≤ this). Default None ("unknown"); backends that can read
+        their KV pool override it. None ⇒ the scheduler falls back to its
+        measured-budget context estimate, so this is always safe to leave unset.
+        """
+        return None
 
     def prepare_batch_inputs(self, batched_requests: List[Request]) -> Optional[Dict[str, Any]]:
         """Prepares inputs for ShardedModel from a batch of requests.
@@ -569,7 +585,8 @@ class BaseExecutor:
                                     per_layer_ms = elapsed_ms / float(self.num_shard_layers)
                                     if self.shared_state is not None:
                                         self.shared_state.update_metrics(
-                                            layer_latency_ms_sample=per_layer_ms
+                                            layer_latency_ms_sample=per_layer_ms,
+                                            kv_free_tokens=self._kv_free_tokens(),
                                         )
                                     self._decode_steps_since_metric = 0
                             except Exception:

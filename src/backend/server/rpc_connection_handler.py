@@ -129,6 +129,7 @@ class RPCConnectionHandler(ConnectionHandler):
                 is_active=node.is_active,
                 last_refit_time=node.last_refit_time,
                 loading_phase=node.loading_phase,
+                kv_free_tokens=node.reported_kv_free_tokens,
             )
             # Return current layer allocation to node
             layer_allocation = self.get_layer_allocation(node.node_id)
@@ -283,6 +284,8 @@ class RPCConnectionHandler(ConnectionHandler):
             node.avg_layer_latency_ms = node_json.get("layer_latency_ms")
         if node_json.get("rtt_to_nodes", None) is not None:
             node.rtt_to_nodes = node_json.get("rtt_to_nodes")
+        if node_json.get("kv_free_tokens", None) is not None:
+            node.reported_kv_free_tokens = node_json.get("kv_free_tokens")
         return node
 
     def build_hardware(self, hardware_json):
