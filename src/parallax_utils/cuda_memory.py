@@ -113,6 +113,80 @@ def resolve_cuda_memory_budget(
     )
 
 
+def cuda_allocator_budget_bytes(device_index: int = 0, torch_module=None) -> Optional[int]:
+    """Return this process's ENFORCED VRAM ceiling in bytes for ``device_index``.
+
+    This is the exact limit installed by :func:`configure_torch_cuda_memory_limit`
+    through ``torch.cuda.set_per_process_memory_fraction`` — i.e. the most this
+    process is ever allowed to allocate on the device. Returns ``None`` if CUDA
+    or PyTorch is unavailable.
+    """
+    if torch_module is None:
+        try:
+            import torch as torch_module  # type: ignore[no-redef]
+        except Exception:
+            return None
+    try:
+        if not torch_module.cuda.is_available():
+            return None
+        props = torch_module.cuda.get_device_properties(device_index)
+        total_bytes = int(props.total_memory)
+        try:
+            free_bytes, _ = torch_module.cuda.mem_get_info(device_index)
+            free_gb = float(free_bytes) / (1024**3)
+        except Exception:
+            free_gb = None
+        budget = resolve_cuda_memory_budget(
+            device_index=device_index,
+            total_gb=total_bytes / (1024**3),
+            free_gb=free_gb,
+        )
+        return int(budget.allocator_fraction * total_bytes)
+    except Exception:
+        return None
+
+
+def available_kv_cache_bytes(
+    device_index: int,
+    kv_cache_memory_fraction: float,
+    torch_module=None,
+) -> Optional[int]:
+    """Bytes available for the KV-cache pool, RESPECTING the per-process cap.
+
+    vLLM normally sizes the KV pool from *physical* free VRAM
+    (``torch.cuda.mem_get_info``). On a node whose allocator is capped below the
+    card's real VRAM (the common case here: a pipeline stage sharing a GPU, or a
+    workstation-safe budget), that over-counts free memory and vLLM requests a KV
+    pool larger than the cap admits → CUDA OOM the moment it touches it.
+
+    This instead bounds the pool by ``cap − already_reserved`` (what this process
+    can still allocate), then applies ``kv_cache_memory_fraction`` as the usual
+    safety margin for activation spikes / fragmentation. Falls back to the
+    physical-free computation when the cap can't be resolved (no behaviour change
+    on uncapped single-model nodes). Returns ``None`` if torch is unavailable.
+    """
+    if torch_module is None:
+        try:
+            import torch as torch_module  # type: ignore[no-redef]
+        except Exception:
+            return None
+    try:
+        physical_free, _ = torch_module.cuda.mem_get_info(device_index)
+    except Exception:
+        return None
+
+    cap = cuda_allocator_budget_bytes(device_index, torch_module)
+    if cap is None:
+        return int(physical_free * kv_cache_memory_fraction)
+    try:
+        reserved = int(torch_module.cuda.memory_reserved(device_index))
+    except Exception:
+        reserved = 0
+    remaining_in_cap = max(0, cap - reserved)
+    headroom = min(int(physical_free), remaining_in_cap)
+    return int(headroom * kv_cache_memory_fraction)
+
+
 def configure_torch_cuda_memory_limit(torch_module=None) -> list[CudaMemoryBudget]:
     """Apply PyTorch CUDA allocator limits for all visible devices.
 

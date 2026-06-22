@@ -41,6 +41,7 @@ from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
 )
 from parallax.utils.tokenizer_utils import load_tokenizer
 from parallax.vllm.monkey_patch import apply_parallax_vllm_monkey_patch
+from parallax_utils.cuda_memory import available_kv_cache_bytes
 from parallax_utils.logging_config import get_logger
 from parallax_utils.prepare_adapter import download_adapter_config
 
@@ -95,12 +96,17 @@ def _create_kv_cache_config_from_specs(
     device: torch.device,
 ) -> KVCacheConfig:
     free_memory, total_memory = torch.cuda.mem_get_info(device.index)
-    available_memory = int(free_memory * kv_cache_memory_fraction)
+    available_memory = available_kv_cache_bytes(
+        device.index or 0, kv_cache_memory_fraction, torch
+    )
+    if available_memory is None:
+        available_memory = int(free_memory * kv_cache_memory_fraction)
 
     logger.info(
         f"Available GPU memory for KV cache: "
         f"{available_memory / (1024**3):.2f} GB "
-        f"({kv_cache_memory_fraction:.1%} of {free_memory / (1024**3):.2f} GB)"
+        f"(capped to per-process budget; physical free "
+        f"{free_memory / (1024**3):.2f} GB)"
     )
 
     page_size_bytes = kv_cache_group.kv_cache_spec.page_size_bytes
@@ -179,12 +185,17 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
             if kv_cache_memory_fraction is not None
             else self.cache_config.gpu_memory_utilization
         )
-        available_memory = int(free_memory * memory_fraction)
+        available_memory = available_kv_cache_bytes(
+            self.device.index or 0, memory_fraction, torch
+        )
+        if available_memory is None:
+            available_memory = int(free_memory * memory_fraction)
 
         logger.debug(
             f"Available GPU memory for KV cache: "
             f"{available_memory / (1024**3):.2f} GB "
-            f"({memory_fraction:.1%} of {free_memory / (1024**3):.2f} GB)"
+            f"(capped to per-process budget; physical free "
+            f"{free_memory / (1024**3):.2f} GB)"
         )
 
         if kv_cache_specs is not None:
@@ -638,12 +649,23 @@ def initialize_vllm_model_runner(
             raise RuntimeError("No KV cache specs found in the loaded model")
 
         free_memory, _ = torch.cuda.mem_get_info(device.index)
-        available_memory = int(free_memory * kv_cache_memory_fraction)
+        # Size the KV pool against this process's ENFORCED allocator cap, not the
+        # card's physical free VRAM. On a capped/shared GPU (pipeline stage), the
+        # physical free over-counts what we may allocate, so vLLM would request a
+        # KV pool bigger than the cap admits → CUDA OOM. available_kv_cache_bytes
+        # bounds it by (cap - reserved); it falls back to the physical-free
+        # computation when no cap is installed (unchanged on dedicated nodes).
+        available_memory = available_kv_cache_bytes(
+            device.index or 0, kv_cache_memory_fraction, torch
+        )
+        if available_memory is None:
+            available_memory = int(free_memory * kv_cache_memory_fraction)
 
         logger.info(
             f"Available GPU memory for KV cache: "
             f"{available_memory / (1024**3):.2f} GB "
-            f"({kv_cache_memory_fraction:.1%} of {free_memory / (1024**3):.2f} GB)"
+            f"(capped to per-process budget; physical free "
+            f"{free_memory / (1024**3):.2f} GB)"
         )
 
         kv_cache_configs = get_kv_cache_configs(
