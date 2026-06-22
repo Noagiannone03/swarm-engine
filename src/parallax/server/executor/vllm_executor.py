@@ -366,8 +366,25 @@ class VLLMExecutor(BaseExecutor):
 
             return {"hidden_states": sampled_token_ids_cpu, "probs": token_probs}
         else:
-            # Intermediate peer: return hidden states for next peer
-            return {"hidden_states": execute_model_state.hidden_states, "probs": None}
+            # First/intermediate peer: forward activations to the next stage.
+            #
+            # vLLM returns an IntermediateTensors for a non-final pipeline shard
+            # (execute_model_state is only set on the last rank). The receive
+            # side (prepare_inputs) rebuilds an IntermediateTensors from a single
+            # hidden_states tensor and zeroes the residual, so — exactly like the
+            # sglang executor — we must fold the residual back into hidden_states
+            # before sending. Sending only hidden_states would silently drop the
+            # residual stream and corrupt every downstream layer.
+            pp_state = execute_model_state
+            if isinstance(pp_state, IntermediateTensors):
+                hidden = pp_state.tensors["hidden_states"]
+                residual = pp_state.tensors.get("residual")
+                if residual is not None:
+                    hidden = hidden + residual
+            else:
+                # Fallback for an ExecuteModelState-shaped payload.
+                hidden = pp_state.hidden_states
+            return {"hidden_states": hidden, "probs": None}
 
     def _release_request(self, rid: str):
         """Release per-request resources in vLLM."""

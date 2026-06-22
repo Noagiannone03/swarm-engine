@@ -318,7 +318,13 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
             )
             logger.debug("Successfully initialized intermediate_tensors buffer")
 
-        super().execute_model(scheduler_output, intermediate_tensors)
+        # vLLM 0.14.0 split execution into execute_model() (which populates
+        # self.execute_model_state and returns None on the *last* pipeline rank)
+        # and sample_tokens() (which consumes that state). A *non-final* shard
+        # instead RETURNS its IntermediateTensors here and never sets
+        # self.execute_model_state. We must therefore keep the return value:
+        # it is the activation payload the first/intermediate peer forwards.
+        model_output = super().execute_model(scheduler_output, intermediate_tensors)
 
         sampled_token_ids = None
         sampled_token_ids_cpu = None
@@ -333,8 +339,13 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
             sampled_token_ids = sampler_output._sampled_token_ids
             sampled_token_ids_cpu = sampler_output.sampled_token_ids_cpu
 
+        # First element carries the pipeline activations: the last rank exposes
+        # them via execute_model_state; a non-final rank via the returned
+        # IntermediateTensors (execute_model_state stays None there).
+        pp_state = self.execute_model_state if self.execute_model_state is not None else model_output
+
         return (
-            self.execute_model_state,
+            pp_state,
             sampled_token_ids,
             sampled_token_ids_cpu,
             sampler_output,
