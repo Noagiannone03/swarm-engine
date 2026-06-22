@@ -321,6 +321,7 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         super().execute_model(scheduler_output, intermediate_tensors)
 
         sampled_token_ids = None
+        sampled_token_ids_cpu = None
         sampler_output = None
         logits = None
 
