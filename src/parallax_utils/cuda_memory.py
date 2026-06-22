@@ -222,21 +222,41 @@ def configure_torch_cuda_memory_limit(torch_module=None) -> list[CudaMemoryBudge
             total_gb=total_gb,
             free_gb=free_gb,
         )
-        try:
-            torch_module.cuda.set_per_process_memory_fraction(
-                budget.allocator_fraction,
-                device_index,
-            )
-            logger.info(
-                "CUDA device %s budget: %.2f GB usable of %.2f GB total "
-                "(free=%s GB, allocator_fraction=%.2f)",
-                device_index,
-                budget.usable_gb,
-                budget.total_gb,
-                f"{budget.free_gb:.2f}" if budget.free_gb is not None else "unknown",
-                budget.allocator_fraction,
-            )
-        except Exception as exc:
-            logger.warning("Unable to set CUDA memory fraction on device %s: %s", device_index, exc)
+        # We always COMPUTE and report this budget so the scheduler can size layer
+        # counts against it. Whether we also HARD-ENFORCE it via
+        # set_per_process_memory_fraction is opt-in (PARALLAX_ENFORCE_CUDA_CAP).
+        #
+        # Upstream parallax never installs a per-process cap: the GPU backend
+        # (sglang's mem_fraction_static / vLLM's gpu_memory_utilization) sizes its
+        # own KV pool from the device's free memory. A hard torch cap is invisible
+        # to those backends — they still target the full card, then OOM the moment
+        # the pool crosses the cap. So the cap is for genuinely SHARED machines
+        # (a workstation also running a desktop/browser); on a dedicated inference
+        # node it only fights the backend. Default: report, don't enforce.
+        enforce = os.environ.get("PARALLAX_ENFORCE_CUDA_CAP", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if enforce:
+            try:
+                torch_module.cuda.set_per_process_memory_fraction(
+                    budget.allocator_fraction,
+                    device_index,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Unable to set CUDA memory fraction on device %s: %s", device_index, exc
+                )
+        logger.info(
+            "CUDA device %s budget: %.2f GB usable of %.2f GB total "
+            "(free=%s GB, allocator_fraction=%.2f, enforced=%s)",
+            device_index,
+            budget.usable_gb,
+            budget.total_gb,
+            f"{budget.free_gb:.2f}" if budget.free_gb is not None else "unknown",
+            budget.allocator_fraction,
+            enforce,
+        )
         budgets.append(budget)
     return budgets
