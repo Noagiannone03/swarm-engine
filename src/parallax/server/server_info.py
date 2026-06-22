@@ -480,7 +480,32 @@ class NvidiaHardwareInfo(HardwareInfo):
         )
 
 
+_HARDWARE_CACHE: Optional[Dict[str, Any]] = None
+
+
 def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
+    """Detect local hardware and return a dict for scheduling (cached).
+
+    Computed ONCE and cached: hardware doesn't change over a process's life, and
+    the CUDA budget (usable_gb / usable_memory_bytes) must stay STABLE across
+    heartbeats. Recomputing each heartbeat reads the *instantaneous* free VRAM,
+    which legitimately drops once our own weights load — that made the advertised
+    budget shrink, the scheduler think the node got smaller (re-allocation
+    churn), and the memory governor misfire. The enforced per-process cap is set
+    at startup, so a cold-start snapshot is the correct, stable figure.
+    """
+    global _HARDWARE_CACHE
+    if _HARDWARE_CACHE is not None:
+        cached = dict(_HARDWARE_CACHE)
+        cached["node_id"] = node_id
+        return cached
+    _HARDWARE_CACHE = _detect_node_hardware_uncached(node_id)
+    cached = dict(_HARDWARE_CACHE)
+    cached["node_id"] = node_id
+    return cached
+
+
+def _detect_node_hardware_uncached(node_id: Optional[str]) -> Dict[str, Any]:
     """Detect local hardware and return a dict for scheduling.
 
     Returns a dictionary with keys compatible with `NodeHardwareInfo` builder:

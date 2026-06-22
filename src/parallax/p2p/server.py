@@ -979,6 +979,17 @@ class GradientServer:
             gov = get_governor()
             if not gov.enabled:
                 return hardware
+            # The memory governor protects shared *system RAM* on interactive
+            # hosts (Apple/CPU) by reading PSI/available-RAM pressure. It does
+            # NOT apply to a CUDA worker's VRAM budget: that budget is the
+            # enforced per-process cap (torch.cuda.set_per_process_memory_fraction)
+            # and reserves its own headroom — it legitimately shows less free
+            # VRAM once our own weights load, which the governor would otherwise
+            # misread as "pressure" and shrink the advertised budget (false
+            # ELEVATED + admission throttle, observed on the A40 nodes). So the
+            # governor is a no-op on CUDA.
+            if hardware.get("device") == "cuda":
+                return hardware
             raw = float(hardware.get("memory_gb") or 0.0)
             if raw <= 0.0:
                 return hardware
