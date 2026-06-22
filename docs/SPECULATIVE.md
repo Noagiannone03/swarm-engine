@@ -31,32 +31,73 @@ client→entry hop too). Verification is a normal forward of **K+1 tokens** thro
 every stage in **one** traversal. The last stage samples greedily for each of the
 K+1 positions and applies the acceptance rule.
 
+## Critical architecture fact (measured)
+
+**Speculative decoding only helps the MULTI-NODE / WAN case.** A single-GPU
+benchmark (`research/spec_bench.py`, Qwen3-8B target + Qwen3-0.6B draft, code
+prompts) measured:
+
+```
+mean accepted / round = 2.68   → ~3.7 tokens per verify traversal
+local speedup          = 0.66x  (spec 17 vs greedy 26 tok/s)   ← SLOWER on 1 GPU
+```
+
+On one fast GPU spec-decode is *slower*: verifying K+1 tokens + drafting costs
+more compute than one greedy step, and there is no network latency to amortise.
+The win appears only when each token otherwise costs a full pipeline round-trip
+over the WAN — then ~3.7 accepted tokens per round-trip ≈ a 3.7× throughput win.
+So this feature must be wired into the **distributed** path, and is pointless to
+enable on a single-node pipeline. (The 2.68 acceptance also confirms the premise
+holds on real Qwen3 + code; a better draft or n-gram on repetitive code lifts it.)
+
+Prerequisite: it needs a true **multi-node split pipeline** (layers spread across
+nodes, activations crossing the relay). On NAT-isolated pods that don't share a
+direct route, the inter-stage transport must go through the lattica relay — that
+path must work before spec-decode matters.
+
 ## Status — staged so the working path is never at risk
 
-**Phase A — core logic (DONE, shipped, unit-tested, gated OFF).**
+**Phase A — core brain (DONE, shipped, tested, gated OFF).**
 `src/parallax/server/speculative.py` + `tests/test_speculative.py`:
 - `NgramProposer` — prompt-lookup drafting (copy the continuation of the longest
   recurring suffix). Zero model, zero tokenizer constraint.
+- `DraftModelProposer` — small same-family draft model held on the entry node,
+  self-managing its KV cache against the committed sequence (Shard's draft
+  bookkeeping). Lazy torch import (module usable without a GPU).
 - `greedy_accept(drafts, target)` — Shard's rule: longest matching prefix + one
-  correction; output identical to greedy decode.
+  correction; output is the target's greedy decode (the correctness oracle).
 - `AdaptiveK` — tune K live from the running acceptance EMA (`round(ema)+2`).
+- `SpeculativeCoordinator` — the full Shard `generate()` loop, **backend-agnostic
+  via a `verify_fn(cur, drafts) -> List[int]` callback**. Validated against a
+  deterministic mock target: output reconstructs the target exactly with a
+  perfect draft (accept≈K), with a bad draft (accept=0), and with n-gram on
+  repeats (accept≈2) — correctness is INDEPENDENT of draft quality. Stops at EOS.
 - `speculative_config()` — all settings, **OFF by default** (`PARALLAX_SPECULATIVE`).
 
-**Phase B — wire/protocol (next, low-risk).** Extend the `forward` message so a
+The brain is complete and the seam is `verify_fn`: it runs `[cur] + drafts`
+through the target in one traversal and returns the greedy token per position.
+Single-node verify is a local K+1 forward; distributed verify is one pipeline
+traversal. `drafts == []` (an n-gram miss) degenerates to a normal 1-token decode.
+
+**Phase B — wire/protocol (GPU-validated).** Extend the `forward` message so a
 verify carries K+1 candidate tokens and the last stage returns K+1 argmax results
 + the accepted length. Strictly additive; only used when the flag is on.
 
-**Phase C — K-in-one-pass verify in the executor (GPU-validated).** A spec-verify
-forward that runs K+1 tokens for a sequence with the right causal mask, produces
-per-position logits, runs `greedy_accept`, commits. Parallel to the normal decode
-path; selected only when the flag is on.
+**Phase C — distributed `verify_fn` in the executor (GPU + multi-node-validated).**
+Run K+1 tokens for a sequence through the pipeline in one traversal (right causal
+mask), last stage produces per-position logits, `greedy_accept`, commit. Needs a
+working multi-node split pipeline first (see the architecture fact above).
 
-**Phase D — paged-KV rollback (GPU-validated).** Free the KV blocks of rejected
-speculative positions on each node. Use Shard's **lazy crop**: the head/local
-caches crop immediately; the downstream stages' crop is piggybacked on the next
-verify message (no extra WAN round-trip). This is the subtle, hardware-specific
-part (vLLM paged KV) and must be validated on real GPUs + multi-node before the
-flag is enabled in any deployment.
+**Phase D — paged-KV rollback (GPU-validated).** Free the KV of rejected
+speculative positions on each node. Use Shard's **lazy crop**: local caches crop
+immediately; downstream stages' crop is piggybacked on the next verify message
+(no extra WAN round-trip). The subtle, hardware-specific part (vLLM paged KV);
+validate on real GPUs + multi-node before enabling the flag anywhere.
+
+## Validation harness
+`research/spec_bench.py` — single-GPU spec-decode bench (draft + whole target,
+`greedy_accept`), measures acceptance / speedup / greedy-identity on code prompts.
+This is how the acceptance numbers above were obtained on an A40.
 
 ## Tunables (env, all no-ops unless `PARALLAX_SPECULATIVE=1`)
 | var | default | meaning |
