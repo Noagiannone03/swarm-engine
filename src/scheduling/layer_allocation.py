@@ -279,12 +279,12 @@ class BaseLayerAllocator:
         self,
         pipeline_nodes: List[Node],
         assume_sorted: bool = False,
-        power_type: Literal["flops", "bandwidth", "memory"] = "flops",
+        power_type: Literal["flops", "bandwidth"] = "flops",
     ) -> None:
         """Rebalance a single pipeline in-place using water-filling and set allocations on nodes.
 
         Adjusts `start_layer`/`end_layer` on the given `pipeline_nodes` so that:
-        - Decoder layers are split proportional to node power (TFLOPS, bandwidth, or memory),
+        - Decoder layers are split proportional to node compute (TFLOPS or bandwidth),
           capped by each node's parameter capacity;
         - The first node reserves input embedding capacity; the last reserves LM head;
         - Assigned stages are contiguous from layer 0 to the final layer.
@@ -329,11 +329,7 @@ class BaseLayerAllocator:
             compute_powers.append(
                 node.hardware.tflops_fp16
                 if power_type == "flops"
-                else (
-                    node.hardware.memory_bandwidth_gbps
-                    if power_type == "bandwidth"
-                    else max(node.hardware.memory_gb, 0.1)
-                )
+                else node.hardware.memory_bandwidth_gbps
             )
 
         if sum(caps) < total_layers:
@@ -646,58 +642,6 @@ class GreedyLayerAllocator(BaseLayerAllocator):
         self._look_ahead_enable = look_ahead_enable
         self._pipeline_rebalance_strategy = pipeline_rebalance_strategy
 
-    def _pipeline_power_type(
-        self, pipeline_nodes: List[Node]
-    ) -> Literal["flops", "bandwidth", "memory"]:
-        """Pick the balancing signal for a pipeline.
-
-        Exo's default pipeline partitioning is memory-weighted: each device gets
-        a layer share proportional to its memory. That is the right first-order
-        signal for Apple Silicon/MLX because weights and KV cache compete in one
-        unified RAM pool. Keep the existing compute-weighted behavior for CUDA
-        nodes where dedicated VRAM is less likely to be the bottleneck.
-        """
-        if any(node.hardware.device == "mlx" for node in pipeline_nodes):
-            return "memory"
-        return "flops"
-
-    def _endpoint_aware_capacity(self, pipeline_nodes: List[Node]) -> int:
-        """Capacity of a concrete pipeline order including endpoint overhead."""
-        total = 0
-        last_index = len(pipeline_nodes) - 1
-        for idx, node in enumerate(pipeline_nodes):
-            total += node.get_decoder_layer_capacity(
-                include_input_embed=idx == 0,
-                include_lm_head=idx == last_index,
-            )
-        return total
-
-    def _assign_pipeline(
-        self,
-        pipeline_nodes: List[Node],
-        rebalance_strategy: Literal["greedy", "water_filling"],
-    ) -> bool:
-        """Assign a candidate pipeline if endpoint-aware capacity is sufficient."""
-        if not pipeline_nodes:
-            return False
-        endpoint_capacity = self._endpoint_aware_capacity(pipeline_nodes)
-        if endpoint_capacity < self.num_total_layers:
-            logger.debug(
-                "[Greedy] Candidate pipeline endpoint capacity %d < total layers %d",
-                endpoint_capacity,
-                self.num_total_layers,
-            )
-            return False
-        if rebalance_strategy == "greedy":
-            self.adjust_pipeline_layers_greedy(pipeline_nodes)
-        else:
-            self.adjust_pipeline_layers(
-                pipeline_nodes,
-                assume_sorted=False,
-                power_type=self._pipeline_power_type(pipeline_nodes),
-            )
-        return True
-
     def allocate_from_standby(self) -> bool:
         """
         Allocate layers to nodes greedily to maximize the number of pipelines.
@@ -788,15 +732,13 @@ class GreedyLayerAllocator(BaseLayerAllocator):
                     "[Greedy] Built pipeline with %d nodes; adjusting layers",
                     len(pipeline_nodes),
                 )
-                any_assigned = self._assign_pipeline(pipeline_nodes, rebalance_strategy)
+                if rebalance_strategy == "greedy":
+                    self.adjust_pipeline_layers_greedy(pipeline_nodes)
+                else:
+                    self.adjust_pipeline_layers(pipeline_nodes, assume_sorted=False)
+                any_assigned = True
             else:
-                # Normal layer capacity can overestimate small shared-memory
-                # nodes because the head/tail also need embedding tables. Before
-                # giving up, validate the concrete order with endpoint-aware
-                # capacity and assign it if the full pipeline really fits.
-                if self._assign_pipeline(pipeline_nodes, rebalance_strategy):
-                    any_assigned = True
-                    continue
+                # Cannot form a complete pipeline with remaining nodes
                 logger.debug("[Greedy] Unable to form complete pipeline; stopping")
                 break
 
