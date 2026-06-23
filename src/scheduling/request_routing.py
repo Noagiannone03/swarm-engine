@@ -57,6 +57,31 @@ from scheduling.node_management import NodeManager
 
 logger = get_logger(__name__)
 
+# Fallback RTT (ms) for a pair of nodes whose round-trip was never measured.
+#
+# RTT between two peers is measured via the P2P layer (lattica.get_peer_rtt) and
+# reported to the scheduler. In a fully-connected swarm every pair gets a real
+# value, but in a NAT-isolated deployment (e.g. cloud pods that can't open a
+# direct connection to each other and only reach the relay) a worker never
+# discovers its peer to probe it, so the scheduler holds NO rtt for that pair and
+# Node.get_rtt_to returns inf. Upstream uses that inf directly as the DP edge
+# cost / pipeline-latency term, which makes any route through such a pair
+# IMPOSSIBLE (empty routing table -> request dropped) even though the activation
+# transport itself works fine over the relay. RTT is only a latency-optimization
+# signal; an unmeasured RTT must not make a structurally-valid route unroutable.
+# So we estimate it with a finite penalty (matching the worker's own 100 ms
+# fallback in p2p/server.py) — real measurements are still preferred because
+# they're smaller, but routing degrades gracefully instead of failing.
+DEFAULT_INTER_NODE_RTT_MS = 100.0
+
+
+def _rtt_or_default(src: Node, dst: Node) -> float:
+    """RTT src->dst, or DEFAULT_INTER_NODE_RTT_MS when it was never measured."""
+    rtt = src.get_rtt_to(dst)
+    if rtt == float("inf"):
+        return DEFAULT_INTER_NODE_RTT_MS
+    return float(rtt)
+
 
 def estimate_pipeline_latency(
     pipeline_node_ids: List[str],
@@ -87,9 +112,7 @@ def estimate_pipeline_latency(
             return float("inf")
         total += node_lat
         if prev is not None:
-            hop = 0.0 if prev.node_id == n.node_id else float(prev.get_rtt_to(n))
-            if hop == float("inf"):
-                return float("inf")
+            hop = 0.0 if prev.node_id == n.node_id else _rtt_or_default(prev, n)
             total += hop
         prev = n
     return total
@@ -142,7 +165,7 @@ def find_turning_points(nodes: List[Node], num_layers: int) -> List[Tuple[str, i
                 if prev_cost == float("inf"):
                     continue
                 node_j = nodes[j]
-                trans = 0.0 if i == j else node_j.get_rtt_to(node_i)
+                trans = 0.0 if i == j else _rtt_or_default(node_j, node_i)
                 total = prev_cost + trans + node_i.layer_latency_ms
                 if total < best_cost:
                     best_cost = total
@@ -354,39 +377,7 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
             if path:
                 return path, latency
             # No context-capable full cover — route best-effort rather than drop.
-        path, latency = self._find_path(last_refit_time, context_tokens=None)
-        if not path:
-            try:
-                nodes = list(self.node_manager.active_nodes)
-                logger.warning(
-                    "[ROUTEDBG] empty path: total_layers=%s active=%d ctx=%s",
-                    self.total_layers,
-                    len(nodes),
-                    context_tokens,
-                )
-                for n in nodes:
-                    logger.warning(
-                        "[ROUTEDBG] node=%s L=%s-%s active=%s overloaded=%s lat=%s maxctx=%s",
-                        str(n.node_id)[:10],
-                        n.start_layer,
-                        n.end_layer,
-                        n.is_active,
-                        n.is_overloaded,
-                        n.layer_latency_ms,
-                        n.max_context_tokens,
-                    )
-                for a in nodes:
-                    for b in nodes:
-                        if a.node_id != b.node_id:
-                            logger.warning(
-                                "[ROUTEDBG] rtt %s->%s = %s",
-                                str(a.node_id)[:6],
-                                str(b.node_id)[:6],
-                                a.get_rtt_to(b),
-                            )
-            except Exception as exc:
-                logger.warning("[ROUTEDBG] diag error: %s", exc)
-        return path, latency
+        return self._find_path(last_refit_time, context_tokens=None)
 
     def _find_path(
         self,
@@ -459,7 +450,7 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
                 if dp[j] == float("inf"):
                     continue
                 n_j = nodes[j]
-                trans = 0.0 if n_j.node_id == n_i.node_id else float(n_j.get_rtt_to(n_i))
+                trans = 0.0 if n_j.node_id == n_i.node_id else _rtt_or_default(n_j, n_i)
                 cand = dp[j] + trans + float(n_i.layer_latency_ms)
                 if cand < dp[i]:
                     dp[i] = cand
