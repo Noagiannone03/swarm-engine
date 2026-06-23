@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from typing import List
@@ -7,13 +8,80 @@ from lattica import Lattica
 from backend.server.constants import NODE_STATUS_AVAILABLE, NODE_STATUS_WAITING
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 from backend.server.static_config import get_model_info, get_node_join_command
-from parallax.cli import PUBLIC_INITIAL_PEERS, PUBLIC_RELAY_SERVERS
+from parallax.cli import get_public_initial_peers, get_public_relay_servers
 from parallax.p2p.server import TransformerConnectionHandler
 from parallax_utils.logging_config import get_logger
 from scheduling.node import RequestSignal
 from scheduling.scheduler import Scheduler
 
 logger = get_logger(__name__)
+
+# How often we re-`lattica.store("scheduler_peer_id", ...)` to keep the entry
+# alive in the DHT. Kademlia keys live "until expiration" *only as long as
+# some peer still caches them* — when DHT peers churn (which happens within
+# hours on a small swarm) the key vanishes, and new workers calling
+# `lattica.get("scheduler_peer_id")` get nothing back. Upstream stores the
+# key once at boot with a 1-year expiration and never refreshes, so after
+# ~1–2h of uptime the scheduler becomes invisible to fresh workers even
+# though the process is still running. Petals/Hivemind solve this by
+# re-announcing every 30–60s; we do it every 5min, which is conservative
+# enough to never spam the DHT yet keeps the entry warm well below the
+# typical Kademlia replication window.
+SCHEDULER_PEER_ID_REANNOUNCE_SEC = 5 * 60
+
+
+def _scheduler_runtime_overrides() -> dict:
+    """Read Scheduler() kwargs that should be tunable in deployment.
+
+    These are exposed as environment variables so an operator running the
+    scheduler in a container or systemd unit can change behavior without
+    forking the source. Bad/empty values fall back to the Scheduler default.
+
+    Recognized vars:
+        PARALLAX_STRATEGY                "greedy" | "dp"
+        PARALLAX_HEARTBEAT_TIMEOUT       float seconds, e.g. 20
+        PARALLAX_ROUTING_STRATEGY        "rr" | "dp" (dp = redundant joins + LB)
+    """
+    overrides: dict = {}
+
+    strategy = os.environ.get("PARALLAX_STRATEGY", "").strip().lower()
+    if strategy in ("greedy", "dp"):
+        overrides["strategy"] = strategy
+    elif strategy:
+        logger.warning(
+            "Ignoring PARALLAX_STRATEGY=%r (expected 'greedy' or 'dp')", strategy
+        )
+
+    # Request-router mode. "rr" (round-robin over fixed, node-disjoint pipelines)
+    # is the upstream default; "dp" (dynamic-programming per-request routing) is
+    # the mode that:
+    #   - allocates a JOINING node to the lightest layers (dynamic_join) so extra
+    #     contributors become ACTIVE replicas instead of idling in STANDBY,
+    #   - routes each request across replicas by live latency (load balancing),
+    #   - handles joins incrementally (no full re-bootstrap churn).
+    # On a sparse swarm this is what lets a 2nd+ node actually contribute (and
+    # thus earn a consumption lease). See scheduler.py dynamic_pipelines_router.
+    routing = os.environ.get("PARALLAX_ROUTING_STRATEGY", "").strip().lower()
+    if routing in ("rr", "dp"):
+        overrides["routing_strategy"] = routing
+    elif routing:
+        logger.warning(
+            "Ignoring PARALLAX_ROUTING_STRATEGY=%r (expected 'rr' or 'dp')", routing
+        )
+
+    raw_timeout = os.environ.get("PARALLAX_HEARTBEAT_TIMEOUT", "").strip()
+    if raw_timeout:
+        try:
+            timeout = float(raw_timeout)
+            if timeout <= 0:
+                raise ValueError("must be > 0")
+            overrides["heartbeat_timeout"] = timeout
+        except ValueError as exc:
+            logger.warning(
+                "Ignoring PARALLAX_HEARTBEAT_TIMEOUT=%r (%s)", raw_timeout, exc
+            )
+
+    return overrides
 
 
 class SchedulerManage:
@@ -63,11 +131,18 @@ class SchedulerManage:
         logger.debug(
             f"SchedulerManage starting: model_name={model_name}, init_nodes_num={init_nodes_num}"
         )
+        is_local_network = bool(is_local_network)
+        if self.initial_peers or self.relay_servers:
+            # If the operator has explicitly configured initial peers or
+            # relay servers, the swarm is by definition not a local-only
+            # cluster. Tolerate is_local_network=True being passed by an
+            # older API caller and force the consistent state.
+            is_local_network = False
         self.is_local_network = is_local_network
         if not is_local_network and not self.initial_peers and not self.relay_servers:
             logger.debug("Using public relay servers")
-            self.initial_peers = PUBLIC_INITIAL_PEERS
-            self.relay_servers = PUBLIC_RELAY_SERVERS
+            self.initial_peers = get_public_initial_peers()
+            self.relay_servers = get_public_relay_servers()
 
         self._start_scheduler(model_name, init_nodes_num)
         self._start_lattica()
@@ -134,7 +209,78 @@ class SchedulerManage:
     def need_more_nodes(self):
         return self.scheduler.need_more_nodes() if self.scheduler else False
 
+    def get_pipeline_readiness(self):
+        """Pipeline/routing readiness, exposed to clients (registry → IDE → SSE).
+
+        The IDE GATES the Fabi model on these fields: it only declares the model
+        to the chat once a request can ACTUALLY be routed (``pipeline_ready``).
+        Without this signal the client may send a completion before any pipeline
+        finished loading and hit "Routing pipelines not ready" (503).
+
+        ``routing_ready`` is authoritative — "a request can be dispatched right
+        now" — and works for every router (DP path-finding AND RR fixed
+        pipelines). The remaining fields describe the fixed-pipeline registry
+        used by RR and degrade gracefully to 0 for routers without one (e.g. DP),
+        where ``routing_ready`` alone decides. Every probe is best-effort:
+        ``self.scheduler`` can be None during a model switch/restart, and a probe
+        failing must NOT take down the health endpoint.
+        """
+        if self.scheduler is None:
+            return {
+                "pipeline_count": 0,
+                "pipeline_ready_count": 0,
+                "pipeline_ready": False,
+                "routing_ready": False,
+                "pipeline_capacity_total": 0,
+                "pipeline_capacity_current": 0,
+            }
+
+        routing_ready = False
+        try:
+            routing_ready = bool(self.scheduler.request_router.routing_ready())
+        except Exception:
+            logger.debug("get_pipeline_readiness: routing_ready() failed", exc_info=True)
+
+        pipeline_count = 0
+        pipeline_ready_count = 0
+        try:
+            pipelines = self.scheduler.node_manager.get_registered_pipelines()
+            pipeline_count = len(pipelines)
+            pipeline_ready_count = sum(1 for p in pipelines.values() if p.is_ready)
+        except Exception:
+            logger.debug("get_pipeline_readiness: get_registered_pipelines() failed", exc_info=True)
+
+        total_capacity = 0
+        cur_capacity = 0
+        try:
+            _, total_capacity, cur_capacity = self.scheduler.report_pipeline_capacity(
+                ready_only=True
+            )
+        except Exception:
+            logger.debug("get_pipeline_readiness: report_pipeline_capacity() failed", exc_info=True)
+
+        return {
+            "pipeline_count": int(pipeline_count or 0),
+            "pipeline_ready_count": int(pipeline_ready_count or 0),
+            # pipeline_ready mirrors routing_ready so clients reading either name
+            # agree on the single truth "can a request be routed now?".
+            "pipeline_ready": routing_ready,
+            "routing_ready": routing_ready,
+            "pipeline_capacity_total": int(total_capacity or 0),
+            "pipeline_capacity_current": int(cur_capacity or 0),
+        }
+
     def get_cluster_status(self):
+        # Bootstrap result/timestamp are exposed verbatim so clients can detect
+        # "failed_capacity" (allocation tried, can't fit) vs "pending" (still
+        # running) without polling intervals. Falls back to None when the
+        # scheduler hasn't been initialized yet (model not set).
+        last_bootstrap_result = (
+            self.scheduler.last_bootstrap_result if self.scheduler else None
+        )
+        last_bootstrap_attempt_ts = (
+            self.scheduler.last_bootstrap_attempt_ts if self.scheduler else 0.0
+        )
         return {
             "type": "cluster_status",
             "data": {
@@ -146,9 +292,14 @@ class SchedulerManage:
                 ),
                 "node_list": self.get_node_list(),
                 "need_more_nodes": self.need_more_nodes(),
+                "last_bootstrap_result": last_bootstrap_result,
+                "last_bootstrap_attempt_ts": last_bootstrap_attempt_ts,
                 "max_running_request": (
                     self.scheduler.report_pipeline_capacity()[1] if self.scheduler else 0
                 ),
+                # Pipeline/routing readiness — the IDE gates the Fabi model on
+                # these (registry republishes them, pushed to clients over SSE).
+                **self.get_pipeline_readiness(),
             },
         }
 
@@ -159,9 +310,23 @@ class SchedulerManage:
         return [self.build_node_info(node) for node in self.scheduler.node_manager.nodes]
 
     def build_node_info(self, node):
+        # Per-node state for richer UI feedback. The scheduler's `state_of()`
+        # tells us if the node is in an active pipeline (ACTIVE) or held in
+        # reserve (STANDBY); `loading_phase` is the worker-reported lifecycle
+        # ("joining" / "initializing" / "ready" / ...). Together they let the
+        # CLI distinguish "downloading model" from "standby for redundancy"
+        # from "ready to serve" without parsing logs.
+        node_state = None
+        if self.scheduler is not None:
+            state_obj = self.scheduler.node_manager.state_of(node.node_id)
+            node_state = state_obj.value if state_obj is not None else None
         return {
             "node_id": node.node_id,
             "status": NODE_STATUS_AVAILABLE if node.is_active else NODE_STATUS_WAITING,
+            "node_state": node_state,
+            "loading_phase": node.loading_phase,
+            "start_layer": node.start_layer,
+            "end_layer": node.end_layer,
             "gpu_num": node.hardware.num_gpus,
             "gpu_name": node.hardware.gpu_name,
             "gpu_memory": node.hardware.memory_gb,
@@ -182,12 +347,14 @@ class SchedulerManage:
         self.init_nodes_num = init_nodes_num
 
         model_info = get_model_info(model_name, self.use_hfcache)
+        scheduler_kwargs = _scheduler_runtime_overrides()
         self.scheduler = Scheduler(
             model_info,
             [],
             min_nodes_bootstrapping=init_nodes_num,
             enable_weight_refit=self.enable_weight_refit,
             weight_refit_mode=self.weight_refit_mode,
+            **scheduler_kwargs,
         )
 
         # Run the scheduler's event/dispatch loops in background so the process
@@ -223,10 +390,24 @@ class SchedulerManage:
                 logger.debug("Created connection handler with existing Lattica")
             return
 
+        # The historical debug log claimed `mdns=False` but no `with_mdns`
+        # call was made; Lattica defaults to mDNS=True. For a public swarm
+        # (relays + bootstraps gradient.network) mDNS hurts: it lets a
+        # peer on the operator's LAN advertise itself ahead of the public
+        # bootstrap and locks the swarm in a private mini-DHT. Turn it off
+        # explicitly; opt back in via `PARALLAX_ENABLE_MDNS=1` for
+        # genuinely LAN-only deployments.
+        mdns_enabled = os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() == "1"
         logger.debug(
-            f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns=False, dht_prefix={self.dht_prefix}"
+            f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns={mdns_enabled}, dht_prefix={self.dht_prefix}"
         )
-        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(".")
+        self.lattica = (
+            Lattica.builder()
+            .with_listen_addrs(self.host_maddrs)
+            .with_key_path(".")
+        )
+        if not mdns_enabled:
+            self.lattica.with_mdns(False)
 
         if len(self.relay_servers) > 0:
             logger.info(f"Using relay servers: {self.relay_servers}")
@@ -277,6 +458,11 @@ class SchedulerManage:
             logger.error("Failed to store scheduler peer id, after 10 times")
             exit(1)
 
+        # Keep the DHT entry warm. Without this, the key drops out of the
+        # Kademlia cache after ~1-2h and workers can no longer discover the
+        # scheduler — see comment on SCHEDULER_PEER_ID_REANNOUNCE_SEC.
+        self._start_peer_id_reannouncer()
+
         self.connection_handler = RPCConnectionHandler(
             lattica=self.lattica,
             scheduler=self.scheduler,
@@ -284,16 +470,76 @@ class SchedulerManage:
         )
         logger.debug("RPCConnectionHandler initialized")
 
-    def get_routing_table(self, request_id, received_ts):
+    def _start_peer_id_reannouncer(self):
+        """Background daemon that re-stores the scheduler peer ID in the DHT.
+
+        Idempotent: if a thread is already running, do nothing. The thread
+        exits silently when `self.lattica` is set to None (e.g. on shutdown).
+        """
+        if getattr(self, "_peer_id_reannouncer_started", False):
+            return
+        self._peer_id_reannouncer_started = True
+
+        def _loop():
+            while True:
+                try:
+                    time.sleep(SCHEDULER_PEER_ID_REANNOUNCE_SEC)
+                except Exception:
+                    return
+                lattica = self.lattica
+                if lattica is None:
+                    logger.debug("Lattica is gone, stopping peer-id reannouncer")
+                    return
+                try:
+                    if lattica.store(
+                        "scheduler_peer_id",
+                        lattica.peer_id(),
+                        expiration_time=time.time() + 365 * 24 * 60 * 60,
+                    ):
+                        logger.debug(
+                            "Re-stored scheduler peer id in DHT: %s",
+                            lattica.peer_id(),
+                        )
+                    else:
+                        logger.warning(
+                            "Re-store of scheduler peer id returned False; will retry in %ds",
+                            SCHEDULER_PEER_ID_REANNOUNCE_SEC,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Re-store of scheduler peer id raised: %s; will retry in %ds",
+                        exc,
+                        SCHEDULER_PEER_ID_REANNOUNCE_SEC,
+                    )
+
+        threading.Thread(
+            target=_loop,
+            name="SchedulerPeerIdReannouncer",
+            daemon=True,
+        ).start()
+        logger.info(
+            "Scheduler peer-id DHT re-announcer started (every %ds)",
+            SCHEDULER_PEER_ID_REANNOUNCE_SEC,
+        )
+
+    def max_context_capacity(self) -> int:
+        """Largest request context (tokens) a complete pipeline can serve now.
+        0 = unknown (caller must not reject on it). Used for graceful 413."""
+        return self.scheduler.max_context_capacity() if self.scheduler else 0
+
+    def get_routing_table(self, request_id, received_ts, context_tokens=None):
         """Block briefly until the scheduler assigns a routing path for the request.
 
         Distinguish three states via `RequestSignal.routing_table`:
         - None: not yet decided, keep waiting up to timeout
         - []: decided but no capacity (pipelines full), return immediately
         - [..]: valid routing path, return immediately
+
+        `context_tokens` (prompt + expected generation) flows into the RequestSignal
+        so the router only picks a pipeline that can hold this request's context.
         """
         logger.debug(f"Routing table requested for request_id={request_id}")
-        request = RequestSignal(request_id, received_ts)
+        request = RequestSignal(request_id, received_ts, context_tokens=context_tokens)
         self.scheduler.receive_request(request)
 
         # Wait up to 5 seconds, but return immediately if the routing table is set (including an empty list)

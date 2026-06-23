@@ -46,6 +46,7 @@ final node path and total latency.
 """
 
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
@@ -58,17 +59,28 @@ logger = get_logger(__name__)
 
 
 def estimate_pipeline_latency(
-    pipeline_node_ids: List[str], *, id_to_node: Dict[str, Node]
+    pipeline_node_ids: List[str],
+    *,
+    id_to_node: Dict[str, Node],
+    ignore_banned: bool = False,
+    now: Optional[float] = None,
 ) -> float:
     """Estimate end-to-end latency for a node-id pipeline.
 
-    Returns `inf` if any node is missing, overloaded, or if any required RTT is missing.
+    Returns `inf` if any node is missing, overloaded, temporarily banned (unless
+    ``ignore_banned``), or if any required RTT is missing.
+
+    ``ignore_banned`` is the "all peers blacklisted → allow them anyway" escape
+    valve (same idea as Petals' routing): serving prefers healthy peers, but falls
+    back to a flaky one rather than failing the request outright.
     """
     total = 0.0
     prev: Optional[Node] = None
     for nid in pipeline_node_ids:
         n = id_to_node.get(nid)
         if n is None or n.is_overloaded:
+            return float("inf")
+        if not ignore_banned and n.is_banned(now):
             return float("inf")
         node_lat = float(n.layer_latency_ms)
         if node_lat == float("inf"):
@@ -188,11 +200,15 @@ class RequestRoutingStrategy(ABC):
     def find_optimal_path(
         self,
         last_refit_time: Optional[float] = None,
+        context_tokens: Optional[int] = None,
     ) -> Tuple[List[str], float]:
         """Return the chosen node-id path and its estimated latency.
 
         Args:
             last_refit_time: Last refit time for weight refit
+            context_tokens: Total sequence budget of the request (prompt + expected
+                generation). When set, the route must only use nodes that can hold
+                that context. None = no context filtering (legacy behaviour).
 
         Returns:
             (node_ids, latency_ms). If no valid route exists, returns ([], inf).
@@ -206,6 +222,14 @@ class RequestRoutingStrategy(ABC):
     def routing_ready(self) -> bool:
         """Return True iff the router can dispatch requests right now."""
         return True
+
+    def max_context_capacity(self) -> int:
+        """Largest request context (tokens) a complete pipeline can serve now.
+
+        0 means "unknown / not computed" — callers must treat 0 as "don't reject".
+        Overridden by routers that track per-node context capacity (DP).
+        """
+        return 0
 
     def expand_pipelines(self) -> None:
         """Opportunistically expand pipelines for fixed-pipeline routers.
@@ -269,8 +293,16 @@ class RequestRoutingStrategy(ABC):
             return
 
         for n in standby:
-            lat = n.layer_latency_ms
-            lat_str = "inf" if lat == float("inf") else f"{lat:.2f}"
+            # layer_latency_ms divides by num_current_layers under the hood
+            # (see Node.roofline_layer_latency_ms). A node that just joined
+            # and hasn't been allocated layers yet has num_current_layers=0,
+            # which raises ZeroDivisionError when this snapshot is logged
+            # mid-bootstrap. Skip the latency for that case.
+            if n.num_current_layers == 0:
+                lat_str = "n/a"
+            else:
+                lat = n.layer_latency_ms
+                lat_str = "inf" if lat == float("inf") else f"{lat:.2f}"
             lines.append(
                 "  %-16s | load %3d/%-3d | latency %7s ms | ready %s"
                 % (
@@ -300,6 +332,34 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
     def find_optimal_path(
         self,
         last_refit_time: Optional[float] = None,
+        context_tokens: Optional[int] = None,
+    ) -> Tuple[List[str], float]:
+        """Minimum-latency node-id path; context-aware as a PREFERENCE, not a gate.
+
+        Context-aware routing must never silently drop a request: it biases toward
+        nodes that can hold the request's context, but if no such full cover
+        exists it falls back to routing over whatever covers the model (the stage
+        then truncates/spills per its own ``max_sequence_length``). This is the
+        same prefer-but-fall-back policy decentralized routers use (Petals' "all
+        peers blacklisted → use them anyway" escape valve; our ``ignore_banned``).
+
+        Crucially this keeps ``find_optimal_path`` consistent with
+        ``routing_ready``: if a structural cover of active nodes exists,
+        ``find_optimal_path`` returns a non-empty path — so the dispatcher never
+        dequeues a request it then hands an empty routing table (the cause of the
+        "no routing table, drop it" / 504 in DP mode).
+        """
+        if context_tokens is not None:
+            path, latency = self._find_path(last_refit_time, context_tokens=context_tokens)
+            if path:
+                return path, latency
+            # No context-capable full cover — route best-effort rather than drop.
+        return self._find_path(last_refit_time, context_tokens=None)
+
+    def _find_path(
+        self,
+        last_refit_time: Optional[float] = None,
+        context_tokens: Optional[int] = None,
     ) -> Tuple[List[str], float]:
         """Compute a minimum-latency node-id path using shard-level DP.
 
@@ -308,8 +368,13 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
         where the next starts (contiguous cover). Vertex cost is `layer_latency_ms`;
         edge cost is RTT via `get_rtt_to`.
 
-        Returns ([], inf) if no full cover `[0, num_layers)` exists or if any
-        required RTT is missing.
+        When ``context_tokens`` is provided (context-aware routing), a node is only
+        usable if it can hold that many tokens (``max_context_tokens``) — so a
+        request only routes through a pipeline that can actually serve its context.
+        ``None`` keeps the previous behaviour (no context filtering).
+
+        Returns ([], inf) if no full cover `[0, num_layers)` exists (none, or none
+        big enough for the context) or if any required RTT is missing.
         """
         nodes = self.node_manager.active_nodes
         num_layers = self.total_layers
@@ -317,24 +382,27 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
         if num_layers <= 0 or not nodes:
             return [], 0.0
 
-        # Collect vertices from nodes with valid layer ranges
+        def _eligible(n) -> bool:
+            if n.start_layer is None or n.end_layer is None or n.is_active is False:
+                return False
+            if context_tokens is not None and n.max_context_tokens < context_tokens:
+                return False
+            return True
+
+        # Collect vertices from eligible nodes (valid range, active, big enough)
         starts: Dict[int, List[int]] = {}
         ends: Dict[int, List[int]] = {}
         for idx, n in enumerate(nodes):
-            if n.start_layer is None or n.end_layer is None or n.is_active is False:
+            if not _eligible(n):
                 continue
             starts.setdefault(n.start_layer, []).append(idx)
             ends.setdefault(n.end_layer, []).append(idx)
 
-        # DP over vertices sorted by (start, end)
+        # DP over eligible vertices sorted by (start, end)
         order = [
             i
             for i, n in sorted(
-                [
-                    (i, n)
-                    for i, n in enumerate(nodes)
-                    if n.start_layer is not None and n.end_layer is not None
-                ],
+                [(i, n) for i, n in enumerate(nodes) if _eligible(n)],
                 key=lambda p: (p[1].start_layer, p[1].end_layer),
             )
         ]
@@ -418,9 +486,75 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
         return "\n".join(lines)
 
     def routing_ready(self) -> bool:
-        """Return True iff DP routing can find a finite-latency path right now."""
-        node_ids, lat = self.find_optimal_path()
-        return bool(node_ids) and lat != float("inf")
+        """True iff active, ready nodes STRUCTURALLY cover ``[0, total_layers)``.
+
+        This is a structural readiness check — "a complete pipeline of loaded
+        nodes exists" — DELIBERATELY independent of current load. The previous
+        implementation delegated to ``find_optimal_path()``, whose vertex cost is
+        ``layer_latency_ms``, and that returns ``inf`` for an OVERLOADED node
+        (``current_requests >= max``). So a single in-flight request flipped
+        ``routing_ready()`` to ``False`` even though the swarm could serve — which
+        made clients believe the pipeline disappeared after every prompt. Whether
+        there is spare capacity *right now* is a request-time concern (retry /
+        429), not a readiness one; routing-ready must reflect structure only.
+
+        Greedy interval cover (jump-game): from layer 0, repeatedly extend the
+        reached layer by the furthest end among ready segments that start at or
+        before the current reach. Covered iff we reach ``total_layers``.
+        """
+        num_layers = self.total_layers
+        if num_layers <= 0:
+            return False
+        segments = [
+            (n.start_layer, n.end_layer)
+            for n in self.node_manager.active_nodes
+            if n.start_layer is not None and n.end_layer is not None and n.is_active
+        ]
+        reach = 0
+        progressed = True
+        while progressed and reach < num_layers:
+            progressed = False
+            for start, end in segments:
+                if start <= reach and end > reach:
+                    reach = end
+                    progressed = True
+        return reach >= num_layers
+
+    def max_context_capacity(self) -> int:
+        """Largest context (in tokens) any complete pipeline of ACTIVE nodes can
+        serve right now: the WIDEST-BOTTLENECK contiguous cover of
+        ``[0, total_layers)``, where a node's "width" is ``max_context_tokens``.
+
+        Used to reject a request (413) whose context exceeds anything the swarm
+        can physically serve — instead of silently truncating it. Like
+        ``routing_ready``, it is load-independent (it's about capacity, not free
+        capacity right now). Returns 0 if no complete pipeline exists (so callers
+        treat 0 as "unknown" and never reject on it).
+        """
+        num_layers = self.total_layers
+        if num_layers <= 0:
+            return 0
+        segments = [
+            (n.start_layer, n.end_layer, n.max_context_tokens)
+            for n in self.node_manager.active_nodes
+            if n.start_layer is not None and n.end_layer is not None and n.is_active
+        ]
+        if not segments:
+            return 0
+        # best[layer] = max achievable bottleneck capacity to reach `layer` from 0.
+        # Relax until stable (DAG over increasing layer indices -> terminates).
+        best: Dict[int, float] = {0: float("inf")}
+        changed = True
+        while changed:
+            changed = False
+            for start, end, cap in segments:
+                if start in best:
+                    cand = min(best[start], cap)
+                    if cand > best.get(end, -1.0):
+                        best[end] = cand
+                        changed = True
+        reached = best.get(num_layers, 0.0)
+        return 0 if reached == float("inf") else int(max(0.0, reached))
 
     def expand_pipelines(self) -> None:
         return None
@@ -521,6 +655,7 @@ class RandomizedOverDynamicPipelinesRouting(RequestRoutingStrategy):
         nodes: Optional[List[Node]] = None,
         num_layers: Optional[int] = None,
         last_refit_time: Optional[float] = None,
+        context_tokens: Optional[int] = None,
     ) -> Tuple[List[str], float]:
         """Randomly choose among cached complete pipelines, skipping overloaded ones.
 
@@ -799,6 +934,7 @@ class RoundRobinOverFixedPipelinesRouting(RequestRoutingStrategy):
         nodes: Optional[List[Node]] = None,
         num_layers: Optional[int] = None,
         last_refit_time: Optional[float] = None,
+        context_tokens: Optional[int] = None,
     ) -> Tuple[List[str], float]:
         """Return the next viable *registered* pipeline in round-robin order.
 
@@ -813,40 +949,65 @@ class RoundRobinOverFixedPipelinesRouting(RequestRoutingStrategy):
         # Build lookup from the latest node snapshot.
         id_to_node: Dict[str, Node] = {n.node_id: n for n in self.node_manager.nodes}
 
-        attempts = 0
         pipelines_list = [pipelines[k] for k in sorted(pipelines.keys())]
         total_pipelines = len(pipelines_list)
-        while attempts < total_pipelines:
-            pid = self._rr_cursor % total_pipelines
-            candidate_pipeline = pipelines_list[pid]
-            candidate = list(candidate_pipeline.node_ids)
-            self._rr_cursor += 1
-            attempts += 1
+        if total_pipelines == 0:
+            return [], float("inf")
 
-            # If any stage is not ready, skip quickly.
-            if not candidate_pipeline.is_ready:
-                logger.warning(f"Pipeline {candidate} is not ready, skipping")
-                continue
+        # Snapshot `now` once so every ban check in this dispatch is consistent.
+        now = time.time()
 
-            latency = estimate_pipeline_latency(candidate, id_to_node=id_to_node)
-            for nid in candidate:
-                if nid not in id_to_node:
-                    raise ValueError(
-                        f"To be dispatched node {nid} in pipeline {candidate} not found in node manager!"
-                    )
-                if not id_to_node[nid].is_active:
-                    # If node is not active, skip the pipeline
-                    logger.warning(f"Pipeline {candidate} is not active, skipping")
-                    latency = float("inf")
-                if (
-                    last_refit_time is not None
-                    and id_to_node[nid].last_refit_time < last_refit_time
-                ):
-                    # If node holds an older version of weight, skip the pipeline
-                    logger.warning(f"Pipeline {candidate} holds an old version of weight, skipping")
-                    latency = float("inf")
+        def _scan(ignore_banned: bool) -> Tuple[List[str], float]:
+            """One round-robin sweep over registered pipelines."""
+            attempts = 0
+            while attempts < total_pipelines:
+                pid = self._rr_cursor % total_pipelines
+                candidate_pipeline = pipelines_list[pid]
+                candidate = list(candidate_pipeline.node_ids)
+                self._rr_cursor += 1
+                attempts += 1
 
-            if latency != float("inf"):
-                return list(candidate), float(latency)
+                # If any stage is not ready, skip quickly.
+                if not candidate_pipeline.is_ready:
+                    logger.warning(f"Pipeline {candidate} is not ready, skipping")
+                    continue
 
-        return [], float("inf")
+                latency = estimate_pipeline_latency(
+                    candidate, id_to_node=id_to_node, ignore_banned=ignore_banned, now=now
+                )
+                for nid in candidate:
+                    if nid not in id_to_node:
+                        raise ValueError(
+                            f"To be dispatched node {nid} in pipeline {candidate} not found in node manager!"
+                        )
+                    if not id_to_node[nid].is_active:
+                        # If node is not active, skip the pipeline
+                        logger.warning(f"Pipeline {candidate} is not active, skipping")
+                        latency = float("inf")
+                    if (
+                        last_refit_time is not None
+                        and id_to_node[nid].last_refit_time < last_refit_time
+                    ):
+                        # If node holds an older version of weight, skip the pipeline
+                        logger.warning(
+                            f"Pipeline {candidate} holds an old version of weight, skipping"
+                        )
+                        latency = float("inf")
+
+                if latency != float("inf"):
+                    return list(candidate), float(latency)
+            return [], float("inf")
+
+        # First sweep avoids temporarily-banned peers. If that finds nothing, the
+        # banned peers may be the only ones covering some layers — fall back to a
+        # sweep that ignores bans rather than failing the request (Petals' "all
+        # blacklisted → allow them" escape valve). A pipeline still blocked by a
+        # genuinely overloaded/not-ready/stale node stays `inf` in both sweeps.
+        path, latency = _scan(ignore_banned=False)
+        if not path:
+            path, latency = _scan(ignore_banned=True)
+            if path:
+                logger.warning(
+                    "All viable pipelines contained banned peers; dispatching to %s anyway", path
+                )
+        return path, latency

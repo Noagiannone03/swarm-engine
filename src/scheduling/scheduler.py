@@ -37,7 +37,11 @@ class Scheduler:
         enable_weight_refit: bool = False,
         weight_refit_mode: str = "disk",
         strategy: Literal["greedy", "dp"] = "dp",
-        routing_strategy: Literal["rr", "dp"] = "rr",
+        # dp routing places spare/standby nodes on the lightest layers (redundant
+        # coverage) and routes per-request by live latency, so losing one node
+        # degrades gracefully instead of holing the pipeline and forcing a global
+        # re-bootstrap (the rr failure mode). Redundancy is the safe default.
+        routing_strategy: Literal["rr", "dp"] = "dp",
         *,
         request_arrival_horizon_sec: float = 600.0,
         rebalance_threshold: float = float("inf"),
@@ -101,7 +105,7 @@ class Scheduler:
         # Event queues for main loop orchestration (thread-safe)
         self._pending_joins: "queue.Queue[Node]" = queue.Queue()
         self._pending_leaves: "queue.Queue[str]" = queue.Queue()
-        self._pending_node_updates: "queue.Queue[Tuple[str, Optional[int], Optional[float], Optional[Dict[str, float]], Optional[bool], Optional[bool]]]" = (queue.Queue())
+        self._pending_node_updates: "queue.Queue[Tuple[str, Optional[int], Optional[float], Optional[Dict[str, float]], Optional[bool], Optional[float], Optional[str]]]" = (queue.Queue())
 
         # Concurrency controls
         self._stop_event: threading.Event = threading.Event()
@@ -116,6 +120,14 @@ class Scheduler:
         self.alloc_log_snapshot: str = ""
         # Avoid spamming: only emit the "all nodes active" INFO log on transitions.
         self._all_nodes_active_logged: bool = False
+        # Result of the most recent bootstrap attempt — exposed via the API so
+        # the CLI can show a precise message instead of a timer-based heuristic.
+        # Values: None (never attempted), "pending" (running), "success",
+        # "failed_capacity" (had enough nodes but allocation didn't fit),
+        # "deferred_not_enough_nodes" (below min_nodes_bootstrapping).
+        # Timestamp lets the UI ignore stale results after a node leave/rejoin.
+        self.last_bootstrap_result: Optional[str] = None
+        self.last_bootstrap_attempt_ts: float = 0.0
         logger.info(
             f"Scheduler initialized, min_nodes_bootstrapping {self.min_nodes_bootstrapping}, "
             f"Layer allocations trategy {strategy}, Request routing strategy {routing_strategy}."
@@ -144,6 +156,18 @@ class Scheduler:
         """Check if there is a full pipeline among ACTIVE nodes."""
         return self.node_manager.has_full_pipeline(self.num_layers)
 
+    def max_context_capacity(self) -> int:
+        """Largest request context (tokens) a complete pipeline can serve now.
+
+        Delegates to the router (which knows per-node context capacity). 0 means
+        "unknown" — callers must not reject a request on a 0. Best-effort.
+        """
+        try:
+            return self.request_router.max_context_capacity()
+        except Exception:
+            logger.debug("max_context_capacity() failed", exc_info=True)
+            return 0
+
     def report_pipeline_capacity(
         self,
         ready_only: bool = True,
@@ -154,6 +178,8 @@ class Scheduler:
     def bootstrap(self, reboot: bool = False) -> bool:
         """Initial Node Allocation Assignment."""
         logger.info("[Scheduler] Starting Bootstrap")
+        self.last_bootstrap_attempt_ts = time.time()
+        self.last_bootstrap_result = "pending"
         overide_min_node_check = False
         if reboot:
             # Clear any fixed pipeline registrations; they are no longer valid.
@@ -167,14 +193,22 @@ class Scheduler:
             if self._bootstrapped_event.is_set():
                 logger.info("[Scheduler] Already bootstrapped, returning Success")
                 return True
-        # Check if we have enough nodes for bootstraping
+        # Check if we have enough nodes for bootstraping. Use the standby
+        # count rather than the total: ACTIVE nodes that have not been
+        # successfully placed (e.g. ghosts left over from a previous run
+        # that still pass heartbeat) inflate num_nodes without contributing
+        # to a full pipeline, which masks the threshold and makes
+        # allocate_from_standby() fail anyway. need_more_nodes() and
+        # _process_joins() already key off num_standby_nodes; aligning here
+        # keeps the recruiting story consistent across the codebase.
         if (
-            self.node_manager.num_nodes < self.min_nodes_bootstrapping
+            self.node_manager.num_standby_nodes < self.min_nodes_bootstrapping
             and not overide_min_node_check
         ):
             logger.info(
-                f"[Scheduler] Bootstrap deferred: have {self.node_manager.num_nodes} nodes; need >= {self.min_nodes_bootstrapping}"
+                f"[Scheduler] Bootstrap deferred: have {self.node_manager.num_standby_nodes} standby nodes; need >= {self.min_nodes_bootstrapping}"
             )
+            self.last_bootstrap_result = "deferred_not_enough_nodes"
             return False
 
         # Perform global allocation
@@ -183,6 +217,7 @@ class Scheduler:
             logger.warning("Global allocation failed to produce a full pipeline")
             # Stay un-bootstrapped so future joins can retry bootstrap.
             self._bootstrapped_event.clear()
+            self.last_bootstrap_result = "failed_capacity"
             return False
 
         assignments = self.node_manager.list_node_allocations(self.num_layers)
@@ -190,6 +225,7 @@ class Scheduler:
 
         self.request_router.bootstrap()
         self._bootstrapped_event.set()
+        self.last_bootstrap_result = "success"
         # Snapshot at INFO after bootstrap since allocations/pipelines may have materially changed.
         self.emit_alloc_log_snapshot(reason="Post Bootstrap")
         return True
@@ -217,10 +253,14 @@ class Scheduler:
         new_rtt_to_nodes: Optional[Dict[str, float]] = None,
         is_active: Optional[bool] = None,
         last_refit_time: Optional[float] = 0.0,
+        loading_phase: Optional[str] = None,
+        kv_free_tokens: Optional[int] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
             node.current_requests = current_requests
+        if kv_free_tokens is not None:
+            node.reported_kv_free_tokens = kv_free_tokens
         if layer_latency_ms is not None:
             node.set_layer_latency_ms(layer_latency_ms)
         if new_rtt_to_nodes is not None:
@@ -229,6 +269,23 @@ class Scheduler:
             node.is_active = is_active
         if last_refit_time > 0.0:
             node.last_refit_time = last_refit_time
+        if loading_phase is not None:
+            node.loading_phase = loading_phase
+            # Feed the peer-reliability backoff from the worker's self-reported
+            # health. A node stuck in "error" is shed from routing immediately
+            # (with exponential backoff via Node.record_request_failure) instead
+            # of lingering until the heartbeat timeout; "ready" rehabilitates it.
+            # record_request_failure no-ops while a ban is still active, so a node
+            # that keeps reporting "error" only escalates once per ban episode.
+            # NOTE: this is currently the only reliability signal; a per-request
+            # failure hook (serving layer) can call the same Node API later.
+            # String literals (not an import of parallax.p2p.server.ServerState)
+            # to avoid a circular dependency — the server already depends on
+            # scheduling. These mirror ServerState.ERROR / ServerState.READY.
+            if loading_phase == "error":
+                node.record_request_failure()
+            elif loading_phase == "ready":
+                node.record_request_success()
         node.last_heartbeat = time.time()
 
     # Async-style event enqueuers for main loop
@@ -252,6 +309,8 @@ class Scheduler:
         new_rtt_to_nodes: Optional[Dict[str, float]] = None,
         is_active: Optional[bool] = None,
         last_refit_time: Optional[float] = 0.0,
+        loading_phase: Optional[str] = None,
+        kv_free_tokens: Optional[int] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -262,15 +321,32 @@ class Scheduler:
                 new_rtt_to_nodes,
                 is_active,
                 last_refit_time,
+                loading_phase,
+                kv_free_tokens,
             )
         )
         self._wake_event.set()
 
     def checking_node_heartbeat(self) -> None:
-        """Check the heartbeat of all nodes."""
-        for node in self.node_manager.active_nodes:
-            if time.time() - node.last_heartbeat > self.heartbeat_timeout:
-                logger.debug(f"Node {node.node_id} heartbeat timeout")
+        """Check the heartbeat of all nodes.
+
+        Un nœud encore en chargement de son shard (loading_phase joining/
+        initializing) peut manquer des heartbeats pendant un gros download/
+        chargement de poids. On lui laisse une marge plus large (6×) pour ne pas
+        l'évincer en plein chargement — une éviction déclencherait un rebootstrap
+        global qui casse le service. Un nœud READY garde le timeout normal.
+        """
+        now = time.time()
+        # ACTIFS + STANDBY : un noeud standby deconnecte (client qui ferme l app
+        # pendant le handshake, ou worker mort) n est jamais retire si on ne le
+        # verifie pas -> fantome permanent qui gonfle le pool standby et fait
+        # echouer allocate_from_standby (failed_capacity). On l evince au meme
+        # titre, avec la meme marge 6x pour un noeud encore en chargement.
+        for node in [*self.node_manager.active_nodes, *self.node_manager.standby_nodes]:
+            loading = getattr(node, "loading_phase", None) in ("joining", "initializing")
+            timeout = self.heartbeat_timeout * 6 if loading else self.heartbeat_timeout
+            if now - node.last_heartbeat > timeout:
+                logger.info(f"Node {node.node_id} heartbeat timeout (loading={loading}) -> eviction")
                 # Route leave through the event loop so global rebalance/reboot is serialized.
                 self.enqueue_leave(node.node_id)
 
@@ -278,6 +354,15 @@ class Scheduler:
     def join(self, node: Node) -> None:
         """Add a node to allocation and refresh plan and materialized nodes."""
         bootstrapped = self._bootstrapped_event.is_set()
+        if not node.manual_layer_assignment:
+            # A worker may reconnect after a scheduler restart while still
+            # advertising its previous layer range. Fresh automatic joins
+            # are inserted as STANDBY first, so leftover allocations would
+            # make the layer allocator try to deallocate a non-ACTIVE node
+            # and abort bootstrap. Clearing the allocation here keeps the
+            # scheduler-side state consistent with the worker being newly
+            # observed in this scheduler lifetime.
+            node.clear_layer_allocation()
         logger.info(
             "Joining node %s (kv_ratio=%.2f, param_ratio=%.2f, manual_assignment=%s, bootstrapped=%s)",
             node.node_id,
@@ -296,6 +381,14 @@ class Scheduler:
                     self.request_router.expand_pipelines()
                 except NotImplementedError:
                     pass
+                except Exception:
+                    # expand_pipelines is best-effort optimization on a hot
+                    # path. Anything raised beyond NotImplementedError used
+                    # to take down join() and leave the swarm half-attached.
+                    logger.warning(
+                        "Failed to expand pipelines after node join; keeping existing pipelines",
+                        exc_info=True,
+                    )
 
         # Manual layer assignment bypasses bootstrap waiting
         if node.manual_layer_assignment:
@@ -383,7 +476,11 @@ class Scheduler:
             )
         except queue.Empty:
             return None
-        path, latency = self.request_router.find_optimal_path(self.last_refit_time)
+        # Pass the request's context budget so the router only picks a pipeline
+        # whose nodes can all hold it (context-aware routing). None -> no filter.
+        path, latency = self.request_router.find_optimal_path(
+            self.last_refit_time, context_tokens=req.context_tokens
+        )
         req.routing_table = path
         # Update simple load counters
         for node_id in path:
@@ -519,7 +616,7 @@ class Scheduler:
         """Apply pending node stats updates from the queue."""
         while True:
             try:
-                node_id, cur, lat, rtts, is_active, last_refit_time = (
+                node_id, cur, lat, rtts, is_active, last_refit_time, loading_phase, kv_free = (
                     self._pending_node_updates.get_nowait()
                 )
             except queue.Empty:
@@ -535,7 +632,50 @@ class Scheduler:
                 new_rtt_to_nodes=rtts,
                 is_active=is_active,
                 last_refit_time=last_refit_time,
+                loading_phase=loading_phase,
+                kv_free_tokens=kv_free,
             )
+
+        # Re-enregistrement des pipelines de routage quand des noeuds deviennent
+        # ACTIVE. Le routeur RR enregistre ses pipelines au bootstrap (search ->
+        # register) a partir des noeuds ACTIVE ; or un noeud ne devient ACTIVE
+        # qu'apres avoir charge ses poids et envoye is_active=True ICI -- donc
+        # APRES le bootstrap initial (ou active_nodes etait encore vide -> 0
+        # pipeline enregistre -> 503 'routing pipelines not ready').
+        #
+        # IMPORTANT : on ne tente le ré-enregistrement QUE s'il existe deja une
+        # pipeline complete parmi les noeuds ACTIVE. Sans cette garde, quand le
+        # swarm n'a pas (ou pas encore) de pipeline complete -- p.ex. un seul
+        # contributeur dont la capacite ne couvre pas toutes les couches --
+        # routing_ready() reste False en permanence, et on rappelait bootstrap()
+        # + on logguait a CHAQUE node_update (toutes les ~50 ms) : du bruit et du
+        # churn de routage inutiles. Avec la garde : pas de pipeline complete ->
+        # on ne fait rien ; pipeline complete mais routage pas encore enregistre
+        # -> on enregistre UNE fois et on ne logue qu'au succes reel.
+        #
+        # MODE-SPECIFIC : ce ré-enregistrement n'a de sens qu'en routage RR, qui
+        # s'appuie sur un REGISTRE de pipelines fixes construit au bootstrap. Le
+        # routeur DP ne maintient aucun registre — il calcule la route par
+        # requête (find_optimal_path), donc routing_ready()=DP n'a rien à
+        # ré-enregistrer et bootstrap()=DP est un no-op. On garde donc ce bloc
+        # STRICTEMENT côté RR : zéro machinerie RR ne tourne en mode DP, et RR
+        # conserve son correctif 503. (Les deux modes restent fonctionnels.)
+        if (
+            self.routing_strategy == "rr"
+            and self._bootstrapped_event.is_set()
+            and not self.request_router.routing_ready()
+            and self.has_full_pipeline()
+        ):
+            try:
+                self.request_router.bootstrap()
+                if self.request_router.routing_ready():
+                    logger.info(
+                        '[Scheduler] Routing pipelines registered after node(s) became active'
+                    )
+            except Exception:
+                logger.warning(
+                    'Re-register routing pipelines after node update failed', exc_info=True
+                )
 
     def _process_joins(self) -> None:
         """Handle pending join events, honoring bootstrap state for assignment."""
@@ -567,9 +707,14 @@ class Scheduler:
                         logger.debug(
                             "Bootstrap attempt after join did not produce a full pipeline; will retry on future joins"
                         )
-                except Exception as exc:
-                    logger.debug(
-                        f"Bootstrap attempt after join failed: {exc}; will retry on future joins"
+                except Exception:
+                    # Bootstrap failures here used to be hidden at debug
+                    # level. In production this turned every recurring
+                    # failure into a silent symptom (swarm appears to have
+                    # enough nodes but never serves traffic). Surface them.
+                    logger.warning(
+                        "Bootstrap attempt after join failed; will retry on future joins",
+                        exc_info=True,
                     )
             else:
                 logger.debug(
@@ -645,5 +790,5 @@ class Scheduler:
     def need_more_nodes(self):
         return (
             not self._bootstrapped_event.is_set()
-            and self.node_manager.num_standby_nodes >= self.min_nodes_bootstrapping
+            and self.node_manager.num_standby_nodes < self.min_nodes_bootstrapping
         )

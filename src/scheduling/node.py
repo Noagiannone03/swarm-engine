@@ -9,16 +9,48 @@ Scheduling primitives for distributed LLM inference.
   latency tracking, and RTT cache for network-aware request routing
 """
 
+import os
 import time
 from dataclasses import dataclass, field
 from math import floor
 from typing import Dict, List, Optional
 
 from parallax_utils.logging_config import get_logger
-from parallax_utils.utils import bytes_per_element, compute_max_batch_size
+from parallax_utils.utils import (
+    bytes_per_element,
+    compute_max_batch_size,
+)
 from scheduling.model_info import ModelInfo
 
 logger = get_logger(__name__)
+
+
+def _env_float(key: str, default: float, *, minimum: Optional[float] = None) -> float:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring %s=%r (not a number)", key, raw)
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
+# --- Peer reliability backoff -------------------------------------------------
+# Faithful port of hivemind.dht.node.Blacklist (used by Petals' routing): a peer
+# that fails/errors is temporarily excluded from routing, and each successive ban
+# episode lasts longer (base * rate**streak). The scheduler otherwise only learns
+# a node is unhealthy via the heartbeat timeout (tens of seconds), so without this
+# a reachable-but-failing peer keeps getting routed to and stalls requests.
+#
+# Tunable per-deployment via env (dedicated inference clusters may want longer
+# bans; flaky home swarms shorter ones).
+PEER_BAN_BASE_SEC = _env_float("PARALLAX_PEER_BAN_BASE_SEC", 5.0, minimum=0.0)
+PEER_BAN_BACKOFF_RATE = _env_float("PARALLAX_PEER_BAN_BACKOFF_RATE", 2.0, minimum=1.0)
+PEER_BAN_MAX_SEC = _env_float("PARALLAX_PEER_BAN_MAX_SEC", 300.0, minimum=0.0)
 
 
 @dataclass
@@ -38,6 +70,17 @@ class NodeHardwareInfo:
     memory_bandwidth_gbps: float
     device: str
 
+    # Measured, worker-ENFORCED memory budget for the model (weights + KV), in
+    # bytes, summed across this node's GPUs. This is the SAME ceiling the worker
+    # installs at load time (torch.cuda.set_per_process_memory_fraction on CUDA,
+    # the MLX wired limit on Apple). The scheduler sizes layer counts against
+    # exactly that ceiling, so its estimate can never exceed what the worker's
+    # own allocator will admit — which is what removes the over-allocation OOM.
+    # None for legacy workers that don't report it → the capacity helper falls
+    # back to the advertised ``memory_gb`` parameter budget.
+    usable_memory_bytes: Optional[float] = None
+    total_memory_bytes: Optional[float] = None
+
 
 @dataclass
 class RequestSignal:
@@ -48,11 +91,17 @@ class RequestSignal:
     - received_ts: UNIX timestamp (seconds) when the request was received
     - routing_table: Set by the scheduler when a path is assigned. Semantics:
         None -> not assigned yet; [] -> all pipelines full at the moment; [..] -> route
+    - context_tokens: Total sequence budget for this request (prompt tokens +
+        expected generation). Used for context-aware routing: a path is only
+        eligible if every node on it can hold this many tokens. None = unknown
+        (caller couldn't tokenize) -> routing falls back to the load/latency-only
+        behaviour, so we never block a request just because counting failed.
     """
 
     request_id: str
     received_ts: float = field(default_factory=time.time)
     routing_table: Optional[List[str]] = None
+    context_tokens: Optional[int] = None
 
 
 class RooflinePerformanceModel:
@@ -123,9 +172,6 @@ class RooflinePerformanceModel:
         Returns:
             Total latency (ms) combining decoder layers and optional endpoints.
         """
-        if num_current_layers <= 0:
-            return float("inf")
-
         decoder_layer_compute_latency = self.get_compute_roofline_latency_ms(
             self.model_info.decoder_layer_flops(
                 batch_size=self.batch_size,
@@ -155,10 +201,21 @@ class RooflinePerformanceModel:
 
         compute_time_ms = self.get_compute_roofline_latency_ms(flops)
         io_time_ms = self.get_io_roofline_latency_ms(io_bytes)
+        # A node can heartbeat (node_update) while still in STANDBY with no layers
+        # assigned yet (num_current_layers == 0) — a state our "keep standby
+        # contributors alive" change introduced. Upstream never reaches it: node_join
+        # blocks until layers are allocated, so this method was only ever called with
+        # num_current_layers >= 1, and the division below was safe by invariant. Now
+        # that the invariant no longer holds, guard it: a layer count below 1 is
+        # meaningless for a *per-layer* latency, so clamp the divisor to 1. For a
+        # standby node (no embedding/lm_head) this yields exactly the single
+        # decoder-layer roofline latency — a sound estimate of the node's per-layer
+        # speed, which is what the scheduler wants for allocation. No-op for >= 1.
+        effective_layers = max(1, num_current_layers)
         return (
-            num_current_layers * max(decoder_layer_compute_latency, decoder_layer_io_latency)
+            effective_layers * max(decoder_layer_compute_latency, decoder_layer_io_latency)
             + max(compute_time_ms, io_time_ms)
-        ) / num_current_layers
+        ) / effective_layers
 
 
 @dataclass
@@ -188,11 +245,23 @@ class Node:
     end_layer: Optional[int] = None  # exclusive
     current_requests: int = 0
 
+    # Live KV-cache headroom in TOKENS reported by the worker each heartbeat
+    # (free blocks × block size). When set, context-aware routing uses THIS as
+    # the node's real servable context instead of the static measured-budget
+    # estimate — so routing reflects current occupancy. None until reported.
+    reported_kv_free_tokens: Optional[int] = None
+
     # Runtime weight refit for RL
     last_refit_time: float = 0.0
 
     # todo upload is_active
     is_active: bool = True
+    # Worker-reported lifecycle state ("joining" | "initializing" | "ready" |
+    # "offline" | "error"). Mirrors `parallax.p2p.server.ServerState`. Until
+    # the worker reports otherwise we assume "joining" (Lattica handshake in
+    # progress). The UI uses this to distinguish "node connected but still
+    # downloading model" from "node is in standby for redundancy".
+    loading_phase: str = "joining"
     last_heartbeat: float = 0.0
     # Will be updated by node broadcasting
     # otherwise, use roofline performance model to estimate
@@ -200,6 +269,16 @@ class Node:
     load_compensator: float = 0.05
 
     rtt_to_nodes: Optional[Dict[str, float]] = None
+
+    # --- Peer reliability (Blacklist-style backoff) ---
+    # Number of *successive* ban episodes so far (hivemind's ban_counter): the
+    # exponent for the next ban duration. Reset to 0 on a success.
+    failure_streak: int = 0
+    # Wall-clock epoch until which this node is excluded from routing. 0.0 = not
+    # banned. Routing treats `is_banned()` like `is_overloaded` (unavailable),
+    # but — unlike overload — it is deliberately kept OUT of `layer_latency_ms`
+    # so bans only affect routing, never (re)allocation/placement.
+    banned_until: float = 0.0
 
     _force_max_concurrent_requests: bool = False
 
@@ -242,8 +321,7 @@ class Node:
             )
         if self.max_concurrent_requests is None:
             return derived_max
-        else:
-            return max(self.max_concurrent_requests, derived_max)
+        return min(self.max_concurrent_requests, derived_max)
 
     @property
     def num_current_layers(self) -> int:
@@ -251,6 +329,81 @@ class Node:
         if self.start_layer is None or self.end_layer is None:
             return 0
         return self.end_layer - self.start_layer
+
+    @property
+    def max_context_tokens(self) -> int:
+        """Max context (prompt + generation) this node can serve for a SINGLE
+        request, given its ACTUAL layer allocation and MEASURED memory budget.
+
+        This is the per-node figure context-aware routing matches against each
+        request's token count, so the scheduler knows exactly which workers can
+        hold a given request. It is the min of:
+          1. ``max_sequence_length`` — the worker's configured hard cap; its
+             executor truncates anything longer.
+          2. The REAL KV headroom: (measured budget − this node's weights −
+             runtime workspace) ÷ (hosted layers × KV bytes per token per layer).
+
+        Fewer hosted layers ⇒ a larger leftover KV pool AND fewer layers to fill
+        ⇒ a much bigger servable context. So as the swarm spreads thinner (more
+        nodes, fewer layers each) big contexts become routable — dynamically,
+        with no fixed cap baked into allocation. Consistent with
+        ``get_decoder_layer_capacity`` (same measured budget + weights).
+
+        If the worker reports its LIVE KV headroom (``reported_kv_free_tokens``,
+        free blocks × block size) we use that — it reflects the node's actual
+        current occupancy, so routing never sends a 50k request to a node whose
+        cache is already full. Otherwise we fall back to the measured-budget
+        estimate below (accurate at low/zero concurrency).
+
+        Before any layer is assigned only the configured cap is known.
+        """
+        cap = self.max_sequence_length or 0
+        live = self.reported_kv_free_tokens
+        if live is not None and live > 0:
+            return min(cap, int(live)) if cap > 0 else int(live)
+        layers = self.num_current_layers
+        if self.start_layer is None or self.end_layer is None or layers <= 0:
+            return cap
+        try:
+            elem_bytes = bytes_per_element(
+                getattr(self.model_info, "cache_bytes_per_element", None)
+            )
+        except Exception:
+            elem_bytes = 2
+        per_token_per_layer = (
+            self.model_info.num_kv_heads
+            * (self.model_info.head_size_k + self.model_info.head_size_v)
+            * elem_bytes
+        )
+        if per_token_per_layer <= 0:
+            return cap
+
+        # KV pool actually left on this node = budget − its resident weights.
+        usable = getattr(self.hardware, "usable_memory_bytes", None)
+        weight_per_layer = self.model_info.decoder_layer_io_bytes(roofline=False)
+        if self.hardware.device == "mlx":
+            weight_per_layer *= self.model_info.mlx_bit_factor
+        if usable and usable > 0:
+            weights = layers * weight_per_layer
+            if self.has_embedding:
+                weights += self.model_info.embedding_io_bytes
+            if self.has_lm_head and not (self.has_embedding and self.model_info.tie_embedding):
+                weights += self.model_info.embedding_io_bytes
+            kv_pool = float(usable) - self._runtime_workspace_bytes() - weights
+        else:
+            # Legacy fallback (no measured budget): kvcache_mem_ratio of raw VRAM.
+            kv_pool = (
+                self.hardware.num_gpus
+                * self.hardware.memory_gb
+                * 1024**3
+                * self.kvcache_mem_ratio
+            )
+        if kv_pool <= 0:
+            return cap
+        kv_tokens = floor(kv_pool / (layers * per_token_per_layer))
+        if kv_tokens <= 0:
+            return cap
+        return min(cap, kv_tokens) if cap > 0 else kv_tokens
 
     @property
     def has_embedding(self) -> bool:
@@ -271,29 +424,121 @@ class Node:
         """Check if node is at capacity for requests."""
         return self.current_requests >= self.max_requests
 
+    def is_banned(self, now: Optional[float] = None) -> bool:
+        """True while this peer is temporarily excluded from routing after failures."""
+        if self.banned_until <= 0.0:
+            return False
+        return (now if now is not None else time.time()) < self.banned_until
+
+    def record_request_failure(
+        self,
+        *,
+        now: Optional[float] = None,
+        base_sec: float = PEER_BAN_BASE_SEC,
+        backoff_rate: float = PEER_BAN_BACKOFF_RATE,
+        max_sec: float = PEER_BAN_MAX_SEC,
+    ) -> None:
+        """Temporarily ban this peer from routing, with exponential backoff.
+
+        Faithful port of ``hivemind.dht.node.Blacklist.register_failure``: an
+        already-banned peer is left untouched (no extension), and ``failure_streak``
+        only advances per *new* ban episode, so each successive ban lasts
+        ``base_sec * backoff_rate ** failure_streak`` — a chronically flaky peer is
+        shed for longer while a one-off blip recovers quickly. Capped at ``max_sec``.
+        """
+        if base_sec <= 0.0:
+            return
+        t = now if now is not None else time.time()
+        if self.is_banned(t):
+            return  # don't extend an active ban (matches hivemind)
+        ban_duration = base_sec * (backoff_rate**self.failure_streak)
+        if max_sec > 0.0:
+            ban_duration = min(ban_duration, max_sec)
+        self.banned_until = t + ban_duration
+        self.failure_streak += 1
+        logger.info(
+            "Peer %s banned from routing for %.1fs (episode #%d)",
+            self.node_id,
+            ban_duration,
+            self.failure_streak,
+        )
+
+    def record_request_success(self) -> None:
+        """Clear any ban and reset the backoff (matches ``Blacklist.register_success``)."""
+        if self.banned_until > 0.0 or self.failure_streak > 0:
+            logger.debug("Peer %s reliability reset (success)", self.node_id)
+        self.banned_until = 0.0
+        self.failure_streak = 0
+
     def get_decoder_layer_capacity(
         self, include_input_embed: bool = False, include_lm_head: bool = False
     ) -> int:
-        """Return how many decoder layers this node can store for parameters.
+        """Return how many decoder layers this node can host for the current model.
 
-        Capacity is measured using the parameter memory budget on the device.
+        The budget is the node's **measured, worker-enforced** memory ceiling
+        (``hardware.usable_memory_bytes`` — the same per-process allocator cap
+        the worker installs at load time). Sizing against the exact limit the
+        worker enforces is what removes the estimate-vs-reality gap that used to
+        OOM small cards on load: the scheduler can no longer hand a node more
+        layers than the worker's own allocator will admit.
+
+        This mirrors how every mature local-inference stack assigns work — the
+        process that loads the model owns the memory budget (vLLM's
+        ``determine_available_memory``, Ollama's per-device budget, llama.cpp
+        ``--fit``, Petals' ``_choose_num_blocks``). The scheduler only divides
+        that measured budget by the per-layer cost it already knows from
+        ``ModelInfo``.
+
+        Per hosted layer we charge the decoder-layer WEIGHTS plus a KV slice big
+        enough for ONE request at ``max_sequence_length`` (so a node is never
+        handed more layers than it can serve a single full-context request on).
+        Concurrency beyond one request is elastic — the worker sizes the KV pool
+        from whatever memory is left after weights load — so it is not reserved
+        here. A fixed runtime workspace (attention/JIT global buffer +
+        CUDA-graph scratch, e.g. flashinfer) is reserved up front, and endpoint
+        nodes additionally pay for the input-embedding / lm-head weights.
+
+        Legacy fallback: a node that does not report ``usable_memory_bytes``
+        (older worker / generic host) is sized from the parameter-memory budget
+        derived from the advertised ``memory_gb`` — the original heuristic, kept
+        only for backward compatibility.
         """
+        usable = getattr(self.hardware, "usable_memory_bytes", None)
+        if usable and usable > 0:
+            budget = float(usable) - self._runtime_workspace_bytes()
+            # Reserve a share of the measured budget for the KV-cache pool; only
+            # the rest (``param_mem_ratio``) holds weights. This does two things:
+            #   * leaves every node a real KV pool, so the runtime never OOMs
+            #     sizing its cache (the 32k×batch8 failure), and so the node has
+            #     genuine context headroom;
+            #   * the actual servable context is NOT fixed here — it is reported
+            #     dynamically per node by ``max_context_tokens`` (leftover KV ÷
+            #     hosted layers) and matched per request by context-aware
+            #     routing. Fewer layers (more spread) ⇒ bigger servable context.
+            weight_budget = budget * self.param_mem_ratio
+            if include_input_embed:
+                weight_budget -= self.model_info.embedding_io_bytes
+            if include_lm_head and not (
+                include_input_embed and self.model_info.tie_embedding
+            ):
+                weight_budget -= self.model_info.embedding_io_bytes
+            per_layer = self.model_info.decoder_layer_io_bytes(roofline=False)
+            if self.hardware.device == "mlx":
+                per_layer *= self.model_info.mlx_bit_factor
+            if per_layer <= 0 or weight_budget <= 0:
+                return 1
+            return max(1, floor(weight_budget / per_layer))
+
+        # --- Legacy fallback: advertised parameter-memory budget -------------
         available_memory_bytes = floor(
-            self.hardware.num_gpus
-            * self.hardware.memory_gb
-            * 1024
-            * 1024
-            * 1024
-            * self.param_mem_ratio
+            self.hardware.num_gpus * self.hardware.memory_gb * 1024**3 * self.param_mem_ratio
         )
         if include_input_embed:
             available_memory_bytes -= self.model_info.embedding_io_bytes
         if include_lm_head:
             if not (include_input_embed and self.model_info.tie_embedding):
                 available_memory_bytes -= self.model_info.embedding_io_bytes
-
         if self.hardware.device == "mlx":
-            # For mlx, consider mlx bit factor
             return floor(
                 available_memory_bytes
                 / (
@@ -301,10 +546,25 @@ class Node:
                     * self.model_info.mlx_bit_factor
                 )
             )
-        else:
-            return floor(
-                available_memory_bytes / self.model_info.decoder_layer_io_bytes(roofline=False)
-            )
+        return floor(
+            available_memory_bytes / self.model_info.decoder_layer_io_bytes(roofline=False)
+        )
+
+    def _runtime_workspace_bytes(self) -> float:
+        """Non-weight, non-KV runtime GPU buffers to reserve before counting
+        layers: the attention/JIT global workspace (flashinfer allocates a fixed
+        ``global_workspace_buffer``; vLLM defaults it to ~0.4 GiB) plus the
+        CUDA-graph capture scratch. Small on MLX (unified memory, no flashinfer).
+        Tunable via ``PARALLAX_GPU_RUNTIME_WORKSPACE_GB``.
+        """
+        env = os.environ.get("PARALLAX_GPU_RUNTIME_WORKSPACE_GB", "").strip()
+        if env:
+            try:
+                return max(0.0, float(env)) * 1024**3
+            except ValueError:
+                pass
+        default_gb = 0.25 if self.hardware.device == "mlx" else 0.75
+        return default_gb * 1024**3
 
     @property
     def per_decoder_layer_kv_cache_memory(self) -> Optional[int]:
@@ -425,3 +685,13 @@ class Node:
     def remove_request(self):
         """Remove a request from this node."""
         self.current_requests -= 1
+
+    def clear_serving_state(self) -> None:
+        """Clear serving/runtime state for this node.
+
+        TODO: Verify the worker side / p2p server side state is kept in sync with this reset
+        (e.g. any runtime KV cache, in-flight request bookkeeping, and broadcasted metrics).
+        """
+        self.clear_layer_allocation()
+        self.current_requests = 0
+        self.avg_layer_latency_ms = None
