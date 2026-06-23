@@ -37,11 +37,17 @@ class Scheduler:
         enable_weight_refit: bool = False,
         weight_refit_mode: str = "disk",
         strategy: Literal["greedy", "dp"] = "dp",
-        # dp routing places spare/standby nodes on the lightest layers (redundant
-        # coverage) and routes per-request by live latency, so losing one node
-        # degrades gracefully instead of holing the pipeline and forcing a global
-        # re-bootstrap (the rr failure mode). Redundancy is the safe default.
-        routing_strategy: Literal["rr", "dp"] = "dp",
+        # Default is "rr" (fixed, registered pipelines) — upstream's stable,
+        # deterministic behaviour. We previously defaulted to "dp" (dynamic,
+        # redundant pipelines + per-request live-latency routing) for graceful
+        # single-node-loss, but that path proved unstable in a real multi-node
+        # CUDA split: the dynamic router could report pipeline_ready while
+        # pipeline_count stayed 0 (no registered pipeline → empty routing table →
+        # request dropped / 504), and re-pipelining re-rolled layer ranges across
+        # rebootstraps (a node re-downloading the other half → disk churn). "rr"
+        # assigns each node a fixed range once and keeps it. Opt into "dp"
+        # explicitly via PARALLAX_ROUTING_STRATEGY once that path is hardened.
+        routing_strategy: Literal["rr", "dp"] = "rr",
         *,
         request_arrival_horizon_sec: float = 600.0,
         rebalance_threshold: float = float("inf"),
