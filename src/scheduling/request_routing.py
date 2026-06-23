@@ -354,7 +354,39 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
             if path:
                 return path, latency
             # No context-capable full cover — route best-effort rather than drop.
-        return self._find_path(last_refit_time, context_tokens=None)
+        path, latency = self._find_path(last_refit_time, context_tokens=None)
+        if not path:
+            try:
+                nodes = list(self.node_manager.active_nodes)
+                logger.warning(
+                    "[ROUTEDBG] empty path: total_layers=%s active=%d ctx=%s",
+                    self.total_layers,
+                    len(nodes),
+                    context_tokens,
+                )
+                for n in nodes:
+                    logger.warning(
+                        "[ROUTEDBG] node=%s L=%s-%s active=%s overloaded=%s lat=%s maxctx=%s",
+                        str(n.node_id)[:10],
+                        n.start_layer,
+                        n.end_layer,
+                        n.is_active,
+                        n.is_overloaded,
+                        n.layer_latency_ms,
+                        n.max_context_tokens,
+                    )
+                for a in nodes:
+                    for b in nodes:
+                        if a.node_id != b.node_id:
+                            logger.warning(
+                                "[ROUTEDBG] rtt %s->%s = %s",
+                                str(a.node_id)[:6],
+                                str(b.node_id)[:6],
+                                a.get_rtt_to(b),
+                            )
+            except Exception as exc:
+                logger.warning("[ROUTEDBG] diag error: %s", exc)
+        return path, latency
 
     def _find_path(
         self,
