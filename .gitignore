@@ -12,3 +12,6 @@ build/
 .cache
 .vscode/
 hosts.json
+uv.lock
+
+AGENTS.md

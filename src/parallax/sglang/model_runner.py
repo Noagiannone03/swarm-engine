@@ -21,6 +21,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
+    set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -41,6 +42,7 @@ from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
 from parallax.utils.tokenizer_utils import load_tokenizer
+from parallax.utils.utils import normalize_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +120,8 @@ class ParallaxModelRunner(SGLModelRunner):
             backend = "gloo"
         elif self.device == "npu":
             backend = "hccl"
+        else:
+            backend = "gloo"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -129,6 +133,7 @@ class ParallaxModelRunner(SGLModelRunner):
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
+        set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
 
         if not self.is_draft_worker:
             if self.device == "cpu":
@@ -153,6 +158,8 @@ class ParallaxModelRunner(SGLModelRunner):
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
+                moe_a2a_backend=self.server_args.moe_a2a_backend,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
             )
 
             # Use monkey patch modified function
@@ -160,7 +167,12 @@ class ParallaxModelRunner(SGLModelRunner):
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
+                attention_data_parallel_size=self.dp_size,
+                attention_context_model_parallel_size=self.attn_cp_size,
+                moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
+                enable_symm_mem=self.server_args.enable_symm_mem,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
                 pp_start_layer=self.pp_start_layer,
                 pp_end_layer=self.pp_end_layer,
                 hidden_layers=self.model_config.num_hidden_layers,
@@ -225,6 +237,7 @@ def form_sgl_server_args(
     lora_eviction_policy: Optional[str] = "lru",
     lora_backend: Optional[str] = "triton",
     max_lora_chunk_size: Optional[int] = 128,
+    max_num_tokens_per_batch: int = 16384,
 ):
     """Creates a SGL ServerArgs object"""
     sgl_server_args = ServerArgs(
@@ -247,6 +260,7 @@ def form_sgl_server_args(
         lora_backend=lora_backend,
         max_lora_chunk_size=max_lora_chunk_size,
         dp_size=dp_size,
+        max_total_tokens=max_num_tokens_per_batch,
     )
     return sgl_server_args
 
@@ -289,18 +303,18 @@ def initialize_sgl_model_runner(
     use_hfcache = kwargs.get("use_hfcache", False)
     nccl_port = kwargs.get("nccl_port", None)
     # Use selective download for GPU models to save bandwidth and disk space
-    from parallax.utils.selective_download import get_model_path_with_selective_download
+    from parallax.utils.model_download import selective_model_download
 
     logger.info(
         f"Downloading model with selective weight files for layers [{start_layer}, {end_layer})"
     )
-    model_path = get_model_path_with_selective_download(
+    model_path = selective_model_download(
         model_repo, start_layer=start_layer, end_layer=end_layer, local_files_only=use_hfcache
     )
 
-    config = load_config(model_path)
+    config = normalize_model_config(load_config(model_path))
     tokenizer = load_tokenizer(model_path, eos_token_ids=config.get("eos_token_id", None))
-    dtype = config.get("torch_dtype", "bfloat16")
+    dtype = config.get("torch_dtype") or "bfloat16"
 
     if nccl_port is None:
         nccl_port = random.randint(4000, 5000)
@@ -338,6 +352,7 @@ def initialize_sgl_model_runner(
         lora_eviction_policy,
         lora_backend,
         max_lora_chunk_size,
+        max_num_tokens_per_batch=max_num_tokens_per_batch,
     )
     initialize_moe_config(server_args)
     quant_method = None
@@ -353,11 +368,17 @@ def initialize_sgl_model_runner(
     # (multi-node PP where this node doesn't have both embed_tokens and lm_head).
     # For single-node or full-range runs, keep the original setting so that
     # lm_head correctly shares weights with embed_tokens.
-    num_hidden_layers = model_config.hf_config.num_hidden_layers
+    normalized_config = normalize_model_config(model_config.hf_config.to_dict())
+    num_hidden_layers = normalized_config["num_hidden_layers"]
+    model_config.hf_config.num_hidden_layers = num_hidden_layers
     if start_layer > 0 or end_layer < num_hidden_layers:
         model_config.hf_config.tie_word_embeddings = False
     model_config.hf_config.start_layer = start_layer
     model_config.hf_config.end_layer = end_layer
+    if hasattr(model_config.hf_config, "text_config"):
+        model_config.hf_config.text_config.num_hidden_layers = num_hidden_layers
+        model_config.hf_config.text_config.start_layer = start_layer
+        model_config.hf_config.text_config.end_layer = end_layer
 
     logger.debug(f"model_start_layer: {model_config.hf_config.start_layer}")
     logger.debug(f"model_end_layer: {model_config.hf_config.end_layer}")

@@ -4,7 +4,7 @@ Launch the Parallax server.
 This script is used to launch the Parallax server.
 It will start the following services:
     1.Executor each tp_rank as a subprocess.
-    2.HTTP server as a subprocess.
+    2.vLLM Rust frontend as the HTTP server subprocess.
     3.P2P server as a subprocess.
 
 Example command:
@@ -24,10 +24,13 @@ import time
 
 from parallax.p2p.server import ServerState, launch_p2p_server_process, stop_p2p_server
 from parallax.server.executor.factory import run_executor_process, stop_executor_process
-from parallax.server.http_server import launch_http_server, stop_http_server
 from parallax.server.server_args import parse_args
+from parallax.server.vllm_rust_frontend import (
+    launch_vllm_rust_frontend,
+    stop_vllm_rust_frontend,
+)
 from parallax.utils.shared_state import SharedState
-from parallax.utils.utils import fetch_model_from_hf, initialize_nccl_port
+from parallax.utils.utils import initialize_nccl_port, load_config_only
 from parallax_utils.ascii_anime import display_parallax_join
 from parallax_utils.cuda_memory import configure_torch_cuda_memory_limit
 from parallax_utils.logging_config import get_logger, set_log_level
@@ -41,7 +44,7 @@ def _update_args_from_shared_state(args, shared_state: SharedState, force_update
     model_info = shared_state.get_model_info()
     args.start_layer = model_info["block_start_index"]
     args.end_layer = model_info["block_end_index"]
-    if args.model_path is not None and force_update == False:
+    if args.model_path is not None and not force_update:
         # Use local model path first
         pass
     elif model_info["model_name"]:
@@ -139,7 +142,7 @@ if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
 
     p2p_server_process = None
-    http_server_process = None
+    frontend_process = None
     executor_subprocs = []
     # Shared state for layer allocation info (used when P2P server is in subprocess)
     shared_state = SharedState.create()
@@ -172,15 +175,15 @@ if __name__ == "__main__":
                 display_parallax_join(args.model_path)
             check_latest_release()
 
-            config = fetch_model_from_hf(args.model_path, local_files_only=args.use_hfcache)
+            config = load_config_only(args.model_path, local_files_only=args.use_hfcache)
             if args.start_layer is None:
                 args.start_layer = 0
             if args.end_layer is None:
                 args.end_layer = config.get("num_hidden_layers")
 
-            # only launch http server on head node
+            # Only launch the Rust HTTP frontend on head node.
             if args.start_layer == 0:
-                http_server_process = launch_http_server(args)
+                frontend_process = launch_vllm_rust_frontend(args)
             # Launch P2P server as subprocess
             if not (args.start_layer == 0 and args.end_layer == config.get("num_hidden_layers")):
                 p2p_server_process = launch_p2p_server_process(
@@ -293,9 +296,9 @@ if __name__ == "__main__":
                 max_executor_retries = 2
             while True:
                 try:
-                    # only launch http server on head node
+                    # Only launch the Rust HTTP frontend on head node.
                     if args.start_layer == 0:
-                        http_server_process = launch_http_server(args)
+                        frontend_process = launch_vllm_rust_frontend(args)
 
                     # Build connectors for tp communication
                     conn_tp_0 = [conn_refit]
@@ -329,8 +332,9 @@ if __name__ == "__main__":
                             status=ServerState.INITIALIZING.value,
                         )
                         _stop_executor_processes(executor_subprocs)
-                        if http_server_process is not None:
-                            stop_http_server(http_server_process)
+                        if frontend_process is not None:
+                            stop_vllm_rust_frontend(frontend_process)
+                            frontend_process = None
                         _update_args_from_shared_state(args, shared_state, force_update=True)
                         logger.info(
                             f"Reloading executor with layers [{args.start_layer}, {args.end_layer})"
@@ -405,8 +409,8 @@ if __name__ == "__main__":
         if p2p_server_process is not None:
             stop_p2p_server(p2p_server_process)
 
-        # Shutdown http server
-        if http_server_process is not None:
-            stop_http_server(http_server_process)
+        # Shutdown Rust frontend
+        if frontend_process is not None:
+            stop_vllm_rust_frontend(frontend_process)
 
         logger.debug("All processes shut down.")

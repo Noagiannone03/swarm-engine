@@ -172,6 +172,9 @@ class RooflinePerformanceModel:
         Returns:
             Total latency (ms) combining decoder layers and optional endpoints.
         """
+        if num_current_layers <= 0:
+            return float("inf")
+
         decoder_layer_compute_latency = self.get_compute_roofline_latency_ms(
             self.model_info.decoder_layer_flops(
                 batch_size=self.batch_size,
@@ -239,6 +242,10 @@ class Node:
 
     max_concurrent_requests: int = 16
     max_sequence_length: int = 4096
+
+    # Unique epoch for one worker process. The libp2p peer id is intentionally
+    # stable across restarts, so this fences late RPCs from an older process.
+    worker_session_id: Optional[str] = None
 
     manual_layer_assignment: bool = False
     start_layer: Optional[int] = None  # inclusive
@@ -359,8 +366,19 @@ class Node:
         """
         cap = self.max_sequence_length or 0
         live = self.reported_kv_free_tokens
-        if live is not None and live > 0:
-            return min(cap, int(live)) if cap > 0 else int(live)
+        if live is not None:
+            live_tokens = max(0, int(live))
+            return min(cap, live_tokens) if cap > 0 else live_tokens
+        return self.max_context_capacity_tokens
+
+    @property
+    def max_context_capacity_tokens(self) -> int:
+        """Load-independent context ceiling for model metadata and admission.
+
+        Unlike ``max_context_tokens``, this ignores current cache occupancy and
+        answers how large one request can be on an otherwise idle worker.
+        """
+        cap = self.max_sequence_length or 0
         layers = self.num_current_layers
         if self.start_layer is None or self.end_layer is None or layers <= 0:
             return cap
@@ -393,16 +411,13 @@ class Node:
         else:
             # Legacy fallback (no measured budget): kvcache_mem_ratio of raw VRAM.
             kv_pool = (
-                self.hardware.num_gpus
-                * self.hardware.memory_gb
-                * 1024**3
-                * self.kvcache_mem_ratio
+                self.hardware.num_gpus * self.hardware.memory_gb * 1024**3 * self.kvcache_mem_ratio
             )
         if kv_pool <= 0:
-            return cap
+            return 0
         kv_tokens = floor(kv_pool / (layers * per_token_per_layer))
         if kv_tokens <= 0:
-            return cap
+            return 0
         return min(cap, kv_tokens) if cap > 0 else kv_tokens
 
     @property
@@ -518,9 +533,7 @@ class Node:
             weight_budget = budget * self.param_mem_ratio
             if include_input_embed:
                 weight_budget -= self.model_info.embedding_io_bytes
-            if include_lm_head and not (
-                include_input_embed and self.model_info.tie_embedding
-            ):
+            if include_lm_head and not (include_input_embed and self.model_info.tie_embedding):
                 weight_budget -= self.model_info.embedding_io_bytes
             per_layer = self.model_info.decoder_layer_io_bytes(roofline=False)
             if self.hardware.device == "mlx":
@@ -685,13 +698,3 @@ class Node:
     def remove_request(self):
         """Remove a request from this node."""
         self.current_requests -= 1
-
-    def clear_serving_state(self) -> None:
-        """Clear serving/runtime state for this node.
-
-        TODO: Verify the worker side / p2p server side state is kept in sync with this reset
-        (e.g. any runtime KV cache, in-flight request bookkeeping, and broadcasted metrics).
-        """
-        self.clear_layer_allocation()
-        self.current_requests = 0
-        self.avg_layer_latency_ms = None

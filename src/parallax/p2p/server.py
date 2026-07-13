@@ -15,6 +15,7 @@ import random
 import shutil
 import threading
 import time
+import uuid
 from typing import Any, List, Optional
 
 import dijkstar
@@ -22,6 +23,7 @@ import httpx
 import zmq
 from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stream_iter
 
+from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 from parallax.p2p.proto import forward_pb2
 from parallax.p2p.utils import AsyncWorker
@@ -41,6 +43,18 @@ logger = get_logger(__name__)
 
 # Global HTTP client for reuse
 _http_client = None
+
+
+def _resolve_worker_key_path() -> str:
+    """Return a persistent, private directory for the worker's libp2p key."""
+    configured = os.environ.get("PARALLAX_KEY_PATH", "").strip()
+    key_path = os.path.abspath(os.path.expanduser(configured or "~/.parallax"))
+    os.makedirs(key_path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(key_path, 0o700)
+    except OSError:
+        logger.debug("Could not tighten permissions on %s", key_path, exc_info=True)
+    return key_path
 
 
 async def get_http_client():
@@ -88,19 +102,13 @@ def _resolve_heartbeat_interval(default: float = 10.0) -> float:
     try:
         value = float(raw)
     except ValueError:
-        logger.warning(
-            "Ignoring PARALLAX_HEARTBEAT_INTERVAL=%r (not a number)", raw
-        )
+        logger.warning("Ignoring PARALLAX_HEARTBEAT_INTERVAL=%r (not a number)", raw)
         return default
     if value < 1.0:
-        logger.warning(
-            "PARALLAX_HEARTBEAT_INTERVAL=%s clamped to 1.0s minimum", value
-        )
+        logger.warning("PARALLAX_HEARTBEAT_INTERVAL=%s clamped to 1.0s minimum", value)
         return 1.0
     if value > 60.0:
-        logger.warning(
-            "PARALLAX_HEARTBEAT_INTERVAL=%s clamped to 60.0s maximum", value
-        )
+        logger.warning("PARALLAX_HEARTBEAT_INTERVAL=%s clamped to 60.0s maximum", value)
         return 60.0
     return value
 
@@ -233,10 +241,21 @@ class TransformerConnectionHandler(ConnectionHandler):
                     response = client.post(
                         f"http://localhost:{self.http_port}/v1/chat/completions", json=request
                     )
-                    yield response.content
+                    yield encode_http_response_envelope(
+                        status_code=response.status_code,
+                        content_type=response.headers.get("content-type"),
+                        body=response.content,
+                    )
         except Exception as e:
             logger.exception(f"Error in chat completion: {e}")
-            yield b"internal server error"
+            yield encode_http_response_envelope(
+                status_code=502,
+                content_type="application/json",
+                body=(
+                    b'{"error":{"message":"Internal server error",'
+                    b'"type":"upstream_error","param":null,"code":"upstream_error"}}'
+                ),
+            )
 
 
 def check_and_run_weight_refit(gradient_server, message):
@@ -329,7 +348,7 @@ def check_and_run_weight_refit(gradient_server, message):
 
         if not download_res:
             gradient_server.last_refit_time = float(time_stamp)
-            logger.info(f"Error in updating weight. Still holds the previous version of weight.")
+            logger.info("Error in updating weight. Still holds the previous version of weight.")
 
         # step3. concat weight
         # workaround: create sub-process to avoid GIL issues for lattica
@@ -429,6 +448,9 @@ class GradientServer:
         # `parallax join --account-token <T>` (exports FABI_ACCOUNT_TOKEN) or the
         # env directly. None → the gate (if enabled) won't grant this worker.
         self.account_token = os.environ.get("FABI_ACCOUNT_TOKEN") or None
+        self.worker_session_id = (
+            os.environ.get("FABI_WORKER_SESSION_ID", "").strip() or uuid.uuid4().hex
+        )
 
         self.scheduler_stub = None
         self.scheduler_peer_id = None
@@ -469,7 +491,11 @@ class GradientServer:
                 logger.warning(f"Folder '{weight_dir}' does not exist.")
 
     def build_lattica(self):
-        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs)
+        self.lattica = (
+            Lattica.builder()
+            .with_listen_addrs(self.host_maddrs)
+            .with_key_path(_resolve_worker_key_path())
+        )
 
         # mDNS LAN discovery is on by default in Lattica. For a public swarm
         # (the common case — `--use-relay` + bootstraps gradient.network)
@@ -516,6 +542,7 @@ class GradientServer:
         if my_peer_id:
             logger.info(f"Lattica peer_id: {my_peer_id}")
             from parallax_utils.fabi_events import emit as fabi_emit
+
             fabi_emit("peer_id", peer_id=my_peer_id)
 
         if len(self.relay_servers) > 0:
@@ -576,6 +603,7 @@ class GradientServer:
                     node_info["manual_layer_assignment"] = True
 
                 from parallax_utils.fabi_events import emit as fabi_emit
+
                 fabi_emit("joining_scheduler", scheduler_peer_id=self.scheduler_peer_id)
                 response = self.scheduler_stub.node_join(node_info)
                 response = response.result(timeout=300)
@@ -858,6 +886,19 @@ class GradientServer:
                                 else response_future
                             )
 
+                            if (
+                                isinstance(response, dict)
+                                and response.get("error") == "stale_worker_session"
+                            ):
+                                logger.error(
+                                    "Scheduler rejected stale worker session %s; stopping this process",
+                                    self.worker_session_id,
+                                )
+                                self.status = ServerState.ERROR
+                                self._sync_to_shared_state()
+                                self.stop_event.set()
+                                break
+
                             # Print layer allocation information
                             if response and isinstance(response, dict):
                                 start_layer = response.get("start_layer")
@@ -907,18 +948,17 @@ class GradientServer:
                                 logger.warning(
                                     f"Heartbeat: No layer allocation received yet, response: {response}"
                                 )
-                                self.status = ServerState.JOINING
-                                self.model_name = None
-                                if self._shared_state is not None:
-                                    self._shared_state.set_status(self.status.value)
-                                    self._shared_state.update_metrics(current_requests=0)
-                                    self._shared_state.set("model_name", None)
-                                logger.debug(
-                                    "Status set to JOINING and model_name to None because no valid layer allocation received yet."
-                                )
+                                # A transient/legacy empty ACK must never erase a shard
+                                # that is already loaded. Only an as-yet unallocated
+                                # worker remains in JOINING state.
+                                if self.block_start_index is None or self.block_end_index is None:
+                                    self.status = ServerState.JOINING
+                                    if self._shared_state is not None:
+                                        self._shared_state.set_status(self.status.value)
+                                        self._shared_state.update_metrics(current_requests=0)
                             if refit_message and isinstance(refit_message, dict):
                                 if self.enable_weight_refit:
-                                    logger.info(f"Server begin weight refit process.")
+                                    logger.info("Server begin weight refit process.")
                                     if self.refit_finish:
                                         self.refit_finish = False
                                         t = threading.Thread(
@@ -1098,6 +1138,7 @@ class GradientServer:
             # this account's consumption lease. None when not configured (sent
             # over the encrypted lattica RPC channel). No-op if FABI_GATE=off.
             "account_token": self.account_token,
+            "worker_session_id": self.worker_session_id,
         }
 
         # For manual layer assignment, always include start_layer and end_layer
@@ -1181,8 +1222,10 @@ def _run_p2p_server_process(
     # server.shutdown() (qui envoie node_leave au scheduler) est saute ->
     # noeud fantome cote scheduler.
     import signal as _signal
+
     def _sigterm_to_kbi(signum, frame):
         raise KeyboardInterrupt()
+
     try:
         _signal.signal(_signal.SIGTERM, _sigterm_to_kbi)
     except Exception:

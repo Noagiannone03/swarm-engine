@@ -100,7 +100,7 @@ def _make_handler(stub):
     h = RequestHandler()
     completion_handler = types.SimpleNamespace(get_stub=lambda node_id: stub)
     h.scheduler_manage = types.SimpleNamespace(
-        get_routing_table=lambda rid, ts: ["replacement-head"],
+        get_routing_table=lambda rid, ts, **_kwargs: ["replacement-head"],
         completion_handler=completion_handler,
     )
     return h

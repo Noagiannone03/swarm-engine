@@ -88,6 +88,18 @@ To allow the API to be accessible from other machines, add the argument `--host 
 parallax chat --host 0.0.0.0
 ```
 
+### Downloading from ModelScope
+
+Parallax downloads models from Hugging Face by default. To download from ModelScope instead, set `USE_MODELSCOPE` before starting any Parallax process that resolves or loads the model:
+
+```sh
+USE_MODELSCOPE=1 parallax run -m Qwen/Qwen3-0.6B -n 2
+USE_MODELSCOPE=1 parallax join -s {scheduler-address}
+USE_MODELSCOPE=1 parallax serve --model-path Qwen/Qwen3-0.6B
+```
+
+Use a model ID that exists on ModelScope. To switch back to Hugging Face, run the same commands without `USE_MODELSCOPE`.
+
 ### Without frontend
 #### Step 1: Launch scheduler
 First launch our scheduler on the main node.
@@ -135,22 +147,26 @@ For models such as Qwen3 and gpt-oss, the "reasoning" (or "thinking") feature is
 
 ### Skipping Scheduler
 Developers can start Parallax backend engine without a scheduler. Pipeline parallel start/end layers should be set manually.
+
+For a standalone single-machine server:
+```sh
+parallax serve -m Qwen/Qwen3-0.6B
+```
+
 An example of serving Qwen3-0.6B with 2-nodes:
 - First node:
 ```sh
-python3 ./parallax/src/parallax/launch.py \
+parallax serve \
 --model-path Qwen/Qwen3-0.6B \
 --port 3000 \
---max-batch-size 8 \
 --start-layer 0 \
 --end-layer 14
 ```
 - Second node:
 ```sh
-python3 ./parallax/src/parallax/launch.py \
+parallax serve \
 --model-path Qwen/Qwen3-0.6B \
 --port 3000 \
---max-batch-size 8 \
 --start-layer 14 \
 --end-layer 28
 ```

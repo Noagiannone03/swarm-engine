@@ -128,6 +128,9 @@ class Scheduler:
         # Timestamp lets the UI ignore stale results after a node leave/rejoin.
         self.last_bootstrap_result: Optional[str] = None
         self.last_bootstrap_attempt_ts: float = 0.0
+        # Short-lived layer tombstones let a restarted stable peer reclaim its
+        # exact shard without making every surviving worker reload weights.
+        self._recent_allocations: Dict[str, Tuple[int, int, float]] = {}
         logger.info(
             f"Scheduler initialized, min_nodes_bootstrapping {self.min_nodes_bootstrapping}, "
             f"Layer allocations trategy {strategy}, Request routing strategy {routing_strategy}."
@@ -346,7 +349,9 @@ class Scheduler:
             loading = getattr(node, "loading_phase", None) in ("joining", "initializing")
             timeout = self.heartbeat_timeout * 6 if loading else self.heartbeat_timeout
             if now - node.last_heartbeat > timeout:
-                logger.info(f"Node {node.node_id} heartbeat timeout (loading={loading}) -> eviction")
+                logger.info(
+                    f"Node {node.node_id} heartbeat timeout (loading={loading}) -> eviction"
+                )
                 # Route leave through the event loop so global rebalance/reboot is serialized.
                 self.enqueue_leave(node.node_id)
 
@@ -373,7 +378,13 @@ class Scheduler:
         )
         if self.node_manager.get(node.node_id) is None:
             self.node_manager.upsert(node)
-            if bootstrapped:
+            restored = self.dynamic_pipelines_router and self._restore_recent_allocation(node)
+            partial_dp_pipeline = (
+                self.dynamic_pipelines_router
+                and self.node_manager.num_active_nodes > 0
+                and not self.has_full_pipeline()
+            )
+            if not restored and (bootstrapped or partial_dp_pipeline):
                 if self.dynamic_pipelines_router:
                     # for dynamic pipelines router, join the node to the lightest layer
                     self.layer_allocator.dynamic_join(node)
@@ -389,6 +400,10 @@ class Scheduler:
                         "Failed to expand pipelines after node join; keeping existing pipelines",
                         exc_info=True,
                     )
+
+            if self.has_full_pipeline():
+                self._bootstrapped_event.set()
+                self.last_bootstrap_result = "success"
 
         # Manual layer assignment bypasses bootstrap waiting
         if node.manual_layer_assignment:
@@ -422,6 +437,42 @@ class Scheduler:
         with self._node_count_cv:
             self._node_count_cv.notify_all()
 
+    def _restore_recent_allocation(self, node: Node) -> bool:
+        now = time.time()
+        candidates = []
+        own = self._recent_allocations.get(node.node_id)
+        if own is not None:
+            candidates.append((node.node_id, own))
+        # A different peer may replace a dead machine. Prefer the oldest
+        # uncovered tombstone after the exact stable-peer match.
+        candidates.extend(
+            (peer_id, record)
+            for peer_id, record in self._recent_allocations.items()
+            if peer_id != node.node_id
+        )
+        for peer_id, (start_layer, end_layer, expires_at) in candidates:
+            if now > expires_at:
+                self._recent_allocations.pop(peer_id, None)
+                continue
+            required = end_layer - start_layer
+            capacity = node.get_decoder_layer_capacity(
+                include_input_embed=start_layer == 0,
+                include_lm_head=end_layer == self.num_layers,
+            )
+            if capacity < required:
+                continue
+            self._recent_allocations.pop(peer_id, None)
+            self.layer_allocator.allocate(node, start_layer, end_layer)
+            logger.info(
+                "Restored missing layers [%d, %d) from %s on worker %s",
+                start_layer,
+                end_layer,
+                peer_id,
+                node.node_id,
+            )
+            return True
+        return False
+
     def leave(self, node_id: str) -> None:
         """Remove a node from the node manager.
 
@@ -436,7 +487,16 @@ class Scheduler:
         if node is None:
             raise ValueError(f"Node {node_id} not found in nodes")
         logger.info("Leaving node %s (start=%s, end=%s)", node_id, node.start_layer, node.end_layer)
+        if node.start_layer is not None and node.end_layer is not None:
+            self._recent_allocations[node_id] = (
+                int(node.start_layer),
+                int(node.end_layer),
+                time.time() + 15 * 60,
+            )
         self.node_manager.remove(node_id)
+        self.layer_allocator.rebuild_layer_loads()
+        if not self.has_full_pipeline():
+            self._bootstrapped_event.clear()
 
         # Snapshot at INFO after leave since allocations/pipelines may have changed.
         self.emit_alloc_log_snapshot(reason=f"after leave {node_id}")
@@ -584,9 +644,9 @@ class Scheduler:
         """Process joins/leaves/updates and perform heartbeat checks."""
         last_hb_check = 0.0
         while not self._stop_event.is_set():
-            self._process_node_updates()
-            self._process_joins()
             self._process_leaves()
+            self._process_joins()
+            self._process_node_updates()
             now = time.time()
             if now - last_hb_check >= max(0.5, poll_interval):
                 self.checking_node_heartbeat()
@@ -670,11 +730,11 @@ class Scheduler:
                 self.request_router.bootstrap()
                 if self.request_router.routing_ready():
                     logger.info(
-                        '[Scheduler] Routing pipelines registered after node(s) became active'
+                        "[Scheduler] Routing pipelines registered after node(s) became active"
                     )
             except Exception:
                 logger.warning(
-                    'Re-register routing pipelines after node update failed', exc_info=True
+                    "Re-register routing pipelines after node update failed", exc_info=True
                 )
 
     def _process_joins(self) -> None:
@@ -743,6 +803,19 @@ class Scheduler:
 
         # After draining all leaves, decide whether to do a single global rebalance.
         if not removed_any:
+            return
+
+        # DP routing supports a partial allocation graph. Preserve every
+        # surviving shard and let replacement joins fill the lightest uncovered
+        # layers; a destructive global reboot turns one lost worker into an
+        # outage and was the exact failure observed in production.
+        if self.dynamic_pipelines_router:
+            if self.has_full_pipeline():
+                self._bootstrapped_event.set()
+            else:
+                self._bootstrapped_event.clear()
+                self.last_bootstrap_result = "degraded_waiting_replacement"
+            self.emit_alloc_log_snapshot(reason="after DP leave recovery")
             return
 
         if not self.layer_allocator.should_global_rebalance():

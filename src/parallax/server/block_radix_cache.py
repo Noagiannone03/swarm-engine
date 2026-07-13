@@ -16,9 +16,16 @@ class BlockTreeNode:
 
     counter = 0
 
-    def __init__(self, block_id: Optional[int] = None, token_ids: Optional[List[int]] = None):
+    def __init__(
+        self,
+        block_id: Optional[int] = None,
+        token_ids: Optional[List[int]] = None,
+        prefix_len: int = 0,
+    ):
         self.block_id = block_id
         self.token_ids = token_ids or []
+        self.prefix_len = prefix_len
+        self.linear_slot: Optional[int] = None
         self.children: Dict[int, "BlockTreeNode"] = {}
         self.parent: Optional["BlockTreeNode"] = None
         self.lock_ref = 0
@@ -42,28 +49,27 @@ class BlockRadixCache:
     def __init__(
         self,
         block_size: int,
-        max_cached_blocks: int = 1000,
         on_block_evict: Optional[Callable[[int], None]] = None,
+        on_linear_slot_evict: Optional[Callable[[int], None]] = None,
+        has_linear_cache: bool = False,
     ):
         """
         Args:
             block_size: Number of tokens per block
-            max_cached_blocks: Maximum number of blocks to cache
             on_block_evict: Callback function when a block is evicted, receives block_id
+            on_linear_slot_evict: Callback function when a linear slot is evicted
+            has_linear_cache: Whether reusable nodes must also carry linear slots
         """
         self.block_size = block_size
-        self.max_cached_blocks = max_cached_blocks
         self.on_block_evict = on_block_evict
+        self.on_linear_slot_evict = on_linear_slot_evict
+        self.has_linear_cache = has_linear_cache
 
         self.root = BlockTreeNode(block_id=None, token_ids=[])
         self.root.lock_ref = 1
 
         self.num_cached_blocks = 0
         self.request_to_nodes: Dict[str, List[BlockTreeNode]] = {}
-
-        logger.info(
-            f"BlockRadixCache initialized: block_size={block_size}, max_cached_blocks={max_cached_blocks}"
-        )
 
     def match_prefix(self, token_ids: List[int]) -> Tuple[List[int], int]:
         """
@@ -78,6 +84,8 @@ class BlockRadixCache:
         """
         matched_blocks = []
         matched_tokens = 0
+        reusable_blocks = []
+        reusable_tokens = 0
 
         current_node = self.root
 
@@ -109,12 +117,51 @@ class BlockRadixCache:
             current_node = child_node
             current_node.last_access_time = time.monotonic()
 
+            if not self.has_linear_cache or child_node.linear_slot is not None:
+                reusable_blocks = matched_blocks.copy()
+                reusable_tokens = matched_tokens
+
         logger.debug(
-            f"Prefix match: {matched_tokens}/{len(token_ids)} tokens, "
-            f"{len(matched_blocks)} blocks reused"
+            f"Prefix match: {reusable_tokens}/{len(token_ids)} tokens, "
+            f"{len(reusable_blocks)} blocks reused"
         )
 
-        return matched_blocks, matched_tokens
+        return reusable_blocks, reusable_tokens
+
+    def get_path(self, token_ids: List[int]) -> List[BlockTreeNode]:
+        """Return the matched node path for the full-block prefix in token_ids."""
+        path = []
+        current_node = self.root
+
+        num_full_blocks = len(token_ids) // self.block_size
+
+        for block_idx in range(num_full_blocks):
+            block_start = block_idx * self.block_size
+            block_end = block_start + self.block_size
+            block_tokens = token_ids[block_start:block_end]
+            if len(block_tokens) != self.block_size:
+                break
+
+            first_token = block_tokens[0]
+            child_node = current_node.children.get(first_token)
+            if child_node is None or child_node.token_ids != block_tokens:
+                break
+
+            path.append(child_node)
+            current_node = child_node
+
+        return path
+
+    def get_node_for_token_ids(self, token_ids: List[int]) -> Optional[BlockTreeNode]:
+        """Return the node for an exact full-block token prefix, if present."""
+        if not token_ids or len(token_ids) % self.block_size != 0:
+            return None
+
+        num_blocks = len(token_ids) // self.block_size
+        path = self.get_path(token_ids)
+        if len(path) != num_blocks:
+            return None
+        return path[-1]
 
     def insert_block(
         self,
@@ -155,7 +202,11 @@ class BlockRadixCache:
                     existing_node.last_access_time = time.monotonic()
                 return existing_node
 
-        new_node = BlockTreeNode(block_id=block_id, token_ids=token_ids)
+        new_node = BlockTreeNode(
+            block_id=block_id,
+            token_ids=token_ids,
+            prefix_len=parent_node.prefix_len + self.block_size,
+        )
         new_node.parent = parent_node
         if lock:
             new_node.lock_ref += 1
@@ -163,14 +214,6 @@ class BlockRadixCache:
         parent_node.children[first_token] = new_node
 
         self.num_cached_blocks += 1
-
-        logger.debug(
-            f"Inserted new block: block_id={block_id}, "
-            f"tokens={token_ids[:5]}..., total_cached={self.num_cached_blocks}"
-        )
-
-        if self.num_cached_blocks > self.max_cached_blocks:
-            self._evict_lru_blocks(self.num_cached_blocks - self.max_cached_blocks)
 
         return new_node
 
@@ -190,11 +233,6 @@ class BlockRadixCache:
             if node.lock_ref > 0:
                 node.lock_ref -= 1
 
-            if node.lock_ref == 0:
-                logger.debug(
-                    f"Node {node.node_id} (block_id={node.block_id}) ref count = 0, evictable"
-                )
-
     def register_request(self, request_id: str, nodes: List[BlockTreeNode]):
         """Register nodes used by request."""
         self.request_to_nodes[request_id] = nodes
@@ -211,8 +249,11 @@ class BlockRadixCache:
 
         logger.debug(f"Released request {request_id}, decreased ref count for {len(nodes)} nodes")
 
-    def _evict_lru_blocks(self, num_blocks: int):
+    def evict_lru_blocks(self, num_blocks: int) -> int:
         """Evict LRU blocks."""
+        if num_blocks <= 0:
+            return 0
+
         leaves = self._collect_leaves()
         heapq.heapify(leaves)
 
@@ -233,6 +274,7 @@ class BlockRadixCache:
                 heapq.heappush(leaves, node.parent)
 
         logger.info(f"Evicted {num_evicted} blocks from cache")
+        return num_evicted
 
     def _collect_leaves(self) -> List[BlockTreeNode]:
         """Collect all leaf nodes."""
@@ -250,6 +292,10 @@ class BlockRadixCache:
 
     def _delete_leaf(self, node: BlockTreeNode):
         """Delete a leaf node and free the physical block."""
+        if self.on_linear_slot_evict and node.linear_slot is not None:
+            self.on_linear_slot_evict(node.linear_slot)
+        node.linear_slot = None
+
         if node.parent:
             for key, child in list(node.parent.children.items()):
                 if child == node:
@@ -283,6 +329,5 @@ class BlockRadixCache:
         """Get cache statistics."""
         return {
             "num_cached_blocks": self.num_cached_blocks,
-            "max_cached_blocks": self.max_cached_blocks,
             "num_requests": len(self.request_to_nodes),
         }

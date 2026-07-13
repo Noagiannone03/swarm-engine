@@ -1,6 +1,8 @@
+import json
 import os
 import time
 
+import httpx
 from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stream_iter
 
 from parallax_utils.logging_config import get_logger
@@ -8,10 +10,6 @@ from scheduling.node import Node, NodeHardwareInfo
 from scheduling.scheduler import Scheduler
 
 logger = get_logger(__name__)
-
-import json
-
-import httpx
 
 
 def _node_join_allocation_wait_seconds() -> float:
@@ -68,7 +66,25 @@ class RPCConnectionHandler(ConnectionHandler):
         try:
             node = self.build_node(message)
             self._refresh_contribution_lease(message, node, source="node_join")
-            self.scheduler.enqueue_join(node)
+            existing = self.scheduler.get_node(node.node_id)
+            if existing is not None:
+                old_session = existing.worker_session_id
+                new_session = node.worker_session_id
+                if old_session == new_session:
+                    # Idempotent retry from the same process. Do not duplicate
+                    # allocations or reset a READY node to STANDBY.
+                    existing.last_heartbeat = time.time()
+                else:
+                    logger.info(
+                        "Replacing worker %s session %s with %s",
+                        node.node_id,
+                        old_session or "legacy",
+                        new_session or "legacy",
+                    )
+                    self.scheduler.enqueue_leave(node.node_id)
+                    self.scheduler.enqueue_join(node)
+            else:
+                self.scheduler.enqueue_join(node)
 
             response = self.wait_layer_allocation(
                 node.node_id, wait_seconds=_node_join_allocation_wait_seconds()
@@ -86,8 +102,11 @@ class RPCConnectionHandler(ConnectionHandler):
         logger.debug(f"receive node_leave request: {message}")
         try:
             node = self.build_node(message)
+            if self._is_stale_session(node):
+                logger.warning("Ignoring stale leave from %s", node.node_id)
+                return {"accepted": False, "error": "stale_worker_session"}
             self.scheduler.enqueue_leave(node.node_id)
-            return {}
+            return {"accepted": True}
         except Exception as e:
             logger.exception(f"node_leave error: {e}")
             return {}
@@ -102,6 +121,9 @@ class RPCConnectionHandler(ConnectionHandler):
         logger.debug(f"receive node_update request: {message}")
         try:
             node = self.build_node(message)
+            if self._is_stale_session(node):
+                logger.warning("Rejecting stale heartbeat from %s", node.node_id)
+                return {"error": "stale_worker_session", "rejoin": True}, {}
             # Contribution gate: this node is heartbeating into the swarm over the
             # scheduler's own RPC channel → refresh its account lease. Only the
             # scheduler ever writes leases (clients never self-declare), so there
@@ -142,6 +164,13 @@ class RPCConnectionHandler(ConnectionHandler):
         except Exception as e:
             logger.exception(f"node_update error: {e}")
             return {}, {}
+
+    def _is_stale_session(self, incoming: Node) -> bool:
+        """Fence RPCs from a superseded process sharing the same peer id."""
+        current = self.scheduler.get_node(incoming.node_id)
+        if current is None or current.worker_session_id is None:
+            return False
+        return incoming.worker_session_id != current.worker_session_id
 
     def _model_name_for_node(self, node: Node):
         model_info = self.scheduler.model_info if self.scheduler is not None else node.model_info
@@ -266,6 +295,7 @@ class RPCConnectionHandler(ConnectionHandler):
             param_mem_ratio=node_json.get("param_mem_ratio"),
             max_concurrent_requests=node_json.get("max_concurrent_requests"),
             max_sequence_length=node_json.get("max_sequence_length"),
+            worker_session_id=node_json.get("worker_session_id"),
             is_active=node_json.get("is_active", True),
             # Worker sends its ServerState as "status" — store it in
             # `loading_phase` so the UI can show "downloading" vs "ready" vs

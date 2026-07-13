@@ -322,9 +322,14 @@ class AppleSiliconHardwareInfo(HardwareInfo):
         "M3": 7.1,
         "M3 Pro": 9.94,
         "M3 Max": 28.4,
+        "M3 Ultra": 57.34,
         "M4": 8.52,
         "M4 Pro": 17.04,
         "M4 Max": 34.08,
+        "M5": 9.37,
+        "M5 Pro": 18.74,
+        "M5 Max": 37.49,
+        "M5 Ultra": 74.98,
     }
 
     @classmethod

@@ -20,11 +20,13 @@ dependencies = [
   "msgpack>=1.0.7",
   "safetensors>=0.5.1",
   "huggingface-hub",
+  "modelscope",
   "transformers>=4.57.1",
   "jinja2>=3.1.0",
   "numpy>=1.26",
   "pyzmq>=25.0",
   "psutil>=5.9.5",
+  "requests",
   "httpx[socks]>=0.26.0",
   "aiohttp",
   "uvicorn",
@@ -43,22 +45,24 @@ parallax = "parallax.cli:main"
 [project.optional-dependencies]
 
 mac = [
-  "nanobind==2.10.2",
+  "nanobind==2.12.0",
   "torch==2.8.0",
-  "mlx-lm==0.30.6",
-  "mlx==0.30.4",
+  "mlx-lm==0.31.3",
+  "mlx==0.31.2",
 ]
 
 gpu = [
-  "sglang[all]==0.5.7",
-  "mlx-lm==0.28.4",
-  "mlx[cpu]==0.30.0",
+  "sglang[all]==0.5.12",
+  "kernels<0.15",
+  "accelerate",
+  "mlx-lm==0.31.3",
+  "mlx[cpu]==0.31.2",
 ]
 
 vllm = [
   "vllm==0.14.0",
-  "mlx-lm==0.28.4",
-  "mlx[cpu]==0.30.0",
+  "mlx-lm==0.31.3",
+  "mlx[cpu]==0.31.2",
 ]
 
 benchmark = [
@@ -66,12 +70,14 @@ benchmark = [
   "tqdm",
   "datasets",
   "pillow",
-  "modelscope",
 ]
 
 dev = [
   "black>=24.3",
+  "cmake>=3.27",
+  "ninja>=1.11",
   "ruff>=0.4",
+  "setuptools>=68",
   "pytest>=8.2",
   "pytest-mock>=3.14",
   "pytest-cov>=5.0",

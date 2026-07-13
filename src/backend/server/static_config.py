@@ -1,8 +1,7 @@
 import concurrent.futures
-import json
 import math
-from pathlib import Path
 
+from parallax.utils.utils import load_config_only
 from parallax_utils.logging_config import get_logger
 from scheduling.model_info import ModelInfo
 
@@ -32,10 +31,14 @@ MODELS = {
     "zai-org/GLM-4.5-Air": "lmstudio-community/GLM-4.5-Air-MLX-8bit",
     "zai-org/GLM-4.7": "mlx-community/GLM-4.7-4bit",
     "zai-org/GLM-4.7-Flash": "mlx-community/GLM-4.7-Flash-4bit",
-    "zai-org/GLM-4.7-Flash-FP8": "mlx-community/GLM-4.7-Flash-8bit",
+    "zai-org/GLM-5.1": "mlx-community/GLM-5.1",
+    "zai-org/GLM-5.1-FP8": "mlx-community/GLM-5.1",
+    "zai-org/GLM-5.2": "mlx-community/GLM-5.2-mxfp4",
     # Minimax M2 Models
+    "MiniMaxAI/MiniMax-M2.7": "mlx-community/MiniMax-M2.7-4bit",
     "MiniMaxAI/MiniMax-M2.1": "mlx-community/MiniMax-M2.1-4bit",
     "MiniMaxAI/MiniMax-M2": "mlx-community/MiniMax-M2-4bit",
+    "MiniMaxAI/MiniMax-M3": "mlx-community/MiniMax-M3-4bit",
     # ======================================= End ========================================#
     #
     #
@@ -82,6 +85,12 @@ MODELS = {
     "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": "mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit",
     "Qwen/Qwen3-Next-80B-A3B-Thinking": "mlx-community/Qwen3-Next-80B-A3B-Thinking-4bit",
     "Qwen/Qwen3-Next-80B-A3B-Thinking-FP8": "mlx-community/Qwen3-Next-80B-A3B-Thinking-8bit",
+    # Qwen 3.5 MoE Series
+    "Qwen/Qwen3.5-0.8B": "Qwen/Qwen3.5-0.8B",
+    "Qwen/Qwen3.5-35B-A3B": "mlx-community/Qwen3.5-35B-A3B-4bit",
+    # Qwen 3.6 Series
+    "Qwen/Qwen3.6-35B-A3B": "mlx-community/Qwen3.6-35B-A3B-4bit",
+    "Qwen/Qwen3.6-27B": "mlx-community/Qwen3.6-27B-mxfp4",
     # Qwen 3 Large MoE Models
     "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": "mlx-community/Qwen3-235B-A22B-Instruct-2507-8bit",
     "Qwen/Qwen3-235B-A22B-Thinking-2507-FP8": "mlx-community/Qwen3-235B-A22B-Thinking-2507-8bit",
@@ -98,50 +107,39 @@ NODE_JOIN_COMMAND_LOCAL_NETWORK = """parallax join"""
 NODE_JOIN_COMMAND_PUBLIC_NETWORK = """parallax join -s {scheduler_addr} """
 
 
-def get_model_info(model_name, use_hfcache: bool = False):
-    def _load_config_only(name: str) -> dict:
-        local_path = Path(name)
-        if local_path.exists():
-            config_path = local_path / "config.json"
-            with open(config_path, "r") as f:
-                return json.load(f)
-
-        # Hugging Face only – download just config.json
-        from huggingface_hub import hf_hub_download  # type: ignore
-
-        config_file = hf_hub_download(
-            repo_id=name, filename="config.json", local_files_only=use_hfcache
-        )
-        with open(config_file, "r") as f:
-            return json.load(f)
-
-    config = _load_config_only(model_name)
-
+def get_param_bytes_per_element(config, model_name: str) -> float:
     quant_method = config.get("quant_method", None)
-    quantization_config = config.get("quantization_config", None)
+    quantization_config = config.get("quantization_config") or config.get("quantization")
     if quant_method is None and quantization_config is not None:
-        quant_method = quantization_config.get("quant_method", None)
+        quant_method = quantization_config.get("quant_method") or quantization_config.get("mode")
+
+    if quantization_config is not None and quantization_config.get("bits") is not None:
+        return quantization_config["bits"] / 8
 
     if quant_method is None:
-        param_bytes_per_element = 2
+        return 2
     elif quant_method == "fp8":
-        param_bytes_per_element = 1
+        return 1
     elif quant_method in ("mxfp4", "int4", "awq", "gptq", "compressed-tensors"):
-        param_bytes_per_element = 0.5
+        return 0.5
     else:
-        param_bytes_per_element = 1
         logger.warning(
             f"model_name:{model_name} quant_method {quant_method} not supported in get_model_info method"
         )
+        return 1
+
+
+def get_model_info(model_name, use_hfcache: bool = False):
+    config = load_config_only(model_name, local_files_only=use_hfcache)
+
+    param_bytes_per_element = get_param_bytes_per_element(config, model_name)
 
     mlx_param_bytes_per_element = param_bytes_per_element
     mlx_model_name = MODELS.get(model_name, model_name)
 
     if mlx_model_name != model_name:
-        mlx_config = _load_config_only(mlx_model_name)
-        mlx_quant_dict = mlx_config.get("quantization_config", None)
-        if mlx_quant_dict and "bits" in mlx_quant_dict:
-            mlx_param_bytes_per_element = mlx_quant_dict["bits"] / 8
+        mlx_config = load_config_only(mlx_model_name, local_files_only=use_hfcache)
+        mlx_param_bytes_per_element = get_param_bytes_per_element(mlx_config, mlx_model_name)
 
     # get local experts
     num_local_experts = config.get("num_local_experts", None)
@@ -160,6 +158,7 @@ def get_model_info(model_name, use_hfcache: bool = False):
         head_size=config.get("head_dim", 128),
         qk_nope_head_dim=config.get("qk_nope_head_dim", None),
         qk_rope_head_dim=config.get("qk_rope_head_dim", None),
+        v_head_dim=config.get("v_head_dim", None),
         hidden_dim=config.get("hidden_size", 0),
         intermediate_dim=config.get("intermediate_size", 0),
         num_attention_heads=config.get("num_attention_heads", 0),

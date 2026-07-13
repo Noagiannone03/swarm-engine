@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict, deque
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Set
 
 try:
     # CacheManager is the MLX KV-cache manager (pulls the mlx-based cache
@@ -38,6 +38,14 @@ from parallax.utils.shared_state import SharedState
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def _normalize_token_ids(token_ids) -> Set[int]:
+    if token_ids is None:
+        return set()
+    if isinstance(token_ids, (list, tuple, set)):
+        return {int(token_id) for token_id in token_ids if token_id is not None}
+    return {int(token_ids)}
 
 
 class Scheduler:
@@ -57,6 +65,7 @@ class Scheduler:
         cache_manager: Optional[CacheManager] = None,
         request_timeout_s: Optional[int] = 600,
         shared_state: Optional[SharedState] = None,
+        chunked_prefill_size: Optional[int] = None,
         **kwargs,
     ):
         """
@@ -68,6 +77,7 @@ class Scheduler:
             tokenizer: The tokenizer to use for the model;
             cache_manager: The KV cache manager to use for the scheduler.
             request_timeout_s: timeout for each inflight request (default 10mins).
+            chunked_prefill_size: Max tokens to account for each prefill chunk.
         """
         self.max_batch_size = max_batch_size
         self.max_num_tokens_per_batch = max_num_tokens_per_batch
@@ -78,6 +88,15 @@ class Scheduler:
             # Load configs for building InitialRequest
             self.tokenizer = kwargs.get("tokenizer", None)
             self.eos_token_id = kwargs.get("eos_token_id", None)
+            tokenizer_eos_token_id = (
+                getattr(self.tokenizer, "eos_token_id", None)
+                if self.tokenizer is not None
+                else None
+            )
+            if self.eos_token_id is None:
+                self.eos_token_id = tokenizer_eos_token_id
+            self.eos_token_ids = _normalize_token_ids(self.eos_token_id)
+            self.eos_token_ids.update(_normalize_token_ids(tokenizer_eos_token_id))
             self.max_new_tokens = kwargs.get("max_new_tokens", 512)
             self.max_total_length = kwargs.get("max_total_length", 1024)
 
@@ -87,6 +106,7 @@ class Scheduler:
         self._running_requests: Dict[str, Request] = OrderedDict()
 
         self.cache_manager = cache_manager
+        self.chunked_prefill_size = chunked_prefill_size
         self.shared_state = shared_state
         # Default timeout for requests if not set on request object
         self.request_timeout_s = request_timeout_s
@@ -113,18 +133,8 @@ class Scheduler:
         """Gets a request that is currently in the running state."""
         return self._running_requests.get(request_id)
 
-    def _prompt_string_to_request(self, request_str: str) -> InitialRequest:
-        """Convert the prompt string to InitialRequest."""
-        assert self.is_first_peer, "Only first peer can enqueue InitialRequest."
-        input_ids = self.tokenizer.encode(request_str)
-        return InitialRequest.from_prompt_ids(
-            input_ids, self.eos_token_id, self.max_new_tokens, self.max_total_length
-        )
-
-    def enque_request(self, request: Request | str):
+    def enque_request(self, request: Request):
         """Enque a request to the scheduler's wait queue."""
-        if isinstance(request, str):
-            request = self._prompt_string_to_request(request)
 
         if request.is_finished:
             logger.warning(
@@ -135,7 +145,9 @@ class Scheduler:
 
         request.ready_for_next_step = True
         request.last_updated_time = time.time()
-        # TODO: Handle chunked prefill.
+        if request.is_prefill and getattr(request, "origin_input_ids", None) is not None:
+            request.input_ids = request.origin_input_ids
+
         if request.is_decoding:
             rid = request.request_id
             if rid not in self._running_requests:
@@ -208,28 +220,26 @@ class Scheduler:
         if not self.is_first_peer:
             return False
 
-        assert (
-            self.eos_token_id is not None
-        ), "EOS token ID must be set for request status checking."
+        if not request.sampling_params.ignore_eos:
+            assert self.eos_token_ids, "EOS token ID must be set for request status checking."
 
         last_token_id = request.output_ids[-1] if request.output_ids else None
+        can_stop = request.output_length > request.sampling_params.min_new_tokens
+        explicit_stop_token_ids = _normalize_token_ids(request.sampling_params.stop_token_ids)
         if (
             not finished
+            and can_stop
             and not request.sampling_params.ignore_eos
-            and (
-                self.eos_token_id
-                and (
-                    last_token_id == self.eos_token_id
-                    or (isinstance(self.eos_token_id, list) and last_token_id in self.eos_token_id)
-                )
-            )
+            and last_token_id is not None
+            and last_token_id in self.eos_token_ids
         ):
             request.update_status(RequestStatus.FINISHED_EOS)
             finished = True
-        elif not request.sampling_params.ignore_eos and (
-            self.tokenizer
-            and self.tokenizer.eos_token_id
-            and last_token_id == self.tokenizer.eos_token_id
+        elif (
+            not finished
+            and can_stop
+            and last_token_id is not None
+            and last_token_id in explicit_stop_token_ids
         ):
             request.update_status(RequestStatus.FINISHED_EOS)
             finished = True
@@ -267,11 +277,21 @@ class Scheduler:
         while self._wait_queue and len(self._running_requests) < cap:
             req = self._wait_queue.popleft()
             rid = req.request_id
-            if rid in self._running_requests:
+            running_req = self._running_requests.get(rid)
+            if running_req is not None:
+                if req is running_req:
+                    continue
+                if req.is_prefill and running_req.is_prefill:
+                    self._wait_queue.appendleft(req)
+                    break
+                logger.debug(f"Dropping duplicate request {rid} while status={running_req.status}.")
                 continue
 
-            # Check kv cache pool
-            if self.cache_manager is not None:
+            # Check kv cache pool. Chunked prefill performs allocation after the
+            # request is sliced to the current chunk in the executor.
+            if self.cache_manager is not None and not getattr(
+                self.cache_manager, "defer_prefill_allocation", False
+            ):
                 if not self.cache_manager.has_request(req.request_id):
                     # TODO: Handle chunked prefill, and support preemption.
                     # Pass input_ids for prefix cache matching
@@ -356,10 +376,14 @@ class Scheduler:
                     decode_candidates.append(req)
 
         # 1) Fill with prefills first
+        chunked_prefill_size = self.chunked_prefill_size
+
         for req in prefill_candidates:
             if len(batch) >= self.micro_batch_size:
                 break
-            cost = req.prompt_len
+            cost = req.prompt_len or req.total_length
+            if chunked_prefill_size is not None:
+                cost = min(cost, chunked_prefill_size)
             if cost + inflight_tokens > self.max_num_tokens_per_batch:
                 continue
             batch.append(req)

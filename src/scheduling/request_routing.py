@@ -558,7 +558,7 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
         if num_layers <= 0:
             return 0
         segments = [
-            (n.start_layer, n.end_layer, n.max_context_tokens)
+            (n.start_layer, n.end_layer, n.max_context_capacity_tokens)
             for n in self.node_manager.active_nodes
             if n.start_layer is not None and n.end_layer is not None and n.is_active
         ]

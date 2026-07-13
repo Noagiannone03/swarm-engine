@@ -8,6 +8,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool
 
 from backend.server.constants import NODE_STATUS_AVAILABLE
+from backend.server.openai_compat import (
+    decode_http_response_envelope,
+    openai_error_response,
+)
 from parallax_utils.logging_config import get_logger
 from parallax_utils.request_metrics import get_request_metrics
 from parallax_utils.stream_resume import ResumableSSEStream
@@ -15,6 +19,8 @@ from parallax_utils.stream_resume import ResumableSSEStream
 logger = get_logger(__name__)
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+PARALLAX_ROUTING_TABLE_XARG = "parallax_routing_table"
+PARALLAX_SCHEDULER_REQUEST_ID_XARG = "parallax_scheduler_request_id"
 
 # Hard cap for the synchronous lattica `response.cancel()`. When the upstream
 # worker drops mid-stream, libp2p teardown waits for an ACK that never comes
@@ -203,9 +209,7 @@ class RequestHandler:
         try:
             messages = request_data.get("messages")
             if messages:
-                ids = tok.apply_chat_template(
-                    messages, tokenize=True, add_generation_prompt=True
-                )
+                ids = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
                 prompt_tokens = len(ids)
             elif request_data.get("prompt") is not None:
                 prompt_tokens = len(tok.encode(str(request_data["prompt"])))
@@ -277,17 +281,19 @@ class RequestHandler:
         and must cancel it. Raises on any failure (so retry/resume loops re-route).
         """
         routing_table = await self._resolve_routing(
-            request_id, received_ts, max_attempts=routing_max_attempts, context_tokens=context_tokens
+            request_id,
+            received_ts,
+            max_attempts=routing_max_attempts,
+            context_tokens=context_tokens,
         )
-        request_data["rid"] = str(request_id)
-        request_data["routing_table"] = routing_table
         stub = self.get_stub(routing_table[0])
-        response = stub.chat_completion(request_data)
+        backend_request = self._prepare_backend_request(
+            request_data, str(request_id), routing_table
+        )
+        response = stub.chat_completion(backend_request)
         iterator = iterate_in_threadpool(response)
         try:
-            first_chunk = await asyncio.wait_for(
-                anext(iterator), timeout=FIRST_CHUNK_TIMEOUT_SEC
-            )
+            first_chunk = await asyncio.wait_for(anext(iterator), timeout=FIRST_CHUNK_TIMEOUT_SEC)
         except (asyncio.TimeoutError, StopAsyncIteration) as e:
             await _safe_cancel_upstream(response, request_id)
             raise RuntimeError(f"no first chunk from upstream ({type(e).__name__})") from e
@@ -298,6 +304,56 @@ class RequestHandler:
             raise RuntimeError(f"upstream worker returned invalid stream response: {first_text}")
         return response, iterator, first_chunk
 
+    def _get_model_name_for_node(self, node_id: str) -> Optional[str]:
+        try:
+            scheduler = getattr(self.scheduler_manage, "scheduler", None)
+            node = scheduler.get_node(node_id) if scheduler is not None else None
+            if node is not None:
+                if getattr(node.hardware, "device", None) == "mlx":
+                    return node.model_info.mlx_model_name
+                return node.model_info.model_name
+        except Exception as e:
+            logger.debug(f"Unable to resolve model name for node {node_id}: {e}")
+
+        try:
+            return self.scheduler_manage.get_model_name()
+        except Exception:
+            return None
+
+    def _prepare_backend_request(
+        self,
+        request_data: Dict,
+        request_id: str,
+        routing_table: List[str],
+    ) -> Dict:
+        backend_request = dict(request_data)
+        backend_request.pop("rid", None)
+        backend_request.pop("routing_table", None)
+
+        if not backend_request.get("request_id"):
+            backend_request["request_id"] = str(request_id)
+
+        model_name = self._get_model_name_for_node(routing_table[0])
+        backend_request["model"] = model_name
+
+        vllm_xargs = backend_request.get("vllm_xargs")
+        if vllm_xargs is None:
+            vllm_xargs = {}
+        elif isinstance(vllm_xargs, dict):
+            vllm_xargs = dict(vllm_xargs)
+        else:
+            logger.warning(
+                "Ignoring non-object vllm_xargs for request %s; got %s",
+                request_id,
+                type(vllm_xargs).__name__,
+            )
+            vllm_xargs = {}
+
+        vllm_xargs[PARALLAX_ROUTING_TABLE_XARG] = list(routing_table)
+        vllm_xargs[PARALLAX_SCHEDULER_REQUEST_ID_XARG] = str(request_id)
+        backend_request["vllm_xargs"] = vllm_xargs
+        return backend_request
+
     async def _forward_request(self, request_data: Dict, request_id: str, received_ts: int):
         start_time = time.time()
         logger.debug(f"Forwarding request {request_id}; stream={request_data.get('stream', False)}")
@@ -305,9 +361,11 @@ class RequestHandler:
             self.scheduler_manage is None
             or not self.scheduler_manage.get_schedule_status() == NODE_STATUS_AVAILABLE
         ):
-            return JSONResponse(
-                content={"error": "Server is not ready"},
-                status_code=500,
+            return openai_error_response(
+                "Server is not ready",
+                status_code=503,
+                err_type="server_unavailable",
+                code="server_not_ready",
             )
 
         # --- Context-aware routing ---
@@ -322,7 +380,9 @@ class RequestHandler:
             if capacity and context_tokens > capacity:
                 logger.info(
                     "Rejecting request %s: context %d > swarm capacity %d",
-                    request_id, context_tokens, capacity,
+                    request_id,
+                    context_tokens,
+                    capacity,
                 )
                 return JSONResponse(
                     status_code=413,
@@ -371,24 +431,34 @@ class RequestHandler:
                     )
                     logger.debug(f"Streaming response initiated for {request_id}")
                     return resp
-
                 # Non-streaming path.
                 routing_table = await self._resolve_routing(
                     request_id, received_ts, context_tokens=context_tokens
                 )
-                request_data["rid"] = str(request_id)
-                request_data["routing_table"] = routing_table
                 stub = self.get_stub(routing_table[0])
-                response = stub.chat_completion(request_data)
-                content = (
-                    await asyncio.wait_for(
-                        anext(iterate_in_threadpool(response)), timeout=FIRST_CHUNK_TIMEOUT_SEC
-                    )
-                ).decode()
-                if content.strip() == "internal server error":
+                backend_request = self._prepare_backend_request(
+                    request_data, str(request_id), routing_table
+                )
+                response = stub.chat_completion(backend_request)
+                content = await asyncio.wait_for(
+                    anext(iterate_in_threadpool(response)), timeout=FIRST_CHUNK_TIMEOUT_SEC
+                )
+                if content.decode(errors="replace").strip() == "internal server error":
                     raise RuntimeError("upstream worker returned internal server error")
+                decoded_response = decode_http_response_envelope(content)
+                if decoded_response is None:
+                    status_code = 200
+                    content_type = "application/json"
+                    body = content
+                else:
+                    status_code, content_type, body = decoded_response
                 logger.debug(f"Non-stream response completed for {request_id}")
-                return Response(content=content, media_type="application/json")
+                return Response(
+                    content=body,
+                    status_code=status_code,
+                    headers={"content-type": content_type},
+                    media_type=None,
+                )
             except _NoRoute as nr:
                 return JSONResponse(content=nr.content, status_code=nr.status_code)
             except Exception as e:
@@ -402,9 +472,11 @@ class RequestHandler:
                     await asyncio.sleep(self.FORWARD_DELAY_SEC)
                 logger.warning(f"Error in _forward_request: {e}. Retry attempts {forward_attempts}")
 
-        return JSONResponse(
-            content={"error": "Internal server error"},
-            status_code=500,
+        return openai_error_response(
+            "Downstream request failed",
+            status_code=502,
+            err_type="upstream_error",
+            code="upstream_error",
         )
 
     async def _resilient_stream(

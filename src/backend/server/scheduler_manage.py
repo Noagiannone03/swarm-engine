@@ -48,9 +48,7 @@ def _scheduler_runtime_overrides() -> dict:
     if strategy in ("greedy", "dp"):
         overrides["strategy"] = strategy
     elif strategy:
-        logger.warning(
-            "Ignoring PARALLAX_STRATEGY=%r (expected 'greedy' or 'dp')", strategy
-        )
+        logger.warning("Ignoring PARALLAX_STRATEGY=%r (expected 'greedy' or 'dp')", strategy)
 
     # Request-router mode. "rr" (round-robin over fixed, node-disjoint pipelines)
     # is the upstream default; "dp" (dynamic-programming per-request routing) is
@@ -65,9 +63,7 @@ def _scheduler_runtime_overrides() -> dict:
     if routing in ("rr", "dp"):
         overrides["routing_strategy"] = routing
     elif routing:
-        logger.warning(
-            "Ignoring PARALLAX_ROUTING_STRATEGY=%r (expected 'rr' or 'dp')", routing
-        )
+        logger.warning("Ignoring PARALLAX_ROUTING_STRATEGY=%r (expected 'rr' or 'dp')", routing)
 
     raw_timeout = os.environ.get("PARALLAX_HEARTBEAT_TIMEOUT", "").strip()
     if raw_timeout:
@@ -77,9 +73,7 @@ def _scheduler_runtime_overrides() -> dict:
                 raise ValueError("must be > 0")
             overrides["heartbeat_timeout"] = timeout
         except ValueError as exc:
-            logger.warning(
-                "Ignoring PARALLAX_HEARTBEAT_TIMEOUT=%r (%s)", raw_timeout, exc
-            )
+            logger.warning("Ignoring PARALLAX_HEARTBEAT_TIMEOUT=%r (%s)", raw_timeout, exc)
 
     return overrides
 
@@ -275,9 +269,7 @@ class SchedulerManage:
         # "failed_capacity" (allocation tried, can't fit) vs "pending" (still
         # running) without polling intervals. Falls back to None when the
         # scheduler hasn't been initialized yet (model not set).
-        last_bootstrap_result = (
-            self.scheduler.last_bootstrap_result if self.scheduler else None
-        )
+        last_bootstrap_result = self.scheduler.last_bootstrap_result if self.scheduler else None
         last_bootstrap_attempt_ts = (
             self.scheduler.last_bootstrap_attempt_ts if self.scheduler else 0.0
         )
@@ -297,6 +289,10 @@ class SchedulerManage:
                 "max_running_request": (
                     self.scheduler.report_pipeline_capacity()[1] if self.scheduler else 0
                 ),
+                # Stable, load-independent model window. Request-time routing
+                # still uses live KV headroom, but clients must not reconfigure
+                # compaction merely because another request temporarily occupies it.
+                "max_context_tokens": self.max_context_capacity(),
                 # Pipeline/routing readiness — the IDE gates the Fabi model on
                 # these (registry republishes them, pushed to clients over SSE).
                 **self.get_pipeline_readiness(),
@@ -401,11 +397,7 @@ class SchedulerManage:
         logger.debug(
             f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns={mdns_enabled}, dht_prefix={self.dht_prefix}"
         )
-        self.lattica = (
-            Lattica.builder()
-            .with_listen_addrs(self.host_maddrs)
-            .with_key_path(".")
-        )
+        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(".")
         if not mdns_enabled:
             self.lattica.with_mdns(False)
 

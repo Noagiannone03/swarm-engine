@@ -21,6 +21,12 @@ from parallax.server.request import (
 from parallax.server.sampling.sampler import SamplingBatchInfo
 from parallax.server.server_info import resolve_mlx_wired_limit_bytes
 from parallax.server.shard_loader import MLXModelLoader
+from parallax.utils.chunked_prefill import (
+    complete_local_middle_chunk,
+    filter_middle_chunk_next_batch,
+)
+from parallax.utils.layer_types import INDEX_CACHE_LAYER_TYPES, MLA_CACHE_LAYER_TYPES
+from parallax.utils.mac_prefill_adder import AddReqResult, MACPrefillAdder
 from parallax.utils.utils import (
     combine_padding_and_causal_masks,
     create_causal_mask,
@@ -92,6 +98,7 @@ class MLXExecutor(BaseExecutor):
         # Weight Refit
         enable_weight_refit: Optional[bool] = False,
         weight_refit_mode: Optional[str] = "disk",
+        chunked_prefill_size: Optional[int] = None,
         # Pipe communication
         conn: Optional[List[Any]] = [],
     ):
@@ -171,15 +178,19 @@ class MLXExecutor(BaseExecutor):
 
         index_head_dim = self.config.get("index_head_dim", None)
         index_n_heads = self.config.get("index_n_heads", None)
+        kv_lora_rank = self.config.get("kv_lora_rank", None)
 
         layer_types = get_layer_types(self.config, start_layer, end_layer)
+        uses_mla_cache = any(t in MLA_CACHE_LAYER_TYPES for t in layer_types)
+        uses_index_cache = any(t in INDEX_CACHE_LAYER_TYPES for t in layer_types)
+        index_key_heads = 1 if uses_index_cache else None
         sliding_window = self.config.get("sliding_window", None)
         use_sliding_window = self.config.get("use_sliding_window", None)
         if use_sliding_window is False:
             sliding_window = None
 
         # Validate and adjust block size for Metal backend
-        supported_block_sizes = [8, 16, 32, 64]
+        supported_block_sizes = [1, 8, 16, 32, 64]
         if kv_block_size not in supported_block_sizes:
             nearest_block_size = min(supported_block_sizes, key=lambda x: abs(x - kv_block_size))
             logger.warning(
@@ -194,6 +205,21 @@ class MLXExecutor(BaseExecutor):
             kv_block_size,
             self.num_shard_layers,
         )
+        normalized_chunked_prefill_size = None
+        if chunked_prefill_size is not None:
+            if chunked_prefill_size < 0:
+                raise ValueError("chunked_prefill_size must be non-negative")
+            if chunked_prefill_size == 0:
+                chunked_prefill_size = None
+            elif not enable_prefix_cache:
+                raise ValueError(
+                    "Chunked prefill is not supported when disable prefix cache, please enable prefix cache or set --chunked-prefill-size 0"
+                )
+            else:
+                normalized_chunked_prefill_size = (
+                    (chunked_prefill_size + kv_block_size - 1) // kv_block_size * kv_block_size
+                )
+
         self.cache_manager = CacheManager(
             num_layers=self.num_shard_layers,
             num_kv_heads=num_key_value_heads // tp_size,
@@ -202,8 +228,11 @@ class MLXExecutor(BaseExecutor):
             block_size=kv_block_size,
             cache_memory_fraction=kv_cache_memory_fraction,
             head_dim_v=v_head_dim,
-            index_head_dim=index_head_dim,
-            index_n_heads=index_n_heads,
+            index_head_dim=index_head_dim if uses_index_cache else None,
+            index_n_heads=index_n_heads if uses_index_cache else None,
+            index_key_heads=index_key_heads,
+            kv_lora_rank=kv_lora_rank if uses_mla_cache else None,
+            qk_rope_head_dim=qk_rope_head_dim if uses_mla_cache else None,
             layer_types=layer_types,
             max_num_seqs=max_batch_size // micro_batch_ratio,
             conv_dim=conv_dim,
@@ -214,7 +243,13 @@ class MLXExecutor(BaseExecutor):
             linear_num_v_heads=linear_num_value_heads,
             enable_prefix_cache=enable_prefix_cache,
             sliding_window=sliding_window,
+            chunked_prefill_size=normalized_chunked_prefill_size,
         )
+
+        self.chunked_prefill_size = normalized_chunked_prefill_size
+        self.cache_manager.chunked_prefill_size = self.chunked_prefill_size
+        self.cache_manager.defer_prefill_allocation = self.chunked_prefill_size is not None
+
         super().__init__(
             start_layer=start_layer,
             end_layer=end_layer,
@@ -237,11 +272,14 @@ class MLXExecutor(BaseExecutor):
             shared_state=shared_state,
             enable_weight_refit=enable_weight_refit,
             weight_refit_mode=weight_refit_mode,
+            chunked_prefill_size=self.chunked_prefill_size,
+            kv_block_size=kv_block_size,
             conn=conn,
         )
 
         # Prefix Cache Manager
         self.enable_prefix_cache = enable_prefix_cache
+        self.chunked_req = None
         # self.prefix_cache = RadixCache(
         #     num_kv_heads=num_key_value_heads,
         #     head_dim=head_dim,
@@ -280,8 +318,17 @@ class MLXExecutor(BaseExecutor):
         data = pickle.loads(np.array(data_arr).tobytes())
         return data
 
+    def _complete_local_middle_chunk(self, request_id: str):
+        """Finish local bookkeeping after this peer runs a non-final prefill chunk."""
+        complete_local_middle_chunk(
+            self,
+            request_id,
+            release_callback=self.cache_manager.release_request,
+        )
+
     def handle_input_requests(self, requests: List[Request]):
         """Update requests states and status in scheduler and cache manager."""
+        mx.eval(mx.zeros(1024))
         if self.tp_size > 1:
             requests = self._tensor_parallel_broadcast_pyobj(requests)
 
@@ -332,29 +379,12 @@ class MLXExecutor(BaseExecutor):
                     else:
                         self.scheduler.enque_request(original_req)
 
-                    # detokenize and send to http server
+                    # Send token/terminal update to the Rust frontend.
                     if self.tp_rank == 0:
-                        # Only send token if it's valid
-                        token_to_send = req.next_token_id if req.next_token_id is not None else -1
-                        req_dict = {
-                            "prompt_tokens": len(req.input_ids),
-                            "next_token_id": token_to_send,
-                            "rid": req.request_id,
-                        }
-                        if original_req.status == RequestStatus.FINISHED_EOS:
-                            req_dict["eos"] = True
-                        if original_req.status == RequestStatus.FINISHED_MAX_LENGTH:
-                            req_dict["length"] = True
-                        if original_req.status == RequestStatus.FINISHED_ABORT:
-                            req_dict["abort"] = True
-
-                        # Add prob value for the sampled token (if requested and available)
-                        if original_req.return_probs and req.token_prob is not None:
-                            req_dict["probs"] = req.token_prob
-                        if self.enable_weight_refit:
-                            req_dict["weight_version"] = self.weight_version
-                        if hasattr(self, "send_to_ipc_socket"):
-                            self.send_to_ipc_socket.send_pyobj(req_dict)
+                        self.send_engine_core_request_output(
+                            request=original_req,
+                            token_id=req.next_token_id,
+                        )
                 else:
                     raise TypeError(f"First peer received unexpected request type: {type(req)}")
 
@@ -365,11 +395,6 @@ class MLXExecutor(BaseExecutor):
                     req, IntermediateRequest
                 ), "Non-first peers must receive IntermediateRequests."
                 if req.is_finished or req.hidden_states is None:
-                    if self.enable_prefix_cache:
-                        keys, values = self.cache_manager.gather_kv_cache(req.request_id)
-                        self.prefix_cache.cache_finished_request(req, keys, values)
-                        self.prefix_cache.evict_request(req.request_id)
-
                     self.cache_manager.release_request(req.request_id)
                     logger.debug(
                         f"Released resources for finished request {req.request_id}, "
@@ -381,6 +406,17 @@ class MLXExecutor(BaseExecutor):
                 else:
                     # This is an active request, add it to the scheduler queue to be processed.
                     self.scheduler.enque_request(req)
+
+    def prepare_next_batch_requests(
+        self, requests: List[Request], batch_output: Any, context_lengths: Any
+    ) -> List[Request]:
+        next_batch = super().prepare_next_batch_requests(requests, batch_output, context_lengths)
+        return filter_middle_chunk_next_batch(
+            self,
+            requests,
+            next_batch,
+            release_callback=self.cache_manager.release_request,
+        )
 
     def process_batch(self, prepared_inputs: Dict[str, Any], return_decoded_tokens: bool = True):
         """Process a batch of requests in MLX."""
@@ -404,6 +440,9 @@ class MLXExecutor(BaseExecutor):
             prefix_lens=prepared_inputs.get("prefix_lens"),  # For RoPE offset in prefix cache
         )
         mx.eval(hidden_states)
+
+        if self.cache_manager.needs_slots:
+            self.cache_manager.materialize_linear_caches()
 
         if logger.isEnabledFor(logging.DEBUG):
             forward_time = (time.time() - start_time) * 1000
@@ -457,6 +496,8 @@ class MLXExecutor(BaseExecutor):
 
         # Update prefix cache: insert full blocks after prefill
         if self.enable_prefix_cache:
+            if is_prefill_batch:
+                mx.synchronize()
             for req in requests:
                 if req.is_prefill:
                     # Insert all full blocks from this prefill into the prefix cache
@@ -531,6 +572,46 @@ class MLXExecutor(BaseExecutor):
         if batch_size == 0:
             return None
 
+        if self.chunked_prefill_size is not None:
+            original_batched_requests = batched_requests
+            adder = MACPrefillAdder(
+                self.cache_manager.block_size, self.chunked_prefill_size, self.cache_manager
+            )
+            chunked_rid = self.chunked_req.rid if self.chunked_req is not None else None
+
+            if self.chunked_req is not None and chunked_rid in [
+                req.request_id for req in original_batched_requests
+            ]:
+                self.chunked_req = [
+                    req for req in original_batched_requests if req.request_id == chunked_rid
+                ][0]
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
+            for old_req in original_batched_requests:
+                if chunked_rid is not None and old_req.request_id == chunked_rid:
+                    continue
+                res = adder.add_one_req(old_req)
+                if res != AddReqResult.CONTINUE:
+                    break
+
+            if adder.new_chunked_req is not None:
+                self.chunked_req = adder.new_chunked_req
+
+            if self.chunked_req is not None and self.chunked_req.rid in [
+                req.request_id for req in original_batched_requests
+            ]:
+                self.chunked_req.is_chunked = True
+
+            can_run_by_id = {req.request_id: req for req in adder.can_run_list}
+            batched_requests = [
+                can_run_by_id[req.request_id]
+                for req in original_batched_requests
+                if req.request_id in can_run_by_id
+            ]
+            batch_size = len(batched_requests)
+            if batch_size == 0:
+                return None
+
         h_or_tokens_list = []
         block_tables_list = []
         context_lengths_list = []
@@ -547,7 +628,9 @@ class MLXExecutor(BaseExecutor):
                 token_ids = req.input_ids
 
             success, matched_tokens = self.cache_manager.allocate_request(
-                req.request_id, req.total_length, token_ids=token_ids
+                req.request_id,
+                req.total_length,
+                token_ids=token_ids,
             )
             if not success:
                 raise RuntimeError(f"OOM during prefill allocation for {req.request_id}")
@@ -579,14 +662,14 @@ class MLXExecutor(BaseExecutor):
                     actual_processed_lengths_list.append(len(req.input_ids))
             else:
                 if matched_tokens > 0 and self.enable_prefix_cache:
-                    # Skip the prefix hidden states that correspond to cached tokens
-                    new_hidden = req.hidden_states[matched_tokens:]
-                    if new_hidden.shape[0] == 0:
+                    keep_len = req.total_length - matched_tokens
+                    if keep_len <= 0:
                         # All tokens cached - keep the last hidden state
                         new_hidden = req.hidden_states[-1:]
                         prefix_lens_list[-1] = matched_tokens - 1
                         actual_processed_lengths_list.append(1)
                     else:
+                        new_hidden = req.hidden_states[-keep_len:]
                         actual_processed_lengths_list.append(new_hidden.shape[0])
                     h_or_tokens_list.append(new_hidden)
                 else:
@@ -605,33 +688,34 @@ class MLXExecutor(BaseExecutor):
         else:
             padded_inputs, padding_mask = pad_inputs(0, h_or_tokens_list, self.dtype)
 
-        # Generate slot_mapping for prefill (only for NEW tokens, starting from prefix_len)
-        max_len = padded_inputs.shape[1]
-        slot_mapping_flat = []
+        slot_mapping_tensor = None
+        if self.cache_manager.needs_blocks:
+            # Generate slot_mapping for prefill (only for NEW tokens, starting from prefix_len)
+            max_len = padded_inputs.shape[1]
+            slot_mapping_flat = []
 
-        for i, req in enumerate(batched_requests):
-            block_table = block_tables_list[i]
-            prefix_len = prefix_lens_list[i]
-            total_len = req.total_length
-            new_tokens_len = total_len - prefix_len
+            for i, req in enumerate(batched_requests):
+                block_table = block_tables_list[i]
+                prefix_len = prefix_lens_list[i]
+                total_len = req.total_length
+                new_tokens_len = total_len - prefix_len
 
-            for seq_idx in range(max_len):
-                if seq_idx < new_tokens_len:
-                    # Valid new token - map to position after prefix
-                    actual_pos = prefix_len + seq_idx
-                    block_idx = actual_pos // self.cache_manager.block_size
-                    block_offset = actual_pos % self.cache_manager.block_size
-                    physical_block = block_table[block_idx]
-                    slot = physical_block * self.cache_manager.block_size + block_offset
-                    slot_mapping_flat.append(slot)
-                else:
-                    # Padding token
-                    # Map to -1. The kernel should ignore this.
-                    slot_mapping_flat.append(-1)
+                for seq_idx in range(max_len):
+                    if seq_idx < new_tokens_len:
+                        # Valid new token - map to position after prefix
+                        actual_pos = prefix_len + seq_idx
+                        block_idx = actual_pos // self.cache_manager.block_size
+                        block_offset = actual_pos % self.cache_manager.block_size
+                        physical_block = block_table[block_idx]
+                        slot = physical_block * self.cache_manager.block_size + block_offset
+                        slot_mapping_flat.append(slot)
+                    else:
+                        # Padding token. The kernel should ignore this.
+                        slot_mapping_flat.append(-1)
 
-        slot_mapping_tensor = mx.array(slot_mapping_flat, dtype=mx.int64)
+            slot_mapping_tensor = mx.array(slot_mapping_flat, dtype=mx.int64)
 
-        # Pad block tables
+        # Pad block tables. Linear-only shards do not allocate KV blocks.
         max_blocks = max(len(bt) for bt in block_tables_list)
         padded_block_tables = []
         for bt in block_tables_list:
@@ -697,18 +781,12 @@ class MLXExecutor(BaseExecutor):
                 # Add to finished_batch to trigger abort notification
                 self.finished_batch.append(req)
 
-                # If this is First Peer, we must also notify HTTP Server immediately
+                # If this is First Peer, notify the Rust frontend immediately.
                 if self.is_first_peer and self.tp_rank == 0:
-                    req_dict = {
-                        "prompt_tokens": req.prompt_len,
-                        "next_token_id": (
-                            req.output_ids[-1] if req.output_ids else -1
-                        ),  # Best effort to return last token
-                        "rid": req.request_id,
-                        "abort": True,
-                    }
-                    if hasattr(self, "send_to_ipc_socket"):
-                        self.send_to_ipc_socket.send_pyobj(req_dict)
+                    self.send_engine_core_request_output(
+                        request=req,
+                        token_id=None,
+                    )
 
                 continue
 
@@ -744,7 +822,7 @@ class MLXExecutor(BaseExecutor):
             padded_inputs = mx.concatenate(h_or_tokens_list, axis=0)  # (Batch, D)
             padded_inputs = padded_inputs.reshape(batch_size, 1, -1)  # (Batch, 1, D)
 
-        # Pad block tables
+        # Pad block tables. Linear-only shards do not allocate KV blocks.
         max_blocks = max(len(bt) for bt in block_tables_list)
         padded_block_tables = []
         for bt in block_tables_list:
@@ -752,6 +830,16 @@ class MLXExecutor(BaseExecutor):
 
         block_tables_tensor = mx.array(padded_block_tables, dtype=mx.int32)
         context_lengths_tensor = mx.array(context_lengths_list, dtype=mx.int32)
+
+        slot_mapping_tensor = None
+        if self.cache_manager.needs_blocks:
+            slots = []
+            for block_table, context_len in zip(block_tables_list, context_lengths_list):
+                token_pos = context_len - 1
+                block_idx = token_pos // self.cache_manager.block_size
+                block_offset = token_pos % self.cache_manager.block_size
+                slots.append(block_table[block_idx] * self.cache_manager.block_size + block_offset)
+            slot_mapping_tensor = mx.array(slots, dtype=mx.int64)
 
         # Prepare state slot mapping if needed
         state_slot_mapping = None
@@ -767,7 +855,7 @@ class MLXExecutor(BaseExecutor):
             "requests": valid_requests,
             "block_tables": block_tables_tensor,
             "context_lengths": context_lengths_tensor,
-            "slot_mapping": None,
+            "slot_mapping": slot_mapping_tensor,
             "state_slot_mapping": state_slot_mapping,
         }
         logger.debug(f"Prepared MLX decode batch (size={batch_size})")

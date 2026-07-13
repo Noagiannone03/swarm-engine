@@ -109,6 +109,16 @@ class Request:
         self.last_updated_time: Optional[float] = None
         self.lora_id: Optional[str] = None
         self.lora_path = lora_path
+        self.rid = self.request_id
+        self.is_chunked = False
+        # Full prompt tokens as received from the client. Chunked prefill may
+        # temporarily shorten input_ids to the prefix visible to the current
+        # chunk, so keep this immutable source for later chunks and decode.
+        self.origin_input_ids = list(input_ids) if input_ids is not None else None
+        # Optional logical sequence length override for chunked prefill. When
+        # set, total_length reports the end offset of the current prompt chunk
+        # instead of the final prompt+output length.
+        self._effective_total_length: Optional[int] = None
 
     @property
     def is_finished(self) -> bool:
@@ -161,6 +171,7 @@ class InitialRequest(Request):
         status: RequestStatus = RequestStatus.PREFILLING,
         lora_path: Optional[str] = None,
         return_probs: bool = False,
+        routing_table: Optional[List[str]] = None,
     ):
         if not prompt and not input_ids:
             raise ValueError("prompt or input_ids cannot be empty.")
@@ -169,6 +180,7 @@ class InitialRequest(Request):
             status=status,
             prompt_len=len(input_ids) if input_ids else 0,
             input_ids=input_ids,
+            routing_table=routing_table or [],
             sampling_params=sampling_params,
             lora_path=lora_path,
         )
@@ -199,7 +211,9 @@ class InitialRequest(Request):
 
     @property
     def total_length(self) -> int:
-        """Total length of the sequence (input + output)."""
+        """Logical sequence length for scheduling/cache allocation."""
+        if self._effective_total_length is not None:
+            return self._effective_total_length
         return self.prompt_len + self.output_length
 
     def get_model_input_for_first_peer(self) -> List[int]:
@@ -223,6 +237,10 @@ class InitialRequest(Request):
                 f"Request {self.request_id}: Attempted to commit token to a finished request."
             )
             return
+
+        self._effective_total_length = None
+        if self.origin_input_ids is not None:
+            self.input_ids = self.origin_input_ids
 
         self.output_ids.append(token_id)
 
@@ -300,7 +318,9 @@ class IntermediateRequest(Request):
 
     @property
     def total_length(self) -> int:
-        """Total length of the sequence (input + output)."""
+        """Logical sequence length for scheduling/cache allocation."""
+        if self._effective_total_length is not None:
+            return self._effective_total_length
         return self.current_position
 
     @classmethod
@@ -335,7 +355,7 @@ class IntermediateRequest(Request):
         return IntermediateRequest(
             request_id=initial_request.request_id,
             status=initial_request.status,
-            input_ids=initial_request.input_ids,
+            input_ids=initial_request.origin_input_ids,
             next_token_id=next_token_id,
             current_position=initial_request.total_length,
             hidden_states=hidden_states,
@@ -362,7 +382,7 @@ class IntermediateRequest(Request):
             request_id=old_request.request_id,
             status=old_request.status,
             current_position=old_request.total_length,
-            input_ids=old_request.input_ids,
+            input_ids=old_request.origin_input_ids,
             next_token_id=old_request.next_token_id,
             hidden_states=new_hidden_states,
             routing_table=old_request.routing_table,

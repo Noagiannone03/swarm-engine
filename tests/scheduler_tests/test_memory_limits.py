@@ -72,11 +72,14 @@ def test_explicit_worker_memory_override_also_controls_cuda(monkeypatch):
 
 
 def test_derive_max_batch_size_treats_zero_cache_as_capacity_limit():
-    assert derive_max_batch_size(
-        requested_max_batch_size=8,
-        max_sequence_len=32768,
-        max_tokens_in_cache=0,
-    ) == 1
+    assert (
+        derive_max_batch_size(
+            requested_max_batch_size=8,
+            max_sequence_len=32768,
+            max_tokens_in_cache=0,
+        )
+        == 1
+    )
 
 
 def test_node_max_requests_is_clamped_by_kv_capacity():
@@ -101,3 +104,26 @@ def test_node_max_requests_is_clamped_by_kv_capacity():
     node.set_layer_allocation(0, 36)
 
     assert node.max_requests == 1
+
+
+def test_live_zero_kv_headroom_is_a_hard_context_limit():
+    model = build_model_info(12)
+    hardware = NodeHardwareInfo(
+        node_id="busy",
+        num_gpus=1,
+        tflops_fp16=8.0,
+        gpu_name="busy",
+        memory_gb=24.0,
+        memory_bandwidth_gbps=100.0,
+        device="cuda",
+    )
+    node = Node(
+        node_id="busy",
+        hardware=hardware,
+        model_info=model,
+        max_sequence_length=65536,
+        reported_kv_free_tokens=0,
+    )
+    node.set_layer_allocation(0, 12)
+
+    assert node.max_context_tokens == 0

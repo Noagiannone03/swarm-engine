@@ -61,7 +61,7 @@ def test_optimal_path_single_node():
 
 
 def test_optimal_path_missing_rtt():
-    """If RTT is missing between two nodes in a path, it should be invalid."""
+    """A missing RTT uses the conservative estimator instead of killing the route."""
     num_layers = 12
     model = build_model(num_layers)
     n1 = build_node("n1", model, tflops=200.0, x=0.0, y=0.0)
@@ -82,8 +82,8 @@ def test_optimal_path_missing_rtt():
     router = DynamicProgrammingRouting(node_manager, total_layers=num_layers)
     node_ids, latency = router.find_optimal_path()
 
-    assert node_ids == []
-    assert latency == float("inf")
+    assert node_ids == ["n1", "n2"]
+    assert latency < float("inf")
 
 
 @pytest.mark.parametrize(

@@ -1,12 +1,11 @@
 """Utility functions."""
 
 from __future__ import annotations
-
 import json
 import random
 import socket
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 import numpy as np
 import psutil
@@ -21,7 +20,14 @@ try:
 except ImportError:  # pragma: no cover - exercised on Windows
     mx = None
 
-from parallax.utils.selective_download import download_metadata_only
+from parallax.utils.layer_types import (
+    ATTENTION,
+    DSA_ATTENTION,
+    LINEAR,
+    MLA_ATTENTION,
+    MSA_ATTENTION,
+)
+from parallax.utils.model_download import download_model_file
 
 
 def load_config(model_path) -> dict:
@@ -57,10 +63,7 @@ def is_mps_available():
 def is_metal_available():
     """Check if MLX Metal backend is available"""
     try:
-        import mlx.core as mx
-
-        mx.metal.device_info()
-        return True
+        return mx.metal.is_available()
     except (RuntimeError, AttributeError, ImportError):
         return False
 
@@ -73,7 +76,7 @@ def get_current_device():
     device = "cpu"
     if is_cuda_available():
         device = "cuda"
-    if is_mps_available():
+    if is_metal_available():
         device = "mlx"
     return device
 
@@ -322,14 +325,111 @@ def combine_padding_and_causal_masks(
     return causal_mask + padding_mask_float
 
 
-def fetch_model_from_hf(name: str, local_files_only: bool = False):
-    """Fetch model from huggingface and returns model config"""
-
-    if local_files_only:
-        model_path = download_metadata_only(name, local_files_only=local_files_only)
+def load_config_only(name: str, local_files_only: bool = False):
+    """Load only config.json from a local path or Hugging Face repo."""
+    local_path = Path(name)
+    if local_path.exists():
+        config_file = local_path / "config.json"
     else:
-        model_path = _download(name)
-    config = load_config(model_path)
+        config_file = Path(
+            download_model_file(
+                repo_id=name,
+                filename="config.json",
+                local_files_only=local_files_only,
+            )
+        )
+
+    with open(config_file, "r") as f:
+        return normalize_model_config(json.load(f))
+
+
+def _normalize_quantization_key(key: str) -> str:
+    """Map VLM text tower quantization keys to the text-only key layout."""
+    prefixes = ("model.language_model.", "language_model.")
+    for prefix in prefixes:
+        if not key.startswith(prefix):
+            continue
+        suffix = key[len(prefix) :]
+        if suffix.startswith("model.lm_head."):
+            return suffix.replace("model.", "", 1)
+        if suffix.startswith("model.") or suffix.startswith("lm_head."):
+            return suffix
+        return f"model.{suffix}"
+    return key
+
+
+def _normalize_quantization_config(quantization: Any) -> Any:
+    if not isinstance(quantization, dict):
+        return quantization
+
+    normalized = {}
+    for key, value in quantization.items():
+        if isinstance(value, dict):
+            normalized[_normalize_quantization_key(key)] = _normalize_quantization_config(value)
+        elif key == "ignored_layers" and isinstance(value, list):
+            normalized[key] = [
+                _normalize_quantization_key(layer) if isinstance(layer, str) else layer
+                for layer in value
+            ]
+        else:
+            normalized[key] = value
+    return normalized
+
+
+def normalize_model_config(config: dict) -> dict:
+    """Expose nested text model fields at the top level for VLM-style configs."""
+    text_config = config.get("text_config")
+    if config.get("model_type") in {"qwen3_5", "qwen3_5_moe"} and isinstance(text_config, dict):
+        normalized = {**config, **text_config}
+        normalized["model_type"] = config["model_type"]
+        normalized["architectures"] = config.get("architectures", normalized.get("architectures"))
+        normalized["tie_word_embeddings"] = text_config.get(
+            "tie_word_embeddings", config.get("tie_word_embeddings", False)
+        )
+        return normalized
+    if config.get("model_type") == "minimax_m3_vl" and isinstance(text_config, dict):
+        normalized = {**config, **text_config}
+        normalized["model_type"] = "minimax_m3"
+        normalized["original_model_type"] = config["model_type"]
+        normalized["architectures"] = text_config.get("architectures") or [
+            "MiniMaxM3SparseForCausalLM"
+        ]
+        normalized["tie_word_embeddings"] = text_config.get(
+            "tie_word_embeddings", config.get("tie_word_embeddings", False)
+        )
+
+        sparse_config = normalized.get("sparse_attention_config")
+        if isinstance(sparse_config, dict):
+            normalized["index_head_dim"] = sparse_config.get(
+                "sparse_index_dim", normalized.get("index_head_dim")
+            )
+            # MiniMax-M3 stores a single sparse index key head; sparse_num_index_heads
+            # is the number of query heads used for block selection.
+            normalized["index_n_heads"] = normalized.get("index_n_heads", 1)
+            normalized["index_block_size"] = sparse_config.get(
+                "sparse_block_size", normalized.get("index_block_size")
+            )
+            normalized["index_topk_blocks"] = sparse_config.get(
+                "sparse_topk_blocks", normalized.get("index_topk_blocks")
+            )
+            normalized["index_local_blocks"] = sparse_config.get(
+                "sparse_local_block", normalized.get("index_local_blocks")
+            )
+
+        if (
+            normalized.get("moe_intermediate_size") is None
+            and normalized.get("intermediate_size") is not None
+        ):
+            normalized["moe_intermediate_size"] = normalized["intermediate_size"]
+
+        for quantization_key in ("quantization", "quantization_config"):
+            if quantization_key in normalized:
+                normalized[quantization_key] = _normalize_quantization_config(
+                    normalized[quantization_key]
+                )
+        if "quantization" not in normalized and "quantization_config" in normalized:
+            normalized["quantization"] = normalized["quantization_config"]
+        return normalized
     return config
 
 
@@ -363,8 +463,27 @@ def initialize_nccl_port():
     return nccl_port
 
 
+def _attention_cache_layer_type(config: dict) -> str:
+    model_type = config.get("model_type")
+    if model_type == "minimax_m3":
+        return MSA_ATTENTION
+
+    has_mla_cache = (
+        config.get("kv_lora_rank") is not None and config.get("qk_rope_head_dim") is not None
+    )
+    has_dsa_index = (
+        config.get("index_head_dim") is not None and config.get("index_n_heads") is not None
+    )
+    if has_mla_cache and has_dsa_index:
+        return DSA_ATTENTION
+    if has_mla_cache and model_type in {"deepseek_v3", "kimi_k2"}:
+        return MLA_ATTENTION
+    return ATTENTION
+
+
 def get_layer_types(config: dict, start_layer: int, end_layer: int) -> List[str]:
     num_shard_layers = end_layer - start_layer
+    attention_type = _attention_cache_layer_type(config)
 
     # Case 1: Explicit layer types (e.g., DeepSeek with layers_block_type)
     layer_types = config.get("layers_block_type", None)
@@ -372,7 +491,7 @@ def get_layer_types(config: dict, start_layer: int, end_layer: int) -> List[str]
         if len(layer_types) >= end_layer:
             layer_types = layer_types[start_layer:end_layer]
         return [
-            "linear" if t in ["mamba", "linear_attention"] else "attention" for t in layer_types
+            LINEAR if t in ["mamba", "linear_attention"] else attention_type for t in layer_types
         ]
 
     # Case 2: linear_attn_config with full_attn_layers (e.g., Kimi)
@@ -382,9 +501,9 @@ def get_layer_types(config: dict, start_layer: int, end_layer: int) -> List[str]
         layer_types = []
         for i in range(start_layer, end_layer):
             if i in full_attn_layers:
-                layer_types.append("attention")
+                layer_types.append(attention_type)
             else:
-                layer_types.append("linear")
+                layer_types.append(LINEAR)
         return layer_types
 
     # Case 3: full_attention_interval (e.g., Qwen3Next)
@@ -393,8 +512,8 @@ def get_layer_types(config: dict, start_layer: int, end_layer: int) -> List[str]
         layer_types = []
         for i in range(start_layer, end_layer):
             is_linear = (i + 1) % full_attention_interval != 0
-            layer_types.append("linear" if is_linear else "attention")
+            layer_types.append(LINEAR if is_linear else attention_type)
         return layer_types
 
     # Default: all attention layers
-    return ["attention"] * num_shard_layers
+    return [attention_type] * num_shard_layers

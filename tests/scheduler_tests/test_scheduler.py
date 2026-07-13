@@ -113,6 +113,22 @@ def test_scheduler_bootstrap_wait_and_dynamic_events():
     sched._process_leaves()  # type: ignore[attr-defined]
 
 
+def test_scheduler_snapshot_handles_unallocated_standby_nodes():
+    """A joined standby node has no layer allocation yet; snapshot must not divide by zero."""
+    model = build_model_info(12)
+    n1 = build_node("standby-0", model, tflops=312.0, mem_gb=80.0, x=0, y=0)
+    sched = Scheduler(model, [], strategy="dp", routing_strategy="rr", min_nodes_bootstrapping=2)
+
+    sched.enqueue_join(n1)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    snapshot = sched.alloc_log_snapshot
+    assert "failed to build allocation snapshot" not in snapshot
+    assert "Standby nodes (1)" in snapshot
+    assert "standby-0" in snapshot
+    assert "latency     n/a ms" in snapshot
+
+
 def test_scheduler_single_node_leave_then_rejoin_reassigns_layers():
     """With one node, after leave then re-join, layers should be re-assigned.
 
@@ -146,6 +162,40 @@ def test_scheduler_single_node_leave_then_rejoin_reassigns_layers():
     assert (
         n1_rejoin.start_layer is not None and n1_rejoin.end_layer is not None
     ), "After re-join, single node should be assigned a full layer range"
+
+
+def test_dp_leave_preserves_survivors_and_rejoin_restores_exact_shard():
+    model = build_model_info(28)
+    nodes = [
+        build_node(f"n{i}", model, tflops=312.0, mem_gb=138.0, x=float(i), y=0) for i in range(3)
+    ]
+    set_rtt_from_coords(nodes)
+    sched = Scheduler(
+        model, nodes[:2], strategy="dp", routing_strategy="dp", min_nodes_bootstrapping=2
+    )
+    assert sched.bootstrap()
+    sched.enqueue_join(nodes[2])
+    sched._process_joins()
+
+    leaving = nodes[0]
+    old_range = (leaving.start_layer, leaving.end_layer)
+    survivor_ranges = {node.node_id: (node.start_layer, node.end_layer) for node in nodes[1:]}
+    sched.enqueue_leave(leaving.node_id)
+    sched._process_leaves()
+
+    assert {
+        node.node_id: (node.start_layer, node.end_layer) for node in sched.node_manager.active_nodes
+    } == survivor_ranges
+    assert all(
+        leaving.node_id not in load.hosting_nodes
+        for load in sched.layer_allocator.layer_to_load.values()
+    )
+
+    replacement = build_node("n0", model, tflops=312.0, mem_gb=138.0, x=0, y=0)
+    sched.enqueue_join(replacement)
+    sched._process_joins()
+    assert (replacement.start_layer, replacement.end_layer) == old_range
+    assert sched.has_full_pipeline()
 
 
 def test_scheduler_three_nodes_sequential_join_leave_rejoin():
@@ -228,7 +278,9 @@ def test_scheduler_three_nodes_sequential_join_leave_rejoin():
     sched._process_leaves()  # type: ignore[attr-defined]
     assert n2 not in sched.node_manager.nodes
     assert sched.node_manager.num_nodes == 2
-    assert sched.node_manager.has_full_pipeline(model.num_layers)
+    # The single spare replicated the head stage, not the tail. Losing the
+    # unique tail must report degraded until it returns; survivors stay loaded.
+    assert not sched.node_manager.has_full_pipeline(model.num_layers)
 
     # Rejoin n2
     n2_rejoin = build_node("n2", model, tflops=312.0, mem_gb=138.0, x=1, y=0)

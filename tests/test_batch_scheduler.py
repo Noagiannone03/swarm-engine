@@ -1,5 +1,7 @@
 from typing import Optional
 
+import pytest
+
 from parallax.server.request import InitialRequest, Request, RequestStatus
 from parallax.server.scheduler import Scheduler
 
@@ -8,6 +10,7 @@ class FakeCacheManager:
     def __init__(self, allow: bool = True):
         self.allow = allow
         self._reqs = set()
+        self.chunked_prefill_size = None
 
     def has_request(self, request_id: str) -> bool:
         return request_id in self._reqs
@@ -20,6 +23,14 @@ class FakeCacheManager:
             return False, 0
         self._reqs.add(request_id)
         return True, 0
+
+
+class FakeTokenizer:
+    def __init__(self, eos_token_id=None):
+        self.eos_token_id = eos_token_id
+
+    def encode(self, text: str) -> list[int]:
+        return [ord(ch) for ch in text]
 
 
 def make_prefill(rid: str, prompt_len: int) -> InitialRequest:
@@ -94,6 +105,39 @@ def test_token_budget_prefill_skipped_decode_taken():
     assert getattr(d, "ready_for_next_step", False) is False
 
 
+def test_token_budget_uses_explicit_chunked_prefill_size_without_cache_manager():
+    sched = Scheduler(
+        max_batch_size=2,
+        max_num_tokens_per_batch=4,
+        micro_batch_ratio=1,
+        chunked_prefill_size=4,
+    )
+    p = make_prefill("chunked", 16)
+    sched.enque_request(p)
+
+    batch = sched.form_batch()
+
+    assert [r.request_id for r in batch] == ["chunked"]
+
+
+def test_token_budget_does_not_read_chunked_prefill_size_from_cache_manager():
+    cache_mgr = FakeCacheManager()
+    cache_mgr.chunked_prefill_size = 4
+    sched = Scheduler(
+        max_batch_size=2,
+        max_num_tokens_per_batch=4,
+        micro_batch_ratio=1,
+        cache_manager=cache_mgr,
+        chunked_prefill_size=None,
+    )
+    p = make_prefill("unchunked", 16)
+    sched.enque_request(p)
+
+    batch = sched.form_batch()
+
+    assert batch == []
+
+
 def test_kv_cache_admission_guard_blocks_prefill():
     # A KV manager that rejects additions
     cache_mgr = FakeCacheManager(allow=False)
@@ -110,3 +154,82 @@ def test_kv_cache_admission_guard_blocks_prefill():
     batch = sched.form_batch()
     assert len(batch) == 0
     assert sched.num_running_requests == 0
+
+
+def test_admission_preserves_distinct_prefill_with_running_rid():
+    sched = Scheduler(max_batch_size=2, max_num_tokens_per_batch=10_000, micro_batch_ratio=1)
+    first_chunk = make_prefill("chunked", 4)
+    next_chunk = make_prefill("chunked", 8)
+
+    sched.enque_request(first_chunk)
+    sched.enque_request(next_chunk)
+    sched.admit_requests()
+
+    assert sched.get_running_request("chunked") is first_chunk
+    assert list(sched._wait_queue) == [next_chunk]
+
+    sched.evict_request("chunked")
+    sched.admit_requests()
+
+    assert sched.get_running_request("chunked") is next_chunk
+    assert sched.num_queued_requests == 0
+
+
+def test_admission_drops_same_object_prefill_requeue():
+    sched = Scheduler(max_batch_size=2, max_num_tokens_per_batch=10_000, micro_batch_ratio=1)
+    req = make_prefill("local-chunk", 4)
+
+    sched.enque_request(req)
+    sched.admit_requests()
+    sched.enque_request(req)
+    sched.admit_requests()
+
+    assert sched.get_running_request("local-chunk") is req
+    assert sched.num_queued_requests == 0
+
+
+def test_request_status_uses_tokenizer_eos_when_config_eos_missing():
+    sched = Scheduler(
+        max_batch_size=2,
+        is_first_peer=True,
+        tokenizer=FakeTokenizer(eos_token_id=200020),
+        eos_token_id=None,
+    )
+    req = InitialRequest(
+        request_id="minimax",
+        input_ids=[1],
+        output_ids=[200020],
+        status=RequestStatus.DECODING,
+    )
+
+    assert sched.check_and_update_request_status(req) is True
+    assert req.status == RequestStatus.FINISHED_EOS
+
+
+def test_request_status_accepts_zero_eos_token_id():
+    sched = Scheduler(max_batch_size=2, is_first_peer=True, eos_token_id=0)
+    req = InitialRequest(
+        request_id="zero-eos",
+        input_ids=[1],
+        output_ids=[0],
+        status=RequestStatus.DECODING,
+    )
+
+    assert sched.check_and_update_request_status(req) is True
+    assert req.status == RequestStatus.FINISHED_EOS
+
+
+def test_request_status_requires_eos_for_first_peer_status_checks():
+    sched = Scheduler(max_batch_size=2, is_first_peer=True, eos_token_id=None)
+    req = InitialRequest(
+        request_id="no-eos",
+        input_ids=[1],
+        output_ids=[123],
+        status=RequestStatus.DECODING,
+        max_new_tokens=5,
+        max_total_length=10,
+    )
+
+    with pytest.raises(AssertionError, match="EOS token ID must be set"):
+        sched.check_and_update_request_status(req)
+    assert req.status == RequestStatus.DECODING

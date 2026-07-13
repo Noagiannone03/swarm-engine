@@ -3,6 +3,7 @@
 
 ### Prerequisites
 - Python>=3.11.0,<3.14.0
+- Git and curl
 - Ubuntu-24.04 for Blackwell GPUs
 
 Below are installation methods for different operating systems.
@@ -14,13 +15,6 @@ Below are installation methods for different operating systems.
 |macOS | ❌️ | ✅️ | ❌️ |
 
 ### From Source
-#### For Linux/WSL (GPU):
-Note: If you are using DGX Spark, please refer to the Docker installation section
-```sh
-git clone https://github.com/GradientHQ/parallax.git
-cd parallax
-pip install -e '.[gpu]'
-```
 
 Parallax reports a conservative CUDA memory budget to the scheduler and applies
 the same budget to PyTorch's CUDA caching allocator. This keeps Windows WSL and
@@ -39,6 +33,9 @@ export PARALLAX_CUDA_USABLE_MEMORY_FRACTION=0.85
 export PARALLAX_CUDA_ALLOCATOR_FRACTION=0.85
 ```
 
+The source install script installs `uv` if needed, creates `.venv`, installs
+Parallax, and builds the `vllm-rs` frontend binary into `.venv/bin`.
+
 #### For macOS (Apple silicon):
 
 We recommend macOS users to create an isolated Python virtual environment before installation.
@@ -46,20 +43,32 @@ We recommend macOS users to create an isolated Python virtual environment before
 ```sh
 git clone https://github.com/GradientHQ/parallax.git
 cd parallax
-
-# Enter Python virtual environment
-python3 -m venv ./venv
-source ./venv/bin/activate
-
-pip install -e '.[mac]'
+./install.sh
+source .venv/bin/activate
 ```
 
-Next time to re-activate this virtual environment, run ```source ./venv/bin/activate```.
+The script automatically installs `mac` extras on macOS and `gpu` extras on
+Linux. You can also choose explicitly:
 
-#### Extra step for development:
 ```sh
-pip install -e '.[dev]'
+# Linux/WSL GPU
+./install.sh --extras gpu
+
+# macOS Apple silicon
+./install.sh --extras mac
 ```
+
+For development dependencies:
+```sh
+./install.sh --extras gpu,dev
+# or
+./install.sh --extras mac,dev
+```
+
+To use a specific supported Python version, pass `--python`, for example
+`./install.sh --python 3.12`.
+
+Next time to re-activate this virtual environment, run ```source .venv/bin/activate```.
 
 ### Windows Application
 [Click here](https://github.com/GradientHQ/parallax_win_cli/releases/latest/download/Parallax_Win_Setup.exe) to get latest Windows installer.

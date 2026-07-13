@@ -193,13 +193,42 @@ class BaseLayerAllocator:
     def dynamic_join(self, node: Node) -> None:
         """In case of using Dynamic Programming request router, a node is joined dynamically to the lightest layers."""
         lightest_layer = self.get_lightest_layer()
+        if lightest_layer is None:
+            raise ValueError("No layers to assign")
         logger.info(
             "[LayerAllocator] Dynamically Join node %s with the lightest layer %d",
             node.node_id,
             lightest_layer.layer_id,
         )
-        if lightest_layer is None:
-            raise ValueError("No layers to assign")
+
+        # Prefer duplicating an existing stage exactly. Arbitrary overlaps such
+        # as [0, 22) beside [0, 14)->[14, 28) add memory but cannot form an
+        # alternate executable path because stage boundaries do not meet.
+        replicas = [
+            existing
+            for existing in self.node_management.active_nodes
+            if existing.node_id in lightest_layer.hosting_nodes
+            and existing.start_layer is not None
+            and existing.end_layer is not None
+        ]
+        replicas.sort(key=lambda existing: existing.num_current_layers)
+        for existing in replicas:
+            start_layer = int(existing.start_layer)
+            end_layer = int(existing.end_layer)
+            capacity = node.get_decoder_layer_capacity(
+                include_input_embed=start_layer == 0,
+                include_lm_head=end_layer == self.num_total_layers,
+            )
+            if capacity >= end_layer - start_layer:
+                logger.info(
+                    "[LayerAllocator] Replicating executable stage [%d, %d) from %s to %s",
+                    start_layer,
+                    end_layer,
+                    existing.node_id,
+                    node.node_id,
+                )
+                self.allocate(node, start_layer, end_layer)
+                return
 
         # Assign consecutive layers starting from the lightest layer
         start_layer = lightest_layer.layer_id
@@ -568,6 +597,23 @@ class BaseLayerAllocator:
         """Rebuild the layer loads heap."""
         self.layer_loads_heap = list(self.layer_to_load.values())
         heapq.heapify(self.layer_loads_heap)
+
+    def rebuild_layer_loads(self) -> None:
+        """Rebuild allocation accounting from the NodeManager source of truth.
+
+        Node removal and RR pipeline detachment can clear several allocations at
+        once. Reconstructing the heap is cheap (one pass over layers/nodes) and
+        prevents departed peer ids from biasing every later dynamic allocation.
+        """
+        for layer_load in self.layer_to_load.values():
+            layer_load.hosting_nodes.clear()
+            layer_load.current_kv_size = 0
+        for node in self.node_management.active_nodes:
+            if node.start_layer is None or node.end_layer is None:
+                continue
+            for layer_id in range(node.start_layer, node.end_layer):
+                self.layer_to_load[layer_id].add_node(node)
+        self._update_layer_loads_heap()
 
     def _adjust_end_layer_for_tail(self, node: Node, proposed_start_layer: int) -> int:
         """Adjust the number of layers to host for tail nodes."""
