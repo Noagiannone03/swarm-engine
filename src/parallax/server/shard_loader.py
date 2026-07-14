@@ -19,6 +19,7 @@ from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 from mlx_lm.utils import _download, load_config
 
 from parallax.server.model import ShardedModel
+from parallax.utils.long_context import configure_long_context
 from parallax.utils.model_download import download_model_snapshot
 from parallax.utils.tokenizer_utils import load_tokenizer
 from parallax.utils.utils import normalize_model_config
@@ -57,6 +58,7 @@ class MLXModelLoader:
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         use_hfcache: bool = False,
+        max_sequence_length: Optional[int] = None,
     ):
         """
         Initializes the model loader.
@@ -74,6 +76,7 @@ class MLXModelLoader:
         self.start_layer = start_layer
         self.end_layer = end_layer
         self.use_hfcache = use_hfcache
+        self.max_sequence_length = max_sequence_length
         self.register_block_class()
 
     def register_block_class(self):
@@ -371,7 +374,10 @@ class MLXModelLoader:
         else:
             model_path = _download(self.model_path_str)
 
-        config = normalize_model_config(load_config(model_path))
+        config = configure_long_context(
+            normalize_model_config(load_config(model_path)),
+            self.max_sequence_length,
+        )
         self.config = config
         tokenizer = load_tokenizer(model_path, eos_token_ids=config.get("eos_token_id", None))
 

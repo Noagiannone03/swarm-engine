@@ -40,6 +40,7 @@ from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
 from parallax.utils.tokenizer_utils import load_tokenizer
+from parallax.utils.long_context import configure_long_context, long_context_overrides
 from parallax.vllm.monkey_patch import apply_parallax_vllm_monkey_patch
 from parallax_utils.cuda_memory import available_kv_cache_bytes
 from parallax_utils.logging_config import get_logger
@@ -410,7 +411,9 @@ def initialize_vllm_model_runner(
         end_layer=end_layer,
     )
 
-    config = load_config(model_path)
+    original_config = load_config(model_path)
+    config = configure_long_context(original_config, max_sequence_length)
+    hf_overrides = long_context_overrides(original_config, config)
     tokenizer = load_tokenizer(model_path, eos_token_ids=config.get("eos_token_id", None))
     dtype = config.get("torch_dtype", "bfloat16")
 
@@ -524,6 +527,7 @@ def initialize_vllm_model_runner(
         dtype=dtype,
         seed=0,
         max_model_len=max_len,
+        hf_overrides=hf_overrides,
         max_logprobs=1,
         enable_return_routed_experts=enable_return_routed_experts,
     )

@@ -69,7 +69,7 @@ MODELS = {
     "Qwen/Qwen2.5-72B-Instruct": "Qwen/Qwen2.5-72B-Instruct",
     # Qwen 3 Series (small models)
     "Qwen/Qwen3-0.6B-FP8": "Qwen/Qwen3-0.6B-MLX-8bit",
-    "Qwen/Qwen3-1.7B": "Qwen/Qwen3-1.7B",
+    "Qwen/Qwen3-1.7B": "Qwen/Qwen3-1.7B-MLX-4bit",
     "Qwen/Qwen3-1.7B-FP8": "Qwen/Qwen3-1.7B-MLX-8bit",
     "Qwen/Qwen3-4B": "Qwen/Qwen3-4B",
     "Qwen/Qwen3-4B-FP8": "Qwen/Qwen3-4B-MLX-8bit",

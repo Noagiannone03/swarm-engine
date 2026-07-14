@@ -4,6 +4,7 @@ We use monkey patch to modify sglang originated methods. The main purpose is to 
 arguments needed by decentralized inference.
 """
 
+import json
 import logging
 import os
 import random
@@ -41,6 +42,7 @@ from parallax.sglang.monkey_patch import apply_parallax_sglang_monkey_patch
 from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
+from parallax.utils.long_context import configure_long_context, long_context_overrides
 from parallax.utils.tokenizer_utils import load_tokenizer
 from parallax.utils.utils import normalize_model_config
 
@@ -238,6 +240,7 @@ def form_sgl_server_args(
     lora_backend: Optional[str] = "triton",
     max_lora_chunk_size: Optional[int] = 128,
     max_num_tokens_per_batch: int = 16384,
+    max_sequence_length: Optional[int] = None,
 ):
     """Creates a SGL ServerArgs object"""
     sgl_server_args = ServerArgs(
@@ -261,6 +264,7 @@ def form_sgl_server_args(
         max_lora_chunk_size=max_lora_chunk_size,
         dp_size=dp_size,
         max_total_tokens=max_num_tokens_per_batch,
+        context_length=max_sequence_length,
     )
     return sgl_server_args
 
@@ -302,6 +306,7 @@ def initialize_sgl_model_runner(
     dp_rank = kwargs.get("dp_rank", 0)
     use_hfcache = kwargs.get("use_hfcache", False)
     nccl_port = kwargs.get("nccl_port", None)
+    max_sequence_length = kwargs.get("max_sequence_length", None)
     # Use selective download for GPU models to save bandwidth and disk space
     from parallax.utils.model_download import selective_model_download
 
@@ -312,7 +317,9 @@ def initialize_sgl_model_runner(
         model_repo, start_layer=start_layer, end_layer=end_layer, local_files_only=use_hfcache
     )
 
-    config = normalize_model_config(load_config(model_path))
+    original_config = normalize_model_config(load_config(model_path))
+    config = configure_long_context(original_config, max_sequence_length)
+    model_overrides = long_context_overrides(original_config, config)
     tokenizer = load_tokenizer(model_path, eos_token_ids=config.get("eos_token_id", None))
     dtype = config.get("torch_dtype") or "bfloat16"
 
@@ -353,6 +360,7 @@ def initialize_sgl_model_runner(
         lora_backend,
         max_lora_chunk_size,
         max_num_tokens_per_batch=max_num_tokens_per_batch,
+        max_sequence_length=max_sequence_length,
     )
     initialize_moe_config(server_args)
     quant_method = None
@@ -360,7 +368,7 @@ def initialize_sgl_model_runner(
         quant_method = quantization_config.get("quant_method")
     model_config = ModelConfig(
         model_path=str(model_path),
-        model_override_args="{}",
+        model_override_args=json.dumps(model_overrides),
         dtype=dtype,
         quantization=quant_method,
     )

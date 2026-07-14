@@ -3,6 +3,10 @@ from backend.server.static_config import MODELS, get_model_info
 from parallax.utils.utils import normalize_model_config
 
 
+def test_qwen3_1_7b_uses_the_official_quantized_mlx_weights():
+    assert MODELS["Qwen/Qwen3-1.7B"] == "Qwen/Qwen3-1.7B-MLX-4bit"
+
+
 def test_glm_5_1_uses_mlx_community_model():
     assert MODELS["zai-org/GLM-5.1"] == "mlx-community/GLM-5.1"
 
