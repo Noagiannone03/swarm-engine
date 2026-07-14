@@ -254,6 +254,23 @@ class TestParseArgs:
 
     @patch(
         "sys.argv",
+        [
+            "test_server_args.py",
+            "--model-path",
+            "mlx-community/Qwen3-0.6B-bf16",
+            "--max-sequence-length",
+            "1024",
+            "--enable-prefix-cache",
+        ],
+    )
+    def test_parse_enable_prefix_cache(self):
+        """Accept the explicit flag emitted by Fabi worker launchers."""
+        args = parse_args()
+
+        assert args.enable_prefix_cache is True
+
+    @patch(
+        "sys.argv",
         ["test_server_args.py", "--model-path", "test", "--start-layer", "10", "--end-layer", "5"],
     )
     def test_parse_invalid_args(self):

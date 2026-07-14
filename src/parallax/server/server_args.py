@@ -105,11 +105,19 @@ def parse_args() -> argparse.Namespace:
         "--kv-block-size", type=int, default=1, help="Block size for KV cache management"
     )
 
-    parser.add_argument(
+    prefix_cache_group = parser.add_mutually_exclusive_group()
+    prefix_cache_group.add_argument(
+        "--enable-prefix-cache",
+        dest="enable_prefix_cache",
+        action="store_true",
+        default=True,
+        help="Enable prefix cache reuse (the default)",
+    )
+
+    prefix_cache_group.add_argument(
         "--disable-prefix-cache",
         dest="enable_prefix_cache",
         action="store_false",
-        default=True,
         help="Disable prefix cache reuse",
     )
 
