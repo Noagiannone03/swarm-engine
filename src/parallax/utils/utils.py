@@ -1,7 +1,9 @@
 """Utility functions."""
 
 from __future__ import annotations
+
 import json
+import os
 import random
 import socket
 from pathlib import Path
@@ -16,6 +18,8 @@ try:
     # mlx is Apple-Silicon / Linux-only and is absent on Windows. The vLLM (CUDA)
     # path never calls the mx-based helpers below, so a missing mlx must not break
     # import. Same pattern Parallax already uses for uvloop.
+    if os.environ.get("PARALLAX_DISABLE_MLX_IMPORT") == "1":
+        raise ImportError("MLX import explicitly disabled")
     import mlx.core as mx
 except ImportError:  # pragma: no cover - exercised on Windows
     mx = None

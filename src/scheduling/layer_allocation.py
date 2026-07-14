@@ -152,6 +152,12 @@ class BaseLayerAllocator:
             raise ValueError(
                 f"Invalid allocation: start_layer {start_layer} >= end_layer {end_layer}"
             )
+        if not node.can_host_range(start_layer, end_layer):
+            raise ValueError(
+                f"Worker {node.node_id} rejected layer range "
+                f"[{start_layer}, {end_layer}); maximum end from {start_layer} is "
+                f"{node.max_end_layer(start_layer)}"
+            )
         node.set_layer_allocation(start_layer, end_layer)
         self.node_management.activate([node.node_id])
         logger.debug(
@@ -215,11 +221,7 @@ class BaseLayerAllocator:
         for existing in replicas:
             start_layer = int(existing.start_layer)
             end_layer = int(existing.end_layer)
-            capacity = node.get_decoder_layer_capacity(
-                include_input_embed=start_layer == 0,
-                include_lm_head=end_layer == self.num_total_layers,
-            )
-            if capacity >= end_layer - start_layer:
+            if node.can_host_range(start_layer, end_layer):
                 logger.info(
                     "[LayerAllocator] Replicating executable stage [%d, %d) from %s to %s",
                     start_layer,
@@ -336,26 +338,13 @@ class BaseLayerAllocator:
             if assume_sorted
             else sorted(pipeline_nodes, key=lambda n: n.get_decoder_layer_capacity(), reverse=True)
         )
-        n = len(nodes)
-
-        # Clear previous allocations for participating nodes (avoid double counting loads)
+        # Clear previous allocations for participating nodes (avoid double counting loads).
         for node in nodes:
             if node.start_layer is not None and node.end_layer is not None:
                 self.deallocate(node)
 
-        caps: List[int] = []
-        compute_powers: List[float] = []
-        for i, node in enumerate(nodes):
-            if i == 0:
-                cap = node.get_decoder_layer_capacity(include_input_embed=True)
-            elif i == n - 1:
-                cap = node.get_decoder_layer_capacity(include_lm_head=True)
-            else:
-                cap = node.get_decoder_layer_capacity()
-            if cap <= 0:
-                raise ValueError(f"Node {node.node_id} has non-positive capacity: {cap}")
-            caps.append(cap)
-            compute_powers.append(
+        powers = [
+            (
                 node.hardware.tflops_fp16
                 if power_type == "flops"
                 else (
@@ -364,73 +353,61 @@ class BaseLayerAllocator:
                     else max(node.hardware.memory_gb, 0.1)
                 )
             )
+            for node in nodes
+        ]
+        power_sum = sum(max(0.0, float(power)) for power in powers)
+        if power_sum <= 0:
+            powers = [1.0] * len(nodes)
+            power_sum = float(len(nodes))
+        targets = [total_layers * max(0.0, float(power)) / power_sum for power in powers]
 
-        if sum(caps) < total_layers:
-            raise ValueError(f"Total capacity {sum(caps)} is less than total layers {total_layers}")
+        # Exact range-aware partition DP.  State is the layer boundary reached
+        # after considering the first i workers.  Every edge is validated by
+        # that worker's start-dependent contract, preserving non-uniform layer
+        # and endpoint costs.  The objective keeps stage time balanced around
+        # each worker's compute/memory-weighted target.  A worker may be skipped
+        # when the selected candidate contains more nodes than the best route.
+        costs: List[Dict[int, float]] = [{0: 0.0}]
+        parents: List[Dict[int, Tuple[int, int]]] = []
+        for index, node in enumerate(nodes):
+            current: Dict[int, float] = {}
+            parent: Dict[int, Tuple[int, int]] = {}
+            for start, base_cost in costs[-1].items():
+                options = [start]
+                max_end = (
+                    min(total_layers, node.max_end_layer(start)) if start < total_layers else start
+                )
+                options.extend(range(start + 1, max_end + 1))
+                for end in options:
+                    layers = end - start
+                    if layers > 0 and not node.can_host_range(start, end):
+                        continue
+                    target = targets[index]
+                    balance_cost = ((layers - target) ** 2) / max(target, 1.0)
+                    # Prefer using a feasible worker over skipping it when both
+                    # choices have the same balance score.
+                    candidate = base_cost + balance_cost + (1e-6 if layers == 0 else 0.0)
+                    if candidate < current.get(end, float("inf")):
+                        current[end] = candidate
+                        parent[end] = (start, layers)
+            costs.append(current)
+            parents.append(parent)
 
-        # Water-filling: find lambda s.t. sum_i min(c_i, λ F_i) == L
-        def total_at(lmbd: float) -> float:
-            return sum(min(caps[i], lmbd * compute_powers[i]) for i in range(n))
+        if total_layers not in costs[-1]:
+            raise ValueError("No exact worker-capacity partition covers the model")
 
-        lo, hi = 0.0, max((caps[i] / compute_powers[i]) for i in range(n))
-        for _ in range(self.water_filling_max_iterations):
-            mid = 0.5 * (lo + hi)
-            if total_at(mid) >= total_layers:
-                hi = mid
-            else:
-                lo = mid
-        lam = hi
+        assignments: List[Tuple[Node, int, int]] = []
+        end = total_layers
+        for index in range(len(nodes) - 1, -1, -1):
+            start, layers = parents[index][end]
+            if layers > 0:
+                assignments.append((nodes[index], start, end))
+            end = start
+        if end != 0:
+            raise ValueError("Exact capacity partition did not begin at layer zero")
 
-        target = [min(caps[i], lam * compute_powers[i]) for i in range(n)]
-
-        # Integerization: floor + largest remainders (respect caps)
-        stage_layer_counts = [min(caps[i], int(floor(target[i]))) for i in range(n)]
-        assigned = sum(stage_layer_counts)
-        remaining = total_layers - assigned
-        if remaining > 0:
-            frac = [(target[i] - stage_layer_counts[i], -i) for i in range(n)]
-            for _, negi in sorted(frac, reverse=True):
-                i = -negi
-                if remaining == 0:
-                    break
-                room = caps[i] - stage_layer_counts[i]
-                if room > 0:
-                    stage_layer_counts[i] += 1
-                    remaining -= 1
-        elif remaining < 0:
-            raise ValueError(f"Remaining {remaining} is negative")
-
-        # Final clamp (safety) and residual distribute, if any
-        extra = 0
-        for i in range(n):
-            if stage_layer_counts[i] > caps[i]:
-                extra += stage_layer_counts[i] - caps[i]
-                stage_layer_counts[i] = caps[i]
-        if extra > 0:
-            for i in range(n):
-                if extra == 0:
-                    break
-                room = caps[i] - stage_layer_counts[i]
-                take = min(room, extra)
-                stage_layer_counts[i] += take
-                extra -= take
-
-        # Apply contiguous assignments in stage order directly to nodes
-        start_layer = 0
-        for idx, node in enumerate(nodes):
-            layers = stage_layer_counts[idx]
-            if layers <= 0:
-                # TODO(chris-t): should we deallocate the node?
-                continue
-            end_layer = start_layer + layers
-            self.allocate(node, start_layer, end_layer)
-            start_layer = end_layer
-
-        # Sanity check: ensure coverage from 0..num_total_layers
-        if start_layer != total_layers:
-            raise ValueError(
-                f"Assignment did not cover all layers: assigned {start_layer} of {total_layers}"
-            )
+        for node, start, end in reversed(assignments):
+            self.allocate(node, start, end)
 
     def adjust_pipeline_layers_greedy(self, pipeline_nodes: List[Node]) -> None:
         """Greedily assign contiguous layers to `pipeline_nodes` from 0 to L.
@@ -461,19 +438,8 @@ class BaseLayerAllocator:
         remaining_layers = total_layers
 
         for idx, node in enumerate(pipeline_nodes):
-            include_input_embed = start_layer == 0
-
-            # Base capacity without LM head
-            base_cap = node.get_decoder_layer_capacity(include_input_embed=include_input_embed)
-
-            # If this node will be the tail that closes the pipeline, allow LM head
-            if base_cap >= remaining_layers:
-                tail_cap = node.get_decoder_layer_capacity(
-                    include_input_embed=include_input_embed, include_lm_head=True
-                )
-                assign_layers = min(tail_cap, remaining_layers)
-            else:
-                assign_layers = min(base_cap, remaining_layers)
+            max_end = node.max_end_layer(start_layer)
+            assign_layers = min(max(0, max_end - start_layer), remaining_layers)
 
             if assign_layers <= 0:
                 continue
@@ -617,16 +583,7 @@ class BaseLayerAllocator:
 
     def _adjust_end_layer_for_tail(self, node: Node, proposed_start_layer: int) -> int:
         """Adjust the number of layers to host for tail nodes."""
-        include_input_embed = proposed_start_layer == 0
-        node_capacity = node.get_decoder_layer_capacity(include_input_embed=include_input_embed)
-        end_layer = min(proposed_start_layer + node_capacity, self.num_total_layers)
-        if end_layer == self.num_total_layers:
-            adjusted_capacity = node.get_decoder_layer_capacity(
-                include_lm_head=True, include_input_embed=include_input_embed
-            )
-            end_layer = min(proposed_start_layer + adjusted_capacity, self.num_total_layers)
-
-        return end_layer
+        return min(node.max_end_layer(proposed_start_layer), self.num_total_layers)
 
 
 class GreedyLayerAllocator(BaseLayerAllocator):
@@ -726,23 +683,21 @@ class GreedyLayerAllocator(BaseLayerAllocator):
         """Assign a candidate pipeline if endpoint-aware capacity is sufficient."""
         if not pipeline_nodes:
             return False
-        endpoint_capacity = self._endpoint_aware_capacity(pipeline_nodes)
-        if endpoint_capacity < self.num_total_layers:
-            logger.debug(
-                "[Greedy] Candidate pipeline endpoint capacity %d < total layers %d",
-                endpoint_capacity,
-                self.num_total_layers,
-            )
+        try:
+            if rebalance_strategy == "greedy" and not any(
+                node.uses_capacity_contract for node in pipeline_nodes
+            ):
+                self.adjust_pipeline_layers_greedy(pipeline_nodes)
+            else:
+                self.adjust_pipeline_layers(
+                    pipeline_nodes,
+                    assume_sorted=False,
+                    power_type=self._pipeline_power_type(pipeline_nodes),
+                )
+            return True
+        except ValueError as exc:
+            logger.debug("[Greedy] Candidate pipeline is not exactly feasible: %s", exc)
             return False
-        if rebalance_strategy == "greedy":
-            self.adjust_pipeline_layers_greedy(pipeline_nodes)
-        else:
-            self.adjust_pipeline_layers(
-                pipeline_nodes,
-                assume_sorted=False,
-                power_type=self._pipeline_power_type(pipeline_nodes),
-            )
-        return True
 
     def allocate_from_standby(self) -> bool:
         """
@@ -979,31 +934,19 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
 
                 # Option 2: Assign to existing open pipeline
                 for j, rj in enumerate(open_residuals):
-                    c_norm = available_nodes[i].get_decoder_layer_capacity()
-                    r_after = rj - c_norm
+                    start = num_layers - rj
+                    end = available_nodes[i].max_end_layer(start)
+                    if end <= start:
+                        continue
+                    r_after = num_layers - end
+                    new_open = list(open_residuals)
                     if r_after <= 0:
-                        # try closing with LM head allowance
-                        c_close = available_nodes[i].get_decoder_layer_capacity(
-                            include_lm_head=True
-                        )
-                        r_after_close = rj - c_close
-                        if r_after_close <= 0:
-                            new_open = list(open_residuals)
-                            new_open.pop(j)
-                            cost = 1 + dp(i + 1, tuple(new_open), finished_pipes + 1)
-                            if cost < best_cost:
-                                best_cost = cost
-                                best_action = ("assign", j, True)
-                        else:
-                            new_open = list(open_residuals)
-                            new_open[j] = r_after_close
-                            new_open.sort()
-                            cost = 1 + dp(i + 1, tuple(new_open), finished_pipes)
-                            if cost < best_cost:
-                                best_cost = cost
-                                best_action = ("assign", j, False)
+                        new_open.pop(j)
+                        cost = 1 + dp(i + 1, tuple(new_open), finished_pipes + 1)
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_action = ("assign", j, True)
                     else:
-                        new_open = list(open_residuals)
                         new_open[j] = r_after
                         new_open.sort()
                         cost = 1 + dp(i + 1, tuple(new_open), finished_pipes)
@@ -1013,22 +956,21 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
 
                 # Option 3: start a new pipeline (if we still need more)
                 if new_needed > 0:
-                    c_start = available_nodes[i].get_decoder_layer_capacity(
-                        include_input_embed=True
-                    )
-                    r_new = num_layers - c_start
-                    if r_new <= 0:
-                        cost = 1 + dp(i + 1, open_residuals, finished_pipes + 1)
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_action = ("start", 0, True)
-                    else:
-                        new_open = list(open_residuals) + [r_new]
-                        new_open.sort()
-                        cost = 1 + dp(i + 1, tuple(new_open), finished_pipes)
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_action = ("start", r_new, False)
+                    end = available_nodes[i].max_end_layer(0)
+                    if end > 0:
+                        r_new = num_layers - end
+                        if r_new <= 0:
+                            cost = 1 + dp(i + 1, open_residuals, finished_pipes + 1)
+                            if cost < best_cost:
+                                best_cost = cost
+                                best_action = ("start", 0, True)
+                        else:
+                            new_open = list(open_residuals) + [r_new]
+                            new_open.sort()
+                            cost = 1 + dp(i + 1, tuple(new_open), finished_pipes)
+                            if cost < best_cost:
+                                best_cost = cost
+                                best_action = ("start", r_new, False)
 
                 path[(i, open_residuals, finished_pipes)] = best_action
                 return best_cost
@@ -1051,7 +993,7 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
             if not pl_nodes:
                 continue
             logger.debug("[DPLayerAllocator] Adjusting pipeline with %d nodes", len(pl_nodes))
-            self.adjust_pipeline_layers(pl_nodes, assume_sorted=False)
+            self.adjust_pipeline_layers(pl_nodes, assume_sorted=True)
         if not self.node_management.has_full_pipeline(self.num_total_layers):
             logger.warning("[DPLayerAllocator] Allocation did not produce a full pipeline")
             return False
@@ -1090,11 +1032,8 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
                 # ensure open_list sorted like open_tuple
                 open_list.sort(key=lambda x: x[0])
                 rj, nodes_seq = open_list[j]
-                c_norm = node.get_decoder_layer_capacity()
-                r_after = rj - c_norm
-                if r_after <= 0:
-                    c_close = node.get_decoder_layer_capacity(include_lm_head=True)
-                    r_after = rj - c_close
+                start = self.num_total_layers - rj
+                r_after = self.num_total_layers - node.max_end_layer(start)
                 nodes_seq.append(node)
                 if r_after <= 0 or closed:
                     # pipeline closes here

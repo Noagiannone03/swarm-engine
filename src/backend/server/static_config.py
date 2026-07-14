@@ -1,7 +1,14 @@
 import concurrent.futures
 import math
 
-from parallax.utils.utils import load_config_only
+from parallax.utils.layer_types import (
+    ATTENTION,
+    DSA_ATTENTION,
+    LINEAR,
+    MLA_ATTENTION,
+    MSA_ATTENTION,
+)
+from parallax.utils.utils import get_layer_types, load_config_only
 from parallax_utils.logging_config import get_logger
 from scheduling.model_info import ModelInfo
 
@@ -152,27 +159,81 @@ def get_model_info(model_name, use_hfcache: bool = False):
     if num_kv_heads is None:
         num_kv_heads = config.get("num_attention_groups", None)
 
+    num_layers = config.get("num_hidden_layers", 0)
+    head_size = config.get("head_dim", 128)
+    qk_nope_head_dim = config.get("qk_nope_head_dim", None)
+    qk_rope_head_dim = config.get("qk_rope_head_dim", None)
+    v_head_dim = config.get("v_head_dim", None)
+    key_head_dim = (
+        qk_nope_head_dim + qk_rope_head_dim
+        if qk_nope_head_dim is not None and qk_rope_head_dim is not None
+        else head_size
+    )
+    value_head_dim = v_head_dim if v_head_dim is not None else head_size
+    cache_dtype_bytes = 2
+    layer_types = get_layer_types(config, 0, num_layers)
+    exact_kv_bytes: list[int] = []
+    unsupported_reason = None
+    for layer_type in layer_types:
+        if layer_type == ATTENTION:
+            exact_kv_bytes.append(
+                (num_kv_heads or 0) * (key_head_dim + value_head_dim) * cache_dtype_bytes
+            )
+        elif layer_type == MLA_ATTENTION:
+            exact_kv_bytes.append(
+                (config.get("kv_lora_rank", 0) + config.get("qk_rope_head_dim", 0))
+                * cache_dtype_bytes
+            )
+        elif layer_type == DSA_ATTENTION:
+            exact_kv_bytes.append(
+                (
+                    config.get("kv_lora_rank", 0)
+                    + config.get("qk_rope_head_dim", 0)
+                    + (config.get("index_key_heads", 1) or 1) * config.get("index_head_dim", 0)
+                )
+                * cache_dtype_bytes
+            )
+        elif layer_type == MSA_ATTENTION:
+            exact_kv_bytes.append(
+                (
+                    (num_kv_heads or 0) * (key_head_dim + value_head_dim)
+                    + (config.get("index_key_heads", 1) or 1) * config.get("index_head_dim", 0)
+                )
+                * cache_dtype_bytes
+            )
+        elif layer_type == LINEAR:
+            exact_kv_bytes.append(0)
+            unsupported_reason = (
+                "linear/recurrent cache layers require a fixed-state capacity contract"
+            )
+        else:
+            exact_kv_bytes.append(0)
+            unsupported_reason = f"unknown cache layer type: {layer_type}"
+
     model_info = ModelInfo(
         model_name=model_name,
         mlx_model_name=mlx_model_name,
-        head_size=config.get("head_dim", 128),
-        qk_nope_head_dim=config.get("qk_nope_head_dim", None),
-        qk_rope_head_dim=config.get("qk_rope_head_dim", None),
-        v_head_dim=config.get("v_head_dim", None),
+        head_size=head_size,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=v_head_dim,
         hidden_dim=config.get("hidden_size", 0),
         intermediate_dim=config.get("intermediate_size", 0),
         num_attention_heads=config.get("num_attention_heads", 0),
         num_kv_heads=num_kv_heads or 0,
         vocab_size=config.get("vocab_size", 0),
-        num_layers=config.get("num_hidden_layers", 0),
+        num_layers=num_layers,
         ffn_num_projections=3,
         param_bytes_per_element=param_bytes_per_element,
         mlx_param_bytes_per_element=mlx_param_bytes_per_element,
         cache_bytes_per_element=2,
         embedding_bytes_per_element=2,
+        tie_embedding=bool(config.get("tie_word_embeddings", False)),
         num_local_experts=num_local_experts,
         num_experts_per_tok=config.get("num_experts_per_tok", None),
         moe_intermediate_dim=config.get("moe_intermediate_size", None),
+        kv_bytes_per_token_by_layer=exact_kv_bytes,
+        capacity_profile_unsupported_reason=unsupported_reason,
     )
     return model_info
 

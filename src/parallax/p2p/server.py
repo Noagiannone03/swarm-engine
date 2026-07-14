@@ -461,6 +461,114 @@ class GradientServer:
         logger.debug(f"manual_layer_assignment: {self.manual_layer_assignment}")
         self._layer_allocation_changed = False
         self._shared_state = None  # Will be set if running in subprocess mode
+        self.capacity_profile = None
+        self.capacity_profile_error = None
+        self._capacity_profile_last_attempt = 0.0
+        self._capacity_profile_thread = None
+
+    def _ensure_capacity_profile(self, hardware: Optional[dict] = None) -> None:
+        """Build this worker's model-specific placement contract once known.
+
+        The initial join intentionally advertises protocol v1 with no profile,
+        forcing the scheduler to keep the worker in standby.  Its standby ACK
+        supplies the backend-specific model name; the worker can then inspect
+        exact safetensors metadata and publish admissible ranges on heartbeat.
+        """
+
+        if not self.model_name:
+            return
+        if self.capacity_profile is not None:
+            if hardware is not None:
+                try:
+                    from parallax.server.capacity_profile import constrain_profile_to_memory
+
+                    governed_budget = int(float(hardware.get("usable_memory_bytes") or 0))
+                    if governed_budget > 0:
+                        self.capacity_profile = constrain_profile_to_memory(
+                            self.capacity_profile,
+                            governed_budget,
+                        )
+                except Exception:
+                    logger.warning("Failed to apply worker memory pressure", exc_info=True)
+            return
+        if self._capacity_profile_thread is not None and self._capacity_profile_thread.is_alive():
+            return
+        now = time.time()
+        if now - self._capacity_profile_last_attempt < 60.0:
+            return
+        self._capacity_profile_last_attempt = now
+        model_name = self.model_name
+        worker_hardware = dict(
+            hardware or self._govern_hardware(detect_node_hardware(self.lattica.peer_id()))
+        )
+
+        def _build() -> None:
+            try:
+                from backend.server.static_config import get_model_info
+                from parallax.server.capacity_profile import build_worker_capacity_profile
+
+                profile = build_worker_capacity_profile(
+                    model_name=model_name,
+                    model_info=get_model_info(model_name),
+                    hardware=worker_hardware,
+                    target_context_tokens=max(1, int(self.max_sequence_length or 65536)),
+                )
+                # Do not publish a late result for a model that was switched
+                # while metadata was being fetched.
+                if self.model_name != model_name:
+                    return
+                self.capacity_profile = profile
+                self.capacity_profile_error = None
+                logger.info(
+                    "Worker capacity contract ready for %s (budget %.2f GiB)",
+                    model_name,
+                    int(profile["usable_memory_bytes"]) / 1024**3,
+                )
+            except Exception as exc:
+                self.capacity_profile = None
+                self.capacity_profile_error = f"{type(exc).__name__}: {exc}"
+                logger.error(
+                    "Cannot build a safe capacity contract for %s; remaining standby: %s",
+                    model_name,
+                    self.capacity_profile_error,
+                )
+
+        self._capacity_profile_thread = threading.Thread(
+            target=_build,
+            name="WorkerCapacityProfiler",
+            daemon=True,
+        )
+        self._capacity_profile_thread.start()
+
+    def _calibrate_capacity_profile(self, metrics: dict) -> None:
+        if (
+            self.capacity_profile is None
+            or self.block_start_index is None
+            or self.block_end_index is None
+            or metrics.get("kv_capacity_tokens") is None
+        ):
+            return
+        actual = int(metrics["kv_capacity_tokens"])
+        if actual >= int(self.capacity_profile.get("target_context_tokens", 0)):
+            return
+        marker = self.capacity_profile.get("calibrated_from") or {}
+        if (
+            marker.get("start_layer") == self.block_start_index
+            and marker.get("end_layer") == self.block_end_index
+            and marker.get("kv_capacity_tokens") == actual
+        ):
+            return
+        try:
+            from parallax.server.capacity_profile import calibrate_profile_from_runtime
+
+            self.capacity_profile = calibrate_profile_from_runtime(
+                self.capacity_profile,
+                start_layer=self.block_start_index,
+                end_layer=self.block_end_index,
+                kv_capacity_tokens=actual,
+            )
+        except Exception:
+            logger.warning("Runtime capacity calibration failed", exc_info=True)
 
     def _sync_to_shared_state(self):
         """Sync current layer allocation and status to shared state if available"""
@@ -649,6 +757,11 @@ class GradientServer:
                     "enable_weight_refit", self.enable_weight_refit
                 )
                 self.weight_refit_mode = response.get("weight_refit_mode", self.weight_refit_mode)
+
+                # The worker now knows the scheduler-selected model.  Build the
+                # placement contract before starting heartbeats; the scheduler
+                # will never infer capacity while this is absent or invalid.
+                self._ensure_capacity_profile()
 
                 # Sync to shared state if available
                 self._sync_to_shared_state()
@@ -925,6 +1038,10 @@ class GradientServer:
                                         self.block_start_index = start_layer
                                         self.block_end_index = end_layer
                                         if model_name:
+                                            if model_name != self.model_name:
+                                                self.capacity_profile = None
+                                                self.capacity_profile_error = None
+                                                self._capacity_profile_last_attempt = 0.0
                                             self.model_name = model_name
                                         # Set flag to trigger executor reload
                                         self._layer_allocation_changed = True
@@ -1121,14 +1238,21 @@ class GradientServer:
                 self.rtts[peer_id] = rtt if rtt is not None else 100
             self.rtt_last_update = time.time()
 
+        metrics = {}
+        if is_update and hasattr(self, "_shared_state") and self._shared_state is not None:
+            metrics = self._shared_state.get_metrics()
+            self._calibrate_capacity_profile(metrics)
+
+        hardware = self._govern_hardware(detect_node_hardware(self.lattica.peer_id()))
+        self._ensure_capacity_profile(hardware)
         info = {
             "node_id": self.lattica.peer_id(),
-            "hardware": self._govern_hardware(detect_node_hardware(self.lattica.peer_id())),
+            "hardware": hardware,
             "kvcache_mem_ratio": self.kvcache_mem_ratio,
             "param_mem_ratio": self.param_mem_ratio,
             "max_concurrent_requests": self.max_batch_size,
             "max_sequence_length": (
-                1024 if self.max_sequence_length is None else self.max_sequence_length
+                65536 if self.max_sequence_length is None else self.max_sequence_length
             ),
             "rtt_to_nodes": self.rtts,
             "status": self._get_status(),
@@ -1139,7 +1263,11 @@ class GradientServer:
             # over the encrypted lattica RPC channel). No-op if FABI_GATE=off.
             "account_token": self.account_token,
             "worker_session_id": self.worker_session_id,
+            "capacity_protocol_version": 1,
+            "capacity_profile": self.capacity_profile,
         }
+        if self.capacity_profile_error:
+            info["capacity_profile_error"] = self.capacity_profile_error
 
         # For manual layer assignment, always include start_layer and end_layer
         if self.manual_layer_assignment:
@@ -1151,10 +1279,6 @@ class GradientServer:
             )
 
         if is_update:
-            metrics = {}
-            if hasattr(self, "_shared_state") and self._shared_state is not None:
-                metrics = self._shared_state.get_metrics()
-
             info["current_requests"] = metrics.get("current_requests", 0)
             if metrics.get("layer_latency_ms") is not None:
                 info["layer_latency_ms"] = metrics.get("layer_latency_ms")
@@ -1162,6 +1286,8 @@ class GradientServer:
             # servable context. Omitted when unknown → scheduler estimates it.
             if metrics.get("kv_free_tokens") is not None:
                 info["kv_free_tokens"] = metrics.get("kv_free_tokens")
+            if metrics.get("kv_capacity_tokens") is not None:
+                info["kv_capacity_tokens"] = metrics.get("kv_capacity_tokens")
             # In update mode, always include current allocation
             if not self.manual_layer_assignment:
                 info["start_layer"] = self.block_start_index

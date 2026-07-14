@@ -326,6 +326,12 @@ class SchedulerManage:
             "gpu_num": node.hardware.num_gpus,
             "gpu_name": node.hardware.gpu_name,
             "gpu_memory": node.hardware.memory_gb,
+            "capacity_protocol_version": node.capacity_protocol_version,
+            "capacity_profile_state": (
+                node.capacity_profile.get("state") if node.capacity_profile else None
+            ),
+            "kv_capacity_tokens": node.reported_kv_capacity_tokens,
+            "kv_free_tokens": node.reported_kv_free_tokens,
         }
 
     def _start_scheduler(self, model_name, init_nodes_num):

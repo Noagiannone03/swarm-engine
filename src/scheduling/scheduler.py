@@ -17,7 +17,7 @@ from scheduling.layer_allocation import (
 )
 from scheduling.model_info import ModelInfo
 from scheduling.node import Node, RequestSignal
-from scheduling.node_management import NodeManager
+from scheduling.node_management import NodeManager, NodeState
 from scheduling.request_routing import (
     DynamicProgrammingRouting,
     RoundRobinOverFixedPipelinesRouting,
@@ -105,7 +105,7 @@ class Scheduler:
         # Event queues for main loop orchestration (thread-safe)
         self._pending_joins: "queue.Queue[Node]" = queue.Queue()
         self._pending_leaves: "queue.Queue[str]" = queue.Queue()
-        self._pending_node_updates: "queue.Queue[Tuple[str, Optional[int], Optional[float], Optional[Dict[str, float]], Optional[bool], Optional[float], Optional[str]]]" = (queue.Queue())
+        self._pending_node_updates: "queue.Queue[tuple]" = queue.Queue()
 
         # Concurrency controls
         self._stop_event: threading.Event = threading.Event()
@@ -258,18 +258,29 @@ class Scheduler:
         last_refit_time: Optional[float] = 0.0,
         loading_phase: Optional[str] = None,
         kv_free_tokens: Optional[int] = None,
+        kv_capacity_tokens: Optional[int] = None,
+        capacity_protocol_version: Optional[int] = None,
+        capacity_profile: Optional[Dict[str, object]] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
             node.current_requests = current_requests
         if kv_free_tokens is not None:
             node.reported_kv_free_tokens = kv_free_tokens
+        if kv_capacity_tokens is not None:
+            node.reported_kv_capacity_tokens = kv_capacity_tokens
+        if capacity_protocol_version is not None:
+            node.capacity_protocol_version = capacity_protocol_version
+        if capacity_profile is not None:
+            node.capacity_profile = capacity_profile
         if layer_latency_ms is not None:
             node.set_layer_latency_ms(layer_latency_ms)
         if new_rtt_to_nodes is not None:
             node.rtt_to_nodes = new_rtt_to_nodes
         if is_active is not None:
-            node.is_active = is_active
+            node.is_active = bool(is_active)
+            if node.uses_capacity_contract and node.reported_kv_capacity_tokens is None:
+                node.is_active = False
         if last_refit_time > 0.0:
             node.last_refit_time = last_refit_time
         if loading_phase is not None:
@@ -314,6 +325,9 @@ class Scheduler:
         last_refit_time: Optional[float] = 0.0,
         loading_phase: Optional[str] = None,
         kv_free_tokens: Optional[int] = None,
+        kv_capacity_tokens: Optional[int] = None,
+        capacity_protocol_version: Optional[int] = None,
+        capacity_profile: Optional[Dict[str, object]] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -326,6 +340,9 @@ class Scheduler:
                 last_refit_time,
                 loading_phase,
                 kv_free_tokens,
+                kv_capacity_tokens,
+                capacity_protocol_version,
+                capacity_profile,
             )
         )
         self._wake_event.set()
@@ -384,7 +401,13 @@ class Scheduler:
                 and self.node_manager.num_active_nodes > 0
                 and not self.has_full_pipeline()
             )
-            if not restored and (bootstrapped or partial_dp_pipeline):
+            capacity_ready = node.get_decoder_layer_capacity() > 0
+            if not capacity_ready:
+                logger.info(
+                    "Worker %s is negotiating its model capacity; keeping it standby",
+                    node.node_id,
+                )
+            if not restored and capacity_ready and (bootstrapped or partial_dp_pipeline):
                 if self.dynamic_pipelines_router:
                     # for dynamic pipelines router, join the node to the lightest layer
                     self.layer_allocator.dynamic_join(node)
@@ -454,12 +477,7 @@ class Scheduler:
             if now > expires_at:
                 self._recent_allocations.pop(peer_id, None)
                 continue
-            required = end_layer - start_layer
-            capacity = node.get_decoder_layer_capacity(
-                include_input_embed=start_layer == 0,
-                include_lm_head=end_layer == self.num_layers,
-            )
-            if capacity < required:
+            if not node.can_host_range(start_layer, end_layer):
                 continue
             self._recent_allocations.pop(peer_id, None)
             self.layer_allocator.allocate(node, start_layer, end_layer)
@@ -674,17 +692,31 @@ class Scheduler:
 
     def _process_node_updates(self) -> None:
         """Apply pending node stats updates from the queue."""
+        capacity_became_available = False
+        newly_capable_nodes: List[Node] = []
+        replan_required = False
         while True:
             try:
-                node_id, cur, lat, rtts, is_active, last_refit_time, loading_phase, kv_free = (
-                    self._pending_node_updates.get_nowait()
-                )
+                (
+                    node_id,
+                    cur,
+                    lat,
+                    rtts,
+                    is_active,
+                    last_refit_time,
+                    loading_phase,
+                    kv_free,
+                    kv_capacity,
+                    capacity_protocol_version,
+                    capacity_profile,
+                ) = self._pending_node_updates.get_nowait()
             except queue.Empty:
                 break
             node = self.node_manager.get(node_id)
             if node is None:
                 logger.warning(f"Node {node_id} not found in node manager, ignore the update")
                 continue
+            had_capacity = node.get_decoder_layer_capacity() > 0
             self.update_node_info(
                 node,
                 current_requests=cur,
@@ -694,7 +726,65 @@ class Scheduler:
                 last_refit_time=last_refit_time,
                 loading_phase=loading_phase,
                 kv_free_tokens=kv_free,
+                kv_capacity_tokens=kv_capacity,
+                capacity_protocol_version=capacity_protocol_version,
+                capacity_profile=capacity_profile,
             )
+            if not had_capacity and node.get_decoder_layer_capacity() > 0:
+                capacity_became_available = True
+                newly_capable_nodes.append(node)
+            if (
+                node.start_layer is not None
+                and node.end_layer is not None
+                and not node.can_host_range(node.start_layer, node.end_layer)
+            ):
+                replan_required = True
+
+        if replan_required:
+            active_nodes = self.node_manager.active_nodes
+            if all(node.current_requests == 0 for node in active_nodes):
+                logger.warning(
+                    "Runtime KV measurement invalidated a provisional placement; "
+                    "replanning from worker-calibrated contracts"
+                )
+                self.node_manager.standby([node.node_id for node in active_nodes])
+                self.layer_allocator.rebuild_layer_loads()
+                self._bootstrapped_event.clear()
+                capacity_became_available = True
+            else:
+                logger.info("Worker capacity replan deferred until in-flight requests drain")
+
+        if self._bootstrapped_event.is_set() and newly_capable_nodes:
+            for node in newly_capable_nodes:
+                if self.node_manager.state_of(node.node_id) != NodeState.STANDBY:
+                    continue
+                try:
+                    if self.dynamic_pipelines_router:
+                        self.layer_allocator.dynamic_join(node)
+                    else:
+                        self.layer_allocator.allocate_standby_nodes()
+                    self.request_router.expand_pipelines()
+                except NotImplementedError:
+                    pass
+                except Exception:
+                    logger.info(
+                        "Negotiated worker %s remains standby until an exact stage fits",
+                        node.node_id,
+                        exc_info=True,
+                    )
+
+        if (
+            capacity_became_available
+            and not self._bootstrapped_event.is_set()
+            and self.node_manager.num_standby_nodes >= self.min_nodes_bootstrapping
+        ):
+            try:
+                self.bootstrap()
+            except Exception:
+                logger.warning(
+                    "Bootstrap after worker capacity negotiation failed",
+                    exc_info=True,
+                )
 
         # Re-enregistrement des pipelines de routage quand des noeuds deviennent
         # ACTIVE. Le routeur RR enregistre ses pipelines au bootstrap (search ->

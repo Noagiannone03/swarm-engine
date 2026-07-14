@@ -84,6 +84,7 @@ class SharedState:
         current_requests: Optional[int] = None,
         layer_latency_ms_sample: Optional[float] = None,
         kv_free_tokens: Optional[int] = None,
+        kv_capacity_tokens: Optional[int] = None,
         ewma_alpha: float = 0.2,
     ) -> None:
         """Update metrics with optional fields and EWMA smoothing for latency.
@@ -102,6 +103,8 @@ class SharedState:
             metrics_dict["current_requests"] = int(current_requests)
         if kv_free_tokens is not None:
             metrics_dict["kv_free_tokens"] = int(kv_free_tokens)
+        if kv_capacity_tokens is not None:
+            metrics_dict["kv_capacity_tokens"] = int(kv_capacity_tokens)
         if layer_latency_ms_sample is not None:
             prev = metrics_dict.get("layer_latency_ms")
             if prev is None:
@@ -165,6 +168,8 @@ class SharedState:
         # None until the executor reports it (then routing falls back to its
         # measured-budget estimate).
         shared_dict["metrics"]["kv_free_tokens"] = None
+        # Total KV token capacity measured after the real shard/cache is loaded.
+        shared_dict["metrics"]["kv_capacity_tokens"] = None
         shared_dict["metrics"]["_last_update_ts"] = 0.0
 
         return cls(shared_dict)

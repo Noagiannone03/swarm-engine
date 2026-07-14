@@ -152,6 +152,9 @@ class RPCConnectionHandler(ConnectionHandler):
                 last_refit_time=node.last_refit_time,
                 loading_phase=node.loading_phase,
                 kv_free_tokens=node.reported_kv_free_tokens,
+                kv_capacity_tokens=node.reported_kv_capacity_tokens,
+                capacity_protocol_version=node.capacity_protocol_version,
+                capacity_profile=node.capacity_profile,
             )
             # Return current layer allocation to node
             layer_allocation = self.get_layer_allocation(node.node_id)
@@ -303,6 +306,8 @@ class RPCConnectionHandler(ConnectionHandler):
             loading_phase=node_json.get("status", "joining"),
             manual_layer_assignment=node_json.get("manual_layer_assignment", False),
             last_refit_time=node_json.get("last_refit_time", 0.0),
+            capacity_protocol_version=node_json.get("capacity_protocol_version"),
+            capacity_profile=node_json.get("capacity_profile"),
         )
         if node_json.get("start_layer", None) is not None:
             node.start_layer = node_json.get("start_layer")
@@ -316,6 +321,19 @@ class RPCConnectionHandler(ConnectionHandler):
             node.rtt_to_nodes = node_json.get("rtt_to_nodes")
         if node_json.get("kv_free_tokens", None) is not None:
             node.reported_kv_free_tokens = node_json.get("kv_free_tokens")
+        if node_json.get("kv_capacity_tokens", None) is not None:
+            node.reported_kv_capacity_tokens = node_json.get("kv_capacity_tokens")
+        if node.uses_capacity_contract and not node.has_valid_capacity_profile:
+            if node.capacity_profile is not None:
+                logger.warning(
+                    "Ignoring invalid capacity contract from %s for model %s",
+                    node.node_id,
+                    node.expected_model_name,
+                )
+            # An empty mapping is an explicit zero-capacity revocation.  Unlike
+            # None it propagates through the update queue and replaces any old
+            # profile retained by the scheduler.
+            node.capacity_profile = {}
         return node
 
     def build_hardware(self, hardware_json):

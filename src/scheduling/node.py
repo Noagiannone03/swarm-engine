@@ -13,7 +13,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from math import floor
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional
 
 from parallax_utils.logging_config import get_logger
 from parallax_utils.utils import (
@@ -258,6 +258,18 @@ class Node:
     # estimate — so routing reflects current occupancy. None until reported.
     reported_kv_free_tokens: Optional[int] = None
 
+    # Capacity protocol v1 moves model placement authority to the worker.  The
+    # worker publishes exact admissible contiguous ranges built from the model's
+    # safetensors metadata and its locally enforced memory budget.  A v1 worker
+    # without a valid profile has zero placement capacity: the scheduler must
+    # wait for negotiation instead of falling back to a VRAM heuristic.
+    capacity_protocol_version: Optional[int] = None
+    capacity_profile: Optional[Dict[str, object]] = None
+
+    # Load-independent KV token ceiling measured by the executor after the
+    # assigned shard is resident.  This is distinct from live free tokens.
+    reported_kv_capacity_tokens: Optional[int] = None
+
     # Runtime weight refit for RL
     last_refit_time: float = 0.0
 
@@ -379,6 +391,10 @@ class Node:
         answers how large one request can be on an otherwise idle worker.
         """
         cap = self.max_sequence_length or 0
+        measured = self.reported_kv_capacity_tokens
+        if measured is not None:
+            measured_tokens = max(0, int(measured))
+            return min(cap, measured_tokens) if cap > 0 else measured_tokens
         layers = self.num_current_layers
         if self.start_layer is None or self.end_layer is None or layers <= 0:
             return cap
@@ -518,6 +534,20 @@ class Node:
         derived from the advertised ``memory_gb`` — the original heuristic, kept
         only for backward compatibility.
         """
+        if self.uses_capacity_contract:
+            if not self.has_valid_capacity_profile:
+                return 0
+            max_ends = self.capacity_profile["max_end_by_start"]
+            candidates = []
+            for start, raw_end in enumerate(max_ends):
+                end = int(raw_end)
+                if include_input_embed and start != 0:
+                    continue
+                if include_lm_head and end != self.model_info.num_layers:
+                    continue
+                candidates.append(max(0, end - start))
+            return max(candidates, default=0)
+
         usable = getattr(self.hardware, "usable_memory_bytes", None)
         if usable and usable > 0:
             budget = float(usable) - self._runtime_workspace_bytes()
@@ -562,6 +592,82 @@ class Node:
         return floor(
             available_memory_bytes / self.model_info.decoder_layer_io_bytes(roofline=False)
         )
+
+    @property
+    def uses_capacity_contract(self) -> bool:
+        """Whether this worker opted into worker-authoritative placement."""
+
+        try:
+            return int(self.capacity_protocol_version or 0) >= 1
+        except (TypeError, ValueError):
+            return False
+
+    @property
+    def expected_model_name(self) -> str:
+        if self.hardware.device == "mlx":
+            return self.model_info.mlx_model_name or self.model_info.model_name
+        return self.model_info.model_name or self.model_info.mlx_model_name
+
+    @property
+    def has_valid_capacity_profile(self) -> bool:
+        """Validate the untrusted JSON contract before allocation."""
+
+        profile: Optional[Mapping[str, object]] = self.capacity_profile
+        if not isinstance(profile, Mapping):
+            return False
+        try:
+            if int(profile.get("protocol_version", 0)) != 1:
+                return False
+            if profile.get("state") not in ("provisional", "runtime_calibrated"):
+                return False
+            if str(profile.get("model_name")) != self.expected_model_name:
+                return False
+            if str(profile.get("backend")) != self.hardware.device:
+                return False
+            if int(profile.get("num_layers", -1)) != self.model_info.num_layers:
+                return False
+            if int(profile.get("target_context_tokens", -1)) != int(self.max_sequence_length):
+                return False
+            max_ends = profile.get("max_end_by_start")
+            if not isinstance(max_ends, list) or len(max_ends) != self.model_info.num_layers:
+                return False
+            for start, raw_end in enumerate(max_ends):
+                end = int(raw_end)
+                if end < start or end > self.model_info.num_layers:
+                    return False
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    def max_end_layer(self, start_layer: int) -> int:
+        """Largest feasible exclusive end for a shard beginning at ``start``.
+
+        Contract workers are answered exclusively from their profile.  Legacy
+        workers retain the old estimate until the compatibility path is removed.
+        """
+
+        start = int(start_layer)
+        if start < 0 or start >= self.model_info.num_layers:
+            return start
+        if self.uses_capacity_contract:
+            if not self.has_valid_capacity_profile:
+                return start
+            return int(self.capacity_profile["max_end_by_start"][start])
+
+        include_input = start == 0
+        capacity = self.get_decoder_layer_capacity(include_input_embed=include_input)
+        end = min(self.model_info.num_layers, start + max(0, capacity))
+        if end == self.model_info.num_layers:
+            tail_capacity = self.get_decoder_layer_capacity(
+                include_input_embed=include_input,
+                include_lm_head=True,
+            )
+            end = min(self.model_info.num_layers, start + max(0, tail_capacity))
+        return end
+
+    def can_host_range(self, start_layer: int, end_layer: int) -> bool:
+        start, end = int(start_layer), int(end_layer)
+        return start < end <= self.max_end_layer(start)
 
     def _runtime_workspace_bytes(self) -> float:
         """Non-weight, non-KV runtime GPU buffers to reserve before counting

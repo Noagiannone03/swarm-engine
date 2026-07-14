@@ -161,6 +161,9 @@ class SGLExecutor(BaseExecutor):
             chunked_prefill_size, self.model_runner.page_size
         )
         self.model_runner.server_args.chunked_prefill_size = self.chunked_prefill_size
+        self._runtime_kv_capacity_tokens = int(
+            self.model_runner.token_to_kv_pool_allocator.available_size()
+        )
 
         super().__init__(
             start_layer=start_layer,
@@ -523,6 +526,15 @@ class SGLExecutor(BaseExecutor):
             logger.warning(f"Failed to check KV cache availability: {e}")
             # If we can't check, allow the operation to proceed
             return True
+
+    def _kv_free_tokens(self) -> Optional[int]:
+        try:
+            return int(self.model_runner.token_to_kv_pool_allocator.available_size())
+        except Exception:
+            return None
+
+    def _kv_capacity_tokens(self) -> Optional[int]:
+        return getattr(self, "_runtime_kv_capacity_tokens", None)
 
     def _abort_requests_due_to_kv_cache(self, batched_requests: List[Request], reason: str):
         """

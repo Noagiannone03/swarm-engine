@@ -223,7 +223,10 @@ class BaseExecutor:
             # this node's real servable context immediately, before any decode
             # step has reported a live value.
             try:
-                self.shared_state.update_metrics(kv_free_tokens=self._kv_free_tokens())
+                self.shared_state.update_metrics(
+                    kv_free_tokens=self._kv_free_tokens(),
+                    kv_capacity_tokens=self._kv_capacity_tokens(),
+                )
             except Exception:
                 pass
 
@@ -568,7 +571,31 @@ class BaseExecutor:
         their KV pool override it. None ⇒ the scheduler falls back to its
         measured-budget context estimate, so this is always safe to leave unset.
         """
-        return None
+        try:
+            manager = getattr(self, "cache_manager", None)
+            if manager is None:
+                return None
+            if not getattr(manager, "needs_blocks", False):
+                return int(self.max_sequence_length or 0)
+            allocator = getattr(manager, "allocator", None)
+            if allocator is None:
+                return None
+            return int(allocator.get_num_free_blocks()) * int(manager.block_size)
+        except Exception:
+            return None
+
+    def _kv_capacity_tokens(self) -> Optional[int]:
+        """Load-independent KV capacity measured from the runtime cache pool."""
+
+        try:
+            manager = getattr(self, "cache_manager", None)
+            if manager is None:
+                return None
+            if not getattr(manager, "needs_blocks", False):
+                return int(self.max_sequence_length or 0)
+            return int(manager.num_gpu_blocks) * int(manager.block_size)
+        except Exception:
+            return None
 
     def prepare_batch_inputs(self, batched_requests: List[Request]) -> Optional[Dict[str, Any]]:
         """Prepares inputs for ShardedModel from a batch of requests.
@@ -771,6 +798,7 @@ class BaseExecutor:
                                         self.shared_state.update_metrics(
                                             layer_latency_ms_sample=per_layer_ms,
                                             kv_free_tokens=self._kv_free_tokens(),
+                                            kv_capacity_tokens=self._kv_capacity_tokens(),
                                         )
                                     self._decode_steps_since_metric = 0
                             except Exception:

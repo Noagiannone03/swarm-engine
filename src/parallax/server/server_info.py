@@ -17,6 +17,8 @@ from parallax_utils.cuda_memory import (
 )
 
 try:
+    if os.environ.get("PARALLAX_DISABLE_MLX_IMPORT") == "1":
+        raise ImportError("MLX import explicitly disabled")
     import mlx.core as mx
     from mlx import nn
     from mlx.utils import tree_reduce
@@ -339,9 +341,7 @@ class AppleSiliconHardwareInfo(HardwareInfo):
             physical_gb = vm.total / 2**30
             available_gb = vm.available / 2**30
         else:
-            physical_gb = (
-                int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 2**30
-            )
+            physical_gb = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 2**30
             available_gb = None
 
         # Apple silicon shares one pool of RAM between the CPU, the GPU,

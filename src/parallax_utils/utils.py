@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 try:
@@ -14,6 +15,8 @@ logger = get_logger(__name__)
 def bytes_per_element(dtype) -> int:
     """Return element size in bytes for supported torch/MLX dtypes."""
     try:
+        if os.environ.get("PARALLAX_DISABLE_MLX_IMPORT") == "1":
+            raise ImportError("MLX import explicitly disabled")
         import mlx.core as mx  # type: ignore
     except Exception:
         mx = None

@@ -8,7 +8,7 @@ and performance estimation decisions.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 from parallax_utils.logging_config import get_logger
 
@@ -47,6 +47,10 @@ class ModelInfo:
     v_head_dim: Optional[int] = None
     head_size_k: int = None
     head_size_v: int = None
+    # Exact cache geometry used by worker capacity contracts.  This may vary by
+    # layer for hybrid/MLA/DSA models; scalar averages are not placement-safe.
+    kv_bytes_per_token_by_layer: Optional[List[int]] = None
+    capacity_profile_unsupported_reason: Optional[str] = None
 
     def __init__(self, **kwargs):
         for key, value in kwargs.items():

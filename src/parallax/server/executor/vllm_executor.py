@@ -581,6 +581,22 @@ class VLLMExecutor(BaseExecutor):
         except Exception:
             return None
 
+    def _kv_capacity_tokens(self) -> Optional[int]:
+        try:
+            mr = self.model_runner
+            block_size = int(mr.cache_config.block_size)
+            config = getattr(mr, "kv_cache_config", None)
+            if config is None:
+                return None
+            groups = getattr(config, "kv_cache_groups", None)
+            num_groups = max(1, len(groups)) if groups else 1
+            total_blocks = getattr(config, "num_blocks", None)
+            if total_blocks is None:
+                return None
+            return int(int(total_blocks) // num_groups * block_size)
+        except Exception:
+            return None
+
     def _get_routed_experts_for_request(self, request: Request) -> Optional[List]:
         if not self.enable_return_routed_experts or self.routed_experts_reader is None:
             return None
