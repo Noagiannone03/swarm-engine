@@ -26,6 +26,7 @@ from scheduling.model_info import ModelInfo
 logger = get_logger(__name__)
 
 CAPACITY_PROTOCOL_VERSION = 1
+ENGINE_CORE_FRONTEND_PROTOCOL = "vllm-engine-core-v1"
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
@@ -119,6 +120,7 @@ def build_capacity_profile_from_tensor_sizes(
     target_context_tokens: int,
     runtime_reserve_bytes: int,
     backend: str,
+    http_frontend: Optional[Mapping[str, object]] = None,
     generated_at: Optional[float] = None,
 ) -> dict:
     """Build the worker's admissible contiguous ranges.
@@ -196,6 +198,18 @@ def build_capacity_profile_from_tensor_sizes(
         "tie_embedding": tied_embedding,
         "layer_weight_bytes": [int(size) for size in layer_weights],
         "max_end_by_start": max_end_by_start,
+        # Hosting decoder layers and accepting OpenAI HTTP traffic are distinct
+        # capabilities.  In particular, vLLM's v0.24 Rust frontend is Unix-only,
+        # so a native Windows CUDA worker must never be placed at layer zero.
+        "http_frontend": dict(
+            http_frontend
+            or {
+                "available": False,
+                "protocol": ENGINE_CORE_FRONTEND_PROTOCOL,
+                "implementation": None,
+                "reason": "worker did not advertise a compatible frontend",
+            }
+        ),
     }
 
 
@@ -343,7 +357,43 @@ def build_worker_capacity_profile(
         target_context_tokens=target_context_tokens,
         runtime_reserve_bytes=int(reserve_gb * 1024**3),
         backend=backend,
+        http_frontend=detect_http_frontend_capability(),
     )
+
+
+def detect_http_frontend_capability(platform: Optional[str] = None) -> dict:
+    """Report whether this worker can own layer zero and the OpenAI endpoint.
+
+    The worker is the authority because only it knows which runtime artifacts
+    are actually installed.  A platform guess in the scheduler would repeat
+    the exact architecture error the capacity contract is meant to prevent.
+    """
+
+    target = os.name if platform is None else platform
+    if target == "nt":
+        return {
+            "available": False,
+            "protocol": ENGINE_CORE_FRONTEND_PROTOCOL,
+            "implementation": None,
+            "reason": "vllm-rs v0.24 uses Unix listener file descriptors",
+        }
+
+    try:
+        from parallax.server.vllm_rust_frontend import resolve_vllm_rs_binary
+
+        resolve_vllm_rs_binary()
+    except Exception as exc:
+        return {
+            "available": False,
+            "protocol": ENGINE_CORE_FRONTEND_PROTOCOL,
+            "implementation": None,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "available": True,
+        "protocol": ENGINE_CORE_FRONTEND_PROTOCOL,
+        "implementation": "vllm-rs",
+    }
 
 
 def profile_allows_range(profile: Mapping[str, object], start: int, end: int) -> bool:

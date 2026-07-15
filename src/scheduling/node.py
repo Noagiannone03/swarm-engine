@@ -639,6 +639,24 @@ class Node:
         except (TypeError, ValueError):
             return False
 
+    @property
+    def can_host_http_frontend(self) -> bool:
+        """Whether the worker explicitly accepts the layer-zero HTTP role."""
+
+        # Compatibility workers predate capability negotiation.  Keep their
+        # historical behavior; protocol workers fail closed unless their own
+        # validated contract names the exact engine-core protocol.
+        if not self.uses_capacity_contract:
+            return True
+        if not self.has_valid_capacity_profile:
+            return False
+        frontend = self.capacity_profile.get("http_frontend")
+        if not isinstance(frontend, Mapping):
+            return False
+        return bool(frontend.get("available")) and str(frontend.get("protocol")) == (
+            "vllm-engine-core-v1"
+        )
+
     def max_end_layer(self, start_layer: int) -> int:
         """Largest feasible exclusive end for a shard beginning at ``start``.
 

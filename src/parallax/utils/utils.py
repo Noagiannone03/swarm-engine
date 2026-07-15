@@ -6,6 +6,8 @@ import json
 import os
 import random
 import socket
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, List
 
@@ -100,6 +102,43 @@ def get_device_dtype(dtype_str: str, device: str):
             "float32": mx.float32,
         }
     return dtype_map[dtype_str]
+
+
+def create_local_zmq_endpoints(count: int, platform: str | None = None) -> list[str]:
+    """Allocate private endpoints for communication between local processes.
+
+    ZeroMQ's ``ipc://`` transport is not implemented on native Windows.  On
+    that platform we reserve all loopback ports at once, keeping the TCP
+    sockets open until every port has been selected.  This guarantees that a
+    single Parallax process cannot receive the same ephemeral port twice.
+
+    The reservations are released immediately before the returned endpoints
+    are handed to the worker subprocesses.  Only loopback is used: these
+    internal queues are never exposed to the LAN or the public swarm.
+    """
+    if count < 1:
+        raise ValueError("count must be at least 1")
+
+    target = os.name if platform is None else platform
+    if target != "nt":
+        root = tempfile.gettempdir()
+        return [f"ipc://{os.path.join(root, f'parallax-zmq-{uuid.uuid4().hex}')}" for _ in range(count)]
+
+    reservations: list[socket.socket] = []
+    try:
+        endpoints: list[str] = []
+        for _ in range(count):
+            reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Windows otherwise permits surprising address reuse semantics.
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            reservation.bind(("127.0.0.1", 0))
+            reservations.append(reservation)
+            endpoints.append(f"tcp://127.0.0.1:{reservation.getsockname()[1]}")
+        return endpoints
+    finally:
+        for reservation in reservations:
+            reservation.close()
 
 
 def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool):

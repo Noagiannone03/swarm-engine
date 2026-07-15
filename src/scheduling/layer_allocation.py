@@ -221,6 +221,8 @@ class BaseLayerAllocator:
         for existing in replicas:
             start_layer = int(existing.start_layer)
             end_layer = int(existing.end_layer)
+            if start_layer == 0 and not node.can_host_http_frontend:
+                continue
             if node.can_host_range(start_layer, end_layer):
                 logger.info(
                     "[LayerAllocator] Replicating executable stage [%d, %d) from %s to %s",
@@ -234,6 +236,17 @@ class BaseLayerAllocator:
 
         # Assign consecutive layers starting from the lightest layer
         start_layer = lightest_layer.layer_id
+        if start_layer == 0 and not node.can_host_http_frontend:
+            candidates = [
+                load for load in self.layer_loads_heap if load.layer_id > 0
+            ]
+            if not candidates:
+                logger.info(
+                    "[LayerAllocator] Keeping %s in standby: it cannot host the HTTP head",
+                    node.node_id,
+                )
+                return
+            start_layer = min(candidates).layer_id
         # Greedily assign layers that the node can host
         end_layer = self._adjust_end_layer_for_tail(node, start_layer)
         logger.info(
@@ -683,6 +696,8 @@ class GreedyLayerAllocator(BaseLayerAllocator):
         """Assign a candidate pipeline if endpoint-aware capacity is sufficient."""
         if not pipeline_nodes:
             return False
+        if not pipeline_nodes[0].can_host_http_frontend:
+            return False
         try:
             if rebalance_strategy == "greedy" and not any(
                 node.uses_capacity_contract for node in pipeline_nodes
@@ -691,7 +706,11 @@ class GreedyLayerAllocator(BaseLayerAllocator):
             else:
                 self.adjust_pipeline_layers(
                     pipeline_nodes,
-                    assume_sorted=False,
+                    # The first worker is role-selected, not capacity-sorted:
+                    # it owns embeddings and the OpenAI frontend.  Re-sorting
+                    # here would silently move an incapable Windows worker to
+                    # layer zero after the pipeline had been validated.
+                    assume_sorted=True,
                     power_type=self._pipeline_power_type(pipeline_nodes),
                 )
             return True
@@ -708,7 +727,13 @@ class GreedyLayerAllocator(BaseLayerAllocator):
         """
         num_total_layers = self.model_info.num_layers
 
-        available_nodes = self.node_management.standby_nodes
+        available_nodes = sorted(
+            self.node_management.standby_nodes,
+            key=lambda node: (
+                not node.can_host_http_frontend,
+                -node.get_decoder_layer_capacity(include_input_embed=True),
+            ),
+        )
         logger.info(
             "[Greedy LayerAllocator] Starting allocate_from_standby with %d nodes for %d layers",
             len(available_nodes),
@@ -763,11 +788,31 @@ class GreedyLayerAllocator(BaseLayerAllocator):
                                     i  # choose the last matching (smallest due to sorting)
                                 )
 
-                node_to_add = (
-                    available_nodes.pop(best_fit_idx)
-                    if best_fit_idx != -1
-                    else available_nodes.pop(0)
-                )
+                if is_start:
+                    capable_heads = [
+                        (index, candidate)
+                        for index, candidate in enumerate(available_nodes)
+                        if candidate.can_host_http_frontend and candidate.max_end_layer(0) > 0
+                    ]
+                    if not capable_heads:
+                        logger.warning(
+                            "[Greedy] No worker advertises a compatible HTTP frontend; "
+                            "cannot construct a routable pipeline"
+                        )
+                        break
+                    head_idx, _ = max(
+                        capable_heads,
+                        key=lambda pair: pair[1].get_decoder_layer_capacity(
+                            include_input_embed=True
+                        ),
+                    )
+                    node_to_add = available_nodes.pop(head_idx)
+                else:
+                    node_to_add = (
+                        available_nodes.pop(best_fit_idx)
+                        if best_fit_idx != -1
+                        else available_nodes.pop(0)
+                    )
 
                 pipeline_nodes.append(node_to_add)
                 # Update running totals with appropriate capacity at this position
@@ -866,7 +911,16 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
         """
         num_layers = self.model_info.num_layers
 
-        available_nodes = self.node_management.standby_nodes
+        # The DP walks nodes once from left to right.  Put explicit frontend
+        # hosts first so a later layer-only worker can extend a pipeline they
+        # start; the reverse order could only skip the capable head forever.
+        available_nodes = sorted(
+            self.node_management.standby_nodes,
+            key=lambda node: (
+                not node.can_host_http_frontend,
+                -node.get_decoder_layer_capacity(include_input_embed=True),
+            ),
+        )
         logger.info(
             "[DPLayerAllocator] Starting allocate_from_standby with %d nodes for %d layers",
             len(available_nodes),
@@ -956,7 +1010,11 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
 
                 # Option 3: start a new pipeline (if we still need more)
                 if new_needed > 0:
-                    end = available_nodes[i].max_end_layer(0)
+                    end = (
+                        available_nodes[i].max_end_layer(0)
+                        if available_nodes[i].can_host_http_frontend
+                        else 0
+                    )
                     if end > 0:
                         r_new = num_layers - end
                         if r_new <= 0:

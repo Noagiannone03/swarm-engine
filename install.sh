@@ -8,11 +8,15 @@
 
 set -euo pipefail
 
+# Non-login SSH shells on Apple Silicon do not necessarily source the Homebrew
+# shellenv stanza.  Keep tool discovery deterministic for remote workers and CI.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 EXTRAS="${PARALLAX_EXTRAS:-}"
 PYTHON_VERSION="${PARALLAX_PYTHON_VERSION:-3.12}"
-VENV_DIR="$SCRIPT_DIR/.venv"
+VENV_DIR="${PARALLAX_VENV_DIR:-$SCRIPT_DIR/.venv}"
 VLLM_REF="${VLLM_REF:-v0.24.0}"
 VLLM_MINIJINJA_VERSION="${VLLM_MINIJINJA_VERSION-2.20.0}"
 
@@ -34,6 +38,9 @@ Environment:
   VLLM_REF                vLLM git branch, tag, or full commit hash to clone.
   VLLM_MINIJINJA_VERSION  MiniJinja/minijinja-contrib version to use when
                           building vllm-rs. Defaults to 2.20.0.
+  PARALLAX_VENV_DIR       Existing/target virtual environment path.
+  PARALLAX_SKIP_PYTHON_INSTALL=1
+                          Build vllm-rs into an already populated environment.
 EOF
 }
 
@@ -352,9 +359,17 @@ main() {
 
     cd "$SCRIPT_DIR"
 
-    ensure_uv
-    ensure_venv
-    install_parallax_python
+    if [[ "${PARALLAX_SKIP_PYTHON_INSTALL:-0}" == "1" ]]; then
+        if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+            echo "PARALLAX_SKIP_PYTHON_INSTALL=1 but $VENV_DIR/bin/python is missing." >&2
+            exit 1
+        fi
+        echo "Using prebuilt Parallax environment: $VENV_DIR"
+    else
+        ensure_uv
+        ensure_venv
+        install_parallax_python
+    fi
     ensure_git
     build_vllm_rust_frontend
 

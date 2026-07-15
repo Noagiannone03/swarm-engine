@@ -6,7 +6,7 @@ from parallax.server.capacity_profile import (
     constrain_profile_to_memory,
     profile_allows_range,
 )
-from scheduling.layer_allocation import DynamicProgrammingLayerAllocator
+from scheduling.layer_allocation import DynamicProgrammingLayerAllocator, GreedyLayerAllocator
 from scheduling.model_info import ModelInfo
 from scheduling.node import Node, NodeHardwareInfo
 from scheduling.node_management import NodeState
@@ -106,6 +106,11 @@ def _contract(model: ModelInfo, max_ends: list[int]) -> dict:
         "num_layers": model.num_layers,
         "target_context_tokens": 4096,
         "max_end_by_start": max_ends,
+        "http_frontend": {
+            "available": True,
+            "protocol": "vllm-engine-core-v1",
+            "implementation": "test",
+        },
     }
 
 
@@ -147,6 +152,29 @@ def test_dp_allocator_consumes_start_dependent_worker_ranges():
     assert allocator.allocate_from_standby()
     assert (first.start_layer, first.end_layer) == (0, 1)
     assert (tail.start_layer, tail.end_layer) == (1, 3)
+
+
+@pytest.mark.parametrize(
+    "allocator_type", [DynamicProgrammingLayerAllocator, GreedyLayerAllocator]
+)
+def test_contract_worker_without_frontend_cannot_own_layer_zero(allocator_type):
+    model = _model()
+    cuda = _contract_node("windows", model, [3, 3, 3])
+    cuda.capacity_profile["http_frontend"] = {
+        "available": False,
+        "protocol": "vllm-engine-core-v1",
+    }
+    unix_head = _contract_node("mac", model, [1, 2, 3])
+    manager = build_node_management([cuda, unix_head])
+    allocator = allocator_type(
+        model_info=model,
+        node_management=manager,
+        dynamic_pipelines_router=True,
+    )
+
+    assert allocator.allocate_from_standby()
+    assert (unix_head.start_layer, unix_head.end_layer) == (0, 1)
+    assert (cuda.start_layer, cuda.end_layer) == (1, 3)
 
 
 def test_runtime_kv_measurement_can_only_shrink_provisional_contract():
