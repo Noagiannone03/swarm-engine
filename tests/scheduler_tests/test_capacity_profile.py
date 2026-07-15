@@ -242,3 +242,50 @@ def test_bootstrapped_scheduler_keeps_unprofiled_join_safe_until_heartbeat():
     scheduler._process_node_updates()
     assert scheduler.node_manager.state_of(joining.node_id) == NodeState.ACTIVE
     assert (joining.start_layer, joining.end_layer) == (0, 3)
+
+
+def test_dp_reconnect_restores_recent_shard_after_capacity_negotiation():
+    model = _model()
+    head = _contract_node("mac-head", model, [1, 2, 3])
+    tail = _contract_node("windows-tail", model, [0, 3, 3])
+    tail.capacity_profile["http_frontend"] = {
+        "available": False,
+        "protocol": "vllm-engine-core-v1",
+    }
+    scheduler = Scheduler(
+        model,
+        [head, tail],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+    assert scheduler.bootstrap()
+    assert (head.start_layer, head.end_layer) == (0, 1)
+    assert (tail.start_layer, tail.end_layer) == (1, 3)
+
+    scheduler.enqueue_leave(tail.node_id)
+    scheduler._process_leaves()
+    assert not scheduler.has_full_pipeline()
+
+    replacement = _contract_node("windows-tail", model, [0, 3, 3])
+    replacement.capacity_profile = None
+    scheduler.enqueue_join(replacement)
+    scheduler._process_joins()
+    assert scheduler.node_manager.state_of(replacement.node_id) == NodeState.STANDBY
+    assert replacement.start_layer is None
+
+    negotiated = _contract(model, [0, 3, 3])
+    negotiated["http_frontend"] = {
+        "available": False,
+        "protocol": "vllm-engine-core-v1",
+    }
+    scheduler.enqueue_node_update(
+        replacement.node_id,
+        capacity_protocol_version=1,
+        capacity_profile=negotiated,
+    )
+    scheduler._process_node_updates()
+
+    assert (replacement.start_layer, replacement.end_layer) == (1, 3)
+    assert scheduler.node_manager.state_of(replacement.node_id) == NodeState.ACTIVE
+    assert scheduler.has_full_pipeline()

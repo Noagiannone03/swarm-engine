@@ -754,6 +754,30 @@ class Scheduler:
             else:
                 logger.info("Worker capacity replan deferred until in-flight requests drain")
 
+        # A capacity-contract worker initially joins with zero schedulable
+        # capacity, then publishes its exact model profile on a heartbeat. In
+        # DP recovery mode the missing shard already has a tombstone, but
+        # join() could not restore it before the profile existed. Retry the
+        # non-destructive restore now, preserving every surviving loaded shard.
+        # This is the normal reconnect path after a worker/runtime crash.
+        if not self._bootstrapped_event.is_set() and self.dynamic_pipelines_router:
+            for node in newly_capable_nodes:
+                if self.node_manager.state_of(node.node_id) != NodeState.STANDBY:
+                    continue
+                try:
+                    restored = self._restore_recent_allocation(node)
+                except Exception:
+                    logger.warning(
+                        "Failed to restore negotiated worker %s into its recent shard",
+                        node.node_id,
+                        exc_info=True,
+                    )
+                    continue
+                if restored and self.has_full_pipeline():
+                    self._bootstrapped_event.set()
+                    self.last_bootstrap_result = "success"
+                    self.emit_alloc_log_snapshot(reason="after negotiated DP shard restore")
+
         if self._bootstrapped_event.is_set() and newly_capable_nodes:
             for node in newly_capable_nodes:
                 if self.node_manager.state_of(node.node_id) != NodeState.STANDBY:
