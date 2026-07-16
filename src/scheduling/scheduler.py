@@ -803,7 +803,29 @@ class Scheduler:
             and self.node_manager.num_standby_nodes >= self.min_nodes_bootstrapping
         ):
             try:
-                self.bootstrap()
+                bootstrapped = self.bootstrap()
+                # DP normally preserves surviving shards and first tries the
+                # exact tombstone restore above. If the scheduler itself was
+                # restarted, those in-memory tombstones are gone: the cluster
+                # can then contain an incomplete ACTIVE prefix plus a capable
+                # STANDBY replacement that ``allocate_from_standby`` cannot
+                # combine. Upstream's recovery fallback is a global idle
+                # rebalance. Do that only after the non-destructive path failed
+                # and only when it cannot interrupt an in-flight request.
+                active_nodes = self.node_manager.active_nodes
+                if (
+                    not bootstrapped
+                    and self.dynamic_pipelines_router
+                    and active_nodes
+                    and all(node.current_requests == 0 for node in active_nodes)
+                ):
+                    logger.warning(
+                        "No exact DP shard restore was available; rebuilding the idle "
+                        "partial pipeline from worker capacity contracts"
+                    )
+                    self.node_manager.standby([node.node_id for node in active_nodes])
+                    self.layer_allocator.rebuild_layer_loads()
+                    self.bootstrap(reboot=True)
             except Exception:
                 logger.warning(
                     "Bootstrap after worker capacity negotiation failed",

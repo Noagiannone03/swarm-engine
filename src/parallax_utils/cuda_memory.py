@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -13,6 +15,7 @@ _DEFAULT_CUDA_SYSTEM_RESERVE_GB = 1.5
 _DEFAULT_CUDA_AVAILABLE_RESERVE_GB = 0.75
 _DEFAULT_CUDA_USABLE_MEMORY_FRACTION = 0.82
 _MIN_CUDA_BUDGET_GB = 1.0
+_FABI_WINDOWS_CUDA_VERSION = "12.6"
 
 
 @dataclass(frozen=True)
@@ -22,6 +25,63 @@ class CudaMemoryBudget:
     free_gb: Optional[float]
     usable_gb: float
     allocator_fraction: float
+
+
+def configure_windows_cuda_environment(
+    *,
+    environ: Optional[dict[str, str]] = None,
+    platform: Optional[str] = None,
+    program_files: Optional[str] = None,
+) -> Optional[str]:
+    """Expose an installed CUDA toolkit to Windows JIT backends.
+
+    vLLM-Windows discovers CUDA through the standard ``CUDA_PATH`` / ``CUDA_HOME`` /
+    ``CUDA_ROOT`` variables. FlashInfer additionally requires ``CUDA_LIB_PATH``.
+    NVIDIA's installer creates a versioned toolkit directory, but processes that
+    were already running (notably Fabi) do not inherit its new environment. Resolve
+    the official install layout once before importing either backend and populate
+    all four names consistently.
+    """
+
+    if (platform or sys.platform) != "win32":
+        return None
+    env = environ if environ is not None else os.environ
+    candidates = [
+        env.get(name, "").strip()
+        for name in ("CUDA_LIB_PATH", "CUDA_PATH", "CUDA_HOME", "CUDA_ROOT")
+    ]
+    root = Path(
+        program_files
+        or env.get("ProgramFiles", "").strip()
+        or r"C:\Program Files"
+    ) / "NVIDIA GPU Computing Toolkit" / "CUDA"
+    requested = env.get("PARALLAX_CUDA_TOOLKIT_VERSION", _FABI_WINDOWS_CUDA_VERSION).strip()
+    candidates.append(str(root / f"v{requested}"))
+    if root.is_dir():
+        candidates.extend(str(path) for path in sorted(root.glob("v*"), reverse=True))
+
+    cuda_root = next(
+        (
+            Path(candidate).resolve()
+            for candidate in candidates
+            if candidate
+            and (Path(candidate) / "bin").is_dir()
+            and (Path(candidate) / "include").is_dir()
+        ),
+        None,
+    )
+    if cuda_root is None:
+        return None
+
+    resolved = str(cuda_root)
+    for name in ("CUDA_LIB_PATH", "CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"):
+        env[name] = resolved
+    cuda_bin = str(cuda_root / "bin")
+    path_entries = env.get("PATH", "").split(os.pathsep)
+    if cuda_bin.casefold() not in {entry.casefold() for entry in path_entries if entry}:
+        env["PATH"] = os.pathsep.join([cuda_bin, *path_entries])
+    logger.info("Using CUDA toolkit at %s", resolved)
+    return resolved
 
 
 def _read_env_float(

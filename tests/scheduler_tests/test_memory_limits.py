@@ -1,5 +1,10 @@
+import os
+
 from parallax.server.server_info import _resolve_usable_memory_gb
-from parallax_utils.cuda_memory import resolve_cuda_memory_budget
+from parallax_utils.cuda_memory import (
+    configure_windows_cuda_environment,
+    resolve_cuda_memory_budget,
+)
 from parallax_utils.utils import derive_max_batch_size
 from scheduling.node import Node, NodeHardwareInfo
 
@@ -46,6 +51,42 @@ def test_cuda_budget_reserves_vram_for_desktop_hosts(monkeypatch):
 
     assert budget.usable_gb == 19.68
     assert round(budget.allocator_fraction, 2) == 0.82
+
+
+def test_windows_cuda_environment_uses_fabi_runtime_version(tmp_path):
+    toolkit = tmp_path / "NVIDIA GPU Computing Toolkit" / "CUDA" / "v12.6"
+    (toolkit / "bin").mkdir(parents=True)
+    (toolkit / "include").mkdir()
+    env = {"PATH": r"C:\Windows\System32"}
+
+    resolved = configure_windows_cuda_environment(
+        environ=env,
+        platform="win32",
+        program_files=str(tmp_path),
+    )
+
+    assert resolved == str(toolkit.resolve())
+    assert env["CUDA_LIB_PATH"] == resolved
+    assert env["CUDA_PATH"] == resolved
+    assert env["CUDA_HOME"] == resolved
+    assert env["CUDA_ROOT"] == resolved
+    assert env["PATH"].split(os.pathsep)[0] == str(toolkit / "bin")
+
+
+def test_windows_cuda_environment_preserves_explicit_valid_root(tmp_path):
+    toolkit = tmp_path / "custom-cuda"
+    (toolkit / "bin").mkdir(parents=True)
+    (toolkit / "include").mkdir()
+    env = {"CUDA_LIB_PATH": str(toolkit), "PATH": ""}
+
+    resolved = configure_windows_cuda_environment(
+        environ=env,
+        platform="win32",
+        program_files=str(tmp_path / "missing"),
+    )
+
+    assert resolved == str(toolkit.resolve())
+    assert env["CUDA_LIB_PATH"] == resolved
 
 
 def test_cuda_budget_backs_off_when_vram_is_already_used(monkeypatch):

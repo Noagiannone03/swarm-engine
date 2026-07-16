@@ -6,7 +6,10 @@ import argparse
 from typing import Any, List, Optional
 
 from parallax.utils.utils import get_current_device
-from parallax_utils.cuda_memory import configure_torch_cuda_memory_limit
+from parallax_utils.cuda_memory import (
+    configure_torch_cuda_memory_limit,
+    configure_windows_cuda_environment,
+)
 from parallax_utils.logging_config import get_logger, set_log_level
 
 logger = get_logger(__name__)
@@ -150,6 +153,7 @@ def create_from_args(
 def run_executor_process(args, shared_state=None, conn=None):
     """Run executor as a subprocess"""
     set_log_level(args.log_level)
+    configure_windows_cuda_environment()
     configure_torch_cuda_memory_limit()
     executor = None
     try:
