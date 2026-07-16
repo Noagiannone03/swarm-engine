@@ -12,6 +12,32 @@ from scheduling.scheduler import Scheduler
 logger = get_logger(__name__)
 
 
+def node_log_summary(message: object) -> dict:
+    """Return operational node fields without credentials or full contracts."""
+
+    if not isinstance(message, dict):
+        return {"message_type": type(message).__name__}
+    hardware = message.get("hardware")
+    safe_hardware = {}
+    if isinstance(hardware, dict):
+        for key in ("gpu_name", "device", "memory_gb", "usable_memory_bytes"):
+            if key in hardware:
+                safe_hardware[key] = hardware[key]
+    return {
+        key: value
+        for key, value in {
+            "node_id": message.get("node_id"),
+            "status": message.get("status"),
+            "start_layer": message.get("start_layer"),
+            "end_layer": message.get("end_layer"),
+            "current_requests": message.get("current_requests"),
+            "kv_free_tokens": message.get("kv_free_tokens"),
+            "hardware": safe_hardware,
+        }.items()
+        if value is not None and value != {}
+    }
+
+
 def _node_join_allocation_wait_seconds() -> float:
     """Short wait for a synchronous layer assignment during node_join.
 
@@ -62,7 +88,7 @@ class RPCConnectionHandler(ConnectionHandler):
         #     "max_concurrent_requests": 16,
         #     "max_sequence_length": 1024,
         # }
-        logger.info(f"receive node_join request: {message}")
+        logger.info("receive node_join request: %s", node_log_summary(message))
         try:
             node = self.build_node(message)
             self._refresh_contribution_lease(message, node, source="node_join")
@@ -99,7 +125,7 @@ class RPCConnectionHandler(ConnectionHandler):
 
     @rpc_method
     def node_leave(self, message):
-        logger.debug(f"receive node_leave request: {message}")
+        logger.debug("receive node_leave request: %s", node_log_summary(message))
         try:
             node = self.build_node(message)
             if self._is_stale_session(node):
@@ -118,7 +144,7 @@ class RPCConnectionHandler(ConnectionHandler):
         first dict contains layer allocation result and
         second dict records weight refit information.
         """
-        logger.debug(f"receive node_update request: {message}")
+        logger.debug("receive node_update request: %s", node_log_summary(message))
         try:
             node = self.build_node(message)
             if self._is_stale_session(node):
