@@ -17,6 +17,11 @@ _DEFAULT_CUDA_USABLE_MEMORY_FRACTION = 0.82
 _MIN_CUDA_BUDGET_GB = 1.0
 _FABI_WINDOWS_CUDA_VERSION = "12.6"
 
+# A process must keep using the admission budget measured before it loads model
+# weights. Recomputing from live free VRAM later counts this process's own model
+# allocations as external pressure and shrinks the KV budget a second time.
+_cuda_process_budget_bytes: dict[int, int] = {}
+
 
 @dataclass(frozen=True)
 class CudaMemoryBudget:
@@ -174,13 +179,17 @@ def resolve_cuda_memory_budget(
 
 
 def cuda_allocator_budget_bytes(device_index: int = 0, torch_module=None) -> Optional[int]:
-    """Return this process's ENFORCED VRAM ceiling in bytes for ``device_index``.
+    """Return this process's stable VRAM admission budget for ``device_index``.
 
-    This is the exact limit installed by :func:`configure_torch_cuda_memory_limit`
-    through ``torch.cuda.set_per_process_memory_fraction`` — i.e. the most this
-    process is ever allowed to allocate on the device. Returns ``None`` if CUDA
-    or PyTorch is unavailable.
+    :func:`configure_torch_cuda_memory_limit` snapshots the budget before model
+    loading and optionally enforces it through PyTorch's allocator. Keeping the
+    snapshot is essential: live free VRAM later includes this process's own model
+    and workspace allocations. Returns ``None`` if CUDA or PyTorch is unavailable.
     """
+
+    cached = _cuda_process_budget_bytes.get(device_index)
+    if cached is not None:
+        return cached
     if torch_module is None:
         try:
             import torch as torch_module  # type: ignore[no-redef]
@@ -201,7 +210,7 @@ def cuda_allocator_budget_bytes(device_index: int = 0, torch_module=None) -> Opt
             total_gb=total_bytes / (1024**3),
             free_gb=free_gb,
         )
-        return int(budget.allocator_fraction * total_bytes)
+        return int(budget.usable_gb * 1024**3)
     except Exception:
         return None
 
@@ -311,6 +320,13 @@ def configure_torch_cuda_memory_limit(torch_module=None) -> list[CudaMemoryBudge
                 logger.warning(
                     "Unable to set CUDA memory fraction on device %s: %s", device_index, exc
                 )
+        usable_bytes = int(budget.usable_gb * 1024**3)
+        if enforce:
+            usable_bytes = min(
+                usable_bytes,
+                int(budget.allocator_fraction * props.total_memory),
+            )
+        _cuda_process_budget_bytes.setdefault(device_index, usable_bytes)
         logger.info(
             "CUDA device %s budget: %.2f GB usable of %.2f GB total "
             "(free=%s GB, allocator_fraction=%.2f, enforced=%s)",

@@ -1,8 +1,10 @@
 import os
 
+import parallax_utils.cuda_memory as cuda_memory
 from parallax.server.server_info import _resolve_usable_memory_gb
 from parallax_utils.cuda_memory import (
     available_kv_cache_bytes,
+    configure_torch_cuda_memory_limit,
     configure_windows_cuda_environment,
     resolve_cuda_memory_budget,
 )
@@ -145,6 +147,46 @@ def test_kv_budget_reuses_torch_allocator_cache(monkeypatch):
     available = available_kv_cache_bytes(0, 0.8, fake_torch)
 
     assert available == int(7.2 * gib)
+
+
+def test_cuda_process_keeps_its_startup_admission_budget(monkeypatch):
+    gib = 1024**3
+    monkeypatch.setattr(cuda_memory, "_cuda_process_budget_bytes", {})
+    monkeypatch.delenv("PARALLAX_WORKER_MEMORY_GB", raising=False)
+    monkeypatch.delenv("PARALLAX_CUDA_ALLOCATOR_FRACTION", raising=False)
+    monkeypatch.delenv("PARALLAX_ENFORCE_CUDA_CAP", raising=False)
+
+    class FakeCuda:
+        free_bytes = 15 * gib
+
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 1
+
+        @staticmethod
+        def get_device_properties(_device_index):
+            return type("Properties", (), {"total_memory": 16 * gib})()
+
+        @classmethod
+        def mem_get_info(cls, _device_index):
+            return cls.free_bytes, 16 * gib
+
+        @staticmethod
+        def memory_allocated(_device_index):
+            return 4 * gib
+
+    fake_torch = type("FakeTorch", (), {"cuda": FakeCuda})()
+
+    configure_torch_cuda_memory_limit(fake_torch)
+    FakeCuda.free_bytes = 10 * gib
+
+    available = available_kv_cache_bytes(0, 0.8, fake_torch)
+
+    assert available == int((13.12 - 4) * 0.8 * gib)
 
 
 def test_derive_max_batch_size_treats_zero_cache_as_capacity_limit():
