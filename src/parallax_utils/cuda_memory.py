@@ -219,11 +219,14 @@ def available_kv_cache_bytes(
     workstation-safe budget), that over-counts free memory and vLLM requests a KV
     pool larger than the cap admits → CUDA OOM the moment it touches it.
 
-    This instead bounds the pool by ``cap − already_reserved`` (what this process
-    can still allocate), then applies ``kv_cache_memory_fraction`` as the usual
-    safety margin for activation spikes / fragmentation. Falls back to the
-    physical-free computation when the cap can't be resolved (no behaviour change
-    on uncapped single-model nodes). Returns ``None`` if torch is unavailable.
+    This instead bounds the pool by ``budget − actually_allocated`` (what this
+    process can still use), then applies ``kv_cache_memory_fraction`` as the usual
+    safety margin for activation spikes / fragmentation. PyTorch's *reserved*
+    bytes deliberately include reusable allocator cache and must not be counted
+    as permanently occupied; doing so applies the safety margin twice and can
+    reject contexts that fit in the worker's advertised budget. Falls back to the
+    physical-free computation when the budget can't be resolved. Returns ``None``
+    if torch is unavailable.
     """
     if torch_module is None:
         try:
@@ -239,10 +242,10 @@ def available_kv_cache_bytes(
     if cap is None:
         return int(physical_free * kv_cache_memory_fraction)
     try:
-        reserved = int(torch_module.cuda.memory_reserved(device_index))
+        allocated = int(torch_module.cuda.memory_allocated(device_index))
     except Exception:
-        reserved = 0
-    remaining_in_cap = max(0, cap - reserved)
+        allocated = 0
+    remaining_in_cap = max(0, cap - allocated)
     headroom = min(int(physical_free), remaining_in_cap)
     return int(headroom * kv_cache_memory_fraction)
 

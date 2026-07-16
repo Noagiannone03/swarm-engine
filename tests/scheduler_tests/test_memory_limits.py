@@ -2,6 +2,7 @@ import os
 
 from parallax.server.server_info import _resolve_usable_memory_gb
 from parallax_utils.cuda_memory import (
+    available_kv_cache_bytes,
     configure_windows_cuda_environment,
     resolve_cuda_memory_budget,
 )
@@ -110,6 +111,40 @@ def test_explicit_worker_memory_override_also_controls_cuda(monkeypatch):
 
     assert budget.usable_gb == 10
     assert round(budget.allocator_fraction, 2) == 0.42
+
+
+def test_kv_budget_reuses_torch_allocator_cache(monkeypatch):
+    gib = 1024**3
+    monkeypatch.setenv("PARALLAX_WORKER_MEMORY_GB", "13")
+    monkeypatch.delenv("PARALLAX_CUDA_ALLOCATOR_FRACTION", raising=False)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def get_device_properties(_device_index):
+            return type("Properties", (), {"total_memory": 16 * gib})()
+
+        @staticmethod
+        def mem_get_info(_device_index):
+            return 10 * gib, 16 * gib
+
+        @staticmethod
+        def memory_allocated(_device_index):
+            return 4 * gib
+
+        @staticmethod
+        def memory_reserved(_device_index):
+            # Cached blocks are reusable and must not reduce the KV budget.
+            return 8 * gib
+
+    fake_torch = type("FakeTorch", (), {"cuda": FakeCuda})()
+
+    available = available_kv_cache_bytes(0, 0.8, fake_torch)
+
+    assert available == int(7.2 * gib)
 
 
 def test_derive_max_batch_size_treats_zero_cache_as_capacity_limit():
