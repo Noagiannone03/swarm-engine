@@ -23,6 +23,16 @@ from parallax_utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def cap_blocks_to_token_ceiling(num_blocks: int, block_size: int, max_tokens: Optional[int]) -> int:
+    """Bound a physical cache pool by its maximum simultaneously useful tokens."""
+
+    blocks = max(0, int(num_blocks))
+    if max_tokens is None or int(max_tokens) <= 0:
+        return blocks
+    useful_blocks = (int(max_tokens) + int(block_size) - 1) // int(block_size)
+    return min(blocks, useful_blocks)
+
+
 class CacheManager:
     """
     Manages the Layer Caches (KV and Linear) and their memory allocation for requests.
@@ -57,6 +67,7 @@ class CacheManager:
         enable_prefix_cache: bool = False,
         sliding_window: Optional[int] = None,
         chunked_prefill_size: Optional[int] = None,
+        max_tokens: Optional[int] = None,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -72,6 +83,7 @@ class CacheManager:
         self.max_num_seqs = max_num_seqs
         self.sliding_window = sliding_window
         self.enable_prefix_cache = enable_prefix_cache
+        self.max_tokens = int(max_tokens) if max_tokens is not None and max_tokens > 0 else None
         self.chunked_prefill_size = (
             chunked_prefill_size
             if chunked_prefill_size is not None and chunked_prefill_size > 0
@@ -401,6 +413,17 @@ class CacheManager:
             available_for_kv -= num_linear_prefix_slots * linear_slot_bytes
 
         num_gpu_blocks = int(available_for_kv // total_block_bytes)
+
+        # Do not reserve cache blocks that this worker can never address.  A
+        # batch-1, 64k-context contributor previously reserved every byte left
+        # in its MLX budget (968k tokens in one observed layer-zero shard), even
+        # though its scheduler could admit at most 64k tokens.  On unified-memory
+        # Macs that idle reservation competes with the IDE and the OS and can
+        # eventually make Metal abort.  Keep enough blocks for the configured
+        # simultaneous token ceiling; the caller includes batch concurrency.
+        num_gpu_blocks = cap_blocks_to_token_ceiling(
+            num_gpu_blocks, self.block_size, self.max_tokens
+        )
 
         if num_gpu_blocks <= 0:
             logger.warning("Not enough memory for KV cache within the Parallax memory budget.")

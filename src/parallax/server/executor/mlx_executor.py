@@ -206,6 +206,8 @@ class MLXExecutor(BaseExecutor):
             kv_block_size,
             self.num_shard_layers,
         )
+        if max_tokens_in_kv_pool is None and max_sequence_length is not None:
+            max_tokens_in_kv_pool = int(max_sequence_length) * max(1, int(max_batch_size or 1))
         normalized_chunked_prefill_size = None
         if chunked_prefill_size is not None:
             if chunked_prefill_size < 0:
@@ -245,6 +247,7 @@ class MLXExecutor(BaseExecutor):
             enable_prefix_cache=enable_prefix_cache,
             sliding_window=sliding_window,
             chunked_prefill_size=normalized_chunked_prefill_size,
+            max_tokens=max_tokens_in_kv_pool,
         )
 
         self.chunked_prefill_size = normalized_chunked_prefill_size

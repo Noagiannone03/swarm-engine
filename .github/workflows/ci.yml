@@ -64,6 +64,9 @@ jobs:
           pip install -e ".[mac, dev]"
         fi
 
+    - name: Run static checks
+      run: ruff check src tests
+
     - name: Run Unit Tests
       shell: bash
       run: |

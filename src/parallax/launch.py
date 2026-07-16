@@ -292,7 +292,9 @@ if __name__ == "__main__":
             # Main execution loop with layer reallocation support
             executor_crash_count = 0
             try:
-                max_executor_retries = max(0, int(os.environ.get("PARALLAX_EXECUTOR_MAX_RETRIES", "2")))
+                max_executor_retries = max(
+                    0, int(os.environ.get("PARALLAX_EXECUTOR_MAX_RETRIES", "2"))
+                )
             except ValueError:
                 max_executor_retries = 2
             while True:
@@ -357,9 +359,9 @@ if __name__ == "__main__":
                         executor_crash_count += 1
                         codes = [p.exitcode for p in executor_subprocs]
                         _stop_executor_processes(executor_subprocs)
-                        if http_server_process is not None:
-                            stop_http_server(http_server_process)
-                            http_server_process = None
+                        if frontend_process is not None:
+                            stop_vllm_rust_frontend(frontend_process)
+                            frontend_process = None
                         if executor_crash_count > max_executor_retries:
                             logger.error(
                                 "Executor crashed %d times (exitcodes=%s); giving up and leaving.",
