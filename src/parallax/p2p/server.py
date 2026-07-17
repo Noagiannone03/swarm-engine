@@ -44,6 +44,15 @@ logger = get_logger(__name__)
 _http_client = None
 
 
+def _transfer_metrics(payload_bytes: int, elapsed_ns: int) -> tuple[float, float, float]:
+    """Return size, duration, and throughput without a zero-duration division."""
+    elapsed_ns = max(elapsed_ns, 1)
+    size_mb = payload_bytes / (1024 * 1024)
+    elapsed_ms = elapsed_ns / 1_000_000
+    speed_mb_s = size_mb / (elapsed_ns / 1_000_000_000)
+    return size_mb, elapsed_ms, speed_mb_s
+
+
 async def get_http_client():
     """Get or create a shared HTTP client"""
     global _http_client
@@ -688,7 +697,7 @@ class GradientServer:
 
                     for next_peer_id, requests in grouped_requests.items():
                         stub = self.get_stub(next_peer_id)
-                        start = time.time()
+                        start_ns = time.perf_counter_ns()
                         logger.info(f"Start forwarding data to {next_peer_id}")
                         new_forward_request = forward_pb2.ForwardRequest()
                         new_forward_request.forward_mode = forward_request.forward_mode
@@ -703,11 +712,14 @@ class GradientServer:
                             "completed",
                         )
 
+                        size_mb, elapsed_ms, speed_mb_s = _transfer_metrics(
+                            len(message_body), time.perf_counter_ns() - start_ns
+                        )
                         logger.info(
                             f"Forwarding data to {next_peer_id}, "
-                            f"total size: {len(message_body) / (1024 * 1024):.3f} MB, "
-                            f"cost time: {(time.time() - start) * 1000:.3f} ms, "
-                            f"speed: {len(message_body) / (time.time() - start) / (1024 * 1024):.3f} MB/s"
+                            f"total size: {size_mb:.3f} MB, "
+                            f"cost time: {elapsed_ms:.3f} ms, "
+                            f"speed: {speed_mb_s:.3f} MB/s"
                         )
 
                 elif message_type == b"abort":
