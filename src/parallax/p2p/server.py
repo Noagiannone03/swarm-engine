@@ -930,6 +930,7 @@ class GradientServer:
             "rtt_to_nodes": self.rtts,
             "status": self._get_status(),
             "is_active": self._get_status() == ServerState.READY.value,
+            "manual_layer_assignment": self.manual_layer_assignment,
             "last_refit_time": self.last_refit_time,
         }
 
