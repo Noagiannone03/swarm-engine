@@ -59,6 +59,32 @@ def _use_eager_execution() -> bool:
     return sys.platform == "win32"
 
 
+def _build_scheduler_config(
+    *, max_num_batched_tokens: int, max_num_seqs: int, max_model_len: int
+) -> SchedulerConfig:
+    return SchedulerConfig(
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=max_num_seqs,
+        max_model_len=max_model_len,
+        is_encoder_decoder=False,
+        enable_chunked_prefill=False,
+        # Parallax advances the pipeline over its own network scheduler. vLLM's
+        # async scheduler would retain placeholder tokens across those steps.
+        async_scheduling=False,
+    )
+
+
+def _extract_sampled_token_ids(sampler_output):
+    """Normalize vLLM's synchronous and asynchronous sampler outputs."""
+    sampled_token_ids_cpu = getattr(sampler_output, "sampled_token_ids_cpu", None)
+    if sampled_token_ids_cpu is not None:
+        return sampler_output._sampled_token_ids, sampled_token_ids_cpu
+
+    sampled_token_ids = sampler_output.sampled_token_ids
+    sampled_token_ids_cpu = torch.tensor(sampled_token_ids, dtype=torch.int64)
+    return sampled_token_ids, sampled_token_ids_cpu
+
+
 class ParallaxVLLMGroupCoordinator(VLLMGroupCoordinator):
     """
     Parallax version of vLLM's GroupCoordinator.
@@ -322,6 +348,7 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         super().execute_model(scheduler_output, intermediate_tensors)
 
         sampled_token_ids = None
+        sampled_token_ids_cpu = None
         sampler_output = None
         logits = None
 
@@ -330,8 +357,7 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
                 logits = self.execute_model_state.logits
 
             sampler_output = super().sample_tokens(grammar_output=None)
-            sampled_token_ids = sampler_output._sampled_token_ids
-            sampled_token_ids_cpu = sampler_output.sampled_token_ids_cpu
+            sampled_token_ids, sampled_token_ids_cpu = _extract_sampled_token_ids(sampler_output)
 
         return (
             self.execute_model_state,
@@ -542,12 +568,10 @@ def initialize_vllm_model_runner(
     max_batched_tokens = max(max_num_tokens_per_batch, model_config.max_model_len)
     max_num_seqs = max_batch_size
 
-    scheduler_config = SchedulerConfig(
+    scheduler_config = _build_scheduler_config(
         max_num_batched_tokens=max_batched_tokens,
         max_num_seqs=max_num_seqs,
         max_model_len=model_config.max_model_len,
-        is_encoder_decoder=False,
-        enable_chunked_prefill=False,
     )
 
     # LoRA Config construction
