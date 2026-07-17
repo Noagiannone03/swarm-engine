@@ -210,6 +210,21 @@ class TestParseArgs:
         [
             "test_server_args.py",
             "--model-path",
+            "/models/Qwen3-0.6B-bf16",
+            "--served-model-name",
+            "Qwen/Qwen3-0.6B",
+        ],
+    )
+    def test_parse_served_model_name(self):
+        args = parse_args()
+
+        assert args.served_model_name == "Qwen/Qwen3-0.6B"
+
+    @patch(
+        "sys.argv",
+        [
+            "test_server_args.py",
+            "--model-path",
             "mlx-community/Qwen3-0.6B-bf16",
             "--start-layer",
             "0",

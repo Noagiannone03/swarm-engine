@@ -44,7 +44,8 @@ def _update_args_from_shared_state(args, shared_state: SharedState, force_update
     args.end_layer = model_info["block_end_index"]
     # Keep the scheduler's public model name even when this worker loads weights
     # from a local path. The Rust frontend uses it as the OpenAI API alias.
-    args.served_model_name = model_info["model_name"]
+    if not getattr(args, "served_model_name", None) or force_update:
+        args.served_model_name = model_info["model_name"]
     if args.model_path is not None and not force_update:
         # Use local model path first
         pass

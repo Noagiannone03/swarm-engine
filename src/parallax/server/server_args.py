@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to the model repository or model name (e.g., 'mlx-community/Qwen3-0.6B-bf16')",
     )
     parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="Public OpenAI API model name when --model-path points to local weights",
+    )
+    parser.add_argument(
         "--max-sequence-length",
         type=int,
         default=32768,
