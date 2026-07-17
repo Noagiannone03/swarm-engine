@@ -87,3 +87,20 @@ def test_runtime_args_include_max_model_len_when_configured():
         "language_model_only": True,
         "max_model_len": 4096,
     }
+
+
+def test_runtime_args_alias_local_model_path_to_scheduler_model_name():
+    args = SimpleNamespace(
+        model_path="/models/Qwen3-0.6B-bf16",
+        served_model_name="Qwen/Qwen3-0.6B",
+        max_sequence_length=4096,
+    )
+
+    runtime_args = json.loads(vllm_rust_frontend._runtime_args_json(args))
+
+    assert runtime_args == {
+        "model_tag": "/models/Qwen3-0.6B-bf16",
+        "served_model_name": ["Qwen/Qwen3-0.6B"],
+        "language_model_only": True,
+        "max_model_len": 4096,
+    }

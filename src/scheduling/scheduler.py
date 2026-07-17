@@ -537,6 +537,26 @@ class Scheduler:
                 last_refit_time=last_refit_time,
             )
 
+        # Manual allocations can complete before their executors finish loading.
+        # Register the fixed RR route once every stage reports ready; otherwise
+        # the scheduler is bootstrapped but keeps returning zero route capacity.
+        if (
+            self.routing_strategy == "rr"
+            and self._bootstrapped_event.is_set()
+            and not self.request_router.routing_ready()
+            and self.node_manager.has_full_pipeline(self.num_layers, ready_only=True)
+        ):
+            try:
+                self.request_router.bootstrap()
+                if self.request_router.routing_ready():
+                    logger.info(
+                        "[Scheduler] Routing pipelines registered after nodes became active"
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to register routing pipelines after node update", exc_info=True
+                )
+
     def _process_joins(self) -> None:
         """Handle pending join events, honoring bootstrap state for assignment."""
         joined_any = False

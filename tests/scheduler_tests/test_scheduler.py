@@ -129,6 +129,44 @@ def test_scheduler_snapshot_handles_unallocated_standby_nodes():
     assert "latency     inf ms" in snapshot
 
 
+def test_rr_manual_pipeline_registers_after_all_stages_are_ready():
+    """Manual RR allocations become routable only after every stage is ready."""
+    model = build_model_info(12)
+    head = build_node("manual-head", model, x=0, y=0)
+    tail = build_node("manual-tail", model, x=1, y=0)
+    set_rtt_from_coords([head, tail])
+
+    head.manual_layer_assignment = True
+    head.start_layer = 0
+    head.end_layer = 2
+    head.is_active = False
+    tail.manual_layer_assignment = True
+    tail.start_layer = 2
+    tail.end_layer = model.num_layers
+    tail.is_active = False
+
+    sched = Scheduler(model, [], routing_strategy="rr", min_nodes_bootstrapping=2)
+    sched.enqueue_join(head)
+    sched.enqueue_join(tail)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    assert sched._bootstrapped_event.is_set()  # type: ignore[attr-defined]
+    assert not sched.request_router.routing_ready()
+    assert sched.node_manager.get_registered_pipeline_node_ids() == {}
+
+    sched.enqueue_node_update(head.node_id, is_active=True)
+    sched._process_node_updates()  # type: ignore[attr-defined]
+    assert sched.node_manager.get_registered_pipeline_node_ids() == {}
+
+    sched.enqueue_node_update(tail.node_id, is_active=True)
+    sched._process_node_updates()  # type: ignore[attr-defined]
+
+    assert sched.request_router.routing_ready()
+    assert sched.node_manager.get_registered_pipeline_node_ids() == {
+        0: [head.node_id, tail.node_id]
+    }
+
+
 def test_scheduler_single_node_leave_then_rejoin_reassigns_layers():
     """With one node, after leave then re-join, layers should be re-assigned.
 

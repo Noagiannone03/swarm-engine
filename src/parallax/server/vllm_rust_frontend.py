@@ -77,6 +77,9 @@ def _runtime_args_json(args) -> str:
         "model_tag": args.model_path,
         "language_model_only": True,
     }
+    served_model_name = getattr(args, "served_model_name", None)
+    if served_model_name and served_model_name != args.model_path:
+        runtime_args["served_model_name"] = [served_model_name]
     if getattr(args, "max_sequence_length", None) is not None:
         runtime_args["max_model_len"] = int(args.max_sequence_length)
     return json.dumps(runtime_args, separators=(",", ":"))
