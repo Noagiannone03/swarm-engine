@@ -13,6 +13,39 @@ def test_worker_key_path_is_persistent_and_private(monkeypatch, tmp_path):
     assert key_path.stat().st_mode & 0o777 == 0o700
 
 
+def test_shutdown_notifies_scheduler_when_shared_state_is_already_closed(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    leaves = []
+    closed = []
+    server.scheduler_stub = SimpleNamespace(node_leave=leaves.append)
+    server.rtt_last_update = time.time()
+    server.lattica = SimpleNamespace(
+        peer_id=lambda: "worker-peer",
+        get_all_peers=lambda: [],
+        close=lambda: closed.append(True),
+    )
+    server._shared_state = SimpleNamespace(
+        update=lambda **values: (_ for _ in ()).throw(EOFError()),
+        get_status=lambda: (_ for _ in ()).throw(BrokenPipeError()),
+    )
+    monkeypatch.setattr(
+        "parallax.p2p.server.detect_node_hardware",
+        lambda node_id: {"node_id": node_id},
+    )
+
+    server.shutdown()
+
+    assert leaves[0]["node_id"] == "worker-peer"
+    assert leaves[0]["status"] == ServerState.OFFLINE.value
+    assert closed == [True]
+    assert server._shared_state is None
+    assert server.status is ServerState.OFFLINE
+
+
 def test_manual_assignment_is_preserved_in_heartbeat(monkeypatch):
     server = GradientServer(
         recv_from_peer_addr="",

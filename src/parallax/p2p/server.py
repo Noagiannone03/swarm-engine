@@ -990,18 +990,37 @@ class GradientServer:
         self.stop_event.set()
 
         self.status = ServerState.OFFLINE
-        # Sync final status to shared state
-        self._sync_to_shared_state()
-        if self.scheduler_addr is not None:
-            logger.info(f"Leave scheduler: {self.lattica.peer_id()}")
-            self.scheduler_stub.node_leave(self.get_node_info(is_update=True))
+        try:
+            self._sync_to_shared_state()
+        except Exception:
+            # The multiprocessing manager can disappear before this child. A
+            # stale manager must never prevent the scheduler leave RPC.
+            logger.debug("Failed to sync final P2P state", exc_info=True)
+        # Shutdown uses the server's local state from here on. Reading a manager
+        # proxy again can fail after the launch process has started tearing down.
+        self._shared_state = None
 
-        if self.announcer is not None:
-            self.announcer.join()
-        if self.routing_table_updater is not None:
-            self.routing_table_updater.join()
-        if self.lattica is not None:
-            self.lattica.close()
+        try:
+            if self.scheduler_addr is not None and self.scheduler_stub is not None:
+                peer_id = self.lattica.peer_id() if self.lattica is not None else "unknown"
+                logger.info(f"Leave scheduler: {peer_id}")
+                self.scheduler_stub.node_leave(self.get_node_info(is_update=True))
+        except Exception:
+            logger.warning("Failed to notify scheduler that the worker is leaving", exc_info=True)
+
+        try:
+            if self.announcer is not None:
+                self.announcer.join(timeout=1)
+            if self.routing_table_updater is not None:
+                self.routing_table_updater.join(timeout=1)
+        except Exception:
+            logger.debug("Failed to join P2P background threads", exc_info=True)
+        finally:
+            if self.lattica is not None:
+                try:
+                    self.lattica.close()
+                except Exception:
+                    logger.debug("Failed to close Lattica", exc_info=True)
 
 
 def _run_p2p_server_process(
