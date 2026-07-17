@@ -8,7 +8,7 @@ name = "parallax"
 version = "0.1.2"
 description = "Decentralised pipeline-parallel LLM serving with Sglang + MLX-LM + Lattica"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.14"
 packages = [
   { include = "parallax", from = "src" },
   { include = "scheduling", from = "src" },
@@ -30,7 +30,7 @@ dependencies = [
   "httpx[socks]>=0.26.0",
   "aiohttp",
   "uvicorn",
-  "uvloop",
+  "uvloop; sys_platform != 'win32'",
   "fastapi",
   "pydantic",
   "protobuf==6.31.1",
@@ -60,9 +60,9 @@ gpu = [
 ]
 
 vllm = [
-  "vllm==0.14.0",
-  "mlx-lm==0.31.3",
-  "mlx[cpu]==0.31.2",
+  "vllm==0.14.0; sys_platform != 'win32'",
+  "mlx-lm==0.31.3; sys_platform != 'win32'",
+  "mlx[cpu]==0.31.2; sys_platform != 'win32'",
 ]
 
 benchmark = [
@@ -94,5 +94,7 @@ line-length = 100
 profile = "black"
 
 [tool.ruff]
-ignore = ["E501"]              # line length handled by Black
 line-length = 100
+
+[tool.ruff.lint]
+ignore = ["E501"]              # line length handled by Black

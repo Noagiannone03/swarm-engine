@@ -293,7 +293,7 @@ class NodeChatHttpServer:
             host=self.host,
             port=self.port,
             timeout_keep_alive=5,
-            loop="uvloop",
+            loop="auto",
         )
         server = uvicorn.Server(config)
         await server.serve()

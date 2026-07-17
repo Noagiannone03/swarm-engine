@@ -19,7 +19,6 @@ python src/parallax/launch.py \
 import argparse
 import multiprocessing
 import os
-import tempfile
 import time
 
 from parallax.p2p.server import ServerState, launch_p2p_server_process, stop_p2p_server
@@ -30,7 +29,7 @@ from parallax.server.vllm_rust_frontend import (
     stop_vllm_rust_frontend,
 )
 from parallax.utils.shared_state import SharedState
-from parallax.utils.utils import initialize_nccl_port, load_config_only
+from parallax.utils.utils import create_local_zmq_endpoints, initialize_nccl_port, load_config_only
 from parallax_utils.ascii_anime import display_parallax_join
 from parallax_utils.logging_config import get_logger, set_log_level
 from parallax_utils.version_check import check_latest_release
@@ -100,10 +99,12 @@ if __name__ == "__main__":
         args = parse_args()
         set_log_level(args.log_level)
         logger.debug(f"args: {args}")
-        args.recv_from_peer_addr = f"ipc://{tempfile.NamedTemporaryFile().name}"
-        args.send_to_peer_addr = f"ipc://{tempfile.NamedTemporaryFile().name}"
-        args.executor_input_ipc = f"ipc://{tempfile.NamedTemporaryFile().name}"
-        args.executor_output_ipc = f"ipc://{tempfile.NamedTemporaryFile().name}"
+        (
+            args.recv_from_peer_addr,
+            args.send_to_peer_addr,
+            args.executor_input_ipc,
+            args.executor_output_ipc,
+        ) = create_local_zmq_endpoints(4)
         if args.nccl_port is None:
             args.nccl_port = initialize_nccl_port()
 

@@ -19,14 +19,18 @@ We use an explicit 2-Phase approach:
 Our scheduler also handles tokenization and pre-processing for the First Peer's requests.
 """
 
+from __future__ import annotations
+
 import time
 from collections import OrderedDict, deque
-from typing import Deque, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Set
 
-from parallax.server.cache_manager import CacheManager
 from parallax.server.request import InitialRequest, Request, RequestStatus
 from parallax.utils.shared_state import SharedState
 from parallax_utils.logging_config import get_logger
+
+if TYPE_CHECKING:
+    from parallax.server.cache_manager import CacheManager
 
 logger = get_logger(__name__)
 

@@ -64,6 +64,15 @@ def test_load_config_only_downloads_config_json(tmp_path):
     )
 
 
+def test_load_local_model_config_applies_generation_eos_token(tmp_path):
+    (tmp_path / "config.json").write_text('{"eos_token_id": 1}')
+    (tmp_path / "generation_config.json").write_text('{"eos_token_id": [2, 3]}')
+
+    config = utils.load_local_model_config(tmp_path)
+
+    assert config["eos_token_id"] == [2, 3]
+
+
 def test_get_layer_types_marks_dense_mla_attention():
     config = {
         "model_type": "deepseek_v3",

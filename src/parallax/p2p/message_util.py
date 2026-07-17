@@ -8,11 +8,20 @@ between the P2P server and the executor.
 import io
 from typing import Any, List, Optional
 
-import mlx.core as mx
+try:
+    import mlx.core as mx
+except ImportError:  # MLX is not available in native Windows CUDA runtimes.
+    mx = None
 
 from parallax.p2p.proto import forward_pb2
 from parallax.server.request import IntermediateRequest, Request, RequestStatus
 from parallax.server.sampling.sampling_params import SamplingParams
+
+
+def _require_mlx():
+    if mx is None:
+        raise RuntimeError("MLX tensor serialization requires the MLX runtime")
+    return mx
 
 
 def request_to_proto(
@@ -213,9 +222,10 @@ def tensor_to_bytes(tensor: Any, device: Optional[str] = "mlx") -> bytes:
         serialized_data = save({"tensor": cpu_tensor.contiguous()})
         return serialized_data
     else:
+        mlx = _require_mlx()
         assert tensor.size > 0, "Tensor must have size > 0"
         buffer = io.BytesIO()
-        mx.save_safetensors(buffer, {"tensor": tensor})
+        mlx.save_safetensors(buffer, {"tensor": tensor})
         return buffer.getvalue()
 
 
@@ -230,7 +240,8 @@ def bytes_to_tensor(
         tensor_dict = load(tensor)
         tensor = tensor_dict["tensor"].to(device)
     else:
+        mlx = _require_mlx()
         buffer = io.BytesIO(tensor)
-        tensors_dict = mx.load(buffer, format="safetensors")
+        tensors_dict = mlx.load(buffer, format="safetensors")
         tensor = tensors_dict["tensor"]
     return tensor

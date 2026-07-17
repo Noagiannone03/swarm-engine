@@ -2,7 +2,7 @@
 ## Installation
 
 ### Prerequisites
-- Python>=3.11.0,<3.14.0
+- Python>=3.10.0,<3.14.0
 - Git and curl
 - Ubuntu-24.04 for Blackwell GPUs
 

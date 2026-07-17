@@ -19,7 +19,7 @@ Github repo of OpenClaw: https://github.com/openclaw/openclaw
 To integrate Parallax with OpenClaw, you need to meet the prerequisites for both projects:
 
 - **Node.js**: >= 22 (required by OpenClaw)
-- **Python**: >=3.11 (required by Parallax)
+- **Python**: >=3.10,<3.14 (required by Parallax)
 
 Before proceeding, we assume you have already deployed Parallax on your AI cluster. For deployment instructions, please refer to:
 

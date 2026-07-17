@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
 import vllm.distributed.parallel_state as parallel_state
-from mlx_lm.utils import load_config
 from vllm.config import (
     CacheConfig,
+    CompilationConfig,
+    CompilationMode,
+    CUDAGraphMode,
     DeviceConfig,
     LoadConfig,
     LoRAConfig,
@@ -40,11 +43,20 @@ from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
 from parallax.utils.tokenizer_utils import load_tokenizer
+from parallax.utils.utils import load_local_model_config
 from parallax.vllm.monkey_patch import apply_parallax_vllm_monkey_patch
 from parallax_utils.logging_config import get_logger
 from parallax_utils.prepare_adapter import download_adapter_config
 
 logger = get_logger(__name__)
+
+
+def _use_eager_execution() -> bool:
+    """Use the Triton-free execution path by default on native Windows."""
+    configured = os.environ.get("PARALLAX_VLLM_ENFORCE_EAGER", "").strip().lower()
+    if configured:
+        return configured in ("1", "true", "yes", "on")
+    return sys.platform == "win32"
 
 
 class ParallaxVLLMGroupCoordinator(VLLMGroupCoordinator):
@@ -387,7 +399,7 @@ def initialize_vllm_model_runner(
         end_layer=end_layer,
     )
 
-    config = load_config(model_path)
+    config = load_local_model_config(model_path)
     tokenizer = load_tokenizer(model_path, eos_token_ids=config.get("eos_token_id", None))
     dtype = config.get("torch_dtype", "bfloat16")
 
@@ -424,7 +436,7 @@ def initialize_vllm_model_runner(
     torch.cuda.set_device(device)
 
     if not parallel_state.model_parallel_is_initialized():
-        logger.debug(f"Initializing vLLM distributed environment...")
+        logger.debug("Initializing vLLM distributed environment...")
 
         # Set environment variables for distributed initialization
         if "RANK" not in os.environ:
@@ -439,7 +451,11 @@ def initialize_vllm_model_runner(
             os.environ["MASTER_PORT"] = str(nccl_port)
 
         try:
-            parallel_state.init_distributed_environment()
+            parallel_state.init_distributed_environment(
+                world_size=tp_size,
+                rank=tp_rank,
+                local_rank=tp_rank,
+            )
 
             # Initialize with pp_size=1 for single process
             parallel_state.initialize_model_parallel(
@@ -476,7 +492,7 @@ def initialize_vllm_model_runner(
                     f"is_last_rank={parallax_pp_group.is_last_rank}"
                 )
 
-            logger.debug(f"vLLM distributed environment initialized")
+            logger.debug("vLLM distributed environment initialized")
         except Exception as e:
             logger.warning(f"Failed to initialize distributed environment: {e}")
             logger.error(f"vLLM distributed initialization failed. Error: {e}")
@@ -580,6 +596,18 @@ def initialize_vllm_model_runner(
         # Workaround: save adapter_config.json locally for lora update
         download_adapter_config(lora_path)
 
+    enforce_eager = _use_eager_execution()
+    compilation_config = (
+        CompilationConfig(mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE)
+        if enforce_eager
+        else CompilationConfig()
+    )
+    if enforce_eager:
+        logger.info(
+            "Using vLLM eager execution on native Windows "
+            "(set PARALLAX_VLLM_ENFORCE_EAGER=0 to enable graph capture)"
+        )
+
     vllm_config = VllmConfig(
         model_config=model_config,
         cache_config=cache_config,
@@ -590,6 +618,7 @@ def initialize_vllm_model_runner(
         lora_config=lora_config,
         speculative_config=None,
         quant_config=None,
+        compilation_config=compilation_config,
         kv_transfer_config=None,
         kv_events_config=None,
         additional_config={},
@@ -652,18 +681,21 @@ def initialize_vllm_model_runner(
 
         # Warm up the model and capture CUDA graphs if enabled
         # This prevents the first request from triggering compilation/graph capture
-        logger.info("Warming up model and capturing CUDA graphs...")
-        try:
-            # Create a dedicated stream for graph capture to avoid "non-default stream" error
-            with torch.cuda.stream(torch.cuda.Stream(device=device)):
-                model_runner.capture_model()
-            torch.cuda.current_stream(device).synchronize()
-            logger.info("Model warmup and CUDA graph capture completed successfully")
-        except Exception as e:
-            logger.warning(f"Failed to capture CUDA graph during initialization: {e}")
+        if enforce_eager:
+            logger.info("Skipping CUDA graph capture in eager execution mode")
+        else:
+            logger.info("Warming up model and capturing CUDA graphs...")
+            try:
+                # Capture on a dedicated stream, as required by vLLM.
+                with torch.cuda.stream(torch.cuda.Stream(device=device)):
+                    model_runner.capture_model()
+                torch.cuda.current_stream(device).synchronize()
+                logger.info("Model warmup and CUDA graph capture completed successfully")
+            except Exception as e:
+                logger.warning(f"Failed to capture CUDA graph during initialization: {e}")
 
         if enable_lora:
-            logger.info(f"Initializing lora adapters...")
+            logger.info("Initializing lora adapters...")
             model_runner.add_lora(lora_req)
             model_runner.default_lora_req = lora_req
 
@@ -680,12 +712,12 @@ def refit_vllm_model(
 ):
     """Runtime weight refit from disk"""
     if tensors is not None:
-        logger.info(f"Executor begins weight refit from host memory")
+        logger.info("Executor begins weight refit from host memory")
         for x in tensors.keys():
             refit_tensors = [(x, tensors.get(x))]
             model_runner.model.load_weights(weights=refit_tensors)
     elif refit_weight_path is not None:
-        logger.info(f"Executor begins weight refit from disk files")
+        logger.info("Executor begins weight refit from disk files")
         # config_overrides = {"load_config": {"download_dir": refit_weight_path}}
         # model_runner.update_config(overrides=config_overrides)
         # model_runner.reload_weights()
@@ -693,7 +725,7 @@ def refit_vllm_model(
         if os.path.isfile(adapter_path):
             shutil.copy(adapter_path, refit_weight_path)
         else:
-            logger.warning(f"Cannot find adapter_config.json locally. Exit lora weight refit.")
+            logger.warning("Cannot find adapter_config.json locally. Exit lora weight refit.")
             return
 
         lora_name = f"lora_{hash(refit_weight_path) % 10000}"
@@ -710,7 +742,7 @@ def refit_vllm_model(
         history = model_runner.lora_history
         assert len(before_loras) == len(
             history
-        ), f"Before lora refit, number of loaded lora mismatch!"
+        ), "Before lora refit, number of loaded lora mismatch!"
         logger.info(f"Before lora refit number of lora adapters: {len(before_loras)}")
         while len(history) > 1:
             _, old_lora_id, _ = history.pop(0)
@@ -728,8 +760,8 @@ def refit_vllm_model(
         after_history = model_runner.lora_history
         assert len(after_loras) == len(
             after_history
-        ), f"After lora refit, number of loaded lora mismatch!"
+        ), "After lora refit, number of loaded lora mismatch!"
         logger.info(f"After lora refit number of lora adapters: {len(after_loras)}")
     else:
         assert False, "Weight refit needs host tensors or weight path"
-    logger.info(f"Finish weight refit")
+    logger.info("Finish weight refit")

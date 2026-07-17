@@ -4,9 +4,6 @@ import os
 import shutil
 from pathlib import Path
 
-import mlx.core as mx
-import transformers
-
 from parallax.utils.model_download import download_model_file, download_model_snapshot
 
 
@@ -99,6 +96,9 @@ def fetch_from_hub(path_or_hf_repo: str):
     Load model weights, config, and tokenizer from a local path or Hugging Face Hub.
     If the path does not exist locally, download it from HF first.
     """
+    import mlx.core as mx
+    import transformers
+
     model_path = Path(path_or_hf_repo)
 
     # Check if it's a local directory
@@ -131,12 +131,16 @@ def fetch_from_hub(path_or_hf_repo: str):
 
 def save_adapter(weights, tokenizer, config):
     """Save the adapter weights into a single adapters.safetensors file."""
+    import mlx.core as mx
+
     # Save all weights into one file
     mx.save_safetensors("adapters.safetensors", weights, metadata={"format": "mlx"})
     print("[INFO] Saved adapters to adapters.safetensors")
 
 
 def trans_safetensors(model_path: str):
+    import mlx.core as mx
+
     print("[INFO] Loading model...")
     weights, config, tokenizer, model_path = fetch_from_hub(model_path)
 

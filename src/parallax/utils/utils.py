@@ -1,16 +1,25 @@
 """Utility functions."""
 
+from __future__ import annotations
+
 import json
+import os
 import random
 import socket
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, List
 
-import mlx.core as mx
 import numpy as np
 import psutil
 import torch
 import zmq
+
+try:
+    import mlx.core as mx
+except ImportError:  # MLX is not available in native Windows CUDA runtimes.
+    mx = None
 
 from parallax.utils.layer_types import (
     ATTENTION,
@@ -20,6 +29,12 @@ from parallax.utils.layer_types import (
     MSA_ATTENTION,
 )
 from parallax.utils.model_download import download_model_file
+
+
+def _require_mlx():
+    if mx is None:
+        raise RuntimeError("This operation requires the MLX runtime")
+    return mx
 
 
 def is_cuda_available():
@@ -34,6 +49,8 @@ def is_mps_available():
 
 def is_metal_available():
     """Check if MLX Metal backend is available"""
+    if mx is None:
+        return False
     try:
         return mx.metal.is_available()
     except (RuntimeError, AttributeError, ImportError):
@@ -62,12 +79,41 @@ def get_device_dtype(dtype_str: str, device: str):
             "float32": torch.float32,
         }
     else:
+        mlx = _require_mlx()
         dtype_map = {
-            "float16": mx.float16,
-            "bfloat16": mx.bfloat16,
-            "float32": mx.float32,
+            "float16": mlx.float16,
+            "bfloat16": mlx.bfloat16,
+            "float32": mlx.float32,
         }
     return dtype_map[dtype_str]
+
+
+def create_local_zmq_endpoints(count: int, platform: str | None = None) -> list[str]:
+    """Allocate private endpoints for communication between local processes."""
+    if count < 1:
+        raise ValueError("count must be at least 1")
+
+    target = os.name if platform is None else platform
+    if target != "nt":
+        root = tempfile.gettempdir()
+        return [
+            f"ipc://{os.path.join(root, f'parallax-zmq-{uuid.uuid4().hex}')}" for _ in range(count)
+        ]
+
+    reservations: list[socket.socket] = []
+    try:
+        endpoints: list[str] = []
+        for _ in range(count):
+            reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            reservation.bind(("127.0.0.1", 0))
+            reservations.append(reservation)
+            endpoints.append(f"tcp://127.0.0.1:{reservation.getsockname()[1]}")
+        return endpoints
+    finally:
+        for reservation in reservations:
+            reservation.close()
 
 
 def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool):
@@ -115,6 +161,7 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
 
 def get_infinite_value_by_dtype(dtype: mx.Dtype):
     """Returns infinite value according to mx dtype"""
+    _require_mlx()
     inf = 6e4
     if dtype in (mx.bfloat16, mx.float32):
         inf = 1e9
@@ -122,7 +169,7 @@ def get_infinite_value_by_dtype(dtype: mx.Dtype):
 
 
 def pad_prefix_caches(
-    cache: List, input_lengths: List, dtype: mx.Dtype = mx.bfloat16
+    cache: List, input_lengths: List, dtype: mx.Dtype = None
 ) -> tuple[mx.array, mx.array]:
     """
     Pads prefix kv caches.
@@ -131,6 +178,9 @@ def pad_prefix_caches(
         - mx.array: The padded batch of caches with a shape of [B, max_input_seq_len].
         - mx.array: The corresponding 4D k mask with a shape of [B, 1, 1, max_output_seq_len].
     """
+    _require_mlx()
+    if dtype is None:
+        dtype = mx.bfloat16
     caches_mx = [mx.array(i) if isinstance(i, np.ndarray) else i for i in cache]
 
     seq_len_axis = 2
@@ -163,9 +213,7 @@ def pad_prefix_caches(
     return padded_batch, attention_mask
 
 
-def pad_inputs(
-    pad_value: int, inputs: List, dtype: mx.Dtype = mx.bfloat16
-) -> tuple[mx.array, mx.array]:
+def pad_inputs(pad_value: int, inputs: List, dtype: mx.Dtype = None) -> tuple[mx.array, mx.array]:
     """
     Pads a list of sequences (token ID lists or hidden state arrays) to the same length.
     # TODO: refactor this allow cumstomized dim.
@@ -182,6 +230,9 @@ def pad_inputs(
         - mx.array: The padded batch of inputs.
         - mx.array: The corresponding 4D attention mask.
     """
+    _require_mlx()
+    if dtype is None:
+        dtype = mx.bfloat16
     if not inputs:
         return mx.array([]), mx.array([])
 
@@ -243,7 +294,7 @@ def pad_inputs(
     return padded_batch, attention_mask
 
 
-def create_causal_mask(seq_len: int, total_len: int, dtype=mx.bfloat16) -> mx.array:
+def create_causal_mask(seq_len: int, total_len: int, dtype=None) -> mx.array:
     """
     Creates a causal attention mask of shape (input_seq, total_seq).
 
@@ -255,6 +306,9 @@ def create_causal_mask(seq_len: int, total_len: int, dtype=mx.bfloat16) -> mx.ar
     Returns:
         mx.array: A square matrix with -1e9 on the upper triangle (excluding the diagonal).
     """
+    _require_mlx()
+    if dtype is None:
+        dtype = mx.bfloat16
     assert (
         total_len >= seq_len
     ), f"Total lengths {total_len} should be no less than input sequence {seq_len}."
@@ -269,7 +323,7 @@ def create_causal_mask(seq_len: int, total_len: int, dtype=mx.bfloat16) -> mx.ar
 
 
 def combine_padding_and_causal_masks(
-    padding_mask: mx.array, causal_mask: mx.array, dtype=mx.bfloat16
+    padding_mask: mx.array, causal_mask: mx.array, dtype=None
 ) -> mx.array:
     """
     Combines a padding mask and a causal mask.
@@ -283,10 +337,32 @@ def combine_padding_and_causal_masks(
     Returns:
         mx.array: A combined attention mask, typically of shape (B, 1, input_seq, total_seq).
     """
+    _require_mlx()
+    if dtype is None:
+        dtype = mx.bfloat16
     inf_value = get_infinite_value_by_dtype(dtype)
     padding_mask_float = (padding_mask - 1) * inf_value
     padding_mask_float = padding_mask_float.astype(dtype)
     return causal_mask + padding_mask_float
+
+
+def load_local_model_config(model_path: Path) -> dict:
+    """Load model configuration without importing a backend runtime."""
+    with open(model_path / "config.json", "r") as f:
+        config = json.load(f)
+
+    generation_config_file = model_path / "generation_config.json"
+    if generation_config_file.exists():
+        try:
+            with open(generation_config_file, "r") as f:
+                generation_config = json.load(f)
+        except json.JSONDecodeError:
+            generation_config = {}
+
+        if eos_token_id := generation_config.get("eos_token_id", False):
+            config["eos_token_id"] = eos_token_id
+
+    return config
 
 
 def load_config_only(name: str, local_files_only: bool = False):
