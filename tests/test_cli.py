@@ -5,6 +5,19 @@ from unittest.mock import patch
 from parallax import cli
 
 
+def test_wait_for_process_group_exit_waits_for_remaining_descendants():
+    with (
+        patch.object(cli.os, "name", "posix"),
+        patch.object(cli.os, "killpg", side_effect=[None, ProcessLookupError()]) as killpg,
+        patch.object(cli.time, "monotonic", side_effect=[0.0, 0.1]),
+        patch.object(cli.time, "sleep") as sleep,
+    ):
+        assert cli._wait_for_process_group_exit(1234, timeout=1.0)
+
+    assert killpg.call_count == 2
+    sleep.assert_called_once_with(0.05)
+
+
 def test_serve_command_launches_local_server_without_scheduler(tmp_path):
     launch_script = tmp_path / "src" / "parallax" / "launch.py"
     launch_script.parent.mkdir(parents=True)

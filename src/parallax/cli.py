@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 import requests
 
@@ -40,6 +41,23 @@ PUBLIC_RELAY_SERVERS = [
     "/dns4/relay-lattica-eu.gradient.network/udp/18080/quic-v1/p2p/12D3KooWRAuR7rMNA7Yd4S1vgKS6akiJfQoRNNexTtzWxYPiWfG5",
     "/dns4/relay-lattica-eu.gradient.network/tcp/18080/p2p/12D3KooWRAuR7rMNA7Yd4S1vgKS6akiJfQoRNNexTtzWxYPiWfG5",
 ]
+
+
+def _wait_for_process_group_exit(process_group_id: int, timeout: float) -> bool:
+    """Wait for every POSIX process in a spawned session, not only its leader."""
+    if os.name == "nt":
+        return True
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def check_python_version():
@@ -166,7 +184,14 @@ def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None =
                         except Exception:
                             sub_process.kill()
                         sub_process.wait()
-                logger.info("Subprocess exited.")
+                if not _wait_for_process_group_exit(sub_process.pid, timeout=5):
+                    logger.warning("Subprocess descendants are still alive; forcing process group exit")
+                    try:
+                        os.killpg(sub_process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _wait_for_process_group_exit(sub_process.pid, timeout=1)
+                logger.info("Subprocess group exited.")
             except Exception as e:
                 logger.error(f"Failed to terminate subprocess: {e}")
         else:
