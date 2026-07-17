@@ -1,7 +1,16 @@
 import time
 from types import SimpleNamespace
 
-from parallax.p2p.server import GradientServer, ServerState
+from parallax.p2p.server import GradientServer, ServerState, _resolve_worker_key_path
+
+
+def test_worker_key_path_is_persistent_and_private(monkeypatch, tmp_path):
+    key_path = tmp_path / "fabi" / "identity"
+    monkeypatch.setenv("PARALLAX_KEY_PATH", str(key_path))
+
+    assert _resolve_worker_key_path() == str(key_path)
+    assert key_path.is_dir()
+    assert key_path.stat().st_mode & 0o777 == 0o700
 
 
 def test_manual_assignment_is_preserved_in_heartbeat(monkeypatch):

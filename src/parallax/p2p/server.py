@@ -44,6 +44,18 @@ logger = get_logger(__name__)
 _http_client = None
 
 
+def _resolve_worker_key_path() -> str:
+    """Return the persistent private directory used for the worker peer key."""
+    configured = os.environ.get("PARALLAX_KEY_PATH", "").strip()
+    key_path = os.path.abspath(os.path.expanduser(configured or "~/.parallax"))
+    os.makedirs(key_path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(key_path, 0o700)
+    except OSError:
+        logger.debug("Could not tighten permissions on %s", key_path, exc_info=True)
+    return key_path
+
+
 def _transfer_metrics(payload_bytes: int, elapsed_ns: int) -> tuple[float, float, float]:
     """Return size, duration, and throughput without a zero-duration division."""
     elapsed_ns = max(elapsed_ns, 1)
@@ -455,7 +467,11 @@ class GradientServer:
                 logger.warning(f"Folder '{weight_dir}' does not exist.")
 
     def build_lattica(self):
-        self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs)
+        self.lattica = (
+            Lattica.builder()
+            .with_listen_addrs(self.host_maddrs)
+            .with_key_path(_resolve_worker_key_path())
+        )
 
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":
             if self.scheduler_addr.startswith("/"):
