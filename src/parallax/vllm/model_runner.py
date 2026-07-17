@@ -27,7 +27,9 @@ from vllm.lora.request import LoRARequest
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
+    get_request_block_hasher,
     get_kv_cache_configs,
+    init_none_hash,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -37,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.workspace import current_workspace_manager, init_workspace_manager
+from vllm.utils.hashing import get_hash_fn_by_name
 
 from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     apply_weight_loader_filter_patch,
@@ -188,11 +191,18 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
         self.pp_size = 1
 
         self.request_block_hasher: Optional[Callable[[Any], List[Any]]] = None
-        self.enable_prefix_caching: bool = False
+        self.enable_prefix_caching = bool(vllm_config.cache_config.enable_prefix_caching)
         self.lora_history: List[Tuple[str, int, str]] = []  # lora_name, lora_id, lora_path
 
         super().__init__(vllm_config=vllm_config, device=device)
         self.kv_cache_config = kv_cache_config
+
+        if self.enable_prefix_caching:
+            caching_hash_fn = get_hash_fn_by_name(vllm_config.cache_config.prefix_caching_hash_algo)
+            init_none_hash(caching_hash_fn)
+            self.request_block_hasher = get_request_block_hasher(
+                vllm_config.cache_config.block_size, caching_hash_fn
+            )
 
         logger.info(
             f"ParallaxVLLMModelRunner initialized: layers [{start_layer}, {end_layer}), "
@@ -547,11 +557,13 @@ def initialize_vllm_model_runner(
         enable_return_routed_experts=enable_return_routed_experts,
     )
 
+    enable_prefix_cache = bool(kwargs.get("enable_prefix_cache", False))
     cache_config = CacheConfig(
         block_size=kv_block_size,
         gpu_memory_utilization=kv_cache_memory_fraction,
         swap_space=0,
         cache_dtype="auto",
+        enable_prefix_caching=enable_prefix_cache,
     )
 
     parallel_config = ParallelConfig(

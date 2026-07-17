@@ -24,9 +24,12 @@ from parallax.vllm.batch_info import (
     form_vllm_batch_decode,
     form_vllm_batch_prefill,
     release_vllm_request,
-    resize_intermediate_tensors,
 )
 from parallax.vllm.model_runner import initialize_vllm_model_runner, refit_vllm_model
+from parallax.vllm.prefix_cache import (
+    pad_pipeline_activations,
+    select_pipeline_activation_suffix,
+)
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -124,6 +127,7 @@ class VLLMExecutor(BaseExecutor):
             "kv_cache_memory_fraction": kv_cache_memory_fraction,
             "attention_backend": attention_backend,
             "kv_block_size": kv_block_size,
+            "enable_prefix_cache": enable_prefix_cache,
             "max_batch_size": max_batch_size,
             "max_sequence_length": max_sequence_length,
             "max_num_tokens_per_batch": max_num_tokens_per_batch,
@@ -413,6 +417,14 @@ class VLLMExecutor(BaseExecutor):
         if batch_size == 0:
             return None
 
+        schedule_outputs_prefill = form_vllm_batch_prefill(batched_requests, self.model_runner)
+
+        if schedule_outputs_prefill is None:
+            self._abort_requests_due_to_kv_cache(
+                batched_requests, "KV cache insufficient for prefill"
+            )
+            return None
+
         # Prepare PP proxy tensors (common for both backends when not first peer)
         pp_proxy_tensors = None
         if not self.is_first_peer:
@@ -421,15 +433,21 @@ class VLLMExecutor(BaseExecutor):
             hidden_states_list = []
             for req in batched_requests:
                 hs = req.hidden_states
-                if hs.ndim == 2:
-                    # Already (seq_len, hidden_size) or (1, hidden_size)
-                    hidden_states_list.append(hs)
-                elif hs.ndim == 3:
+                if hs.ndim == 3:
                     # (1, seq_len, hidden_size) -> (seq_len, hidden_size)
-                    hidden_states_list.append(hs.squeeze(0))
-                else:
+                    hs = hs.squeeze(0)
+                elif hs.ndim != 2:
                     # (hidden_size,) -> (1, hidden_size)
-                    hidden_states_list.append(hs.unsqueeze(0))
+                    hs = hs.unsqueeze(0)
+
+                hidden_states_list.append(
+                    select_pipeline_activation_suffix(
+                        hs,
+                        scheduled_tokens=schedule_outputs_prefill.num_scheduled_tokens[
+                            req.request_id
+                        ],
+                    )
+                )
 
             # Concatenate along sequence dimension to get (total_tokens, hidden_size)
             hidden_states = torch.cat(hidden_states_list, dim=0)
@@ -453,20 +471,16 @@ class VLLMExecutor(BaseExecutor):
             lengths.append(req.total_length)
         lengths_tensor = torch.tensor(lengths, device=self.device)
 
-        schedule_outputs_prefill = form_vllm_batch_prefill(batched_requests, self.model_runner)
-
-        # Check if KV cache allocation failed
-        if schedule_outputs_prefill is None:
-            self._abort_requests_due_to_kv_cache(
-                batched_requests, "KV cache insufficient for prefill"
-            )
-            return None
-
         if not self.is_first_peer and pp_proxy_tensors is not None:
             target_tokens = compute_expected_intermediate_tokens(
                 schedule_outputs_prefill, self.model_runner
             )
-            pp_proxy_tensors = resize_intermediate_tensors(pp_proxy_tensors, target_tokens)
+            if target_tokens is not None:
+                pp_proxy_tensors = pad_pipeline_activations(
+                    pp_proxy_tensors,
+                    scheduled_tokens=schedule_outputs_prefill.total_num_scheduled_tokens,
+                    padded_tokens=target_tokens,
+                )
 
         ret = {
             "scheduler_output": schedule_outputs_prefill,
