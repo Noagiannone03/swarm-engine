@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -16,6 +17,14 @@ from parallax.server.sampling.sampling_params import (
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Parallax pins vLLM 0.14, while the maintained native Windows build currently
+# exposes the vLLM 0.16 Request API.  EOS handling moved fully into
+# SamplingParams in vLLM 0.16, so keep the adapter aligned with the installed
+# Request contract instead of relying on exception-driven fallbacks.
+_VLLM_REQUEST_SUPPORTS_EOS_TOKEN_ID = (
+    "eos_token_id" in inspect.signature(VLLMRequest).parameters
+)
 
 
 def compute_expected_intermediate_tokens(scheduler_output: Any, model_runner: Any) -> Optional[int]:
@@ -162,16 +171,19 @@ def _build_vllm_request(
         lora_req = getattr(model_runner, "default_lora_req", None)
         logger.debug(f"Using default LoRA request: {lora_req}")
 
-    vllm_req = VLLMRequest(
-        request_id=req.request_id,
-        prompt_token_ids=getattr(req, "input_ids", None),
-        sampling_params=sampling_params,
-        pooling_params=None,
-        eos_token_id=getattr(req, "eos_token_id", None),
-        arrival_time=getattr(req, "arrival_time", 0.0),
-        block_hasher=block_hasher,
-        lora_request=lora_req,
-    )
+    request_kwargs = {
+        "request_id": req.request_id,
+        "prompt_token_ids": getattr(req, "input_ids", None),
+        "sampling_params": sampling_params,
+        "pooling_params": None,
+        "arrival_time": getattr(req, "arrival_time", 0.0),
+        "block_hasher": block_hasher,
+        "lora_request": lora_req,
+    }
+    if _VLLM_REQUEST_SUPPORTS_EOS_TOKEN_ID:
+        request_kwargs["eos_token_id"] = getattr(req, "eos_token_id", None)
+
+    vllm_req = VLLMRequest(**request_kwargs)
     if include_outputs:
         output_ids = getattr(req, "output_ids", None) or []
         if output_ids:

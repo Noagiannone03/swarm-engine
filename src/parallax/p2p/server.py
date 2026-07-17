@@ -114,6 +114,15 @@ def _resolve_heartbeat_interval(default: float = 10.0) -> float:
 
 
 def send_notify(notify_url, block_start_index, block_end_index, request, status):
+    # Notifications are optional observability. Do no work on the hot path when
+    # disabled, and never attempt layer arithmetic before a standby worker has
+    # received its first allocation.
+    if notify_url is None:
+        return
+    if block_start_index is None or block_end_index is None:
+        logger.warning("Skipping %s notification before layer allocation", status)
+        return
+
     payload = [
         {
             "session_id": req.rid,
@@ -127,18 +136,16 @@ def send_notify(notify_url, block_start_index, block_end_index, request, status)
 
     logger.info(f"Send {status} notification, batch size: {len(payload)}")
 
-    if notify_url is not None:
+    async def send_async(notify_url, payload):
+        try:
+            client = await get_http_client()
+            await client.post(notify_url, json=payload)
+        except Exception as e:
+            logger.exception(f"Error in send_async: {e}")
 
-        async def send_async(notify_url, payload):
-            try:
-                client = await get_http_client()
-                await client.post(notify_url, json=payload)
-            except Exception as e:
-                logger.exception(f"Error in send_async: {e}")
-
-        if not hasattr(send_notify, "async_worker"):
-            send_notify.async_worker = AsyncWorker()
-        send_notify.async_worker.run_coroutine(send_async(notify_url, payload), return_future=True)
+    if not hasattr(send_notify, "async_worker"):
+        send_notify.async_worker = AsyncWorker()
+    send_notify.async_worker.run_coroutine(send_async(notify_url, payload), return_future=True)
 
 
 class TransformerConnectionHandler(ConnectionHandler):
@@ -176,6 +183,12 @@ class TransformerConnectionHandler(ConnectionHandler):
             )
         return self._recv_from_peer
 
+    def update_layer_allocation(self, block_start_index: int, block_end_index: int) -> None:
+        """Atomically update metadata used by the forwarding handler."""
+        with self._recv_from_peer_lock:
+            self.block_start_index = block_start_index
+            self.block_end_index = block_end_index
+
     @rpc_stream
     def rpc_pp_forward(
         self,
@@ -183,13 +196,22 @@ class TransformerConnectionHandler(ConnectionHandler):
     ) -> forward_pb2.ForwardResponse:
         """Handle forward pass request with explicit proxy tensors support"""
         try:
-            send_notify(
-                self.notify_url, self.block_start_index, self.block_end_index, request, "started"
-            )
             with self._recv_from_peer_lock:
                 self.recv_from_peer.send_multipart([b"forward", request.SerializeToString()])
+                block_start_index = self.block_start_index
+                block_end_index = self.block_end_index
         except Exception as e:
             logger.exception(f"Error in rpc_pp_forward: {e}")
+            raise
+
+        # A metrics/notification failure must never discard an activation that
+        # was already accepted from the network.
+        try:
+            send_notify(
+                self.notify_url, block_start_index, block_end_index, request, "started"
+            )
+        except Exception as e:
+            logger.exception(f"Error sending forwarding notification: {e}")
         return forward_pb2.ForwardResponse()
 
     @rpc_method
@@ -604,16 +626,6 @@ class GradientServer:
             .with_listen_addrs(self.host_maddrs)
             .with_key_path(_resolve_worker_key_path())
         )
-
-        # mDNS LAN discovery is on by default in Lattica. For a public swarm
-        # (the common case — `--use-relay` + bootstraps gradient.network)
-        # mDNS only causes harm: another machine on the same LAN running
-        # parallax announces itself, the worker prefers the LAN peer over
-        # the public bootstrap, and ends up stuck in a 2-node mini-DHT
-        # that has never heard of the real scheduler. Default it off; opt
-        # in via `PARALLAX_ENABLE_MDNS=1` for genuine LAN-only swarms.
-        if os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() != "1":
-            self.lattica.with_mdns(False)
 
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":
             if self.scheduler_addr.startswith("/"):
@@ -1037,6 +1049,10 @@ class GradientServer:
                                         # Update layer allocation
                                         self.block_start_index = start_layer
                                         self.block_end_index = end_layer
+                                        if self.connection_handler is not None:
+                                            self.connection_handler.update_layer_allocation(
+                                                start_layer, end_layer
+                                            )
                                         if model_name:
                                             if model_name != self.model_name:
                                                 self.capacity_profile = None

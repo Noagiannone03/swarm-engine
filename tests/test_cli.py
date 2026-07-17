@@ -124,3 +124,8 @@ def test_main_dispatches_serve_command_with_passthrough_args():
     assert args.command == "serve"
     assert args.model_path == "Qwen/Qwen3-0.6B"
     assert passthrough_args == ["--log-level", "DEBUG"]
+
+
+def test_process_group_popen_kwargs_are_native():
+    assert cli._process_group_popen_kwargs("posix") == {"start_new_session": True}
+    assert cli._process_group_popen_kwargs("nt") == {"creationflags": 0x00000200}

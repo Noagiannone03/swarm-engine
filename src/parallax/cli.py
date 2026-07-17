@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 
+import psutil
 import requests
 
 from parallax_utils.file_util import get_project_root
@@ -23,32 +24,25 @@ from parallax_utils.version_check import get_current_version
 
 logger = get_logger("parallax.cli")
 
-# Bootstraps Gradient publics. Lattica les essaie en série au démarrage et
-# attend ~75s de timeout SYN_SENT par adresse injoignable avant de passer à
-# la suivante — quand l'asie est down (cas vécu en mai 2026, alicloud HK
-# `bootstrap-lattica.gradient.network` 8.219.131.51 = Connection refused),
-# un worker mettait 2-3 min à se brancher au lieu de quelques secondes.
-# Ordre choisi : EU et US (durables en pratique) → ASIA (fallback). Si
-# Gradient ajoute des régions, mets les plus fiables en tête.
-# Override complet possible via `PARALLAX_INITIAL_PEERS` (CSV ou newline).
+# Official Gradient Lattica peers. Keep upstream ordering: relay/DCUtR
+# behavior can depend on both workers reserving on the same relay region.
+# Operators may still override the complete list through the environment.
 PUBLIC_INITIAL_PEERS = [
-    "/dns4/bootstrap-lattica-eu.gradient.network/udp/18080/quic-v1/p2p/12D3KooWCNuEF4ro95VA4Lgq4NvjdWfJFoTcvWsBA7Z6VkBByPtN",
-    "/dns4/bootstrap-lattica-eu.gradient.network/tcp/18080/p2p/12D3KooWCNuEF4ro95VA4Lgq4NvjdWfJFoTcvWsBA7Z6VkBByPtN",
-    "/dns4/bootstrap-lattica-us.gradient.network/udp/18080/quic-v1/p2p/12D3KooWFD8NoyHfmVxLVCocvXJBjwgE9RZ2bgm2p5WAWQax4FoQ",
-    "/dns4/bootstrap-lattica-us.gradient.network/tcp/18080/p2p/12D3KooWFD8NoyHfmVxLVCocvXJBjwgE9RZ2bgm2p5WAWQax4FoQ",
     "/dns4/bootstrap-lattica.gradient.network/udp/18080/quic-v1/p2p/12D3KooWJHXvu8TWkFn6hmSwaxdCLy4ZzFwr4u5mvF9Fe2rMmFXb",
     "/dns4/bootstrap-lattica.gradient.network/tcp/18080/p2p/12D3KooWJHXvu8TWkFn6hmSwaxdCLy4ZzFwr4u5mvF9Fe2rMmFXb",
+    "/dns4/bootstrap-lattica-us.gradient.network/udp/18080/quic-v1/p2p/12D3KooWFD8NoyHfmVxLVCocvXJBjwgE9RZ2bgm2p5WAWQax4FoQ",
+    "/dns4/bootstrap-lattica-us.gradient.network/tcp/18080/p2p/12D3KooWFD8NoyHfmVxLVCocvXJBjwgE9RZ2bgm2p5WAWQax4FoQ",
+    "/dns4/bootstrap-lattica-eu.gradient.network/udp/18080/quic-v1/p2p/12D3KooWCNuEF4ro95VA4Lgq4NvjdWfJFoTcvWsBA7Z6VkBByPtN",
+    "/dns4/bootstrap-lattica-eu.gradient.network/tcp/18080/p2p/12D3KooWCNuEF4ro95VA4Lgq4NvjdWfJFoTcvWsBA7Z6VkBByPtN",
 ]
 
-# Relays publics (NAT traversal). Même tri que les bootstraps : EU/US en
-# tête. Override via `PARALLAX_RELAY_SERVERS`.
 PUBLIC_RELAY_SERVERS = [
-    "/dns4/relay-lattica-eu.gradient.network/udp/18080/quic-v1/p2p/12D3KooWRAuR7rMNA7Yd4S1vgKS6akiJfQoRNNexTtzWxYPiWfG5",
-    "/dns4/relay-lattica-eu.gradient.network/tcp/18080/p2p/12D3KooWRAuR7rMNA7Yd4S1vgKS6akiJfQoRNNexTtzWxYPiWfG5",
-    "/dns4/relay-lattica-us.gradient.network/udp/18080/quic-v1/p2p/12D3KooWHMXi6SCfaQzLcFt6Th545EgRt4JNzxqmDeLs1PgGm3LU",
-    "/dns4/relay-lattica-us.gradient.network/tcp/18080/p2p/12D3KooWHMXi6SCfaQzLcFt6Th545EgRt4JNzxqmDeLs1PgGm3LU",
     "/dns4/relay-lattica.gradient.network/udp/18080/quic-v1/p2p/12D3KooWDaqDAsFupYvffBDxjHHuWmEAJE4sMDCXiuZiB8aG8rjf",
     "/dns4/relay-lattica.gradient.network/tcp/18080/p2p/12D3KooWDaqDAsFupYvffBDxjHHuWmEAJE4sMDCXiuZiB8aG8rjf",
+    "/dns4/relay-lattica-us.gradient.network/udp/18080/quic-v1/p2p/12D3KooWHMXi6SCfaQzLcFt6Th545EgRt4JNzxqmDeLs1PgGm3LU",
+    "/dns4/relay-lattica-us.gradient.network/tcp/18080/p2p/12D3KooWHMXi6SCfaQzLcFt6Th545EgRt4JNzxqmDeLs1PgGm3LU",
+    "/dns4/relay-lattica-eu.gradient.network/udp/18080/quic-v1/p2p/12D3KooWRAuR7rMNA7Yd4S1vgKS6akiJfQoRNNexTtzWxYPiWfG5",
+    "/dns4/relay-lattica-eu.gradient.network/tcp/18080/p2p/12D3KooWRAuR7rMNA7Yd4S1vgKS6akiJfQoRNNexTtzWxYPiWfG5",
 ]
 
 
@@ -123,6 +117,70 @@ def _find_flag_value(args_list: list[str], flag_names: list[str]) -> str | None:
     return None
 
 
+def _process_group_popen_kwargs(platform: str | None = None) -> dict:
+    """Return the native process-group settings used by worker launchers."""
+    platform = platform or os.name
+    if platform == "nt":
+        # The constant is only exported by subprocess on Windows; its Win32
+        # value is stable and keeping the fallback makes this helper testable
+        # from the other supported platforms.
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)}
+    return {"start_new_session": True}
+
+
+def _stop_process_tree(sub_process: subprocess.Popen, graceful_timeout: float = 5.0) -> None:
+    """Stop a Parallax launcher and every executor it spawned.
+
+    Parallax creates P2P, frontend, resource-tracker and executor descendants.
+    Stopping only the direct child leaves GPU owners and duplicate libp2p peers
+    behind, especially on Windows.  Snapshot the whole tree before signalling
+    it, then follow psutil's documented terminate/wait/kill recipe.
+    """
+    try:
+        parent = psutil.Process(sub_process.pid)
+        processes = parent.children(recursive=True) + [parent]
+    except psutil.NoSuchProcess:
+        try:
+            sub_process.wait(timeout=0)
+        except Exception:
+            pass
+        return
+
+    try:
+        if os.name == "nt":
+            sub_process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            os.killpg(sub_process.pid, signal.SIGINT)
+    except (OSError, ValueError, psutil.Error):
+        # The process group may already be exiting. The tree snapshot below
+        # still lets us reap any descendants that survived it.
+        pass
+
+    _, alive = psutil.wait_procs(processes, timeout=graceful_timeout)
+    if alive:
+        logger.info("Graceful timeout; terminating %d remaining process(es)...", len(alive))
+        for process in reversed(alive):
+            try:
+                process.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        _, alive = psutil.wait_procs(alive, timeout=graceful_timeout)
+
+    if alive:
+        logger.info("Terminate timeout; killing %d remaining process(es)...", len(alive))
+        for process in reversed(alive):
+            try:
+                process.kill()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(alive, timeout=graceful_timeout)
+
+    try:
+        sub_process.wait(timeout=graceful_timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None = None) -> None:
     """Execute a command in a subprocess and handle graceful shutdown on Ctrl-C.
 
@@ -146,8 +204,9 @@ def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None =
     except Exception:
         pass
     try:
-        # Start in a new session so we can signal the entire process group
-        sub_process = subprocess.Popen(cmd, env=env, start_new_session=True)
+        # A native process group lets Ctrl-Break/SIGINT reach Python's
+        # multiprocessing descendants before the psutil tree fallback.
+        sub_process = subprocess.Popen(cmd, env=env, **_process_group_popen_kwargs())
         # Wait for the subprocess to finish
         return_code = sub_process.wait()
         if return_code != 0:
@@ -159,7 +218,13 @@ def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None =
         # If another Ctrl-C arrives during cleanup, force-kill the whole group immediately
         def _force_kill_handler(signum, frame):
             try:
-                os.killpg(sub_process.pid, signal.SIGKILL)
+                parent = psutil.Process(sub_process.pid)
+                processes = parent.children(recursive=True) + [parent]
+                for process in reversed(processes):
+                    try:
+                        process.kill()
+                    except psutil.NoSuchProcess:
+                        pass
             except Exception:
                 try:
                     sub_process.kill()
@@ -174,33 +239,8 @@ def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None =
 
         if sub_process is not None:
             try:
-                logger.info("Terminating subprocess group...")
-                # Gracefully terminate the entire process group
-                try:
-                    os.killpg(sub_process.pid, signal.SIGINT)
-                except Exception:
-                    # Fall back to signaling just the child process
-                    sub_process.send_signal(signal.SIGINT)
-
-                logger.info("Waiting for subprocess to exit...")
-                # Wait for the subprocess to exit gracefully
-                try:
-                    sub_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    logger.info("SIGINT timeout; sending SIGTERM to process group...")
-                    try:
-                        os.killpg(sub_process.pid, signal.SIGTERM)
-                    except Exception:
-                        sub_process.terminate()
-                    try:
-                        sub_process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        logger.info("SIGTERM timeout; forcing SIGKILL on process group...")
-                        try:
-                            os.killpg(sub_process.pid, signal.SIGKILL)
-                        except Exception:
-                            sub_process.kill()
-                        sub_process.wait()
+                logger.info("Stopping subprocess tree...")
+                _stop_process_tree(sub_process)
                 logger.info("Subprocess exited.")
             except Exception as e:
                 logger.error(f"Failed to terminate subprocess: {e}")
