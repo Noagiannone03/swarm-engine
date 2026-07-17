@@ -312,6 +312,18 @@ class SchedulerManage:
             )
         return request.routing_table
 
+    def release_routing_table(self, request_id: str) -> bool:
+        """Release scheduler capacity as soon as the forwarded HTTP request ends."""
+        if self.scheduler is None:
+            return False
+        return self.scheduler.release_request(str(request_id))
+
+    def wait_for_routing_capacity(self, timeout: float) -> bool:
+        """Block until a route can be admitted or the bounded wait expires."""
+        if self.scheduler is None:
+            return False
+        return self.scheduler.wait_for_routing_capacity(timeout)
+
     def get_schedule_status(self):
         """
         Return whether a full pipeline has been allocated across joined nodes.

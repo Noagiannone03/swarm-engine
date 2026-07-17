@@ -187,6 +187,8 @@ class Node:
     start_layer: Optional[int] = None  # inclusive
     end_layer: Optional[int] = None  # exclusive
     current_requests: int = 0
+    reserved_requests: int = field(default=0, init=False)
+    _uses_scheduler_reservations: bool = field(default=False, init=False, repr=False)
 
     # Runtime weight refit for RL
     last_refit_time: float = 0.0
@@ -269,7 +271,14 @@ class Node:
     @property
     def is_overloaded(self) -> bool:
         """Check if node is at capacity for requests."""
-        return self.current_requests >= self.max_requests
+        return self.routing_load >= self.max_requests
+
+    @property
+    def routing_load(self) -> int:
+        """Return the scheduler-authoritative in-flight load used for routing."""
+        if self._uses_scheduler_reservations:
+            return self.reserved_requests
+        return self.current_requests
 
     def get_decoder_layer_capacity(
         self, include_input_embed: bool = False, include_lm_head: bool = False
@@ -345,6 +354,8 @@ class Node:
         """
         self.clear_layer_allocation()
         self.current_requests = 0
+        self.reserved_requests = 0
+        self._uses_scheduler_reservations = False
         self.avg_layer_latency_ms = None
 
     def set_layer_latency_ms(self, latency_ms: float) -> None:
@@ -364,7 +375,7 @@ class Node:
             hardware=self.hardware,
             model_info=self.model_info,
             quantization_speedup=quantization_speedup,
-            batch_size=self.current_requests,
+            batch_size=self.routing_load,
             target_seq_len=1,
             source_seq_len=self.max_sequence_length,
             using_mlx=self.hardware.device == "mlx",
@@ -383,7 +394,7 @@ class Node:
         if self.avg_layer_latency_ms is None:
             return self.roofline_layer_latency_ms()
         return self.avg_layer_latency_ms + self.load_compensator * (
-            1.0 * self.current_requests / self.max_requests
+            1.0 * self.routing_load / self.max_requests
         )
 
     def update_rtt(self, target_node_id: str, rtt_ms: float):
@@ -419,9 +430,11 @@ class Node:
         return self.start_layer <= layer_id < self.end_layer
 
     def add_request(self):
-        """Add a request to this node."""
-        self.current_requests += 1
+        """Reserve capacity for a scheduler-routed request."""
+        self._uses_scheduler_reservations = True
+        self.reserved_requests += 1
 
     def remove_request(self):
-        """Remove a request from this node."""
-        self.current_requests -= 1
+        """Release one scheduler-owned capacity reservation."""
+        self._uses_scheduler_reservations = True
+        self.reserved_requests = max(0, self.reserved_requests - 1)

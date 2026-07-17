@@ -26,7 +26,7 @@ class BlockTreeNode:
         self.token_ids = token_ids or []
         self.prefix_len = prefix_len
         self.linear_slot: Optional[int] = None
-        self.children: Dict[int, "BlockTreeNode"] = {}
+        self.children: Dict[Tuple[int, ...], "BlockTreeNode"] = {}
         self.parent: Optional["BlockTreeNode"] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
@@ -96,14 +96,14 @@ class BlockRadixCache:
             block_end = block_start + self.block_size
             block_tokens = token_ids[block_start:block_end]
 
-            first_token = block_tokens[0]
-            if first_token not in current_node.children:
+            block_key = tuple(block_tokens)
+            if block_key not in current_node.children:
                 logger.debug(
-                    f"Prefix match stopped at block {block_idx}: first_token {first_token} not in children"
+                    f"Prefix match stopped at block {block_idx}: block not in children"
                 )
                 break
 
-            child_node = current_node.children[first_token]
+            child_node = current_node.children[block_key]
 
             if child_node.token_ids != block_tokens:
                 logger.debug(
@@ -142,8 +142,8 @@ class BlockRadixCache:
             if len(block_tokens) != self.block_size:
                 break
 
-            first_token = block_tokens[0]
-            child_node = current_node.children.get(first_token)
+            block_key = tuple(block_tokens)
+            child_node = current_node.children.get(block_key)
             if child_node is None or child_node.token_ids != block_tokens:
                 break
 
@@ -191,10 +191,10 @@ class BlockRadixCache:
         else:
             parent_node = self.root
 
-        first_token = token_ids[0]
+        block_key = tuple(token_ids)
 
-        if first_token in parent_node.children:
-            existing_node = parent_node.children[first_token]
+        if block_key in parent_node.children:
+            existing_node = parent_node.children[block_key]
             if existing_node.token_ids == token_ids:
                 logger.debug(f"Block already exists in cache: {token_ids[:5]}...")
                 if lock:
@@ -211,7 +211,7 @@ class BlockRadixCache:
         if lock:
             new_node.lock_ref += 1
 
-        parent_node.children[first_token] = new_node
+        parent_node.children[block_key] = new_node
 
         self.num_cached_blocks += 1
 

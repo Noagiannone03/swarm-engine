@@ -4,6 +4,10 @@ Minimal tests for the Scheduler orchestrator.
 
 from __future__ import annotations
 
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
 from scheduling.node import RequestSignal
 from scheduling.scheduler import Scheduler
 
@@ -38,6 +42,47 @@ def test_scheduler_initialize_and_dispatch():
     assert req_id == req.request_id
     assert path, "Path should be non-empty"
     assert latency >= 0.0
+
+
+def test_scheduler_releases_route_without_waiting_for_worker_heartbeat():
+    model = build_model_info(12)
+    node = build_node("single", model, mem_gb=400.0)
+    node.max_concurrent_requests = 1
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="greedy",
+        routing_strategy="rr",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+
+    first_id = uuid.uuid4()
+    first = RequestSignal(request_id=first_id)
+    sched.receive_request(first)
+    assert sched.dispatch_next_request() is not None
+    assert node.routing_load == 1
+
+    node.current_requests = 1  # A worker heartbeat may remain stale after completion.
+    second = RequestSignal(request_id="second")
+    sched.receive_request(second)
+    _, busy_path, _ = sched.dispatch_next_request()
+    assert busy_path == []
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        waiter = pool.submit(sched.wait_for_routing_capacity, 1.0)
+        time.sleep(0.01)
+        assert not waiter.done()
+        assert sched.release_request(str(first_id))
+        assert waiter.result(timeout=0.5)
+
+    assert not sched.release_request(str(first_id))
+    assert node.routing_load == 0
+
+    third = RequestSignal(request_id="third")
+    sched.receive_request(third)
+    _, available_path, _ = sched.dispatch_next_request()
+    assert available_path == [node.node_id]
 
 
 def test_scheduler_join_and_leave():
@@ -111,6 +156,56 @@ def test_scheduler_bootstrap_wait_and_dynamic_events():
     core_id = sched.node_manager.nodes[0].node_id
     sched.enqueue_leave(core_id)
     sched._process_leaves()  # type: ignore[attr-defined]
+
+
+def test_bootstrap_starts_a_fresh_heartbeat_lease_for_waiting_nodes():
+    """A worker must not expire immediately after waiting for the cluster bootstrap."""
+    model = build_model_info(12)
+    first = build_node("first", model, mem_gb=400.0)
+    second = build_node("second", model, mem_gb=400.0)
+    first.last_heartbeat = time.time() - 60.0
+
+    sched = Scheduler(
+        model,
+        [first, second],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=2,
+        heartbeat_timeout=30.0,
+    )
+
+    before_bootstrap = time.time()
+    assert sched.bootstrap()
+    assert all(node.last_heartbeat >= before_bootstrap for node in sched.node_manager.active_nodes)
+
+    sched.checking_node_heartbeat()
+    assert sched._pending_leaves.empty()  # type: ignore[attr-defined]
+
+
+def test_automatic_rejoin_discards_stale_worker_layer_assignment():
+    """A reconnecting automatic worker is reallocated from clean STANDBY state."""
+    model = build_model_info(12)
+    first = build_node("first", model, mem_gb=400.0)
+    sched = Scheduler(
+        model,
+        [first],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+
+    rejoining = build_node("rejoining", model, mem_gb=400.0)
+    rejoining.start_layer = 0
+    rejoining.end_layer = model.num_layers
+    assert not rejoining.manual_layer_assignment
+
+    sched.enqueue_join(rejoining)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    assert rejoining in sched.node_manager.active_nodes
+    assert rejoining.start_layer == 0
+    assert rejoining.end_layer == model.num_layers
 
 
 def test_scheduler_snapshot_handles_unallocated_standby_nodes():

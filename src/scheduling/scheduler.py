@@ -94,6 +94,9 @@ class Scheduler:
         )
 
         self._request_queue: "queue.Queue[RequestSignal]" = queue.Queue()
+        self._inflight_routes: Dict[str, List[str]] = {}
+        self._inflight_routes_lock = threading.RLock()
+        self._capacity_cv = threading.Condition()
         self.request_arrival_horizon_sec = request_arrival_horizon_sec
         self.heartbeat_timeout = heartbeat_timeout
         self._arrival_ts: Deque[float] = deque()
@@ -189,6 +192,11 @@ class Scheduler:
         logger.info(f"[Scheduler] Post Bootstrap Layer Assignments: {assignments}")
 
         self.request_router.bootstrap()
+        # Joining workers wait for bootstrap before they can start their heartbeat loop.
+        # Grant every newly active node a full lease once its allocation is ready.
+        lease_started_at = time.time()
+        for node in self.node_manager.active_nodes:
+            node.last_heartbeat = lease_started_at
         self._bootstrapped_event.set()
         # Snapshot at INFO after bootstrap since allocations/pipelines may have materially changed.
         self.emit_alloc_log_snapshot(reason="Post Bootstrap")
@@ -287,6 +295,11 @@ class Scheduler:
             bootstrapped,
         )
         if self.node_manager.get(node.node_id) is None:
+            # Automatic workers can reconnect with the last assignment they received.
+            # The scheduler owns that state and must allocate the fresh STANDBY node
+            # from scratch; manual assignments are the only client-owned ranges.
+            if not node.manual_layer_assignment:
+                node.clear_serving_state()
             self.node_manager.upsert(node)
             if bootstrapped:
                 if self.dynamic_pipelines_router:
@@ -385,13 +398,59 @@ class Scheduler:
             return None
         path, latency = self.request_router.find_optimal_path(self.last_refit_time)
         req.routing_table = path
-        # Update simple load counters
-        for node_id in path:
-            self.node_manager.add_request(node_id)
+        if path:
+            request_key = str(req.request_id)
+            with self._inflight_routes_lock:
+                if request_key in self._inflight_routes:
+                    logger.warning("Request %s was already reserved; replacing its route", req.request_id)
+                    self._release_request_locked(request_key)
+                reserved: List[str] = []
+                try:
+                    for node_id in path:
+                        self.node_manager.add_request(node_id)
+                        reserved.append(node_id)
+                except Exception:
+                    for node_id in reserved:
+                        self.node_manager.remove_request(node_id)
+                    raise
+                self._inflight_routes[request_key] = list(path)
         logger.debug(
             "Dispatched request %s via path %s (est_lat=%.2fms)", req.request_id, path, latency
         )
         return req.request_id, path, latency
+
+    def _release_request_locked(self, request_id: str) -> bool:
+        path = self._inflight_routes.pop(request_id, None)
+        if path is None:
+            return False
+        for node_id in path:
+            self.node_manager.remove_request(node_id)
+        return True
+
+    def release_request(self, request_id: str) -> bool:
+        """Release a dispatched route exactly once when its HTTP request ends."""
+        request_key = str(request_id)
+        with self._inflight_routes_lock:
+            released = self._release_request_locked(request_key)
+        if released:
+            logger.debug("Released scheduler reservation for request %s", request_key)
+            with self._capacity_cv:
+                self._capacity_cv.notify_all()
+        return released
+
+    def has_routing_capacity(self) -> bool:
+        """Return whether the current router can admit at least one request."""
+        if not self.request_router.routing_ready():
+            return False
+        if self.routing_strategy == "rr":
+            _, _, remaining = self.node_manager.report_pipeline_capacity(ready_only=True)
+            return remaining > 0
+        return any(node.is_active and not node.is_overloaded for node in self.node_manager.active_nodes)
+
+    def wait_for_routing_capacity(self, timeout: float) -> bool:
+        """Wait until capacity is available, waking immediately after a release."""
+        with self._capacity_cv:
+            return self._capacity_cv.wait_for(self.has_routing_capacity, timeout=max(0.0, timeout))
 
     def emit_alloc_log_snapshot(self, *, reason: Optional[str] = None) -> str:
         """Update `self.alloc_log_snapshot` and emit it.

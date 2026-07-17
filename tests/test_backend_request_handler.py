@@ -20,6 +20,8 @@ class ForwardingSchedulerManage(DummySchedulerManage):
     def __init__(self, status=NODE_STATUS_AVAILABLE, routing_table=None):
         self.status = status
         self.routing_table = ["node-a"] if routing_table is None else routing_table
+        self.released = []
+        self.capacity_waits = 0
 
     def get_schedule_status(self):
         return self.status
@@ -27,15 +29,41 @@ class ForwardingSchedulerManage(DummySchedulerManage):
     def get_routing_table(self, request_id, received_ts):
         return self.routing_table
 
+    def release_routing_table(self, request_id):
+        self.released.append(request_id)
+        return True
+
+    def wait_for_routing_capacity(self, timeout):
+        self.capacity_waits += 1
+        self.routing_table = ["node-a"]
+        return True
+
 
 class StaticStub:
     def __init__(self, chunks):
         self.chunks = chunks
         self.request = None
+        self.response = None
 
     def chat_completion(self, request):
         self.request = request
-        return iter(self.chunks)
+        self.response = CancellableResponse(self.chunks)
+        return self.response
+
+
+class CancellableResponse:
+    def __init__(self, chunks):
+        self._chunks = iter(chunks)
+        self.cancelled = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._chunks)
+
+    def cancel(self):
+        self.cancelled = True
 
 
 def test_prepare_backend_request_uses_vllm_xargs_for_parallax_metadata():
@@ -135,9 +163,29 @@ def test_forward_request_returns_openai_error_when_pipelines_are_busy():
     assert payload["error"]["code"] == "rate_limit_exceeded"
 
 
+def test_forward_request_wakes_when_capacity_becomes_available():
+    handler = RequestHandler()
+    handler.MAX_ROUTING_RETRY = 2
+    scheduler_manage = ForwardingSchedulerManage(routing_table=[])
+    handler.set_scheduler_manage(scheduler_manage)
+    handler.stubs["node-a"] = StaticStub([b'{"choices":[]}'])
+
+    response = asyncio.run(
+        handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}]},
+            "waiting-req",
+            1.0,
+        )
+    )
+
+    assert response.status_code == 200
+    assert scheduler_manage.capacity_waits == 1
+
+
 def test_forward_request_preserves_non_stream_downstream_status_and_content_type():
     handler = RequestHandler()
-    handler.set_scheduler_manage(ForwardingSchedulerManage())
+    scheduler_manage = ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
     body = (
         b'{"error":{"message":"bad request","type":"invalid_request_error",'
         b'"param":null,"code":"bad_request"}}'
@@ -163,6 +211,29 @@ def test_forward_request_preserves_non_stream_downstream_status_and_content_type
     assert response.status_code == 400
     assert response.body == body
     assert response.headers["content-type"] == "application/json; charset=utf-8"
+    assert scheduler_manage.released == ["scheduler-req"]
+
+
+def test_streaming_request_releases_route_after_completion():
+    handler = RequestHandler()
+    scheduler_manage = ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    stub = StaticStub([b'data: {"choices":[]}\n\n', b"data: [DONE]\n\n"])
+    handler.stubs["node-a"] = stub
+
+    async def consume_stream():
+        response = await handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}], "stream": True},
+            "stream-req",
+            1.0,
+        )
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    body = asyncio.run(consume_stream())
+
+    assert body.endswith(b"data: [DONE]\n\n")
+    assert stub.response.cancelled
+    assert scheduler_manage.released == ["stream-req"]
 
 
 def test_openai_models_returns_empty_list_without_scheduler(monkeypatch):

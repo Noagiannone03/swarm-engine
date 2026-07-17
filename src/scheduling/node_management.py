@@ -124,7 +124,7 @@ class Pipeline:
         """Backward-compatible helper returning (min_node_capacity, min_remaining_capacity).
 
         - Per-node capacity is `node.max_requests`
-        - Remaining capacity is `max(0, node.max_requests - node.current_requests)`
+        - Remaining capacity is `max(0, node.max_requests - node.routing_load)`
         - Pipeline capacity is the bottleneck (min) across stages.
         """
         self.recompute_capacity()
@@ -135,14 +135,14 @@ class Pipeline:
 
         Fields updated:
         - `min_node_capacity`: min(node.max_requests) across stages
-        - `min_remaining_capacity`: min(max(0, max_requests - current_requests)) across stages
+        - `min_remaining_capacity`: min(max(0, max_requests - routing_load)) across stages
         """
         min_node_capacity: Optional[int] = None
         min_remaining_capacity: Optional[int] = None
 
         for node in self.nodes:
             node_capacity = int(node.max_requests)
-            node_remaining = int(max(0, node_capacity - int(node.current_requests)))
+            node_remaining = int(max(0, node_capacity - int(node.routing_load)))
 
             min_node_capacity = (
                 node_capacity
@@ -400,6 +400,15 @@ class NodeManager:
                 self.node_assigned_request_count.get(node_id, 0) + 1
             )
             self._nodes[node_id].add_request()
+
+    def remove_request(self, node_id: str) -> bool:
+        """Release a request reservation, tolerating a node that left in-flight."""
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is None:
+                return False
+            node.remove_request()
+            return True
 
     def register_pipelines(self, pipelines: List[List[str]]) -> Dict[int, List[str]]:
         """Fixed-pipeline registry (for round-robin routing)

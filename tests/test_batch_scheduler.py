@@ -188,6 +188,38 @@ def test_admission_drops_same_object_prefill_requeue():
     assert sched.num_queued_requests == 0
 
 
+def test_chunked_prefill_requeue_does_not_leave_stale_entries_at_capacity_one():
+    sched = Scheduler(max_batch_size=1, max_num_tokens_per_batch=4, chunked_prefill_size=4)
+    req = make_prefill("local-chunk", 12)
+
+    sched.enque_request(req)
+    sched.admit_requests()
+    sched.enque_request(req)
+    sched.enque_request(req)
+
+    assert sched.get_running_request(req.request_id) is req
+    assert sched.num_queued_requests == 0
+
+    req.update_status(RequestStatus.FINISHED_EOS)
+    sched.evict_request(req.request_id)
+    sched.admit_requests()
+
+    assert sched.num_running_requests == 0
+    assert sched.num_queued_requests == 0
+
+
+def test_admission_discards_finished_waiting_request():
+    sched = Scheduler(max_batch_size=1, max_num_tokens_per_batch=10_000)
+    req = make_prefill("already-finished", 4)
+    sched._wait_queue.append(req)
+    req.update_status(RequestStatus.FINISHED_EOS)
+
+    sched.admit_requests()
+
+    assert sched.num_running_requests == 0
+    assert sched.num_queued_requests == 0
+
+
 def test_request_status_uses_tokenizer_eos_when_config_eos_missing():
     sched = Scheduler(
         max_batch_size=2,

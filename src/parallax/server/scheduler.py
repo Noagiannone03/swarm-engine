@@ -156,6 +156,16 @@ class Scheduler:
             logger.debug(f"Decode request {rid} marked ready for next decode.")
             return
 
+        running_req = self._running_requests.get(request.request_id)
+        if running_req is request:
+            # A local chunked prefill reuses its admitted request object. It is
+            # already resident and only needs to become ready for the next
+            # chunk; queueing it again leaves stale entries after completion.
+            logger.debug(
+                f"Prefill request {request.request_id} marked ready for its next chunk."
+            )
+            return
+
         self._wait_queue.append(request)
         logger.debug(
             f"Prefill request {request.request_id} added to the prefill wait queue (size={len(self._wait_queue)})."
@@ -260,6 +270,12 @@ class Scheduler:
         while self._wait_queue and len(self._running_requests) < self.max_batch_size:
             req = self._wait_queue.popleft()
             rid = req.request_id
+            if req.is_finished:
+                logger.debug(
+                    f"Dropping finished request {rid} from the admission queue "
+                    f"(status={req.status})."
+                )
+                continue
             running_req = self._running_requests.get(rid)
             if running_req is not None:
                 if req is running_req:

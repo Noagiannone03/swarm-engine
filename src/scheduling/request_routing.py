@@ -227,7 +227,7 @@ class RequestRoutingStrategy(ABC):
             if node is None:
                 raise ValueError(f"Node {node_id} not found in node manager")
             capacity = node.max_requests
-            current = node.current_requests
+            current = node.routing_load
             latency = node.layer_latency_ms
             latency_str = "inf" if latency == float("inf") else f"{latency:.2f}"
             n_hosted_requests = int(self.node_manager.node_assigned_request_count.get(node_id, 0))
@@ -275,7 +275,7 @@ class RequestRoutingStrategy(ABC):
                 "  %-16s | load %3d/%-3d | latency %7s ms | ready %s"
                 % (
                     n.node_id,
-                    n.current_requests,
+                    n.routing_load,
                     n.max_requests,
                     lat_str,
                     n.is_active,
@@ -393,7 +393,7 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
                 raise ValueError(f"Node {node_id} not found in node manager")
             # Snapshot values to avoid recomputing/logging side-effects twice
             capacity = node.max_requests
-            current = node.current_requests
+            current = node.routing_load
             latency = node.layer_latency_ms
             latency_str = "inf" if latency == float("inf") else f"{latency:.2f}"
             n_hosted_requests = 0
@@ -785,7 +785,7 @@ class RoundRobinOverFixedPipelinesRouting(RequestRoutingStrategy):
                         n.node_id,
                         s,
                         e,
-                        n.current_requests,
+                        n.routing_load,
                         n.max_requests,
                         lat_str,
                         n.is_active,

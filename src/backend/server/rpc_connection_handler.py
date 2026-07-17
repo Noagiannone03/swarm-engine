@@ -95,7 +95,10 @@ class RPCConnectionHandler(ConnectionHandler):
             self.scheduler.enqueue_node_update(
                 node.node_id,
                 current_requests=node.current_requests,
-                layer_latency_ms=node.layer_latency_ms,
+                # The worker reports an already measured base latency. Forward it
+                # unchanged; Node.layer_latency_ms also applies load/overload and
+                # would persist a transient infinity in the scheduler.
+                layer_latency_ms=node.avg_layer_latency_ms,
                 new_rtt_to_nodes=node.rtt_to_nodes,
                 is_active=node.is_active,
                 last_refit_time=node.last_refit_time,

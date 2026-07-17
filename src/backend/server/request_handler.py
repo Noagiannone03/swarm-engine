@@ -47,6 +47,18 @@ class RequestHandler:
             self.stubs[node_id] = self.scheduler_manage.completion_handler.get_stub(node_id)
         return self.stubs[node_id]
 
+    def _release_route(self, request_id: str) -> None:
+        release = getattr(self.scheduler_manage, "release_routing_table", None)
+        if release is not None:
+            release(str(request_id))
+
+    async def _wait_for_routing_capacity(self) -> None:
+        wait = getattr(self.scheduler_manage, "wait_for_routing_capacity", None)
+        if wait is None:
+            await asyncio.sleep(self.RETRY_DELAY_SEC)
+            return
+        await asyncio.to_thread(wait, self.RETRY_DELAY_SEC)
+
     def _get_model_name_for_node(self, node_id: str) -> Optional[str]:
         try:
             scheduler = getattr(self.scheduler_manage, "scheduler", None)
@@ -148,8 +160,7 @@ class RequestHandler:
                 # Empty list -> capacity full now, retry after short delay
                 attempts += 1
                 if attempts < self.MAX_ROUTING_RETRY:
-                    # small async delay before re-forwarding
-                    await asyncio.sleep(self.RETRY_DELAY_SEC)
+                    await self._wait_for_routing_capacity()
 
             # If still empty after retries, return 429 Too Many Requests
             if routing_table is not None and len(routing_table) == 0:
@@ -160,22 +171,23 @@ class RequestHandler:
                     code="rate_limit_exceeded",
                 )
 
-            backend_request = self._prepare_backend_request(
-                request_data,
-                str(request_id),
-                routing_table,
-            )
-            stub = self.get_stub(routing_table[0])
             is_stream = request_data.get("stream", False)
             try:
+                backend_request = self._prepare_backend_request(
+                    request_data,
+                    str(request_id),
+                    routing_table,
+                )
+                stub = self.get_stub(routing_table[0])
                 if is_stream:
 
                     async def stream_generator():
-                        response = stub.chat_completion(backend_request)
+                        response = None
                         first_token_time = None
                         last_chunk = None
                         last_token_time = None
                         try:
+                            response = stub.chat_completion(backend_request)
                             iterator = iterate_in_threadpool(response)
                             async for chunk in iterator:
                                 last_token_time = time.time()
@@ -201,7 +213,11 @@ class RequestHandler:
                                         f"Request ID: {request_id} | TPS: {tps:.2f} |  TTFT: {ttft} ms | Output tokens: {output_tokens} | Input tokens: {input_tokens}"
                                     )
                             logger.debug(f"client disconnected for {request_id}")
-                            response.cancel()
+                            try:
+                                if response is not None:
+                                    response.cancel()
+                            finally:
+                                self._release_route(request_id)
 
                     resp = StreamingResponse(
                         stream_generator(),
@@ -214,23 +230,27 @@ class RequestHandler:
                     logger.debug(f"Streaming response initiated for {request_id}")
                     return resp
                 else:
-                    response = stub.chat_completion(backend_request)
-                    content = await anext(iterate_in_threadpool(response))
-                    decoded_response = decode_http_response_envelope(content)
-                    if decoded_response is None:
-                        status_code = 200
-                        content_type = "application/json"
-                        body = content
-                    else:
-                        status_code, content_type, body = decoded_response
-                    logger.debug(f"Non-stream response completed for {request_id}")
-                    return Response(
-                        content=body,
-                        status_code=status_code,
-                        headers={"content-type": content_type},
-                        media_type=None,
-                    )
+                    try:
+                        response = stub.chat_completion(backend_request)
+                        content = await anext(iterate_in_threadpool(response))
+                        decoded_response = decode_http_response_envelope(content)
+                        if decoded_response is None:
+                            status_code = 200
+                            content_type = "application/json"
+                            body = content
+                        else:
+                            status_code, content_type, body = decoded_response
+                        logger.debug(f"Non-stream response completed for {request_id}")
+                        return Response(
+                            content=body,
+                            status_code=status_code,
+                            headers={"content-type": content_type},
+                            media_type=None,
+                        )
+                    finally:
+                        self._release_route(request_id)
             except Exception as e:
+                self._release_route(request_id)
                 forward_attempts += 1
                 if forward_attempts < self.MAX_FORWARD_RETRY:
                     # small async delay before re-forwarding
