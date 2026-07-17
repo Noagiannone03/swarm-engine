@@ -7,12 +7,10 @@ We haven't used other info, will wait until DHT implemented.
 import platform
 import subprocess
 from dataclasses import asdict, dataclass
-from typing import Any, ClassVar, Dict, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional
 
-import mlx.core as mx
-from mlx import nn
-from mlx.utils import tree_reduce
-from mlx_lm.tuner.utils import get_total_parameters
+if TYPE_CHECKING:
+    from mlx import nn
 
 try:
     import torch
@@ -253,12 +251,19 @@ class ShardedModelInfo:
 
     @classmethod
     def from_sharded_model(
-        cls, sharded_model_instance: nn.Module  # Instance of your ShardedModel
+        cls, sharded_model_instance: "nn.Module"  # Instance of your ShardedModel
     ) -> "ShardedModelInfo":
         """
         Constructs ShardedModelInfo from a loaded ShardedModel instance.
         Assumes sharded_model_instance has start_layer, end_layer, and model_id_original attributes.
         """
+        # These dependencies only exist in the MLX runtime. Keeping them local
+        # lets scheduler and CUDA workers import hardware metadata without
+        # installing an emulated MLX stack.
+        import mlx.core as mx
+        from mlx.utils import tree_reduce
+        from mlx_lm.tuner.utils import get_total_parameters
+
         # Calculate parameter count
         count = get_total_parameters(sharded_model_instance)
 
