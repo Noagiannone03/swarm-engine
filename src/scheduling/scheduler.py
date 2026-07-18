@@ -398,7 +398,23 @@ class Scheduler:
             node.manual_layer_assignment,
             bootstrapped,
         )
-        if self.node_manager.get(node.node_id) is None:
+        existing = self.node_manager.get(node.node_id)
+        if existing is not None:
+            # ``node_join`` is a streaming RPC and can be retried when the
+            # response channel closes after the scheduler has already handled
+            # the request.  Replacing the registered Node here used to discard
+            # its scheduler-owned layer range, KV telemetry, and reservations.
+            # Treat a repeated join as an idempotent reconnect: the worker gets
+            # the existing assignment from ``wait_layer_allocation`` and its
+            # following heartbeat refreshes all mutable runtime telemetry.
+            existing.last_heartbeat = time.time()
+            logger.info(
+                "Node %s is already registered; preserving layers [%s, %s) on repeated join",
+                node.node_id,
+                existing.start_layer,
+                existing.end_layer,
+            )
+        else:
             # Automatic workers can reconnect with the last assignment they received.
             # The scheduler owns that state and must allocate the fresh STANDBY node
             # from scratch; manual assignments are the only client-owned ranges.
@@ -437,8 +453,6 @@ class Scheduler:
                         "marking scheduler as bootstrapped"
                     )
                     self._bootstrapped_event.set()
-        elif bootstrapped:
-            self.node_manager.upsert(node)
 
         # Notify waiters that node count changed
         # Snapshot at INFO after join since allocations/pipelines may have changed.

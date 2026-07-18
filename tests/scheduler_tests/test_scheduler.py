@@ -416,6 +416,38 @@ def test_automatic_rejoin_discards_stale_worker_layer_assignment():
     assert rejoining.end_layer == model.num_layers
 
 
+def test_retried_join_preserves_scheduler_owned_serving_state():
+    """A transport retry of node_join must be idempotent after allocation."""
+    model = build_model_info(12)
+    original = build_node("retrying", model, mem_gb=400.0)
+    sched = Scheduler(
+        model,
+        [original],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+    original.kv_cache_token_capacity = 65536
+    original.kv_cache_block_size = 16
+    original.reserved_context_tokens = 8192
+    allocation_before = sched.list_node_allocations()
+    heartbeat_before = original.last_heartbeat
+
+    retry = build_node("retrying", model, mem_gb=400.0)
+    retry.start_layer = None
+    retry.end_layer = None
+    sched.enqueue_join(retry)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    assert sched.get_node("retrying") is original
+    assert sched.list_node_allocations() == allocation_before
+    assert original.kv_cache_token_capacity == 65536
+    assert original.kv_cache_block_size == 16
+    assert original.reserved_context_tokens == 8192
+    assert original.last_heartbeat >= heartbeat_before
+
+
 def test_scheduler_snapshot_handles_unallocated_standby_nodes():
     """A joined standby node has no layer allocation yet; snapshot must not divide by zero."""
     model = build_model_info(12)
