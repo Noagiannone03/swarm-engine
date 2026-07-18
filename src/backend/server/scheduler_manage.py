@@ -1,6 +1,6 @@
 import threading
 import time
-from typing import List
+from typing import List, Literal
 
 from lattica import Lattica
 
@@ -35,6 +35,8 @@ class SchedulerManage:
         use_hfcache: bool = False,
         enable_weight_refit: bool = False,
         weight_refit_mode: str = "disk",
+        allocation_strategy: Literal["greedy", "dp"] = "dp",
+        routing_strategy: Literal["rr", "dp"] = "dp",
     ):
         """Initialize the manager with networking bootstrap parameters."""
         self.initial_peers = initial_peers
@@ -46,6 +48,8 @@ class SchedulerManage:
         self.use_hfcache = use_hfcache
         self.enable_weight_refit = enable_weight_refit
         self.weight_refit_mode = weight_refit_mode
+        self.allocation_strategy = allocation_strategy
+        self.routing_strategy = routing_strategy
         self.model_name = None
         self.init_nodes_num = None
         self.scheduler = None
@@ -61,7 +65,12 @@ class SchedulerManage:
         Nodes will automatically rejoin via their heartbeat (node_update) mechanism.
         """
         logger.debug(
-            f"SchedulerManage starting: model_name={model_name}, init_nodes_num={init_nodes_num}"
+            "SchedulerManage starting: model_name=%s, init_nodes_num=%s, "
+            "allocation_strategy=%s, routing_strategy=%s",
+            model_name,
+            init_nodes_num,
+            self.allocation_strategy,
+            self.routing_strategy,
         )
         self.is_local_network = is_local_network
         if not is_local_network and not self.initial_peers and not self.relay_servers:
@@ -141,6 +150,8 @@ class SchedulerManage:
                 "status": self.get_schedule_status(),
                 "model_name": self.model_name,
                 "init_nodes_num": self.init_nodes_num,
+                "allocation_strategy": self.allocation_strategy,
+                "routing_strategy": self.routing_strategy,
                 "node_join_command": get_node_join_command(
                     self.get_peer_id(), self.is_local_network
                 ),
@@ -188,6 +199,8 @@ class SchedulerManage:
             min_nodes_bootstrapping=init_nodes_num,
             enable_weight_refit=self.enable_weight_refit,
             weight_refit_mode=self.weight_refit_mode,
+            strategy=self.allocation_strategy,
+            routing_strategy=self.routing_strategy,
         )
 
         # Run the scheduler's event/dispatch loops in background so the process

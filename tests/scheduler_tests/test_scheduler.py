@@ -8,10 +8,22 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from scheduling.node import RequestSignal
 from scheduling.scheduler import Scheduler
 
 from .test_utils import build_model_info, build_node, set_rtt_from_coords
+
+
+def test_scheduler_rejects_unknown_allocation_and_routing_strategies():
+    model = build_model_info(12)
+
+    with pytest.raises(ValueError, match="Unsupported layer allocation strategy"):
+        Scheduler(model, [], strategy="unknown")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Unsupported request routing strategy"):
+        Scheduler(model, [], routing_strategy="unknown")  # type: ignore[arg-type]
 
 
 def test_scheduler_initialize_and_dispatch():

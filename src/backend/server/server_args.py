@@ -33,6 +33,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", type=str, default=None, help="Model name")
     parser.add_argument("--init-nodes-num", type=int, default=None, help="Number of initial nodes")
     parser.add_argument(
+        "--allocation-strategy",
+        choices=["dp", "greedy"],
+        default="dp",
+        help="Layer allocation strategy",
+    )
+    parser.add_argument(
+        "--routing-strategy",
+        choices=["dp", "rr"],
+        default="dp",
+        help="Request routing strategy; dp dynamically allocates newly joined workers",
+    )
+    parser.add_argument(
         "--is-local-network", type=bool, default=True, help="Whether to use local network"
     )
     parser.add_argument(

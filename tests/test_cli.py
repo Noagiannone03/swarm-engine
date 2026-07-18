@@ -83,6 +83,44 @@ def test_join_command_does_not_inject_runtime_defaults(tmp_path):
     assert env["SGLANG_ENABLE_JIT_DEEPGEMM"] == "0"
 
 
+def test_run_command_selects_dynamic_dp_mode(tmp_path):
+    backend_main = tmp_path / "src" / "backend" / "main.py"
+    backend_main.parent.mkdir(parents=True)
+    backend_main.touch()
+
+    args = Namespace(
+        model_name="Qwen/Qwen3-1.7B",
+        init_nodes_num=2,
+        allocation_strategy="dp",
+        routing_strategy="dp",
+        skip_upload=True,
+        use_relay=False,
+    )
+
+    with (
+        patch.object(cli, "check_python_version"),
+        patch.object(cli, "get_project_root", return_value=Path(tmp_path)),
+        patch.object(cli.sys, "executable", "/repo/.venv/bin/python"),
+        patch.object(cli, "_execute_with_graceful_shutdown") as execute,
+    ):
+        cli.run_command(args)
+
+    assert execute.call_args.args[0] == [
+        "/repo/.venv/bin/python",
+        str(backend_main),
+        "--port",
+        "3001",
+        "--model-name",
+        "Qwen/Qwen3-1.7B",
+        "--init-nodes-num",
+        "2",
+        "--allocation-strategy",
+        "dp",
+        "--routing-strategy",
+        "dp",
+    ]
+
+
 def test_main_dispatches_serve_command_with_passthrough_args():
     with (
         patch.object(
@@ -105,3 +143,20 @@ def test_main_dispatches_serve_command_with_passthrough_args():
     assert args.command == "serve"
     assert args.model_path == "Qwen/Qwen3-0.6B"
     assert passthrough_args == ["--log-level", "DEBUG"]
+
+
+def test_main_defaults_scheduler_to_dynamic_dp_mode():
+    with (
+        patch.object(
+            cli.sys,
+            "argv",
+            ["parallax", "run", "--model-name", "Qwen/Qwen3-1.7B", "--init-nodes-num", "2"],
+        ),
+        patch.object(cli, "run_command") as run_command,
+    ):
+        cli.main()
+
+    args, passthrough_args = run_command.call_args.args
+    assert args.allocation_strategy == "dp"
+    assert args.routing_strategy == "dp"
+    assert passthrough_args == []

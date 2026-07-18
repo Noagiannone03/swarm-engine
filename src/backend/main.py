@@ -261,6 +261,8 @@ if __name__ == "__main__":
         use_hfcache=args.use_hfcache,
         enable_weight_refit=args.enable_weight_refit,
         weight_refit_mode=args.weight_refit_mode,
+        allocation_strategy=args.allocation_strategy,
+        routing_strategy=args.routing_strategy,
     )
 
     request_handler.set_scheduler_manage(scheduler_manage)

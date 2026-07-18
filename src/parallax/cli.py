@@ -233,6 +233,8 @@ def run_command(args, passthrough_args: list[str] | None = None):
         cmd.extend(["--model-name", args.model_name])
     if args.init_nodes_num:
         cmd.extend(["--init-nodes-num", str(args.init_nodes_num)])
+    cmd.extend(["--allocation-strategy", args.allocation_strategy])
+    cmd.extend(["--routing-strategy", args.routing_strategy])
     if args.use_relay:
         cmd.extend(_get_relay_params())
         logger.info(
@@ -445,6 +447,18 @@ Examples:
     )
     run_parser.add_argument("-n", "--init-nodes-num", type=int, help="Number of initial nodes")
     run_parser.add_argument("-m", "--model-name", type=str, help="Model name")
+    run_parser.add_argument(
+        "--allocation-strategy",
+        choices=["dp", "greedy"],
+        default="dp",
+        help="Layer allocation strategy",
+    )
+    run_parser.add_argument(
+        "--routing-strategy",
+        choices=["dp", "rr"],
+        default="dp",
+        help="Request routing strategy",
+    )
     run_parser.add_argument(
         "-r", "--use-relay", action="store_true", help="Use public relay servers"
     )

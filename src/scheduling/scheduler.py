@@ -61,6 +61,11 @@ class Scheduler:
             heartbeat_timeout: Time in seconds to consider node heartbeat stale.
             trim_layers_on_turning_points: Whether to trim layers on turning points.
         """
+        if strategy not in ("greedy", "dp"):
+            raise ValueError(f"Unsupported layer allocation strategy: {strategy}")
+        if routing_strategy not in ("rr", "dp"):
+            raise ValueError(f"Unsupported request routing strategy: {routing_strategy}")
+
         self.model_info = model_info
         self.num_layers = model_info.num_layers
         self.routing_strategy: Literal["rr", "dp"] = routing_strategy
