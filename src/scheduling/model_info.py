@@ -41,6 +41,7 @@ class ModelInfo:
     mlx_param_bytes_per_element: float = 1
     cache_bytes_per_element: int = 1
     embedding_bytes_per_element: int = 1
+    max_context_length: Optional[int] = None
 
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None

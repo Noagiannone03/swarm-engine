@@ -7,6 +7,29 @@ from scheduling.model_info import ModelInfo
 
 logger = get_logger(__name__)
 
+
+def get_model_context_limit(config) -> int | None:
+    """Read the model's declared total sequence limit without backend imports."""
+    candidates = [
+        config.get("max_position_embeddings"),
+        config.get("model_max_length"),
+    ]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        candidates.extend(
+            [
+                text_config.get("max_position_embeddings"),
+                text_config.get("model_max_length"),
+            ]
+        )
+    limits = [
+        int(value)
+        for value in candidates
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < 2**63
+    ]
+    return min(limits) if limits else None
+
+
 # Supported model list - key: model name, value: MLX model name (same as key if no MLX variant)
 MODELS = {
     # =============================== for quickly test ===================================#
@@ -131,6 +154,7 @@ def get_param_bytes_per_element(config, model_name: str) -> float:
 
 def get_model_info(model_name, use_hfcache: bool = False):
     config = load_config_only(model_name, local_files_only=use_hfcache)
+    context_limits = [get_model_context_limit(config)]
 
     param_bytes_per_element = get_param_bytes_per_element(config, model_name)
 
@@ -140,6 +164,10 @@ def get_model_info(model_name, use_hfcache: bool = False):
     if mlx_model_name != model_name:
         mlx_config = load_config_only(mlx_model_name, local_files_only=use_hfcache)
         mlx_param_bytes_per_element = get_param_bytes_per_element(mlx_config, mlx_model_name)
+        context_limits.append(get_model_context_limit(mlx_config))
+
+    valid_context_limits = [limit for limit in context_limits if limit is not None]
+    max_context_length = min(valid_context_limits) if valid_context_limits else None
 
     # get local experts
     num_local_experts = config.get("num_local_experts", None)
@@ -170,6 +198,7 @@ def get_model_info(model_name, use_hfcache: bool = False):
         mlx_param_bytes_per_element=mlx_param_bytes_per_element,
         cache_bytes_per_element=2,
         embedding_bytes_per_element=2,
+        max_context_length=max_context_length,
         num_local_experts=num_local_experts,
         num_experts_per_tok=config.get("num_experts_per_tok", None),
         moe_intermediate_dim=config.get("moe_intermediate_size", None),

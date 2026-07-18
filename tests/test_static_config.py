@@ -1,5 +1,9 @@
 from backend.server import static_config
-from backend.server.static_config import MODELS, get_model_info
+from backend.server.static_config import (
+    MODELS,
+    get_model_context_limit,
+    get_model_info,
+)
 from parallax.utils.utils import normalize_model_config
 
 
@@ -14,6 +18,44 @@ def test_glm_5_2_uses_mlx_community_mxfp4_model():
 def test_qwen3_6_mxfp4_is_scheduler_supported():
     assert MODELS["Qwen/Qwen3.6-27B"] == "mlx-community/Qwen3.6-27B-mxfp4"
     assert "mlx-community/Qwen3.6-27B-mxfp4" not in MODELS
+
+
+def test_model_context_limit_reads_nested_text_config_and_ignores_sentinel():
+    assert (
+        get_model_context_limit(
+            {
+                "model_max_length": 10**30,
+                "text_config": {"max_position_embeddings": 32768},
+            }
+        )
+        == 32768
+    )
+
+
+def test_model_info_uses_common_context_limit_across_runtime_variants(monkeypatch):
+    def fake_load_config_only(model_name, local_files_only=False):
+        max_context = 40960 if model_name == "Qwen/Qwen3-1.7B" else 65536
+        return {
+            "head_dim": 128,
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "vocab_size": 151936,
+            "num_hidden_layers": 28,
+            "max_position_embeddings": max_context,
+        }
+
+    monkeypatch.setattr(static_config, "load_config_only", fake_load_config_only)
+    monkeypatch.setitem(
+        MODELS,
+        "Qwen/Qwen3-1.7B",
+        "Qwen/Qwen3-1.7B-MLX-4bit",
+    )
+
+    model_info = get_model_info("Qwen/Qwen3-1.7B")
+
+    assert model_info.max_context_length == 40960
 
 
 def test_minimax_m3_uses_mlx_community_4bit_model():

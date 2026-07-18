@@ -62,6 +62,9 @@ def test_scheduler_forwards_required_context_to_router(monkeypatch):
     observed = {}
 
     class RecordingRouter:
+        def max_supported_context_tokens(self):
+            return 65536
+
         def find_optimal_path(self, **kwargs):
             observed.update(kwargs)
             return [], float("inf")
@@ -77,6 +80,29 @@ def test_scheduler_forwards_required_context_to_router(monkeypatch):
         "last_refit_time": 0.0,
         "required_context_tokens": 32768,
     }
+
+
+def test_scheduler_caps_worker_context_by_model_contract():
+    model = build_model_info(12)
+    model.max_context_length = 32768
+    node = build_node("single", model, mem_gb=400.0)
+    node.max_sequence_length = 65536
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="greedy",
+        routing_strategy="rr",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+
+    assert sched.max_supported_context_tokens() == 32768
+    request = RequestSignal(request_id="beyond-model-limit", required_context_tokens=32769)
+    sched.receive_request(request)
+    _, path, latency = sched.dispatch_next_request()
+
+    assert path == []
+    assert latency == float("inf")
 
 
 def test_scheduler_releases_route_without_waiting_for_worker_heartbeat():
