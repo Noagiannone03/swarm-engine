@@ -60,6 +60,11 @@ def _update_args_from_shared_state(args, shared_state: SharedState, force_update
     # Update weight refit switch
     args.enable_weight_refit = model_info["enable_weight_refit"] or args.enable_weight_refit
     args.weight_refit_mode = model_info["weight_refit_mode"] or args.weight_refit_mode
+    negotiated_chunk_size = model_info.get("chunked_prefill_size")
+    if negotiated_chunk_size is not None:
+        args.chunked_prefill_size = (
+            None if int(negotiated_chunk_size) == 0 else int(negotiated_chunk_size)
+        )
 
 
 def _stop_executor_processes(executor_subprocs):
@@ -160,6 +165,8 @@ if __name__ == "__main__":
                     max_sequence_length=args.max_sequence_length,
                     param_mem_ratio=args.param_mem_ratio,
                     kvcache_mem_ratio=args.kvcache_mem_ratio,
+                    gpu_backend=args.gpu_backend,
+                    chunked_prefill_size=args.chunked_prefill_size,
                     shared_state=shared_state.dict,
                     log_level=args.log_level,
                     conn=conn_main,
@@ -218,6 +225,8 @@ if __name__ == "__main__":
                 max_sequence_length=args.max_sequence_length,
                 param_mem_ratio=args.param_mem_ratio,
                 kvcache_mem_ratio=args.kvcache_mem_ratio,
+                gpu_backend=args.gpu_backend,
+                chunked_prefill_size=args.chunked_prefill_size,
                 shared_state=shared_state.dict,  # Pass dict to subprocess
                 log_level=args.log_level,
                 conn=conn_main,

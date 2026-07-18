@@ -118,6 +118,7 @@ class SharedState:
             "tp_size": self._dict.get("tp_size"),
             "enable_weight_refit": self._dict.get("enable_weight_refit"),
             "weight_refit_mode": self._dict.get("weight_refit_mode"),
+            "chunked_prefill_size": self._dict.get("chunked_prefill_size"),
             "_layer_allocation_changed": self._dict.get("_layer_allocation_changed", False),
         }
 
@@ -150,6 +151,7 @@ class SharedState:
         shared_dict["tp_size"] = None
         shared_dict["enable_weight_refit"] = None
         shared_dict["weight_refit_mode"] = None
+        shared_dict["chunked_prefill_size"] = None
         shared_dict["_layer_allocation_changed"] = False
         shared_dict["status"] = None
 

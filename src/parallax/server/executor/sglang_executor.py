@@ -274,9 +274,9 @@ class SGLExecutor(BaseExecutor):
                                 lora_name=lora_path, lora_path=lora_path, pinned=False
                             )
                     elif isinstance(lora_path, dict):
-                        assert (
-                            "lora_name" in lora_path and "lora_path" in lora_path
-                        ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                        assert "lora_name" in lora_path and "lora_path" in lora_path, (
+                            f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                        )
                         lora_ref = LoRARef(
                             lora_name=lora_path["lora_name"],
                             lora_path=lora_path["lora_path"],
@@ -305,15 +305,15 @@ class SGLExecutor(BaseExecutor):
             if self.lora_target_modules:
                 self.lora_target_modules = set(self.lora_target_modules)
                 if "all" in self.lora_target_modules:
-                    assert (
-                        len(self.lora_target_modules) == 1
-                    ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                    assert len(self.lora_target_modules) == 1, (
+                        "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                    )
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
 
             # Ensure sufficient information is provided for LoRA initialization.
-            assert self.lora_paths or (
-                self.max_lora_rank and self.lora_target_modules
-            ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+            assert self.lora_paths or (self.max_lora_rank and self.lora_target_modules), (
+                "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+            )
 
             # Validate max_loaded_loras
             if self.max_loaded_loras is not None:
@@ -371,8 +371,7 @@ class SGLExecutor(BaseExecutor):
                         original_req.routing_table = req.routing_table
 
                     # Check for termination.
-                    if req.abort:
-                        original_req.abort = True
+                    self.apply_peer_terminal_status(original_req, req)
 
                     if self.scheduler.check_and_update_request_status(original_req):
                         logger.debug(f"Releasing resources for finished request {req.request_id}")
@@ -393,9 +392,9 @@ class SGLExecutor(BaseExecutor):
         else:
             # Intermediate and Last peers receive IntermediateRequests from the previous peer.
             for req in requests:
-                assert isinstance(
-                    req, IntermediateRequest
-                ), "Non-first peers must receive IntermediateRequests."
+                assert isinstance(req, IntermediateRequest), (
+                    "Non-first peers must receive IntermediateRequests."
+                )
                 if req.is_finished or req.hidden_states is None:
                     self.release_and_evict_request(req.request_id)
                     if not self.is_last_peer and not req.abort:
@@ -407,9 +406,9 @@ class SGLExecutor(BaseExecutor):
     def process_batch(self, prepared_inputs: Dict[str, Any], return_decoded_tokens: bool = True):
         """Process a batch of requests in SGLang."""
         assert "forward_batch" in prepared_inputs, "forward_batch should be in cuda prepared inputs"
-        assert (
-            "pp_proxy_tensors" in prepared_inputs
-        ), "pp_proxy_tensors should be in cuda prepared inputs"
+        assert "pp_proxy_tensors" in prepared_inputs, (
+            "pp_proxy_tensors should be in cuda prepared inputs"
+        )
 
         forward_batch = prepared_inputs["forward_batch"]
         pp_proxy_tensors = prepared_inputs["pp_proxy_tensors"]

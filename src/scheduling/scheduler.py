@@ -109,7 +109,7 @@ class Scheduler:
         # Event queues for main loop orchestration (thread-safe)
         self._pending_joins: "queue.Queue[Node]" = queue.Queue()
         self._pending_leaves: "queue.Queue[str]" = queue.Queue()
-        self._pending_node_updates: "queue.Queue[Tuple[str, Optional[int], Optional[float], Optional[Dict[str, float]], Optional[bool], Optional[bool]]]" = (queue.Queue())
+        self._pending_node_updates: "queue.Queue[Tuple[str, Optional[int], Optional[float], Optional[Dict[str, float]], Optional[bool], Optional[float], Optional[bool], Optional[int], Optional[int]]]" = queue.Queue()
 
         # Concurrency controls
         self._stop_event: threading.Event = threading.Event()
@@ -151,6 +151,51 @@ class Scheduler:
     def has_full_pipeline(self) -> bool:
         """Check if there is a full pipeline among ACTIVE nodes."""
         return self.node_manager.has_full_pipeline(self.num_layers)
+
+    def negotiated_chunked_prefill_size(self) -> int:
+        """Return the cluster-wide chunked-prefill contract.
+
+        Dynamic DP routing may combine any compatible allocated ranges into a
+        pipeline, so the activation chunk size must be common to every allocated
+        worker. A worker that cannot chunk (currently the Parallax vLLM adapter),
+        or one that explicitly prefers chunking disabled, safely lowers the
+        whole cluster contract to 0.
+        """
+        allocated = [
+            node
+            for node in self.node_manager.active_nodes
+            if node.start_layer is not None and node.end_layer is not None
+        ]
+        if not allocated:
+            return 0
+
+        preferred_sizes: List[int] = []
+        for node in allocated:
+            preferred = node.preferred_chunked_prefill_size
+            if not node.supports_chunked_prefill or preferred is None or preferred <= 0:
+                return 0
+            preferred_sizes.append(int(preferred))
+        return min(preferred_sizes)
+
+    def prefill_contract_ready(self) -> bool:
+        """Whether every allocated worker runs the negotiated prefill contract."""
+        allocated = [
+            node
+            for node in self.node_manager.active_nodes
+            if node.start_layer is not None and node.end_layer is not None
+        ]
+        if not allocated:
+            return False
+        negotiated = self.negotiated_chunked_prefill_size()
+        return all(node.chunked_prefill_size == negotiated for node in allocated)
+
+    def serving_ready(self) -> bool:
+        """Whether a live full pipeline is safe to receive requests."""
+        return (
+            self.node_manager.has_full_pipeline(self.num_layers, ready_only=True)
+            and self.prefill_contract_ready()
+            and self.request_router.routing_ready()
+        )
 
     def report_pipeline_capacity(
         self,
@@ -230,6 +275,9 @@ class Scheduler:
         new_rtt_to_nodes: Optional[Dict[str, float]] = None,
         is_active: Optional[bool] = None,
         last_refit_time: Optional[float] = 0.0,
+        supports_chunked_prefill: Optional[bool] = None,
+        preferred_chunked_prefill_size: Optional[int] = None,
+        chunked_prefill_size: Optional[int] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
@@ -242,6 +290,12 @@ class Scheduler:
             node.is_active = is_active
         if last_refit_time > 0.0:
             node.last_refit_time = last_refit_time
+        if supports_chunked_prefill is not None:
+            node.supports_chunked_prefill = supports_chunked_prefill
+        if preferred_chunked_prefill_size is not None:
+            node.preferred_chunked_prefill_size = preferred_chunked_prefill_size
+        if chunked_prefill_size is not None:
+            node.chunked_prefill_size = chunked_prefill_size
         node.last_heartbeat = time.time()
 
     # Async-style event enqueuers for main loop
@@ -265,6 +319,9 @@ class Scheduler:
         new_rtt_to_nodes: Optional[Dict[str, float]] = None,
         is_active: Optional[bool] = None,
         last_refit_time: Optional[float] = 0.0,
+        supports_chunked_prefill: Optional[bool] = None,
+        preferred_chunked_prefill_size: Optional[int] = None,
+        chunked_prefill_size: Optional[int] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -275,6 +332,9 @@ class Scheduler:
                 new_rtt_to_nodes,
                 is_active,
                 last_refit_time,
+                supports_chunked_prefill,
+                preferred_chunked_prefill_size,
+                chunked_prefill_size,
             )
         )
         self._wake_event.set()
@@ -391,7 +451,7 @@ class Scheduler:
         If `timeout` is provided, blocks up to `timeout` seconds waiting for a request.
         """
         # Don't dequeue requests until routing is actually possible.
-        if not self.request_router.routing_ready():
+        if not self.serving_ready():
             return None
         try:
             req = (
@@ -407,7 +467,9 @@ class Scheduler:
             request_key = str(req.request_id)
             with self._inflight_routes_lock:
                 if request_key in self._inflight_routes:
-                    logger.warning("Request %s was already reserved; replacing its route", req.request_id)
+                    logger.warning(
+                        "Request %s was already reserved; replacing its route", req.request_id
+                    )
                     self._release_request_locked(request_key)
                 reserved: List[str] = []
                 try:
@@ -445,12 +507,14 @@ class Scheduler:
 
     def has_routing_capacity(self) -> bool:
         """Return whether the current router can admit at least one request."""
-        if not self.request_router.routing_ready():
+        if not self.serving_ready():
             return False
         if self.routing_strategy == "rr":
             _, _, remaining = self.node_manager.report_pipeline_capacity(ready_only=True)
             return remaining > 0
-        return any(node.is_active and not node.is_overloaded for node in self.node_manager.active_nodes)
+        return any(
+            node.is_active and not node.is_overloaded for node in self.node_manager.active_nodes
+        )
 
     def wait_for_routing_capacity(self, timeout: float) -> bool:
         """Wait until capacity is available, waking immediately after a release."""
@@ -583,9 +647,17 @@ class Scheduler:
         """Apply pending node stats updates from the queue."""
         while True:
             try:
-                node_id, cur, lat, rtts, is_active, last_refit_time = (
-                    self._pending_node_updates.get_nowait()
-                )
+                (
+                    node_id,
+                    cur,
+                    lat,
+                    rtts,
+                    is_active,
+                    last_refit_time,
+                    supports_chunked_prefill,
+                    preferred_chunked_prefill_size,
+                    chunked_prefill_size,
+                ) = self._pending_node_updates.get_nowait()
             except queue.Empty:
                 break
             node = self.node_manager.get(node_id)
@@ -599,6 +671,9 @@ class Scheduler:
                 new_rtt_to_nodes=rtts,
                 is_active=is_active,
                 last_refit_time=last_refit_time,
+                supports_chunked_prefill=supports_chunked_prefill,
+                preferred_chunked_prefill_size=preferred_chunked_prefill_size,
+                chunked_prefill_size=chunked_prefill_size,
             )
 
         # Manual allocations can complete before their executors finish loading.
@@ -708,9 +783,9 @@ class Scheduler:
 
         # Move active nodes to standby and re-bootstrap (reboot) once.
         self.node_manager.standby([n.node_id for n in self.node_manager.active_nodes])
-        assert (
-            self.node_manager.num_standby_nodes == self.node_manager.num_nodes
-        ), "All active nodes should be moved to standby"
+        assert self.node_manager.num_standby_nodes == self.node_manager.num_nodes, (
+            "All active nodes should be moved to standby"
+        )
         assert self.node_manager.num_active_nodes == 0, "No active nodes before re-bootstrap"
         logger.warning("Re-bootstrapping for global rebalance")
         try:

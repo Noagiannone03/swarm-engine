@@ -1,5 +1,7 @@
+import json
 import time
 
+import httpx
 from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stream_iter
 
 from parallax_utils.logging_config import get_logger
@@ -7,10 +9,6 @@ from scheduling.node import Node, NodeHardwareInfo
 from scheduling.scheduler import Scheduler
 
 logger = get_logger(__name__)
-
-import json
-
-import httpx
 
 
 class RPCConnectionHandler(ConnectionHandler):
@@ -102,6 +100,9 @@ class RPCConnectionHandler(ConnectionHandler):
                 new_rtt_to_nodes=node.rtt_to_nodes,
                 is_active=node.is_active,
                 last_refit_time=node.last_refit_time,
+                supports_chunked_prefill=node.supports_chunked_prefill,
+                preferred_chunked_prefill_size=node.preferred_chunked_prefill_size,
+                chunked_prefill_size=node.chunked_prefill_size,
             )
             # Return current layer allocation to node
             layer_allocation = self.get_layer_allocation(node.node_id)
@@ -184,6 +185,7 @@ class RPCConnectionHandler(ConnectionHandler):
                         "tp_size": node.hardware.num_gpus,
                         "enable_weight_refit": self.scheduler.enable_weight_refit,
                         "weight_refit_mode": self.scheduler.weight_refit_mode,
+                        "chunked_prefill_size": self.scheduler.negotiated_chunked_prefill_size(),
                     }
         return {}
 
@@ -197,6 +199,9 @@ class RPCConnectionHandler(ConnectionHandler):
             max_concurrent_requests=node_json.get("max_concurrent_requests"),
             max_sequence_length=node_json.get("max_sequence_length"),
             supports_frontend=node_json.get("supports_frontend", True),
+            supports_chunked_prefill=node_json.get("supports_chunked_prefill", False),
+            preferred_chunked_prefill_size=node_json.get("preferred_chunked_prefill_size"),
+            chunked_prefill_size=node_json.get("chunked_prefill_size"),
             is_active=node_json.get("is_active", True),
             manual_layer_assignment=node_json.get("manual_layer_assignment", False),
             last_refit_time=node_json.get("last_refit_time", 0.0),

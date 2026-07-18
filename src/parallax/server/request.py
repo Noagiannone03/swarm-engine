@@ -105,6 +105,7 @@ class Request:
         self.routing_table = routing_table
         self.sampling_params = sampling_params or SamplingParams()
         self.abort = False
+        self.terminal_error = status == RequestStatus.ERROR
         self.ready_for_next_step = False
         self.last_updated_time: Optional[float] = None
         self.lora_id: Optional[str] = None

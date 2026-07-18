@@ -91,3 +91,47 @@ def test_worker_advertises_frontend_capability(monkeypatch):
     node_info = server.get_node_info()
 
     assert node_info["supports_frontend"] is False
+
+
+def test_worker_advertises_runtime_chunked_prefill_capability(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+        gpu_backend="vllm",
+        chunked_prefill_size=1024,
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.rtt_last_update = time.time()
+    monkeypatch.setattr(
+        "parallax.p2p.server.detect_node_hardware",
+        lambda node_id: {"node_id": node_id, "device": "cuda"},
+    )
+
+    node_info = server.get_node_info()
+
+    assert node_info["supports_chunked_prefill"] is False
+    assert node_info["preferred_chunked_prefill_size"] == 1024
+    assert node_info["chunked_prefill_size"] == 0
+
+
+def test_mlx_worker_keeps_chunked_prefill_enabled(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+        gpu_backend="vllm",
+        chunked_prefill_size=1024,
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.rtt_last_update = time.time()
+    monkeypatch.setattr(
+        "parallax.p2p.server.detect_node_hardware",
+        lambda node_id: {"node_id": node_id, "device": "mlx"},
+    )
+
+    node_info = server.get_node_info()
+
+    assert node_info["supports_chunked_prefill"] is True
+    assert node_info["preferred_chunked_prefill_size"] == 1024
+    assert node_info["chunked_prefill_size"] == 1024

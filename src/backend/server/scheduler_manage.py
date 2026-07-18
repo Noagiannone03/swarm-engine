@@ -152,6 +152,12 @@ class SchedulerManage:
                 "init_nodes_num": self.init_nodes_num,
                 "allocation_strategy": self.allocation_strategy,
                 "routing_strategy": self.routing_strategy,
+                "chunked_prefill_size": (
+                    self.scheduler.negotiated_chunked_prefill_size() if self.scheduler else 0
+                ),
+                "prefill_contract_ready": (
+                    self.scheduler.prefill_contract_ready() if self.scheduler else False
+                ),
                 "node_join_command": get_node_join_command(
                     self.get_peer_id(), self.is_local_network
                 ),
@@ -347,9 +353,7 @@ class SchedulerManage:
             return NODE_STATUS_WAITING
 
         # todo rebalance status
-        status = (
-            NODE_STATUS_AVAILABLE if self.scheduler.has_full_pipeline() else NODE_STATUS_WAITING
-        )
+        status = NODE_STATUS_AVAILABLE if self.scheduler.serving_ready() else NODE_STATUS_WAITING
         logger.debug(f"SchedulerManage status queried: {status}")
         return status
 

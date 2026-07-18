@@ -282,7 +282,7 @@ class MLXExecutor(BaseExecutor):
         #     page_size=1,
         # )
         logger.debug(
-            f"mlx_executor initialized; wired_limit set; prefix_cache={'on' if self.enable_prefix_cache else 'off'}, total memory usage: {mx.get_active_memory() / 1024**3 :.3f} GB"
+            f"mlx_executor initialized; wired_limit set; prefix_cache={'on' if self.enable_prefix_cache else 'off'}, total memory usage: {mx.get_active_memory() / 1024**3:.3f} GB"
         )
 
     def _tensor_parallel_broadcast_pyobj(self, broadcast_obj):
@@ -358,14 +358,13 @@ class MLXExecutor(BaseExecutor):
                         original_req.routing_table = req.routing_table
 
                     # Check for termination.
-                    if req.abort:
-                        original_req.abort = True
+                    self.apply_peer_terminal_status(original_req, req)
 
                     if self.scheduler.check_and_update_request_status(original_req):
                         self.cache_manager.release_request(original_req.request_id)
                         logger.debug(
                             f"Released resources for finished request {req.request_id}, "
-                            f"memory usage: {mx.get_active_memory() / 1024**3 :.3f} GB"
+                            f"memory usage: {mx.get_active_memory() / 1024**3:.3f} GB"
                         )
                         if not self.is_last_peer and not req.abort:
                             self.finished_batch.append(req)
@@ -384,14 +383,14 @@ class MLXExecutor(BaseExecutor):
         else:
             # Intermediate and Last peers receive IntermediateRequests from the previous peer.
             for req in requests:
-                assert isinstance(
-                    req, IntermediateRequest
-                ), "Non-first peers must receive IntermediateRequests."
+                assert isinstance(req, IntermediateRequest), (
+                    "Non-first peers must receive IntermediateRequests."
+                )
                 if req.is_finished or req.hidden_states is None:
                     self.cache_manager.release_request(req.request_id)
                     logger.debug(
                         f"Released resources for finished request {req.request_id}, "
-                        f"memory usage: {mx.get_active_memory() / 1024**3 :.3f} GB"
+                        f"memory usage: {mx.get_active_memory() / 1024**3:.3f} GB"
                     )
                     self.scheduler.evict_request(req.request_id)
                     if not self.is_last_peer and not req.abort:

@@ -576,9 +576,9 @@ class BaseExecutor:
             context_lengths: Context lengths for each request
         """
         # Extract hidden_states and probs from output (always a dict now)
-        assert isinstance(
-            batch_output, dict
-        ), f"Expected dict from process_batch, got {type(batch_output)}"
+        assert isinstance(batch_output, dict), (
+            f"Expected dict from process_batch, got {type(batch_output)}"
+        )
         hidden_states = batch_output["hidden_states"]
         token_probs = batch_output["probs"]
 
@@ -630,6 +630,31 @@ class BaseExecutor:
             self.scheduler.evict_request(rid)
         except Exception:
             pass
+
+    @staticmethod
+    def apply_peer_terminal_status(original_request: Request, peer_request: Request) -> None:
+        """Apply a terminal status received from another pipeline shard."""
+        if getattr(peer_request, "terminal_error", False):
+            original_request.terminal_error = True
+            original_request.update_status(RequestStatus.ERROR)
+        elif peer_request.abort:
+            original_request.abort = True
+
+    def fail_batch(self, requests: List[Request]) -> None:
+        """Release a failed batch and propagate ERROR across the whole pipeline."""
+        for req in requests:
+            req.terminal_error = True
+            req.update_status(RequestStatus.ERROR)
+            self.release_and_evict_request(req.request_id)
+            if self.tp_rank != 0:
+                continue
+            if not (self.is_first_peer and self.is_last_peer):
+                self.finished_batch.append(req)
+            if self.is_first_peer:
+                self._send_engine_core_terminal_output(
+                    request_id=req.request_id,
+                    finish_reason=EngineCoreFinishReason.ERROR,
+                )
 
     def run_loop(self):
         """The main loop of the executor."""
@@ -759,14 +784,7 @@ class BaseExecutor:
 
             except Exception as e:
                 logger.exception(f"Error processing batch: {e}")
-                # Naive error handling: release and evict all requests in the batch
-                for req in batch_to_process:
-                    self.release_and_evict_request(req.request_id)
-                    if self.is_first_peer and self.tp_rank == 0:
-                        self._send_engine_core_terminal_output(
-                            request_id=req.request_id,
-                            finish_reason=EngineCoreFinishReason.ERROR,
-                        )
+                self.fail_batch(batch_to_process)
 
     def run_loop_in_background(self):
         """Run the executor loop in the background."""
@@ -826,9 +844,9 @@ class BaseExecutor:
         """
         # This peer is the last peer or a single node.
         if self.is_last_peer and self.is_first_peer:
-            assert isinstance(
-                request, (InitialRequest, IntermediateRequest)
-            ), "Invalid request type for decoding."
+            assert isinstance(request, (InitialRequest, IntermediateRequest)), (
+                "Invalid request type for decoding."
+            )
 
             next_token_id, hidden_states = self._gen_token_id_from_hidden(hidden_states)
             return IntermediateRequest(
@@ -845,9 +863,9 @@ class BaseExecutor:
         if self.is_last_peer:
             # Last peer decodes a token and sends it back to the first peer.
             # The token is wrapped in an IntermediateRequest.
-            assert isinstance(
-                request, IntermediateRequest
-            ), "Last peer must receive an IntermediateRequest."
+            assert isinstance(request, IntermediateRequest), (
+                "Last peer must receive an IntermediateRequest."
+            )
 
             next_token_id, hidden_states = self._gen_token_id_from_hidden(hidden_states)
             return IntermediateRequest(
@@ -869,9 +887,9 @@ class BaseExecutor:
             return IntermediateRequest.from_initial_request(
                 request, hidden_states=hidden_states, lora_path=request.lora_path
             )
-        assert isinstance(
-            request, IntermediateRequest
-        ), "Intermediate peer must process an IntermediateRequest."
+        assert isinstance(request, IntermediateRequest), (
+            "Intermediate peer must process an IntermediateRequest."
+        )
         return IntermediateRequest.from_intermediate_request(
             request, hidden_states, lora_path=request.lora_path
         )

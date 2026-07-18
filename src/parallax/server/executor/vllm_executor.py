@@ -250,8 +250,7 @@ class VLLMExecutor(BaseExecutor):
                         original_req.routing_table = req.routing_table
 
                     # Check for termination.
-                    if req.abort:
-                        original_req.abort = True
+                    self.apply_peer_terminal_status(original_req, req)
 
                     if self.scheduler.check_and_update_request_status(original_req):
                         logger.debug(f"Releasing resources for finished request {req.request_id}")
@@ -272,9 +271,9 @@ class VLLMExecutor(BaseExecutor):
         else:
             # Intermediate and Last peers receive IntermediateRequests from the previous peer.
             for req in requests:
-                assert isinstance(
-                    req, IntermediateRequest
-                ), "Non-first peers must receive IntermediateRequests."
+                assert isinstance(req, IntermediateRequest), (
+                    "Non-first peers must receive IntermediateRequests."
+                )
                 if req.is_finished or req.hidden_states is None:
                     self.release_and_evict_request(req.request_id)
                     if not self.is_last_peer:
@@ -285,12 +284,12 @@ class VLLMExecutor(BaseExecutor):
 
     def process_batch(self, prepared_inputs: Dict[str, Any], return_decoded_tokens: bool = True):
         """Process a batch of requests in vLLM."""
-        assert (
-            "scheduler_output" in prepared_inputs
-        ), "scheduler_output should be provided for vLLM backend"
-        assert (
-            "pp_proxy_tensors" in prepared_inputs
-        ), "pp_proxy_tensors should be in cuda prepared inputs"
+        assert "scheduler_output" in prepared_inputs, (
+            "scheduler_output should be provided for vLLM backend"
+        )
+        assert "pp_proxy_tensors" in prepared_inputs, (
+            "pp_proxy_tensors should be in cuda prepared inputs"
+        )
         scheduler_output = prepared_inputs["scheduler_output"]
         pp_proxy_tensors = prepared_inputs["pp_proxy_tensors"]
         # For vLLM, pp_proxy_tensors is already an IntermediateTensors object
@@ -319,7 +318,6 @@ class VLLMExecutor(BaseExecutor):
 
             token_probs = None
             if needs_probs and logits is not None and isinstance(logits, torch.Tensor):
-
                 if logits.ndim == 3:
                     logits = logits[:, -1, :]  # [batch, seq, vocab_size]
                 elif logits.ndim != 2:

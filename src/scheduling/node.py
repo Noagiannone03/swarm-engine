@@ -184,6 +184,15 @@ class Node:
     max_sequence_length: int = 4096
     supports_frontend: bool = True
 
+    # Chunked prefill is a pipeline-wide wire contract: every shard must process
+    # the same activation span for a request. ``preferred`` is the worker's local
+    # setting, while ``chunked_prefill_size`` is the scheduler-negotiated value
+    # the running executor currently uses. ``None`` means an old/unknown worker,
+    # not "disabled"; disabled is represented explicitly as 0 on the wire.
+    supports_chunked_prefill: bool = False
+    preferred_chunked_prefill_size: Optional[int] = None
+    chunked_prefill_size: Optional[int] = None
+
     manual_layer_assignment: bool = False
     start_layer: Optional[int] = None  # inclusive
     end_layer: Optional[int] = None  # exclusive

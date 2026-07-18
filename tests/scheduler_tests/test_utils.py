@@ -96,6 +96,9 @@ def build_node(
         hardware=hw,
         model_info=model,
         supports_frontend=supports_frontend,
+        supports_chunked_prefill=True,
+        preferred_chunked_prefill_size=0,
+        chunked_prefill_size=0,
         _force_max_concurrent_requests=True,
     )
     # Attach coordinates for RTT synthesis in tests

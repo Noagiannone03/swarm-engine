@@ -333,7 +333,7 @@ def check_and_run_weight_refit(gradient_server, message):
 
         if not download_res:
             gradient_server.last_refit_time = float(time_stamp)
-            logger.info(f"Error in updating weight. Still holds the previous version of weight.")
+            logger.info("Error in updating weight. Still holds the previous version of weight.")
 
         # step3. concat weight
         # workaround: create sub-process to avoid GIL issues for lattica
@@ -389,6 +389,8 @@ class GradientServer:
         max_sequence_length: Optional[int] = None,
         param_mem_ratio: float = 0.65,
         kvcache_mem_ratio: float = 0.25,
+        gpu_backend: str = "sglang",
+        chunked_prefill_size: Optional[int] = None,
         conn: Any = None,
     ):
         self.recv_from_peer_addr = recv_from_peer_addr
@@ -412,6 +414,12 @@ class GradientServer:
         self.supports_frontend = vllm_rust_frontend_available()
         self.param_mem_ratio = param_mem_ratio
         self.kvcache_mem_ratio = kvcache_mem_ratio
+        self.gpu_backend = gpu_backend
+        self.preferred_chunked_prefill_size = (
+            0 if chunked_prefill_size is None else int(chunked_prefill_size)
+        )
+        self.chunked_prefill_size = self.preferred_chunked_prefill_size
+        self.supports_chunked_prefill = False
         self.enable_weight_refit = False
         self.weight_refit_mode = "disk"
         self.last_refit_time = 0.0
@@ -450,6 +458,7 @@ class GradientServer:
                 tp_size=self.tp_size,
                 enable_weight_refit=self.enable_weight_refit,
                 weight_refit_mode=self.weight_refit_mode,
+                chunked_prefill_size=self.chunked_prefill_size,
                 status=self.status.value,
                 _layer_allocation_changed=self._layer_allocation_changed,
             )
@@ -570,6 +579,7 @@ class GradientServer:
                 self.tp_size = response.get("tp_size")
                 self.enable_weight_refit = response.get("enable_weight_refit")
                 self.weight_refit_mode = response.get("weight_refit_mode")
+                self.chunked_prefill_size = int(response.get("chunked_prefill_size", 0))
 
                 # Sync to shared state if available
                 self._sync_to_shared_state()
@@ -697,9 +707,9 @@ class GradientServer:
                     for req in forward_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert (
-                                self.block_start_index == 0
-                            ), "Request routing table is not set for non-head rank"
+                            assert self.block_start_index == 0, (
+                                "Request routing table is not set for non-head rank"
+                            )
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -750,9 +760,9 @@ class GradientServer:
                     for req in abort_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert (
-                                self.block_start_index == 0
-                            ), "Request routing table is not set for non-head rank"
+                            assert self.block_start_index == 0, (
+                                "Request routing table is not set for non-head rank"
+                            )
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -808,28 +818,38 @@ class GradientServer:
                                 start_layer = response.get("start_layer")
                                 end_layer = response.get("end_layer")
                                 model_name = response.get("model_name")
+                                negotiated_chunk_size = response.get("chunked_prefill_size")
                                 if start_layer is not None and end_layer is not None:
                                     logger.debug(
                                         f"Heartbeat: Node {self.lattica.peer_id()}... "
                                         f"Model: {model_name}, Layers: [{start_layer}, {end_layer})"
                                     )
                                     # Check if layer allocation changed
-                                    if (
+                                    allocation_changed = (
                                         start_layer != self.block_start_index
                                         or end_layer != self.block_end_index
                                         or model_name != self.model_name
-                                    ):
+                                    )
+                                    prefill_contract_changed = (
+                                        negotiated_chunk_size is not None
+                                        and int(negotiated_chunk_size) != self.chunked_prefill_size
+                                    )
+                                    if allocation_changed or prefill_contract_changed:
                                         logger.warning(
-                                            f"Layer allocation changed! "
+                                            f"Worker serving contract changed! "
                                             f"Current: [{self.block_start_index}, {self.block_end_index}) -> "
                                             f"New: [{start_layer}, {end_layer}) "
-                                            f"Model: {self.model_name} -> {model_name}"
+                                            f"Model: {self.model_name} -> {model_name}; "
+                                            f"chunked prefill: {self.chunked_prefill_size} -> "
+                                            f"{negotiated_chunk_size}"
                                         )
                                         # Update layer allocation
                                         self.block_start_index = start_layer
                                         self.block_end_index = end_layer
                                         if model_name:
                                             self.model_name = model_name
+                                        if negotiated_chunk_size is not None:
+                                            self.chunked_prefill_size = int(negotiated_chunk_size)
                                         # Set flag to trigger executor reload
                                         self._layer_allocation_changed = True
                                         # Set status to INITIALIZING to prevent scheduler from sending requests
@@ -863,7 +883,7 @@ class GradientServer:
                                 )
                             if refit_message and isinstance(refit_message, dict):
                                 if self.enable_weight_refit:
-                                    logger.info(f"Server begin weight refit process.")
+                                    logger.info("Server begin weight refit process.")
                                     if self.refit_finish:
                                         self.refit_finish = False
                                         t = threading.Thread(
@@ -948,9 +968,18 @@ class GradientServer:
                 self.rtts[peer_id] = rtt if rtt is not None else 100
             self.rtt_last_update = time.time()
 
+        hardware = detect_node_hardware(self.lattica.peer_id())
+        runtime_backend = "mlx" if hardware.get("device") == "mlx" else self.gpu_backend
+        self.supports_chunked_prefill = runtime_backend in {"mlx", "sglang"}
+        if not self.supports_chunked_prefill:
+            # The official Parallax vLLM adapter does not implement chunk
+            # progression. Advertising 0 here prevents an upstream MLX/SGLang
+            # shard from sending partial activations to it.
+            self.chunked_prefill_size = 0
+
         info = {
             "node_id": self.lattica.peer_id(),
-            "hardware": detect_node_hardware(self.lattica.peer_id()),
+            "hardware": hardware,
             "kvcache_mem_ratio": self.kvcache_mem_ratio,
             "param_mem_ratio": self.param_mem_ratio,
             "max_concurrent_requests": self.max_batch_size,
@@ -958,6 +987,9 @@ class GradientServer:
                 1024 if self.max_sequence_length is None else self.max_sequence_length
             ),
             "supports_frontend": self.supports_frontend,
+            "supports_chunked_prefill": self.supports_chunked_prefill,
+            "preferred_chunked_prefill_size": self.preferred_chunked_prefill_size,
+            "chunked_prefill_size": self.chunked_prefill_size,
             "rtt_to_nodes": self.rtts,
             "status": self._get_status(),
             "is_active": self._get_status() == ServerState.READY.value,
@@ -1048,6 +1080,8 @@ def _run_p2p_server_process(
     max_sequence_length: Optional[int] = None,
     param_mem_ratio: float = 0.65,
     kvcache_mem_ratio: float = 0.25,
+    gpu_backend: str = "sglang",
+    chunked_prefill_size: Optional[int] = None,
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
     conn: Any = None,
@@ -1061,8 +1095,10 @@ def _run_p2p_server_process(
     # server.shutdown() (qui envoie node_leave au scheduler) est saute ->
     # noeud fantome cote scheduler.
     import signal as _signal
+
     def _sigterm_to_kbi(signum, frame):
         raise KeyboardInterrupt()
+
     try:
         _signal.signal(_signal.SIGTERM, _sigterm_to_kbi)
     except Exception:
@@ -1092,6 +1128,8 @@ def _run_p2p_server_process(
             max_sequence_length=max_sequence_length,
             param_mem_ratio=param_mem_ratio,
             kvcache_mem_ratio=kvcache_mem_ratio,
+            gpu_backend=gpu_backend,
+            chunked_prefill_size=chunked_prefill_size,
             conn=conn,
         )
         # Attach shared state to server for syncing layer allocation
@@ -1106,6 +1144,7 @@ def _run_p2p_server_process(
                 tp_size=server.tp_size,
                 enable_weight_refit=False,
                 weight_refit_mode="disk",
+                chunked_prefill_size=server.chunked_prefill_size,
                 status=server.status.value,
             )
 
@@ -1141,6 +1180,8 @@ def launch_p2p_server_process(
     max_sequence_length: Optional[int] = None,
     param_mem_ratio: float = 0.65,
     kvcache_mem_ratio: float = 0.25,
+    gpu_backend: str = "sglang",
+    chunked_prefill_size: Optional[int] = None,
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
     conn: Optional[Any] = None,
@@ -1176,6 +1217,8 @@ def launch_p2p_server_process(
             max_sequence_length,
             param_mem_ratio,
             kvcache_mem_ratio,
+            gpu_backend,
+            chunked_prefill_size,
             shared_state,
             log_level,
             conn,

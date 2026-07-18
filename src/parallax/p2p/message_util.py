@@ -1,4 +1,4 @@
-﻿"""
+"""
 Utility functions for message serialization and deserialization.
 
 This module contains utility functions for serializing and deserializing messages
@@ -34,9 +34,9 @@ def request_to_proto(
     """
     forward_request = forward_pb2.ForwardRequest()
     assert len(requests) > 0, "No requests to convert"
-    assert all(
-        request.status == requests[0].status for request in requests
-    ), "All requests must have the same status"
+    assert all(request.status == requests[0].status for request in requests), (
+        "All requests must have the same status"
+    )
     if requests[0].status == RequestStatus.PREFILLING:
         forward_request.forward_mode = forward_pb2.ForwardMode.EXTEND
     elif requests[0].status == RequestStatus.DECODING:
@@ -138,6 +138,9 @@ def abort_request_to_proto(reqs: List[Request]) -> forward_pb2.AbortRequest:
         req_proto.rid = req.request_id
         if req.routing_table is not None:
             req_proto.routing_table.extend(req.routing_table)
+        req_proto.terminal_error = bool(
+            getattr(req, "terminal_error", False) or req.status == RequestStatus.ERROR
+        )
         proto.reqs.append(req_proto)
     return proto
 
@@ -147,16 +150,18 @@ def proto_to_abort_request(proto_request: forward_pb2.AbortRequest) -> List[Inte
     Converts a AbortRequest a list of IntermediateRequest objects.
     Only request_id and routing table are useful information.
     """
-    status = RequestStatus.FINISHED_ABORT
     requests = []
     for proto_req in proto_request.reqs:
+        terminal_error = bool(proto_req.terminal_error)
+        status = RequestStatus.ERROR if terminal_error else RequestStatus.FINISHED_ABORT
         request = IntermediateRequest(
             request_id=proto_req.rid,
             current_position=0,
             status=status,
             routing_table=list(proto_req.routing_table),
         )
-        request.abort = True
+        request.abort = not terminal_error
+        request.terminal_error = terminal_error
 
         requests.append(request)
 

@@ -269,3 +269,16 @@ class TestMessageUtil:
         assert intermediate_reqs[0].abort is True
         assert intermediate_reqs[0].routing_table == ["nodeA", "nodeB"]
         assert intermediate_reqs[1].request_id == "abort2"
+
+    def test_pipeline_error_preserves_terminal_error_status(self):
+        request = Request(request_id="failed", routing_table=["head", "tail"])
+        request.terminal_error = True
+        request.update_status(RequestStatus.ERROR)
+
+        terminal_proto = abort_request_to_proto([request])
+        assert terminal_proto.reqs[0].terminal_error is True
+
+        [converted] = proto_to_abort_request(terminal_proto)
+        assert converted.status == RequestStatus.ERROR
+        assert converted.terminal_error is True
+        assert converted.abort is False
