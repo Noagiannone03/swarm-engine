@@ -11,7 +11,7 @@ Scheduling primitives for distributed LLM inference.
 
 import time
 from dataclasses import dataclass, field
-from math import floor
+from math import floor, isfinite
 from typing import Dict, List, Optional
 
 from parallax_utils.logging_config import get_logger
@@ -461,8 +461,15 @@ class Node:
     def get_rtt_to(self, other: "Node") -> float:
         """Get RTT to another node from cached RTTs.
 
+        A freshly joined pair of workers may not have dialled each other yet,
+        even though both are reachable through the same Lattica peer.  In that
+        cold-start case, use the shortest sum of their measured RTTs to a
+        common peer as a conservative routing estimate.  Once either worker
+        reports a direct RTT, the direct measurement always takes precedence.
+
         Returns:
-            RTT in milliseconds, or float("inf") if no cached RTT exists.
+            RTT in milliseconds, or float("inf") if neither a direct/reverse
+            measurement nor a finite common-peer estimate exists.
         """
         if self == other:
             return 0.0
@@ -473,6 +480,29 @@ class Node:
             # Treat RTT as symmetric for routing/selection purposes if reverse RTT exists.
             if other.rtt_to_nodes is not None and self.node_id in other.rtt_to_nodes:
                 return other.rtt_to_nodes[self.node_id]
+
+            # Workers publish measurements to every connected Lattica peer.
+            # A common peer provides real reachability evidence before the two
+            # workers have established their first direct/relayed stream.
+            if other.rtt_to_nodes:
+                estimates = []
+                for peer_id in self.rtt_to_nodes.keys() & other.rtt_to_nodes.keys():
+                    try:
+                        self_rtt = float(self.rtt_to_nodes[peer_id])
+                        other_rtt = float(other.rtt_to_nodes[peer_id])
+                    except (TypeError, ValueError):
+                        continue
+                    if self_rtt >= 0 and other_rtt >= 0 and isfinite(self_rtt) and isfinite(other_rtt):
+                        estimates.append(self_rtt + other_rtt)
+                if estimates:
+                    estimated_rtt = min(estimates)
+                    logger.debug(
+                        "Estimated RTT from node %s to node %s via a common peer: %.3f ms",
+                        self.node_id,
+                        other.node_id,
+                        estimated_rtt,
+                    )
+                    return estimated_rtt
             logger.warning("Cannot find RTT from node %s to node %s", self.node_id, other.node_id)
             return float("inf")
         return self.rtt_to_nodes[other.node_id]

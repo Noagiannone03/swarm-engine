@@ -140,6 +140,58 @@ def test_optimal_path_missing_rtt():
     assert latency == float("inf")
 
 
+def test_rtt_cold_start_uses_best_common_peer_measurements():
+    """A common Lattica peer makes a fresh worker pair routable."""
+    model = build_model(12)
+    n1 = build_node("n1", model)
+    n2 = build_node("n2", model)
+    n1.set_layer_allocation(0, 6)
+    n2.set_layer_allocation(6, 12)
+    n1.rtt_to_nodes = {
+        "scheduler": 20.0,
+        "relay": 35.0,
+        "unshared": 1.0,
+    }
+    n2.rtt_to_nodes = {
+        "scheduler": 25.0,
+        "relay": 5.0,
+        "invalid": float("inf"),
+    }
+
+    assert n1.get_rtt_to(n2) == pytest.approx(40.0)
+
+    node_manager = build_node_management([n1, n2])
+    node_manager.activate([n1.node_id, n2.node_id])
+    path, latency = DynamicProgrammingRouting(node_manager, total_layers=12).find_optimal_path()
+
+    assert path == [n1.node_id, n2.node_id]
+    assert latency < float("inf")
+
+
+def test_rtt_direct_and_reverse_measurements_precede_common_peer_estimate():
+    """Landmark estimates are bootstrap-only and never mask measured worker RTT."""
+    model = build_model(12)
+    n1 = build_node("n1", model)
+    n2 = build_node("n2", model)
+    n1.rtt_to_nodes = {"scheduler": 20.0, n2.node_id: 7.0}
+    n2.rtt_to_nodes = {"scheduler": 25.0, n1.node_id: 9.0}
+
+    assert n1.get_rtt_to(n2) == pytest.approx(7.0)
+
+    del n1.rtt_to_nodes[n2.node_id]
+    assert n1.get_rtt_to(n2) == pytest.approx(9.0)
+
+
+def test_rtt_common_peer_estimate_ignores_invalid_measurements():
+    model = build_model(12)
+    n1 = build_node("n1", model)
+    n2 = build_node("n2", model)
+    n1.rtt_to_nodes = {"bad-text": "unknown", "negative": -1.0, "infinite": float("inf")}
+    n2.rtt_to_nodes = {"bad-text": 2.0, "negative": 2.0, "infinite": 2.0}
+
+    assert n1.get_rtt_to(n2) == float("inf")
+
+
 @pytest.mark.parametrize(
     "num_layers,segments,expected_path",
     [
