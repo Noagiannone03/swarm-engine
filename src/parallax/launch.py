@@ -46,11 +46,18 @@ def _update_args_from_shared_state(args, shared_state: SharedState, force_update
     # from a local path. The Rust frontend uses it as the OpenAI API alias.
     if not getattr(args, "served_model_name", None) or force_update:
         args.served_model_name = model_info["model_name"]
-    if args.model_path is not None and not force_update:
-        # Use local model path first
-        pass
+
+    # A worker may load an optimized local artifact (for example an MLX model on
+    # macOS) while serving the scheduler's public model name. Preserve that
+    # explicit CLI choice across every DP layer reallocation. Without a stable
+    # override, a join/leave event replaces the local path with the public Hub
+    # name and can either download the wrong artifact or fail during recovery.
+    if not hasattr(args, "_worker_model_path_override"):
+        args._worker_model_path_override = args.model_path
+
+    if args._worker_model_path_override is not None:
+        args.model_path = args._worker_model_path_override
     elif model_info["model_name"]:
-        # Update model_path if provided
         args.model_path = model_info["model_name"]
         logger.debug(f"Updated model_path to: {args.model_path}")
     else:
