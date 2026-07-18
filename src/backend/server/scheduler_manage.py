@@ -188,6 +188,15 @@ class SchedulerManage:
             "gpu_name": node.hardware.gpu_name,
             "gpu_memory": node.hardware.memory_gb,
             "supports_frontend": node.supports_frontend,
+            "max_sequence_length": getattr(node, "max_sequence_length", None),
+            "max_concurrent_requests": getattr(node, "max_requests", None),
+            "kv_cache_telemetry_ready": (
+                getattr(node, "kv_cache_token_capacity", None) is not None
+            ),
+            "kv_cache_token_capacity": getattr(node, "kv_cache_token_capacity", None),
+            "kv_cache_block_size": getattr(node, "kv_cache_block_size", None),
+            "reserved_context_tokens": getattr(node, "reserved_context_tokens", 0),
+            "remaining_context_tokens": getattr(node, "remaining_context_tokens", None),
         }
 
     def _start_scheduler(self, model_name, init_nodes_num):

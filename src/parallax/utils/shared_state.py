@@ -152,6 +152,9 @@ class SharedState:
         shared_dict["enable_weight_refit"] = None
         shared_dict["weight_refit_mode"] = None
         shared_dict["chunked_prefill_size"] = None
+        shared_dict["kv_cache_token_capacity"] = None
+        shared_dict["kv_cache_block_size"] = None
+        shared_dict["max_concurrent_requests"] = None
         shared_dict["_layer_allocation_changed"] = False
         shared_dict["status"] = None
 

@@ -977,12 +977,22 @@ class GradientServer:
             # shard from sending partial activations to it.
             self.chunked_prefill_size = 0
 
+        runtime_max_requests = self.max_batch_size
+        runtime_kv_capacity = None
+        runtime_kv_block_size = None
+        if hasattr(self, "_shared_state") and self._shared_state is not None:
+            measured_max_requests = self._shared_state.get("max_concurrent_requests")
+            if measured_max_requests is not None:
+                runtime_max_requests = measured_max_requests
+            runtime_kv_capacity = self._shared_state.get("kv_cache_token_capacity")
+            runtime_kv_block_size = self._shared_state.get("kv_cache_block_size")
+
         info = {
             "node_id": self.lattica.peer_id(),
             "hardware": hardware,
             "kvcache_mem_ratio": self.kvcache_mem_ratio,
             "param_mem_ratio": self.param_mem_ratio,
-            "max_concurrent_requests": self.max_batch_size,
+            "max_concurrent_requests": runtime_max_requests,
             "max_sequence_length": (
                 1024 if self.max_sequence_length is None else self.max_sequence_length
             ),
@@ -996,6 +1006,9 @@ class GradientServer:
             "manual_layer_assignment": self.manual_layer_assignment,
             "last_refit_time": self.last_refit_time,
         }
+        if runtime_kv_capacity is not None and runtime_kv_block_size is not None:
+            info["kv_cache_token_capacity"] = int(runtime_kv_capacity)
+            info["kv_cache_block_size"] = int(runtime_kv_block_size)
 
         # For manual layer assignment, always include start_layer and end_layer
         if self.manual_layer_assignment:

@@ -63,6 +63,30 @@ def test_cluster_node_info_exposes_frontend_capability():
     assert manager.build_node_info(node)["supports_frontend"] is False
 
 
+def test_cluster_node_info_exposes_measured_kv_capacity():
+    manager = SchedulerManage()
+    node = SimpleNamespace(
+        node_id="measured-worker",
+        is_active=True,
+        supports_frontend=True,
+        max_sequence_length=32768,
+        max_requests=4,
+        kv_cache_token_capacity=65536,
+        kv_cache_block_size=64,
+        reserved_context_tokens=10048,
+        remaining_context_tokens=55488,
+        hardware=SimpleNamespace(num_gpus=1, gpu_name="RTX", memory_gb=16.0),
+    )
+
+    info = manager.build_node_info(node)
+
+    assert info["kv_cache_telemetry_ready"] is True
+    assert info["kv_cache_token_capacity"] == 65536
+    assert info["kv_cache_block_size"] == 64
+    assert info["reserved_context_tokens"] == 10048
+    assert info["remaining_context_tokens"] == 55488
+
+
 def test_context_tokenizer_is_canonical_cached_and_offline_aware():
     manager = SchedulerManage(use_hfcache=True)
     manager.model_name = "Qwen/Qwen3-0.6B"

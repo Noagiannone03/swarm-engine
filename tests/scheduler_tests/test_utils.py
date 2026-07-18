@@ -99,6 +99,8 @@ def build_node(
         supports_chunked_prefill=True,
         preferred_chunked_prefill_size=0,
         chunked_prefill_size=0,
+        kv_cache_token_capacity=1_000_000,
+        kv_cache_block_size=16,
         _force_max_concurrent_requests=True,
     )
     # Attach coordinates for RTT synthesis in tests

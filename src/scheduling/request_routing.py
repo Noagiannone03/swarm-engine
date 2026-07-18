@@ -71,7 +71,7 @@ def estimate_pipeline_latency(
     prev: Optional[Node] = None
     for nid in pipeline_node_ids:
         n = id_to_node.get(nid)
-        if n is None or n.is_overloaded or n.max_sequence_length < required_context_tokens:
+        if n is None or not n.can_accept_request(required_context_tokens):
             return float("inf")
         node_lat = float(n.layer_latency_ms)
         if node_lat == float("inf"):
@@ -105,7 +105,7 @@ def max_complete_pipeline_context(nodes: List[Node], num_layers: int) -> int:
             and node.start_layer is not None
             and node.end_layer is not None
             and node.end_layer > node.start_layer
-            and node.max_sequence_length > 0
+            and node.static_context_capacity > 0
         ),
         key=lambda node: (int(node.start_layer), int(node.end_layer)),
     )
@@ -115,7 +115,7 @@ def max_complete_pipeline_context(nodes: List[Node], num_layers: int) -> int:
         prefix_capacity = best_at_layer.get(start)
         if prefix_capacity is None:
             continue
-        route_capacity = min(prefix_capacity, int(node.max_sequence_length))
+        route_capacity = min(prefix_capacity, int(node.static_context_capacity))
         best_at_layer[end] = max(best_at_layer.get(end, 0), route_capacity)
     return best_at_layer.get(num_layers, 0)
 
@@ -369,7 +369,7 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
                 n.start_layer is None
                 or n.end_layer is None
                 or n.is_active is False
-                or n.max_sequence_length < required_context_tokens
+                or not n.can_accept_request(required_context_tokens)
             ):
                 continue
             starts.setdefault(n.start_layer, []).append(idx)
@@ -384,7 +384,7 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
                     for i, n in enumerate(nodes)
                     if n.start_layer is not None
                     and n.end_layer is not None
-                    and n.max_sequence_length >= required_context_tokens
+                    and n.can_accept_request(required_context_tokens)
                 ],
                 key=lambda p: (p[1].start_layer, p[1].end_layer),
             )
@@ -915,7 +915,7 @@ class RoundRobinOverFixedPipelinesRouting(RequestRoutingStrategy):
     def max_supported_context_tokens(self) -> int:
         """Largest context accepted by one ready registered pipeline."""
         capacities = [
-            min(int(node.max_sequence_length) for node in pipeline.nodes)
+            min(int(node.static_context_capacity) for node in pipeline.nodes)
             for pipeline in self.node_manager.get_registered_pipelines().values()
             if pipeline.is_ready and pipeline.nodes
         ]

@@ -103,6 +103,9 @@ class RPCConnectionHandler(ConnectionHandler):
                 supports_chunked_prefill=node.supports_chunked_prefill,
                 preferred_chunked_prefill_size=node.preferred_chunked_prefill_size,
                 chunked_prefill_size=node.chunked_prefill_size,
+                kv_cache_token_capacity=node.kv_cache_token_capacity,
+                kv_cache_block_size=node.kv_cache_block_size,
+                max_concurrent_requests=node.max_concurrent_requests,
             )
             # Return current layer allocation to node
             layer_allocation = self.get_layer_allocation(node.node_id)
@@ -198,6 +201,8 @@ class RPCConnectionHandler(ConnectionHandler):
             param_mem_ratio=node_json.get("param_mem_ratio"),
             max_concurrent_requests=node_json.get("max_concurrent_requests"),
             max_sequence_length=node_json.get("max_sequence_length"),
+            kv_cache_token_capacity=node_json.get("kv_cache_token_capacity"),
+            kv_cache_block_size=node_json.get("kv_cache_block_size"),
             supports_frontend=node_json.get("supports_frontend", True),
             supports_chunked_prefill=node_json.get("supports_chunked_prefill", False),
             preferred_chunked_prefill_size=node_json.get("preferred_chunked_prefill_size"),

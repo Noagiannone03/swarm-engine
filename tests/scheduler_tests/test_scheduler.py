@@ -146,6 +146,102 @@ def test_scheduler_releases_route_without_waiting_for_worker_heartbeat():
     assert available_path == [node.node_id]
 
 
+def test_scheduler_reserves_measured_kv_blocks_and_releases_them():
+    model = build_model_info(12)
+    node = build_node("measured", model, mem_gb=400.0)
+    node.max_concurrent_requests = 4
+    node.max_sequence_length = 32768
+    node.kv_cache_token_capacity = 16384
+    node.kv_cache_block_size = 64
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="greedy",
+        routing_strategy="rr",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+    assert sched.max_supported_context_tokens() == 16384
+
+    sched.receive_request(RequestSignal(request_id="large", required_context_tokens=10000))
+    _, first_path, _ = sched.dispatch_next_request()
+    assert first_path == [node.node_id]
+    assert node.reserved_context_tokens == 10048
+
+    sched.receive_request(RequestSignal(request_id="does-not-fit", required_context_tokens=6400))
+    _, busy_path, _ = sched.dispatch_next_request()
+    assert busy_path == []
+
+    assert sched.release_request("large")
+    assert node.reserved_context_tokens == 0
+    sched.receive_request(RequestSignal(request_id="now-fits", required_context_tokens=6400))
+    _, available_path, _ = sched.dispatch_next_request()
+    assert available_path == [node.node_id]
+
+
+def test_scheduler_never_admits_context_without_runtime_telemetry():
+    model = build_model_info(12)
+    node = build_node("legacy", model, mem_gb=400.0)
+    node.kv_cache_token_capacity = None
+    node.kv_cache_block_size = None
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="greedy",
+        routing_strategy="rr",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+    assert sched.max_supported_context_tokens() == 0
+
+    sched.receive_request(RequestSignal(request_id="requires-telemetry", required_context_tokens=1))
+    _, path, latency = sched.dispatch_next_request()
+
+    assert path == []
+    assert latency == float("inf")
+    assert node.reserved_context_tokens == 0
+
+
+def test_concurrent_dispatch_cannot_double_reserve_last_kv_blocks():
+    model = build_model_info(12)
+    node = build_node("atomic", model, mem_gb=400.0)
+    node.max_concurrent_requests = 4
+    node.max_sequence_length = 32768
+    node.kv_cache_token_capacity = 16384
+    node.kv_cache_block_size = 64
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="greedy",
+        routing_strategy="rr",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+    for request_id in ("concurrent-a", "concurrent-b"):
+        sched.receive_request(RequestSignal(request_id=request_id, required_context_tokens=10000))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: sched.dispatch_next_request(), range(2)))
+
+    paths = [result[1] for result in results if result is not None]
+    assert sorted(bool(path) for path in paths) == [False, True]
+    assert node.reserved_requests == 1
+    assert node.reserved_context_tokens == 10048
+
+
+def test_layer_reallocation_invalidates_old_executor_kv_geometry():
+    model = build_model_info(12)
+    node = build_node("reallocated", model)
+    node.start_layer = 0
+    node.end_layer = 6
+
+    node.set_layer_allocation(0, 12)
+
+    assert node.kv_cache_token_capacity is None
+    assert node.kv_cache_block_size is None
+    assert node.static_context_capacity == 0
+
+
 def test_scheduler_join_and_leave():
     """New node can join and be assigned; leave removes it and may rebalance."""
     model = build_model_info(12)
@@ -353,9 +449,9 @@ def test_scheduler_single_node_leave_then_rejoin_reassigns_layers():
     sched._process_joins()  # type: ignore[attr-defined]
 
     # Expected behavior: after re-join with min_nodes_bootstrapping=1, layers are assigned again
-    assert (
-        n1_rejoin.start_layer is not None and n1_rejoin.end_layer is not None
-    ), "After re-join, single node should be assigned a full layer range"
+    assert n1_rejoin.start_layer is not None and n1_rejoin.end_layer is not None, (
+        "After re-join, single node should be assigned a full layer range"
+    )
 
 
 def test_scheduler_three_nodes_sequential_join_leave_rejoin():

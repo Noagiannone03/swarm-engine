@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 from collections import deque
-from typing import Deque, Dict, List, Literal, Optional, Tuple
+from typing import Deque, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 from parallax_utils.logging_config import get_logger
 from scheduling.layer_allocation import (
@@ -24,6 +24,21 @@ from scheduling.request_routing import (
 )
 
 logger = get_logger(__name__)
+
+NodeUpdate: TypeAlias = Tuple[
+    str,
+    Optional[int],
+    Optional[float],
+    Optional[Dict[str, float]],
+    Optional[bool],
+    Optional[float],
+    Optional[bool],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+]
 
 
 class Scheduler:
@@ -99,7 +114,8 @@ class Scheduler:
         )
 
         self._request_queue: "queue.Queue[RequestSignal]" = queue.Queue()
-        self._inflight_routes: Dict[str, List[str]] = {}
+        # request id -> (ordered node path, per-node requested context tokens)
+        self._inflight_routes: Dict[str, Tuple[List[str], int]] = {}
         self._inflight_routes_lock = threading.RLock()
         self._capacity_cv = threading.Condition()
         self.request_arrival_horizon_sec = request_arrival_horizon_sec
@@ -109,7 +125,7 @@ class Scheduler:
         # Event queues for main loop orchestration (thread-safe)
         self._pending_joins: "queue.Queue[Node]" = queue.Queue()
         self._pending_leaves: "queue.Queue[str]" = queue.Queue()
-        self._pending_node_updates: "queue.Queue[Tuple[str, Optional[int], Optional[float], Optional[Dict[str, float]], Optional[bool], Optional[float], Optional[bool], Optional[int], Optional[int]]]" = queue.Queue()
+        self._pending_node_updates: "queue.Queue[NodeUpdate]" = queue.Queue()
 
         # Concurrency controls
         self._stop_event: threading.Event = threading.Event()
@@ -286,6 +302,9 @@ class Scheduler:
         supports_chunked_prefill: Optional[bool] = None,
         preferred_chunked_prefill_size: Optional[int] = None,
         chunked_prefill_size: Optional[int] = None,
+        kv_cache_token_capacity: Optional[int] = None,
+        kv_cache_block_size: Optional[int] = None,
+        max_concurrent_requests: Optional[int] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
@@ -304,6 +323,12 @@ class Scheduler:
             node.preferred_chunked_prefill_size = preferred_chunked_prefill_size
         if chunked_prefill_size is not None:
             node.chunked_prefill_size = chunked_prefill_size
+        if kv_cache_token_capacity is not None:
+            node.kv_cache_token_capacity = int(kv_cache_token_capacity)
+        if kv_cache_block_size is not None:
+            node.kv_cache_block_size = int(kv_cache_block_size)
+        if max_concurrent_requests is not None:
+            node.max_concurrent_requests = int(max_concurrent_requests)
         node.last_heartbeat = time.time()
 
     # Async-style event enqueuers for main loop
@@ -330,6 +355,9 @@ class Scheduler:
         supports_chunked_prefill: Optional[bool] = None,
         preferred_chunked_prefill_size: Optional[int] = None,
         chunked_prefill_size: Optional[int] = None,
+        kv_cache_token_capacity: Optional[int] = None,
+        kv_cache_block_size: Optional[int] = None,
+        max_concurrent_requests: Optional[int] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -343,6 +371,9 @@ class Scheduler:
                 supports_chunked_prefill,
                 preferred_chunked_prefill_size,
                 chunked_prefill_size,
+                kv_cache_token_capacity,
+                kv_cache_block_size,
+                max_concurrent_requests,
             )
         )
         self._wake_event.set()
@@ -469,43 +500,64 @@ class Scheduler:
             )
         except queue.Empty:
             return None
-        if req.required_context_tokens > self.max_supported_context_tokens():
-            path, latency = [], float("inf")
-        else:
-            path, latency = self.request_router.find_optimal_path(
-                last_refit_time=self.last_refit_time,
-                required_context_tokens=req.required_context_tokens,
-            )
-        req.routing_table = path
-        if path:
-            request_key = str(req.request_id)
-            with self._inflight_routes_lock:
+        request_key = str(req.request_id)
+        # Route selection and reservations form one transaction. Without this
+        # lock, concurrent dispatchers can both observe the same last KV blocks.
+        with self._inflight_routes_lock:
+            if req.required_context_tokens > self.max_supported_context_tokens():
+                path, latency = [], float("inf")
+            else:
                 if request_key in self._inflight_routes:
                     logger.warning(
                         "Request %s was already reserved; replacing its route", req.request_id
                     )
                     self._release_request_locked(request_key)
-                reserved: List[str] = []
-                try:
-                    for node_id in path:
-                        self.node_manager.add_request(node_id)
-                        reserved.append(node_id)
-                except Exception:
-                    for node_id in reserved:
-                        self.node_manager.remove_request(node_id)
-                    raise
-                self._inflight_routes[request_key] = list(path)
+                path, latency = [], float("inf")
+                # A heartbeat or leave can change capacity between the router's
+                # snapshot and NodeManager's guarded mutation. Retry once from a
+                # fresh snapshot instead of killing the dispatch loop.
+                for attempt in range(2):
+                    candidate, candidate_latency = self.request_router.find_optimal_path(
+                        last_refit_time=self.last_refit_time,
+                        required_context_tokens=req.required_context_tokens,
+                    )
+                    if not candidate:
+                        break
+                    reserved: List[str] = []
+                    try:
+                        for node_id in candidate:
+                            self.node_manager.add_request(node_id, req.required_context_tokens)
+                            reserved.append(node_id)
+                    except (ValueError, KeyError) as exc:
+                        for node_id in reserved:
+                            self.node_manager.remove_request(node_id, req.required_context_tokens)
+                        logger.info(
+                            "Route reservation changed during dispatch for request %s "
+                            "(attempt %d): %s",
+                            req.request_id,
+                            attempt + 1,
+                            exc,
+                        )
+                        continue
+                    path, latency = list(candidate), float(candidate_latency)
+                    self._inflight_routes[request_key] = (
+                        path,
+                        int(req.required_context_tokens),
+                    )
+                    break
+            req.routing_table = path
         logger.debug(
             "Dispatched request %s via path %s (est_lat=%.2fms)", req.request_id, path, latency
         )
         return req.request_id, path, latency
 
     def _release_request_locked(self, request_id: str) -> bool:
-        path = self._inflight_routes.pop(request_id, None)
-        if path is None:
+        reservation = self._inflight_routes.pop(request_id, None)
+        if reservation is None:
             return False
+        path, required_context_tokens = reservation
         for node_id in path:
-            self.node_manager.remove_request(node_id)
+            self.node_manager.remove_request(node_id, required_context_tokens)
         return True
 
     def release_request(self, request_id: str) -> bool:
@@ -671,6 +723,9 @@ class Scheduler:
                     supports_chunked_prefill,
                     preferred_chunked_prefill_size,
                     chunked_prefill_size,
+                    kv_cache_token_capacity,
+                    kv_cache_block_size,
+                    max_concurrent_requests,
                 ) = self._pending_node_updates.get_nowait()
             except queue.Empty:
                 break
@@ -688,6 +743,9 @@ class Scheduler:
                 supports_chunked_prefill=supports_chunked_prefill,
                 preferred_chunked_prefill_size=preferred_chunked_prefill_size,
                 chunked_prefill_size=chunked_prefill_size,
+                kv_cache_token_capacity=kv_cache_token_capacity,
+                kv_cache_block_size=kv_cache_block_size,
+                max_concurrent_requests=max_concurrent_requests,
             )
 
         # Manual allocations can complete before their executors finish loading.

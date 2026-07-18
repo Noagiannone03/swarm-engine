@@ -194,6 +194,7 @@ class BaseExecutor:
         # Rust frontend reads this value from the registration payload.
         self.max_sequence_length = max_sequence_length
         self.kv_block_size = int(kv_block_size)
+        self._publish_runtime_capacity()
         self.model_path = None
 
         # Communication Related
@@ -227,6 +228,64 @@ class BaseExecutor:
             f"tp_rank={self.tp_rank}/{self.tp_size}, "
             f"device={self.device}, "
             f"num_shard_layers={self.num_shard_layers})"
+        )
+
+    def _runtime_kv_cache_geometry(self) -> Tuple[int, int]:
+        """Read the token capacity and block size from the initialized backend.
+
+        This deliberately avoids RAM/VRAM formulas: each backend has already
+        accounted for loaded weights, allocator metadata, tensor parallelism,
+        cache dtype, hybrid attention, and its physical page granularity.
+        """
+        cache_manager = getattr(self, "cache_manager", None)
+        num_gpu_blocks = getattr(cache_manager, "num_gpu_blocks", None)
+        cache_block_size = getattr(cache_manager, "block_size", None)
+        if num_gpu_blocks is not None and cache_block_size is not None:
+            return int(num_gpu_blocks) * int(cache_block_size), int(cache_block_size)
+
+        model_runner = getattr(self, "model_runner", None)
+        token_allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
+        allocator_size = getattr(token_allocator, "size", None)
+        runner_page_size = getattr(model_runner, "page_size", None)
+        if allocator_size is not None and runner_page_size is not None:
+            # SGLang's allocator size and available_size() are expressed in tokens.
+            return int(allocator_size), int(runner_page_size)
+
+        kv_cache_config = getattr(model_runner, "kv_cache_config", None)
+        num_blocks = getattr(kv_cache_config, "num_blocks", None)
+        runner_cache_config = getattr(model_runner, "cache_config", None)
+        runner_block_size = getattr(runner_cache_config, "block_size", None)
+        if num_blocks is not None and runner_block_size is not None:
+            # vLLM's shared block pool contains num_blocks physical pages. KV
+            # groups share that pool; dividing by the group count is incorrect.
+            return int(num_blocks) * int(runner_block_size), int(runner_block_size)
+
+        raise RuntimeError(
+            "Initialized executor did not expose KV cache capacity; refusing to advertise "
+            "an estimated product capacity"
+        )
+
+    def _publish_runtime_capacity(self) -> None:
+        """Publish executor-measured admission limits to the P2P heartbeat."""
+        capacity, block_size = BaseExecutor._runtime_kv_cache_geometry(self)
+        if capacity <= 0 or block_size <= 0:
+            raise RuntimeError(
+                f"Invalid runtime KV cache geometry: capacity={capacity}, block_size={block_size}"
+            )
+        max_requests = int(self.scheduler.max_batch_size)
+        if max_requests <= 0:
+            raise RuntimeError(f"Invalid runtime request capacity: {max_requests}")
+        if self.shared_state is not None:
+            self.shared_state.update(
+                kv_cache_token_capacity=capacity,
+                kv_cache_block_size=block_size,
+                max_concurrent_requests=max_requests,
+            )
+        logger.info(
+            "Runtime admission capacity: %d KV tokens (%d-token blocks), %d requests",
+            capacity,
+            block_size,
+            max_requests,
         )
 
     @abstractmethod

@@ -389,25 +389,26 @@ class NodeManager:
         """Check if there is a full pipeline among ACTIVE nodes."""
         return self.num_full_pipelines(num_total_layers, ready_only) > 0
 
-    def add_request(self, node_id: str) -> None:
-        """Add a request to a node."""
+    def add_request(self, node_id: str, required_context_tokens: int = 0) -> None:
+        """Atomically reserve request-count and KV-token capacity on a node."""
         with self._lock:
             if self._nodes.get(node_id) is None:
                 raise ValueError(f"Node {node_id} not found in registry")
             if self._state.get(node_id) != NodeState.ACTIVE:
                 raise ValueError(f"Node {node_id} is not ACTIVE")
+            # Node.add_request validates before mutating either reservation.
+            self._nodes[node_id].add_request(required_context_tokens)
             self.node_assigned_request_count[node_id] = (
                 self.node_assigned_request_count.get(node_id, 0) + 1
             )
-            self._nodes[node_id].add_request()
 
-    def remove_request(self, node_id: str) -> bool:
+    def remove_request(self, node_id: str, required_context_tokens: int = 0) -> bool:
         """Release a request reservation, tolerating a node that left in-flight."""
         with self._lock:
             node = self._nodes.get(node_id)
             if node is None:
                 return False
-            node.remove_request()
+            node.remove_request(required_context_tokens)
             return True
 
     def register_pipelines(self, pipelines: List[List[str]]) -> Dict[int, List[str]]:

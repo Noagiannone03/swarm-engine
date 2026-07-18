@@ -40,6 +40,8 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
             "param_mem_ratio": 0.65,
             "max_concurrent_requests": 1,
             "max_sequence_length": 65536,
+            "kv_cache_token_capacity": 131072,
+            "kv_cache_block_size": 32,
             "current_requests": 1,
             "layer_latency_ms": 1.5,
             "is_active": True,
@@ -54,6 +56,9 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
     assert node_id == "worker"
     assert update["current_requests"] == 1
     assert update["layer_latency_ms"] == 1.5
+    assert update["kv_cache_token_capacity"] == 131072
+    assert update["kv_cache_block_size"] == 32
+    assert update["max_concurrent_requests"] == 1
 
 
 def test_build_node_preserves_frontend_capability():
@@ -82,3 +87,33 @@ def test_build_node_preserves_frontend_capability():
     )
 
     assert node.supports_frontend is False
+
+
+def test_build_node_preserves_measured_kv_geometry():
+    scheduler = RecordingScheduler()
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = scheduler
+
+    node = handler.build_node(
+        {
+            "node_id": "measured-worker",
+            "hardware": {
+                "node_id": "measured-worker",
+                "num_gpus": 1,
+                "tflops_fp16": 50.0,
+                "gpu_name": "RTX",
+                "memory_gb": 16.0,
+                "memory_bandwidth_gbps": 600.0,
+                "device": "cuda",
+            },
+            "kvcache_mem_ratio": 0.25,
+            "param_mem_ratio": 0.65,
+            "max_concurrent_requests": 4,
+            "max_sequence_length": 32768,
+            "kv_cache_token_capacity": 98304,
+            "kv_cache_block_size": 64,
+        }
+    )
+
+    assert node.kv_cache_token_capacity == 98304
+    assert node.kv_cache_block_size == 64

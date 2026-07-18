@@ -135,3 +135,34 @@ def test_mlx_worker_keeps_chunked_prefill_enabled(monkeypatch):
     assert node_info["supports_chunked_prefill"] is True
     assert node_info["preferred_chunked_prefill_size"] == 1024
     assert node_info["chunked_prefill_size"] == 1024
+
+
+def test_worker_advertises_executor_measured_kv_geometry(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+        max_batch_size=8,
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.rtt_last_update = time.time()
+    values = {
+        "max_concurrent_requests": 6,
+        "kv_cache_token_capacity": 123456,
+        "kv_cache_block_size": 64,
+    }
+    server._shared_state = SimpleNamespace(
+        get=lambda key, default=None: values.get(key, default),
+        get_metrics=lambda: {},
+        get_status=lambda: ServerState.READY.value,
+    )
+    monkeypatch.setattr(
+        "parallax.p2p.server.detect_node_hardware",
+        lambda node_id: {"node_id": node_id, "device": "mlx"},
+    )
+
+    node_info = server.get_node_info(is_update=True)
+
+    assert node_info["max_concurrent_requests"] == 6
+    assert node_info["kv_cache_token_capacity"] == 123456
+    assert node_info["kv_cache_block_size"] == 64

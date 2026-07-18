@@ -15,7 +15,6 @@ from math import floor
 from typing import Dict, List, Optional
 
 from parallax_utils.logging_config import get_logger
-from parallax_utils.utils import bytes_per_element, compute_max_batch_size
 from scheduling.model_info import ModelInfo
 
 logger = get_logger(__name__)
@@ -182,8 +181,12 @@ class Node:
     kvcache_mem_ratio: float = 0.3
     param_mem_ratio: float = 0.5
 
-    max_concurrent_requests: int = 16
+    max_concurrent_requests: Optional[int] = 16
     max_sequence_length: int = 4096
+    # Exact cache geometry published by the initialized executor. Hardware
+    # estimates remain diagnostic only and are never used to admit traffic.
+    kv_cache_token_capacity: Optional[int] = None
+    kv_cache_block_size: Optional[int] = None
     supports_frontend: bool = True
 
     # Chunked prefill is a pipeline-wide wire contract: every shard must process
@@ -200,6 +203,7 @@ class Node:
     end_layer: Optional[int] = None  # exclusive
     current_requests: int = 0
     reserved_requests: int = field(default=0, init=False)
+    reserved_context_tokens: int = field(default=0, init=False)
     _uses_scheduler_reservations: bool = field(default=False, init=False, repr=False)
 
     # Runtime weight refit for RL
@@ -225,39 +229,66 @@ class Node:
 
     @property
     def max_requests(self) -> int:
-        """Max concurrent requests bounded by KV budget using sequence length."""
-        if self._force_max_concurrent_requests:
-            return self.max_concurrent_requests
+        """Executor request-count limit.
 
-        if self.start_layer is None or self.end_layer is None:
-            return self.max_concurrent_requests
-        try:
-            elem_bytes = bytes_per_element(
-                getattr(self.model_info, "cache_bytes_per_element", None)
-            )
-        except Exception:
-            elem_bytes = 2
-        derived_max = compute_max_batch_size(
-            requested_max_batch_size=self.max_concurrent_requests,
-            max_sequence_len=self.max_sequence_length,
-            device=None,
-            kv_cache_memory_fraction=self.kvcache_mem_ratio,
-            num_shard_layers=self.num_current_layers,
-            num_key_value_heads=self.model_info.num_kv_heads,
-            head_dim=self.model_info.head_size,
-            elem_bytes=elem_bytes,
-            memory_gb=self.hardware.memory_gb,
-            head_dim_k=self.model_info.head_size_k,
-            head_dim_v=self.model_info.head_size_v,
-        )
-        if derived_max <= 0:
-            raise ValueError(
-                f"Node {self.node_id} has invalid max concurrent requests: {derived_max}"
-            )
-        if self.max_concurrent_requests is None:
-            return derived_max
-        else:
-            return max(self.max_concurrent_requests, derived_max)
+        KV memory is a token budget, not a fixed batch-size limit: two 2k
+        requests do not consume the same cache as two 32k requests. Keeping the
+        count and token constraints separate also avoids the upstream bug where
+        a derived KV clamp was immediately undone with ``max(requested, derived)``.
+        """
+        value = 16 if self.max_concurrent_requests is None else int(self.max_concurrent_requests)
+        if value <= 0:
+            raise ValueError(f"Node {self.node_id} has invalid max concurrent requests: {value}")
+        return value
+
+    @property
+    def effective_kv_cache_token_capacity(self) -> Optional[int]:
+        """Return measured executor capacity; estimates never admit traffic."""
+        if self.kv_cache_token_capacity is not None:
+            capacity = int(self.kv_cache_token_capacity)
+            return capacity if capacity > 0 else None
+        return None
+
+    def reservation_tokens(self, required_context_tokens: int) -> int:
+        """Round a request to the physical allocation granularity of the backend."""
+        required = max(0, int(required_context_tokens))
+        if required == 0:
+            return 0
+        block_size = 1
+        if self.kv_cache_block_size is not None and int(self.kv_cache_block_size) > 0:
+            block_size = int(self.kv_cache_block_size)
+        return ((required + block_size - 1) // block_size) * block_size
+
+    @property
+    def static_context_capacity(self) -> int:
+        """Largest single request this shard can ever admit."""
+        kv_capacity = self.effective_kv_cache_token_capacity
+        if kv_capacity is None:
+            return 0
+        return max(0, min(int(self.max_sequence_length), kv_capacity))
+
+    @property
+    def remaining_context_tokens(self) -> Optional[int]:
+        """Unreserved scheduler-side KV budget, if it is known."""
+        capacity = self.effective_kv_cache_token_capacity
+        if capacity is None:
+            return None
+        return max(0, capacity - self.reserved_context_tokens)
+
+    def can_accept_request(self, required_context_tokens: int = 0) -> bool:
+        """Check request-count, context-window, and aggregate KV constraints."""
+        required = max(0, int(required_context_tokens))
+        reservation = self.reservation_tokens(required)
+        if self.routing_load >= self.max_requests:
+            return False
+        if required == 0:
+            return True
+        if required > self.static_context_capacity:
+            return False
+        remaining = self.remaining_context_tokens
+        # A context-bearing request requires executor telemetry. This prevents
+        # scheduler estimates from becoming product admission decisions.
+        return remaining is not None and reservation <= remaining
 
     @property
     def num_current_layers(self) -> int:
@@ -346,6 +377,13 @@ class Node:
 
     def set_layer_allocation(self, start_layer: int, end_layer: int) -> None:
         """Set the layer range allocated to this node."""
+        had_allocation = self.start_layer is not None and self.end_layer is not None
+        allocation_changed = (self.start_layer, self.end_layer) != (start_layer, end_layer)
+        if had_allocation and allocation_changed:
+            # Cache geometry depends on the number and type of hosted layers.
+            # The reloaded executor must measure and publish it again.
+            self.kv_cache_token_capacity = None
+            self.kv_cache_block_size = None
         self.start_layer = start_layer
         self.end_layer = end_layer
 
@@ -353,6 +391,8 @@ class Node:
         """Clear the layer allocation for this node."""
         self.start_layer = None
         self.end_layer = None
+        self.kv_cache_token_capacity = None
+        self.kv_cache_block_size = None
 
     def clear_serving_state(self) -> None:
         """Clear serving/runtime state for this node.
@@ -367,6 +407,7 @@ class Node:
         self.clear_layer_allocation()
         self.current_requests = 0
         self.reserved_requests = 0
+        self.reserved_context_tokens = 0
         self._uses_scheduler_reservations = False
         self.avg_layer_latency_ms = None
 
@@ -441,12 +482,23 @@ class Node:
             return False
         return self.start_layer <= layer_id < self.end_layer
 
-    def add_request(self):
-        """Reserve capacity for a scheduler-routed request."""
+    def add_request(self, required_context_tokens: int = 0):
+        """Atomically reserve count and KV-token capacity for one request."""
+        required = max(0, int(required_context_tokens))
+        reservation = self.reservation_tokens(required)
+        if not self.can_accept_request(required):
+            raise ValueError(
+                f"Node {self.node_id} has insufficient request/KV capacity "
+                f"(required_tokens={required}, load={self.routing_load}/{self.max_requests}, "
+                f"remaining_kv_tokens={self.remaining_context_tokens})"
+            )
         self._uses_scheduler_reservations = True
         self.reserved_requests += 1
+        self.reserved_context_tokens += reservation
 
-    def remove_request(self):
-        """Release one scheduler-owned capacity reservation."""
+    def remove_request(self, required_context_tokens: int = 0):
+        """Release one scheduler-owned count and KV-token reservation."""
+        required = self.reservation_tokens(required_context_tokens)
         self._uses_scheduler_reservations = True
         self.reserved_requests = max(0, self.reserved_requests - 1)
+        self.reserved_context_tokens = max(0, self.reserved_context_tokens - required)
