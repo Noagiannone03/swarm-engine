@@ -828,7 +828,18 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
         """
         num_layers = self.model_info.num_layers
 
-        available_nodes = self.node_management.standby_nodes
+        # The DP consumes nodes from left to right and cannot assign a node that
+        # appears before the node which starts its pipeline. Canonicalize the
+        # input so allocation does not depend on worker join order: pipeline
+        # heads come first, followed by capacity and a stable identity tie-break.
+        available_nodes = sorted(
+            self.node_management.standby_nodes,
+            key=lambda node: (
+                not node.supports_frontend,
+                -node.get_decoder_layer_capacity(),
+                node.node_id,
+            ),
+        )
         logger.info(
             "[DPLayerAllocator] Starting allocate_from_standby with %d nodes for %d layers",
             len(available_nodes),

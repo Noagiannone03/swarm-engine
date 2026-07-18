@@ -289,6 +289,30 @@ def test_frontend_incapable_worker_is_allocated_away_from_layer_zero(
     assert node_management.num_standby_nodes == 0
 
 
+def test_dp_allocation_is_independent_of_frontend_worker_join_order():
+    """A tail-only worker may join before the only pipeline-head worker."""
+    model = build_model_info(10)
+    head = _build_node("a100-80g", model, id_suffix="-head")
+    head.param_mem_ratio = 0.10
+    tail = _build_node("a100-80g", model, id_suffix="-tail")
+    tail.param_mem_ratio = 0.65
+    tail.supports_frontend = False
+
+    # Reproduce the real deployment order: Windows tail first, macOS head second.
+    node_management = build_node_management([tail, head])
+    allocator = DynamicProgrammingLayerAllocator(
+        model_info=model,
+        node_management=node_management,
+        trim_layers_on_turning_points=False,
+    )
+
+    assert allocator.allocate_from_standby()
+    assert node_management.has_full_pipeline(model.num_layers)
+    assert head.start_layer == 0
+    assert tail.start_layer is not None and tail.start_layer > 0
+    assert tail.end_layer == model.num_layers
+
+
 @pytest.mark.parametrize("strategy", ["greedy", "dp"])
 def test_allocator_refuses_cluster_without_frontend_capability(
     strategy: Literal["greedy", "dp"],
