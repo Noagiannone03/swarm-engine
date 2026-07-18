@@ -54,6 +54,10 @@ class RequestSignal:
     received_ts: float = field(default_factory=time.time)
     routing_table: Optional[List[str]] = None
     required_context_tokens: int = 0
+    # Set when the HTTP waiter gives up before dispatch. The scheduler may keep
+    # the object in its FIFO until a pipeline recovers, so cancellation travels
+    # with this exact queue entry instead of relying on a reusable request id.
+    cancelled: bool = False
 
 
 class RooflinePerformanceModel:

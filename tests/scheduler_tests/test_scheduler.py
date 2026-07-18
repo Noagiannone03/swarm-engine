@@ -146,6 +146,57 @@ def test_scheduler_releases_route_without_waiting_for_worker_heartbeat():
     assert available_path == [node.node_id]
 
 
+def test_cancelled_pending_request_cannot_reserve_recovered_pipeline():
+    model = build_model_info(12)
+    node = build_node("recovered", model, mem_gb=400.0)
+    node.max_concurrent_requests = 1
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="greedy",
+        routing_strategy="rr",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+
+    abandoned = RequestSignal(
+        request_id="timed-out-http-request",
+        required_context_tokens=16316,
+    )
+    sched.receive_request(abandoned)
+    assert not sched.cancel_request_signal(abandoned)
+
+    result = sched.dispatch_next_request()
+
+    assert result == (abandoned.request_id, [], float("inf"))
+    assert abandoned.cancelled
+    assert node.reserved_requests == 0
+    assert node.reserved_context_tokens == 0
+
+
+def test_cancelling_signal_releases_route_when_dispatch_wins_race():
+    model = build_model_info(12)
+    node = build_node("dispatch-won", model, mem_gb=400.0)
+    node.max_concurrent_requests = 1
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="greedy",
+        routing_strategy="rr",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+
+    request = RequestSignal(request_id="dispatched-before-timeout", required_context_tokens=4096)
+    sched.receive_request(request)
+    assert sched.dispatch_next_request() is not None
+    assert node.reserved_requests == 1
+
+    assert sched.cancel_request_signal(request)
+    assert node.reserved_requests == 0
+    assert node.reserved_context_tokens == 0
+
+
 def test_scheduler_reserves_measured_kv_blocks_and_releases_them():
     model = build_model_info(12)
     node = build_node("measured", model, mem_gb=400.0)

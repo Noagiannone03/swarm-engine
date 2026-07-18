@@ -504,6 +504,10 @@ class Scheduler:
         # Route selection and reservations form one transaction. Without this
         # lock, concurrent dispatchers can both observe the same last KV blocks.
         with self._inflight_routes_lock:
+            if req.cancelled:
+                logger.debug("Discarded cancelled request %s before dispatch", request_key)
+                req.routing_table = []
+                return req.request_id, [], float("inf")
             if req.required_context_tokens > self.max_supported_context_tokens():
                 path, latency = [], float("inf")
             else:
@@ -567,6 +571,25 @@ class Scheduler:
             released = self._release_request_locked(request_key)
         if released:
             logger.debug("Released scheduler reservation for request %s", request_key)
+            with self._capacity_cv:
+                self._capacity_cv.notify_all()
+        return released
+
+    def cancel_request_signal(self, request: RequestSignal) -> bool:
+        """Atomically cancel one queued signal and release it if dispatch won the race.
+
+        A worker loss can make ``get_routing_table`` time out while the signal is
+        still in the scheduler FIFO. Merely returning HTTP 503 leaves that signal
+        eligible for dispatch after the cluster recovers, creating a route with no
+        client and a permanent KV reservation. The signal flag and route release
+        share the dispatch lock so every timing resolves to either discard-before-
+        reserve or reserve-then-release.
+        """
+        request_key = str(request.request_id)
+        with self._inflight_routes_lock:
+            request.cancelled = True
+            released = self._release_request_locked(request_key)
+        if released:
             with self._capacity_cv:
                 self._capacity_cv.notify_all()
         return released

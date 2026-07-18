@@ -370,6 +370,10 @@ class SchedulerManage:
 
         # Return the routing_table
         if request.routing_table is None:
+            # The queue entry can outlive this HTTP waiter when the cluster is
+            # temporarily incomplete. Cancel it atomically with dispatch so it
+            # cannot reserve a recovered pipeline after the caller receives 503.
+            self.scheduler.cancel_request_signal(request)
             logger.debug(
                 f"Routing table not ready after {(time.time() - start_time):.2f}s for request_id={request_id}"
             )
