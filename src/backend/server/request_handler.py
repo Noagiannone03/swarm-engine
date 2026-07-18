@@ -7,6 +7,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool
 
 from backend.server.constants import NODE_STATUS_AVAILABLE
+from backend.server.context_admission import ContextRequestError
 from backend.server.openai_compat import (
     decode_http_response_envelope,
     openai_error_response,
@@ -123,6 +124,52 @@ class RequestHandler:
                 code="server_not_ready",
             )
 
+        required_context_tokens = 0
+        build_budget = getattr(self.scheduler_manage, "build_context_budget", None)
+        max_supported_context = getattr(self.scheduler_manage, "max_supported_context_tokens", None)
+        if build_budget is not None and max_supported_context is not None:
+            try:
+                budget = await asyncio.to_thread(build_budget, request_data)
+            except ContextRequestError as exc:
+                return openai_error_response(
+                    str(exc),
+                    status_code=400,
+                    err_type="invalid_request_error",
+                    param="messages",
+                    code="context_validation_error",
+                )
+            except Exception as exc:
+                logger.exception("Unable to compute request context budget: %s", exc)
+                return openai_error_response(
+                    "The model tokenizer is temporarily unavailable",
+                    status_code=503,
+                    err_type="server_unavailable",
+                    code="context_tokenizer_unavailable",
+                )
+
+            required_context_tokens = budget.required_tokens
+            route_context_limit = max_supported_context()
+            if route_context_limit <= 0:
+                return openai_error_response(
+                    "No context-capable pipeline is ready",
+                    status_code=503,
+                    err_type="server_unavailable",
+                    code="context_route_not_ready",
+                )
+            if required_context_tokens > route_context_limit:
+                return openai_error_response(
+                    (
+                        f"This request requires {required_context_tokens} tokens "
+                        f"({budget.prompt_tokens} prompt + "
+                        f"{budget.max_output_tokens} maximum output), but the largest "
+                        f"available pipeline supports {route_context_limit} tokens."
+                    ),
+                    status_code=400,
+                    err_type="invalid_request_error",
+                    param="messages",
+                    code="context_length_exceeded",
+                )
+
         # Try to get a success response
         forward_attempts = 0
         while forward_attempts < self.MAX_FORWARD_RETRY:
@@ -131,7 +178,11 @@ class RequestHandler:
             routing_table = None
             while attempts < self.MAX_ROUTING_RETRY:
                 try:
-                    routing_table = self.scheduler_manage.get_routing_table(request_id, received_ts)
+                    routing_table = self.scheduler_manage.get_routing_table(
+                        request_id,
+                        received_ts,
+                        required_context_tokens,
+                    )
                     logger.debug(
                         f"get_routing_table for request {request_id} return: {routing_table} (attempt {attempts+1})"
                     )

@@ -48,11 +48,13 @@ class RequestSignal:
     - received_ts: UNIX timestamp (seconds) when the request was received
     - routing_table: Set by the scheduler when a path is assigned. Semantics:
         None -> not assigned yet; [] -> all pipelines full at the moment; [..] -> route
+    - required_context_tokens: Rendered prompt plus the maximum requested output.
     """
 
     request_id: str
     received_ts: float = field(default_factory=time.time)
     routing_table: Optional[List[str]] = None
+    required_context_tokens: int = 0
 
 
 class RooflinePerformanceModel:

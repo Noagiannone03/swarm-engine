@@ -60,6 +60,60 @@ def test_optimal_path_single_node():
     assert latency == pytest.approx(float(n.layer_latency_ms), rel=1e-6)
 
 
+def test_dp_routes_large_context_only_through_capable_shards():
+    num_layers = 12
+    model = build_model(num_layers)
+    fast_head = build_node("fast-head", model, tflops=1000.0, x=0.0, y=0.0)
+    fast_tail = build_node("fast-tail", model, tflops=1000.0, x=1.0, y=0.0)
+    large_head = build_node("large-head", model, tflops=20.0, x=0.0, y=1.0)
+    large_tail = build_node("large-tail", model, tflops=20.0, x=1.0, y=1.0)
+    for head in (fast_head, large_head):
+        head.set_layer_allocation(0, 6)
+    for tail in (fast_tail, large_tail):
+        tail.set_layer_allocation(6, num_layers)
+    fast_head.max_sequence_length = 4096
+    fast_tail.max_sequence_length = 4096
+    large_head.max_sequence_length = 65536
+    large_tail.max_sequence_length = 32768
+    nodes = [fast_head, fast_tail, large_head, large_tail]
+    set_rtt_from_coords(nodes)
+
+    node_manager = build_node_management(nodes)
+    node_manager.activate([node.node_id for node in nodes])
+    router = DynamicProgrammingRouting(node_manager, total_layers=num_layers)
+
+    small_path, _ = router.find_optimal_path(required_context_tokens=2048)
+    large_path, _ = router.find_optimal_path(required_context_tokens=32000)
+    impossible_path, impossible_latency = router.find_optimal_path(required_context_tokens=32769)
+
+    assert small_path == ["fast-head", "fast-tail"]
+    assert large_path == ["large-head", "large-tail"]
+    assert impossible_path == []
+    assert impossible_latency == float("inf")
+    assert router.max_supported_context_tokens() == 32768
+
+
+@pytest.mark.parametrize("context_limit", [4096, 32768, 65536])
+def test_dp_context_boundaries_are_inclusive(context_limit):
+    num_layers = 12
+    model = build_model(num_layers)
+    node = build_node("full-pipeline", model)
+    node.set_layer_allocation(0, num_layers)
+    node.max_sequence_length = context_limit
+    node_manager = build_node_management([node])
+    node_manager.activate([node.node_id])
+    router = DynamicProgrammingRouting(node_manager, total_layers=num_layers)
+
+    boundary_path, _ = router.find_optimal_path(required_context_tokens=context_limit)
+    oversized_path, oversized_latency = router.find_optimal_path(
+        required_context_tokens=context_limit + 1
+    )
+
+    assert boundary_path == [node.node_id]
+    assert oversized_path == []
+    assert oversized_latency == float("inf")
+
+
 def test_optimal_path_missing_rtt():
     """If RTT is missing between two nodes in a path, it should be invalid."""
     num_layers = 12

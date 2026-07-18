@@ -5,6 +5,7 @@ from typing import List, Literal
 from lattica import Lattica
 
 from backend.server.constants import NODE_STATUS_AVAILABLE, NODE_STATUS_WAITING
+from backend.server.context_admission import ContextBudget, build_context_budget
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 from backend.server.static_config import get_model_info, get_node_join_command
 from parallax.cli import PUBLIC_INITIAL_PEERS, PUBLIC_RELAY_SERVERS
@@ -57,6 +58,9 @@ class SchedulerManage:
         self.lattica = None
         self.stubs = {}
         self.is_local_network = False
+        self._context_tokenizer = None
+        self._context_tokenizer_model = None
+        self._context_tokenizer_lock = threading.Lock()
 
     def run(self, model_name, init_nodes_num, is_local_network=True):
         """
@@ -158,6 +162,7 @@ class SchedulerManage:
                 "prefill_contract_ready": (
                     self.scheduler.prefill_contract_ready() if self.scheduler else False
                 ),
+                "max_supported_context_tokens": self.max_supported_context_tokens(),
                 "node_join_command": get_node_join_command(
                     self.get_peer_id(), self.is_local_network
                 ),
@@ -198,6 +203,9 @@ class SchedulerManage:
 
         self.model_name = model_name
         self.init_nodes_num = init_nodes_num
+        with self._context_tokenizer_lock:
+            self._context_tokenizer = None
+            self._context_tokenizer_model = None
 
         model_info = get_model_info(model_name, self.use_hfcache)
         self.scheduler = Scheduler(
@@ -304,7 +312,33 @@ class SchedulerManage:
         )
         logger.debug("RPCConnectionHandler initialized")
 
-    def get_routing_table(self, request_id, received_ts):
+    def _get_context_tokenizer(self):
+        """Lazily load the canonical tokenizer used by the scheduler's model."""
+        model_name = self.model_name
+        if model_name is None:
+            raise RuntimeError("scheduler model is not configured")
+        with self._context_tokenizer_lock:
+            if self._context_tokenizer is None or self._context_tokenizer_model != model_name:
+                from transformers import AutoTokenizer
+
+                self._context_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    local_files_only=self.use_hfcache,
+                )
+                self._context_tokenizer_model = model_name
+            return self._context_tokenizer
+
+    def build_context_budget(self, request_data) -> ContextBudget:
+        """Tokenize the fully rendered chat and reserve its requested output."""
+        return build_context_budget(self._get_context_tokenizer(), request_data)
+
+    def max_supported_context_tokens(self) -> int:
+        if self.scheduler is None:
+            return 0
+        return self.scheduler.max_supported_context_tokens()
+
+    def get_routing_table(self, request_id, received_ts, required_context_tokens: int = 0):
         """Block briefly until the scheduler assigns a routing path for the request.
 
         Distinguish three states via `RequestSignal.routing_table`:
@@ -313,7 +347,11 @@ class SchedulerManage:
         - [..]: valid routing path, return immediately
         """
         logger.debug(f"Routing table requested for request_id={request_id}")
-        request = RequestSignal(request_id, received_ts)
+        request = RequestSignal(
+            request_id,
+            received_ts,
+            required_context_tokens=required_context_tokens,
+        )
         self.scheduler.receive_request(request)
 
         # Wait up to 5 seconds, but return immediately if the routing table is set (including an empty list)

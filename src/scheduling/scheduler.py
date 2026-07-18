@@ -197,6 +197,10 @@ class Scheduler:
             and self.request_router.routing_ready()
         )
 
+    def max_supported_context_tokens(self) -> int:
+        """Largest request context that at least one complete route can hold."""
+        return self.request_router.max_supported_context_tokens()
+
     def report_pipeline_capacity(
         self,
         ready_only: bool = True,
@@ -461,7 +465,10 @@ class Scheduler:
             )
         except queue.Empty:
             return None
-        path, latency = self.request_router.find_optimal_path(self.last_refit_time)
+        path, latency = self.request_router.find_optimal_path(
+            last_refit_time=self.last_refit_time,
+            required_context_tokens=req.required_context_tokens,
+        )
         req.routing_table = path
         if path:
             request_key = str(req.request_id)

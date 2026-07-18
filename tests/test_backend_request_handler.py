@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 import backend.main as backend_main
 from backend.server.constants import NODE_STATUS_AVAILABLE, NODE_STATUS_WAITING
+from backend.server.context_admission import ContextBudget
 from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.request_handler import RequestHandler
 
@@ -17,16 +18,32 @@ class DummySchedulerManage:
 
 
 class ForwardingSchedulerManage(DummySchedulerManage):
-    def __init__(self, status=NODE_STATUS_AVAILABLE, routing_table=None):
+    def __init__(
+        self,
+        status=NODE_STATUS_AVAILABLE,
+        routing_table=None,
+        context_budget=ContextBudget(prompt_tokens=5, max_output_tokens=128),
+        max_context=4096,
+    ):
         self.status = status
         self.routing_table = ["node-a"] if routing_table is None else routing_table
         self.released = []
         self.capacity_waits = 0
+        self.context_budget = context_budget
+        self.max_context = max_context
+        self.routing_requests = []
 
     def get_schedule_status(self):
         return self.status
 
-    def get_routing_table(self, request_id, received_ts):
+    def build_context_budget(self, request_data):
+        return self.context_budget
+
+    def max_supported_context_tokens(self):
+        return self.max_context
+
+    def get_routing_table(self, request_id, received_ts, required_context_tokens=0):
+        self.routing_requests.append((request_id, required_context_tokens))
         return self.routing_table
 
     def release_routing_table(self, request_id):
@@ -161,6 +178,51 @@ def test_forward_request_returns_openai_error_when_pipelines_are_busy():
     assert response.status_code == 429
     assert payload["error"]["type"] == "rate_limit_error"
     assert payload["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_forward_request_rejects_context_larger_than_every_pipeline():
+    handler = RequestHandler()
+    scheduler_manage = ForwardingSchedulerManage(
+        context_budget=ContextBudget(prompt_tokens=32768, max_output_tokens=4096),
+        max_context=32768,
+    )
+    handler.set_scheduler_manage(scheduler_manage)
+
+    response = asyncio.run(
+        handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "large context"}]},
+            "oversized-req",
+            1.0,
+        )
+    )
+
+    payload = json.loads(response.body)
+    assert response.status_code == 400
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert payload["error"]["code"] == "context_length_exceeded"
+    assert "32768 prompt + 4096 maximum output" in payload["error"]["message"]
+    assert scheduler_manage.routing_requests == []
+
+
+def test_forward_request_routes_with_exact_required_context():
+    handler = RequestHandler()
+    scheduler_manage = ForwardingSchedulerManage(
+        context_budget=ContextBudget(prompt_tokens=28672, max_output_tokens=4096),
+        max_context=65536,
+    )
+    handler.set_scheduler_manage(scheduler_manage)
+    handler.stubs["node-a"] = StaticStub([b'{"choices":[]}'])
+
+    response = asyncio.run(
+        handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "large context"}]},
+            "accepted-req",
+            1.0,
+        )
+    )
+
+    assert response.status_code == 200
+    assert scheduler_manage.routing_requests == [("accepted-req", 32768)]
 
 
 def test_forward_request_wakes_when_capacity_becomes_available():

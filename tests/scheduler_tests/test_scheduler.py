@@ -56,6 +56,29 @@ def test_scheduler_initialize_and_dispatch():
     assert latency >= 0.0
 
 
+def test_scheduler_forwards_required_context_to_router(monkeypatch):
+    model = build_model_info(12)
+    sched = Scheduler(model, [], routing_strategy="dp")
+    observed = {}
+
+    class RecordingRouter:
+        def find_optimal_path(self, **kwargs):
+            observed.update(kwargs)
+            return [], float("inf")
+
+    sched.request_router = RecordingRouter()
+    monkeypatch.setattr(sched, "serving_ready", lambda: True)
+    request = RequestSignal(request_id="large-request", required_context_tokens=32768)
+    sched.receive_request(request)
+
+    sched.dispatch_next_request()
+
+    assert observed == {
+        "last_refit_time": 0.0,
+        "required_context_tokens": 32768,
+    }
+
+
 def test_scheduler_releases_route_without_waiting_for_worker_heartbeat():
     model = build_model_info(12)
     node = build_node("single", model, mem_gb=400.0)

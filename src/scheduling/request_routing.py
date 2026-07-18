@@ -58,7 +58,10 @@ logger = get_logger(__name__)
 
 
 def estimate_pipeline_latency(
-    pipeline_node_ids: List[str], *, id_to_node: Dict[str, Node]
+    pipeline_node_ids: List[str],
+    *,
+    id_to_node: Dict[str, Node],
+    required_context_tokens: int = 0,
 ) -> float:
     """Estimate end-to-end latency for a node-id pipeline.
 
@@ -68,7 +71,7 @@ def estimate_pipeline_latency(
     prev: Optional[Node] = None
     for nid in pipeline_node_ids:
         n = id_to_node.get(nid)
-        if n is None or n.is_overloaded:
+        if n is None or n.is_overloaded or n.max_sequence_length < required_context_tokens:
             return float("inf")
         node_lat = float(n.layer_latency_ms)
         if node_lat == float("inf"):
@@ -81,6 +84,40 @@ def estimate_pipeline_latency(
             total += hop
         prev = n
     return total
+
+
+def max_complete_pipeline_context(nodes: List[Node], num_layers: int) -> int:
+    """Return the largest context supported by one complete contiguous route.
+
+    The capacity of a route is its weakest shard. Unlike live request routing,
+    this calculation deliberately ignores current request load so callers can
+    distinguish a permanently oversized request from a temporarily busy route.
+    """
+    if num_layers <= 0:
+        return 0
+
+    best_at_layer: Dict[int, int] = {0: int(2**63 - 1)}
+    candidates = sorted(
+        (
+            node
+            for node in nodes
+            if node.is_active
+            and node.start_layer is not None
+            and node.end_layer is not None
+            and node.end_layer > node.start_layer
+            and node.max_sequence_length > 0
+        ),
+        key=lambda node: (int(node.start_layer), int(node.end_layer)),
+    )
+    for node in candidates:
+        start = int(node.start_layer)
+        end = int(node.end_layer)
+        prefix_capacity = best_at_layer.get(start)
+        if prefix_capacity is None:
+            continue
+        route_capacity = min(prefix_capacity, int(node.max_sequence_length))
+        best_at_layer[end] = max(best_at_layer.get(end, 0), route_capacity)
+    return best_at_layer.get(num_layers, 0)
 
 
 def find_turning_points(nodes: List[Node], num_layers: int) -> List[Tuple[str, int, str]]:
@@ -188,16 +225,22 @@ class RequestRoutingStrategy(ABC):
     def find_optimal_path(
         self,
         last_refit_time: Optional[float] = None,
+        required_context_tokens: int = 0,
     ) -> Tuple[List[str], float]:
         """Return the chosen node-id path and its estimated latency.
 
         Args:
             last_refit_time: Last refit time for weight refit
+            required_context_tokens: Minimum sequence capacity for every shard.
 
         Returns:
             (node_ids, latency_ms). If no valid route exists, returns ([], inf).
         """
         raise NotImplementedError
+
+    def max_supported_context_tokens(self) -> int:
+        """Largest context window exposed by a complete live allocation."""
+        return max_complete_pipeline_context(self.node_manager.active_nodes, self.total_layers)
 
     def bootstrap(self) -> None:
         """Optional bootstrap for best-effort initialization."""
@@ -300,6 +343,7 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
     def find_optimal_path(
         self,
         last_refit_time: Optional[float] = None,
+        required_context_tokens: int = 0,
     ) -> Tuple[List[str], float]:
         """Compute a minimum-latency node-id path using shard-level DP.
 
@@ -321,7 +365,12 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
         starts: Dict[int, List[int]] = {}
         ends: Dict[int, List[int]] = {}
         for idx, n in enumerate(nodes):
-            if n.start_layer is None or n.end_layer is None or n.is_active is False:
+            if (
+                n.start_layer is None
+                or n.end_layer is None
+                or n.is_active is False
+                or n.max_sequence_length < required_context_tokens
+            ):
                 continue
             starts.setdefault(n.start_layer, []).append(idx)
             ends.setdefault(n.end_layer, []).append(idx)
@@ -333,7 +382,9 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
                 [
                     (i, n)
                     for i, n in enumerate(nodes)
-                    if n.start_layer is not None and n.end_layer is not None
+                    if n.start_layer is not None
+                    and n.end_layer is not None
+                    and n.max_sequence_length >= required_context_tokens
                 ],
                 key=lambda p: (p[1].start_layer, p[1].end_layer),
             )
@@ -521,6 +572,7 @@ class RandomizedOverDynamicPipelinesRouting(RequestRoutingStrategy):
         nodes: Optional[List[Node]] = None,
         num_layers: Optional[int] = None,
         last_refit_time: Optional[float] = None,
+        required_context_tokens: int = 0,
     ) -> Tuple[List[str], float]:
         """Randomly choose among cached complete pipelines, skipping overloaded ones.
 
@@ -542,7 +594,11 @@ class RandomizedOverDynamicPipelinesRouting(RequestRoutingStrategy):
         id_to_node: Dict[str, Node] = {n.node_id: n for n in nodes}
         viable: List[Tuple[List[str], float]] = []
         for p in self._pipelines:
-            lat = estimate_pipeline_latency(p, id_to_node=id_to_node)
+            lat = estimate_pipeline_latency(
+                p,
+                id_to_node=id_to_node,
+                required_context_tokens=required_context_tokens,
+            )
             if lat != float("inf"):
                 viable.append((p, lat))
 
@@ -799,6 +855,7 @@ class RoundRobinOverFixedPipelinesRouting(RequestRoutingStrategy):
         nodes: Optional[List[Node]] = None,
         num_layers: Optional[int] = None,
         last_refit_time: Optional[float] = None,
+        required_context_tokens: int = 0,
     ) -> Tuple[List[str], float]:
         """Return the next viable *registered* pipeline in round-robin order.
 
@@ -828,7 +885,11 @@ class RoundRobinOverFixedPipelinesRouting(RequestRoutingStrategy):
                 logger.warning(f"Pipeline {candidate} is not ready, skipping")
                 continue
 
-            latency = estimate_pipeline_latency(candidate, id_to_node=id_to_node)
+            latency = estimate_pipeline_latency(
+                candidate,
+                id_to_node=id_to_node,
+                required_context_tokens=required_context_tokens,
+            )
             for nid in candidate:
                 if nid not in id_to_node:
                     raise ValueError(
@@ -850,3 +911,12 @@ class RoundRobinOverFixedPipelinesRouting(RequestRoutingStrategy):
                 return list(candidate), float(latency)
 
         return [], float("inf")
+
+    def max_supported_context_tokens(self) -> int:
+        """Largest context accepted by one ready registered pipeline."""
+        capacities = [
+            min(int(node.max_sequence_length) for node in pipeline.nodes)
+            for pipeline in self.node_manager.get_registered_pipelines().values()
+            if pipeline.is_ready and pipeline.nodes
+        ]
+        return max(capacities, default=0)

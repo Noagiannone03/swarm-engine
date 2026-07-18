@@ -61,3 +61,22 @@ def test_cluster_node_info_exposes_frontend_capability():
     )
 
     assert manager.build_node_info(node)["supports_frontend"] is False
+
+
+def test_context_tokenizer_is_canonical_cached_and_offline_aware():
+    manager = SchedulerManage(use_hfcache=True)
+    manager.model_name = "Qwen/Qwen3-0.6B"
+    tokenizer = SimpleNamespace(
+        apply_chat_template=lambda messages, **kwargs: {"input_ids": [1, 2, 3]}
+    )
+
+    with patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer) as loader:
+        first = manager.build_context_budget({"messages": [{"role": "user", "content": "hello"}]})
+        second = manager.build_context_budget({"messages": [{"role": "user", "content": "again"}]})
+
+    assert first.prompt_tokens == second.prompt_tokens == 3
+    loader.assert_called_once_with(
+        "Qwen/Qwen3-0.6B",
+        trust_remote_code=True,
+        local_files_only=True,
+    )
