@@ -176,6 +176,7 @@ class SchedulerManage:
             "gpu_num": node.hardware.num_gpus,
             "gpu_name": node.hardware.gpu_name,
             "gpu_memory": node.hardware.memory_gb,
+            "supports_frontend": node.supports_frontend,
         }
 
     def _start_scheduler(self, model_name, init_nodes_num):

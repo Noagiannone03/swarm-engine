@@ -182,6 +182,7 @@ class Node:
 
     max_concurrent_requests: int = 16
     max_sequence_length: int = 4096
+    supports_frontend: bool = True
 
     manual_layer_assignment: bool = False
     start_layer: Optional[int] = None  # inclusive

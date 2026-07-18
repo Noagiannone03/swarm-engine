@@ -69,3 +69,25 @@ def test_manual_assignment_is_preserved_in_heartbeat(monkeypatch):
     assert heartbeat["manual_layer_assignment"] is True
     assert heartbeat["start_layer"] == 2
     assert heartbeat["end_layer"] == 28
+
+
+def test_worker_advertises_frontend_capability(monkeypatch):
+    monkeypatch.setattr(
+        "parallax.p2p.server.vllm_rust_frontend_available",
+        lambda: False,
+    )
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.rtt_last_update = time.time()
+    monkeypatch.setattr(
+        "parallax.p2p.server.detect_node_hardware",
+        lambda node_id: {"node_id": node_id},
+    )
+
+    node_info = server.get_node_info()
+
+    assert node_info["supports_frontend"] is False

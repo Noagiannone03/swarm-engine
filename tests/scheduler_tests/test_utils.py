@@ -79,6 +79,7 @@ def build_node(
     x: float = 0.0,
     y: float = 0.0,
     mem_bandwidth_gbps: float = 100.0,
+    supports_frontend: bool = True,
 ) -> Node:
     """Create a `Node` with hardware info and attach test-only coordinates/bandwidth."""
     hw = NodeHardwareInfo(
@@ -90,7 +91,13 @@ def build_node(
         memory_bandwidth_gbps=mem_bandwidth_gbps,
         device="cuda",
     )
-    n = Node(node_id=node_id, hardware=hw, model_info=model, _force_max_concurrent_requests=True)
+    n = Node(
+        node_id=node_id,
+        hardware=hw,
+        model_info=model,
+        supports_frontend=supports_frontend,
+        _force_max_concurrent_requests=True,
+    )
     # Attach coordinates for RTT synthesis in tests
     setattr(n, "_x", float(x))
     setattr(n, "_y", float(y))

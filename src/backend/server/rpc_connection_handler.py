@@ -196,6 +196,7 @@ class RPCConnectionHandler(ConnectionHandler):
             param_mem_ratio=node_json.get("param_mem_ratio"),
             max_concurrent_requests=node_json.get("max_concurrent_requests"),
             max_sequence_length=node_json.get("max_sequence_length"),
+            supports_frontend=node_json.get("supports_frontend", True),
             is_active=node_json.get("is_active", True),
             manual_layer_assignment=node_json.get("manual_layer_assignment", False),
             last_refit_time=node_json.get("last_refit_time", 0.0),

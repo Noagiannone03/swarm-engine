@@ -66,6 +66,24 @@ def test_resolve_vllm_rs_binary_raises_when_missing(monkeypatch, tmp_path):
         vllm_rust_frontend.resolve_vllm_rs_binary()
 
 
+def test_frontend_is_unavailable_when_listener_fd_inheritance_is_unsupported(monkeypatch):
+    monkeypatch.setattr(vllm_rust_frontend.os, "name", "nt")
+    monkeypatch.setattr(
+        vllm_rust_frontend,
+        "resolve_vllm_rs_binary",
+        lambda: pytest.fail("binary resolution must not run on Windows"),
+    )
+
+    assert vllm_rust_frontend.vllm_rust_frontend_available() is False
+
+
+def test_frontend_is_available_with_posix_runtime_and_binary(monkeypatch):
+    monkeypatch.setattr(vllm_rust_frontend.os, "name", "posix")
+    monkeypatch.setattr(vllm_rust_frontend, "resolve_vllm_rs_binary", lambda: "/bin/vllm-rs")
+
+    assert vllm_rust_frontend.vllm_rust_frontend_available() is True
+
+
 def test_runtime_args_default_to_language_model_only():
     args = SimpleNamespace(model_path="mlx-community/MiniMax-M3-4bit", max_sequence_length=None)
 

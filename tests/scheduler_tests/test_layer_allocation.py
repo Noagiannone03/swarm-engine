@@ -258,6 +258,57 @@ def test_single_node_can_host_all_layers_greedy(strategy: Literal["greedy", "dp"
 
 
 @pytest.mark.parametrize("strategy", ["greedy", "dp"])
+def test_frontend_incapable_worker_is_allocated_away_from_layer_zero(
+    strategy: Literal["greedy", "dp"],
+):
+    model = build_model_info(5)
+    head = _build_node("a100-80g", model, id_suffix="-head")
+    tail = _build_node("a100-80g", model, id_suffix="-tail")
+    tail.supports_frontend = False
+    node_management = build_node_management([head, tail])
+    allocator = (
+        GreedyLayerAllocator(
+            model_info=model,
+            node_management=node_management,
+            dynamic_pipelines_router=True,
+        )
+        if strategy == "greedy"
+        else DynamicProgrammingLayerAllocator(
+            model_info=model,
+            node_management=node_management,
+            dynamic_pipelines_router=True,
+        )
+    )
+
+    assert allocator.allocate_from_standby()
+
+    assert head.start_layer == 0
+    assert head.end_layer == model.num_layers
+    assert tail.start_layer is not None and tail.start_layer > 0
+    assert tail.end_layer == model.num_layers
+    assert node_management.num_standby_nodes == 0
+
+
+@pytest.mark.parametrize("strategy", ["greedy", "dp"])
+def test_allocator_refuses_cluster_without_frontend_capability(
+    strategy: Literal["greedy", "dp"],
+):
+    model = build_model_info(5)
+    worker = _build_node("a100-80g", model)
+    worker.supports_frontend = False
+    node_management = build_node_management([worker])
+    allocator = (
+        GreedyLayerAllocator(model_info=model, node_management=node_management)
+        if strategy == "greedy"
+        else DynamicProgrammingLayerAllocator(model_info=model, node_management=node_management)
+    )
+
+    assert not allocator.allocate_from_standby()
+    assert worker.start_layer is None
+    assert node_management.num_standby_nodes == 1
+
+
+@pytest.mark.parametrize("strategy", ["greedy", "dp"])
 def test_mixed_pool_single_host_available(strategy: Literal["greedy", "dp"]):
     """Intermediate model: one A100 can host alone; others (4090) remain unused."""
     model = build_model_info(6)

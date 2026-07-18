@@ -152,6 +152,8 @@ class BaseLayerAllocator:
             raise ValueError(
                 f"Invalid allocation: start_layer {start_layer} >= end_layer {end_layer}"
             )
+        if start_layer == 0 and not node.supports_frontend:
+            raise ValueError(f"Node {node.node_id} cannot host the pipeline frontend")
         node.set_layer_allocation(start_layer, end_layer)
         self.node_management.activate([node.node_id])
         logger.debug(
@@ -190,16 +192,17 @@ class BaseLayerAllocator:
         self.deallocate(node)
         self.allocate(node, start_layer, end_layer)
 
-    def dynamic_join(self, node: Node) -> None:
+    def dynamic_join(self, node: Node) -> bool:
         """In case of using Dynamic Programming request router, a node is joined dynamically to the lightest layers."""
-        lightest_layer = self.get_lightest_layer()
+        lightest_layer = self.get_lightest_layer(allow_head=node.supports_frontend)
+        if lightest_layer is None:
+            logger.warning("No compatible layers to assign to node %s", node.node_id)
+            return False
         logger.info(
             "[LayerAllocator] Dynamically Join node %s with the lightest layer %d",
             node.node_id,
             lightest_layer.layer_id,
         )
-        if lightest_layer is None:
-            raise ValueError("No layers to assign")
 
         # Assign consecutive layers starting from the lightest layer
         start_layer = lightest_layer.layer_id
@@ -212,6 +215,7 @@ class BaseLayerAllocator:
             end_layer,
         )
         self.allocate(node, start_layer, end_layer)
+        return True
 
     def allocate_standby_nodes(self) -> bool:
         """In case of enabling dynamic pipelines, allocate left-over nodes to the lightest layers using dynamic join."""
@@ -302,11 +306,14 @@ class BaseLayerAllocator:
         if not pipeline_nodes or total_layers <= 0:
             raise ValueError("No nodes or total layers is non-positive")
 
-        nodes = (
-            pipeline_nodes
-            if assume_sorted
-            else sorted(pipeline_nodes, key=lambda n: n.get_decoder_layer_capacity(), reverse=True)
-        )
+        nodes = list(pipeline_nodes)
+        if not assume_sorted:
+            nodes.sort(
+                key=lambda n: (n.supports_frontend, n.get_decoder_layer_capacity()),
+                reverse=True,
+            )
+        if not nodes[0].supports_frontend:
+            raise ValueError("Pipeline has no node capable of hosting the frontend")
         n = len(nodes)
 
         # Clear previous allocations for participating nodes (avoid double counting loads)
@@ -418,6 +425,8 @@ class BaseLayerAllocator:
         total_layers = self.num_total_layers
         if not pipeline_nodes or total_layers <= 0:
             raise ValueError("No nodes or total layers is non-positive")
+        if not pipeline_nodes[0].supports_frontend:
+            raise ValueError("Pipeline has no node capable of hosting the frontend")
 
         # Clear previous allocations for participating nodes (avoid double counting loads)
         for node in pipeline_nodes:
@@ -554,11 +563,14 @@ class BaseLayerAllocator:
                 self.reallocate(n, l0, n.end_layer)
         return turning
 
-    def get_lightest_layer(self) -> Optional[LayerLoad]:
+    def get_lightest_layer(self, *, allow_head: bool = True) -> Optional[LayerLoad]:
         """Return the current lightest-hosted layer from the heap, if any."""
-        if not self.layer_loads_heap:
-            return None
-        return self.layer_loads_heap[0]
+        compatible = (
+            self.layer_loads_heap
+            if allow_head
+            else [layer for layer in self.layer_loads_heap if layer.layer_id != 0]
+        )
+        return min(compatible, default=None)
 
     def _update_layer_loads_heap(self):
         """Rebuild the layer loads heap."""
@@ -686,6 +698,14 @@ class GreedyLayerAllocator(BaseLayerAllocator):
 
             while remaining_layers > 0 and available_nodes:
                 is_start = len(pipeline_nodes) == 0
+                compatible_indices = [
+                    i
+                    for i, node in enumerate(available_nodes)
+                    if not is_start or node.supports_frontend
+                ]
+                if not compatible_indices:
+                    logger.debug("[Greedy] No frontend-capable node can start a pipeline")
+                    break
                 # Look-ahead optimization (only for picking the last node to finish a pipeline)
                 look_ahead_possible = (
                     look_ahead_enabled
@@ -695,7 +715,8 @@ class GreedyLayerAllocator(BaseLayerAllocator):
                 best_fit_idx = -1
                 if look_ahead_possible:
                     # Find smallest node that can complete the pipeline while leaving enough for another full pipeline
-                    for i, node in enumerate(available_nodes):
+                    for i in compatible_indices:
+                        node = available_nodes[i]
                         node_i_capacity = node.get_decoder_layer_capacity(include_lm_head=True)
                         if node_i_capacity >= remaining_layers:
                             remaining_nodes_capacity = (
@@ -709,7 +730,7 @@ class GreedyLayerAllocator(BaseLayerAllocator):
                 node_to_add = (
                     available_nodes.pop(best_fit_idx)
                     if best_fit_idx != -1
-                    else available_nodes.pop(0)
+                    else available_nodes.pop(compatible_indices[0])
                 )
 
                 pipeline_nodes.append(node_to_add)
@@ -815,11 +836,14 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
         )
         num_nodes = len(available_nodes)
         total_cap = sum(node.get_decoder_layer_capacity() for node in available_nodes)
+        frontend_nodes = sum(node.supports_frontend for node in available_nodes)
 
-        if num_layers <= 0 or num_nodes == 0 or total_cap < num_layers:
+        if num_layers <= 0 or num_nodes == 0 or frontend_nodes == 0 or total_cap < num_layers:
             logger.warning(
-                "[DPLayerAllocator] Insufficient resources: nodes=%d, layers=%d, total_cap=%d",
+                "[DPLayerAllocator] Insufficient resources: nodes=%d, frontend_nodes=%d, "
+                "layers=%d, total_cap=%d",
                 num_nodes,
+                frontend_nodes,
                 num_layers,
                 total_cap,
             )
@@ -836,7 +860,7 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
         for i in range(num_nodes - 1, -1, -1):
             suffix_sum[i] = suffix_sum[i + 1] + available_nodes[i].get_decoder_layer_capacity()
 
-        max_num_pipes = min(num_nodes, total_cap // num_layers)
+        max_num_pipes = min(num_nodes, frontend_nodes, total_cap // num_layers)
         best_num_pipes = 0
         best_score: float = float("-inf")
 
@@ -908,7 +932,7 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
                             best_action = ("assign", j, False)
 
                 # Option 3: start a new pipeline (if we still need more)
-                if new_needed > 0:
+                if new_needed > 0 and available_nodes[i].supports_frontend:
                     c_start = available_nodes[i].get_decoder_layer_capacity(
                         include_input_embed=True
                     )

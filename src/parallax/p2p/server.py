@@ -27,6 +27,7 @@ from backend.server.rpc_connection_handler import RPCConnectionHandler
 from parallax.p2p.proto import forward_pb2
 from parallax.p2p.utils import AsyncWorker
 from parallax.server.server_info import detect_node_hardware
+from parallax.server.vllm_rust_frontend import vllm_rust_frontend_available
 from parallax.utils.shared_state import SharedState
 from parallax.utils.utils import get_zmq_socket
 from parallax.utils.weight_refit_utils import (
@@ -408,6 +409,7 @@ class GradientServer:
         self.model_name = model_name
         self.max_batch_size = max_batch_size
         self.max_sequence_length = max_sequence_length
+        self.supports_frontend = vllm_rust_frontend_available()
         self.param_mem_ratio = param_mem_ratio
         self.kvcache_mem_ratio = kvcache_mem_ratio
         self.enable_weight_refit = False
@@ -955,6 +957,7 @@ class GradientServer:
             "max_sequence_length": (
                 1024 if self.max_sequence_length is None else self.max_sequence_length
             ),
+            "supports_frontend": self.supports_frontend,
             "rtt_to_nodes": self.rtts,
             "status": self._get_status(),
             "is_active": self._get_status() == ServerState.READY.value,

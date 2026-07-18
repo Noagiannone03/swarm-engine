@@ -55,6 +55,19 @@ def resolve_vllm_rs_binary() -> str:
     )
 
 
+def vllm_rust_frontend_available() -> bool:
+    """Return whether this runtime can host Parallax's HTTP frontend."""
+    if os.name != "posix":
+        # The official frontend inherits a listener file descriptor through
+        # `pass_fds`, which Python subprocess does not support on Windows.
+        return False
+    try:
+        resolve_vllm_rs_binary()
+    except VllmRustFrontendNotFound:
+        return False
+    return True
+
+
 def _bind_listener_socket(host: str, port: int) -> socket.socket:
     addrinfos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     last_error: Optional[OSError] = None

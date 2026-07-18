@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -44,3 +45,19 @@ def test_scheduler_manager_forwards_dynamic_dp_configuration():
         routing_strategy="dp",
     )
     thread_class.return_value.start.assert_called_once_with()
+
+
+def test_cluster_node_info_exposes_frontend_capability():
+    manager = SchedulerManage()
+    node = SimpleNamespace(
+        node_id="windows-worker",
+        is_active=False,
+        supports_frontend=False,
+        hardware=SimpleNamespace(
+            num_gpus=1,
+            gpu_name="RTX 4080 SUPER",
+            memory_gb=16.0,
+        ),
+    )
+
+    assert manager.build_node_info(node)["supports_frontend"] is False

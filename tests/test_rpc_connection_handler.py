@@ -54,3 +54,31 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
     assert node_id == "worker"
     assert update["current_requests"] == 1
     assert update["layer_latency_ms"] == 1.5
+
+
+def test_build_node_preserves_frontend_capability():
+    scheduler = RecordingScheduler()
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = scheduler
+
+    node = handler.build_node(
+        {
+            "node_id": "windows-worker",
+            "hardware": {
+                "node_id": "windows-worker",
+                "num_gpus": 1,
+                "tflops_fp16": 50.0,
+                "gpu_name": "RTX 4080 SUPER",
+                "memory_gb": 16.0,
+                "memory_bandwidth_gbps": 600.0,
+                "device": "cuda",
+            },
+            "kvcache_mem_ratio": 0.25,
+            "param_mem_ratio": 0.65,
+            "max_concurrent_requests": 1,
+            "max_sequence_length": 4096,
+            "supports_frontend": False,
+        }
+    )
+
+    assert node.supports_frontend is False
