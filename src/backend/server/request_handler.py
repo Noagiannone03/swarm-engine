@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from typing import Awaitable, Callable, Dict, List, Optional
 
@@ -10,6 +11,7 @@ from backend.server.constants import NODE_STATUS_AVAILABLE
 from backend.server.context_admission import ContextRequestError
 from backend.server.openai_compat import (
     decode_http_response_envelope,
+    openai_error_payload,
     openai_error_response,
 )
 from parallax_utils.logging_config import get_logger
@@ -85,9 +87,12 @@ class RequestHandler:
         response,
         is_disconnected: Optional[Callable[[], Awaitable[bool]]],
         request_id: str,
+        iterator=None,
     ) -> bytes:
         """Wait for one RPC chunk while observing client and route liveness."""
-        next_chunk = asyncio.create_task(anext(iterate_in_threadpool(response)))
+        if iterator is None:
+            iterator = iterate_in_threadpool(response)
+        next_chunk = asyncio.create_task(anext(iterator))
 
         try:
             while not next_chunk.done():
@@ -105,6 +110,21 @@ class RequestHandler:
             if not next_chunk.done():
                 next_chunk.cancel()
             raise
+
+    @staticmethod
+    def _stream_error_chunk(
+        message: str,
+        *,
+        err_type: str,
+        code: str,
+    ) -> bytes:
+        """Encode an OpenAI-compatible error as a server-sent event."""
+        payload = openai_error_payload(
+            message,
+            err_type=err_type,
+            code=code,
+        )
+        return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n"
 
     def _get_model_name_for_node(self, node_id: str) -> Optional[str]:
         try:
@@ -292,7 +312,37 @@ class RequestHandler:
                         try:
                             response = stub.chat_completion(backend_request)
                             iterator = iterate_in_threadpool(response)
-                            async for chunk in iterator:
+                            while True:
+                                try:
+                                    chunk = await self._next_chunk_until_disconnect(
+                                        response,
+                                        is_disconnected,
+                                        str(request_id),
+                                        iterator,
+                                    )
+                                except StopAsyncIteration:
+                                    break
+                                except ClientDisconnectedError:
+                                    logger.info(
+                                        "Streaming client disconnected during request %s",
+                                        request_id,
+                                    )
+                                    return
+                                except DownstreamRouteLostError:
+                                    logger.warning(
+                                        "Worker route was lost during streaming request %s",
+                                        request_id,
+                                    )
+                                    yield self._stream_error_chunk(
+                                        (
+                                            "A worker assigned to this request became "
+                                            "unavailable. Please retry."
+                                        ),
+                                        err_type="upstream_error",
+                                        code="upstream_worker_lost",
+                                    )
+                                    yield b"data: [DONE]\n\n"
+                                    return
                                 last_token_time = time.time()
                                 if first_token_time is None:
                                     first_token_time = last_token_time

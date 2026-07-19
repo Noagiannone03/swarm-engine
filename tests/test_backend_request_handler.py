@@ -385,6 +385,64 @@ def test_streaming_request_releases_route_after_completion():
     assert scheduler_manage.released == ["stream-req"]
 
 
+def test_streaming_worker_loss_cancels_rpc_emits_error_and_releases_route():
+    handler = RequestHandler()
+    scheduler_manage = ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    stub = BlockingStub()
+    handler.stubs["node-a"] = stub
+
+    async def consume_after_route_loss():
+        response = await handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}], "stream": True},
+            "lost-stream-worker-req",
+            1.0,
+        )
+        consume_task = asyncio.create_task(anext(response.body_iterator))
+        while "lost-stream-worker-req" not in scheduler_manage.active_routes:
+            await asyncio.sleep(0)
+        scheduler_manage.active_routes.remove("lost-stream-worker-req")
+        first_chunk = await consume_task
+        remaining = b"".join([chunk async for chunk in response.body_iterator])
+        return first_chunk + remaining
+
+    body = asyncio.run(consume_after_route_loss())
+
+    events = [line.removeprefix(b"data: ") for line in body.splitlines() if line]
+    error = json.loads(events[0])
+    assert error["error"]["type"] == "upstream_error"
+    assert error["error"]["code"] == "upstream_worker_lost"
+    assert events[-1] == b"[DONE]"
+    assert stub.response.cancelled
+    assert scheduler_manage.released == ["lost-stream-worker-req"]
+
+
+def test_streaming_client_disconnect_cancels_rpc_without_emitting_error():
+    handler = RequestHandler()
+    scheduler_manage = ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    stub = BlockingStub()
+    handler.stubs["node-a"] = stub
+
+    async def disconnected():
+        return True
+
+    async def consume_stream():
+        response = await handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}], "stream": True},
+            "disconnected-stream-req",
+            1.0,
+            disconnected,
+        )
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    body = asyncio.run(consume_stream())
+
+    assert body == b""
+    assert stub.response.cancelled
+    assert scheduler_manage.released == ["disconnected-stream-req"]
+
+
 def test_openai_models_returns_empty_list_without_scheduler(monkeypatch):
     monkeypatch.setattr(backend_main, "scheduler_manage", None)
 
