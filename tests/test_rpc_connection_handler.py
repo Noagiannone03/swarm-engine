@@ -1,3 +1,4 @@
+from backend.server.contribution_gate import account_hash
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 
 from tests.scheduler_tests.test_utils import build_model_info, build_node
@@ -73,6 +74,7 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
             "start_layer": 0,
             "end_layer": 12,
             "direct_peer_ids": ["downstream-worker"],
+            "account_token": "ab" * 32,
         }
     )
 
@@ -86,6 +88,7 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
     assert update["kv_cache_block_size"] == 32
     assert update["max_concurrent_requests"] == 1
     assert update["direct_peer_ids"] == ["downstream-worker"]
+    assert update["account_hash"] == account_hash("ab" * 32)
 
 
 def test_layer_allocation_returns_all_possible_cyclic_outbound_peers():

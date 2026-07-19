@@ -38,6 +38,8 @@ NodeUpdate: TypeAlias = Tuple[
     Optional[int],
     Optional[int],
     Optional[int],
+    Optional[List[str]],
+    Optional[str],
 ]
 
 
@@ -306,6 +308,7 @@ class Scheduler:
         kv_cache_block_size: Optional[int] = None,
         max_concurrent_requests: Optional[int] = None,
         direct_peer_ids: Optional[List[str]] = None,
+        account_hash: Optional[str] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
@@ -332,6 +335,8 @@ class Scheduler:
             node.max_concurrent_requests = int(max_concurrent_requests)
         if direct_peer_ids is not None:
             node.direct_peer_ids = set(direct_peer_ids)
+        if account_hash is not None:
+            node.account_hash = account_hash
         node.last_heartbeat = time.time()
 
     # Async-style event enqueuers for main loop
@@ -362,6 +367,7 @@ class Scheduler:
         kv_cache_block_size: Optional[int] = None,
         max_concurrent_requests: Optional[int] = None,
         direct_peer_ids: Optional[List[str]] = None,
+        account_hash: Optional[str] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -379,6 +385,7 @@ class Scheduler:
                 kv_cache_block_size,
                 max_concurrent_requests,
                 direct_peer_ids,
+                account_hash,
             )
         )
         self._wake_event.set()
@@ -802,6 +809,7 @@ class Scheduler:
                     kv_cache_block_size,
                     max_concurrent_requests,
                     direct_peer_ids,
+                    account_hash,
                 ) = self._pending_node_updates.get_nowait()
             except queue.Empty:
                 break
@@ -823,6 +831,7 @@ class Scheduler:
                 kv_cache_block_size=kv_cache_block_size,
                 max_concurrent_requests=max_concurrent_requests,
                 direct_peer_ids=direct_peer_ids,
+                account_hash=account_hash,
             )
 
         # Manual allocations can complete before their executors finish loading.

@@ -4,11 +4,37 @@ import time
 import httpx
 from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stream_iter
 
+from backend.server.contribution_gate import account_hash
 from parallax_utils.logging_config import get_logger
 from scheduling.node import Node, NodeHardwareInfo
 from scheduling.scheduler import Scheduler
 
 logger = get_logger(__name__)
+
+
+def node_log_summary(message: object) -> dict:
+    """Return useful node telemetry without credentials or oversized payloads."""
+
+    if not isinstance(message, dict):
+        return {"message_type": type(message).__name__}
+    hardware = message.get("hardware")
+    safe_hardware = {}
+    if isinstance(hardware, dict):
+        for key in ("gpu_name", "device", "memory_gb", "usable_memory_bytes"):
+            if key in hardware:
+                safe_hardware[key] = hardware[key]
+    return {
+        key: value
+        for key, value in {
+            "node_id": message.get("node_id"),
+            "status": message.get("status"),
+            "start_layer": message.get("start_layer"),
+            "end_layer": message.get("end_layer"),
+            "current_requests": message.get("current_requests"),
+            "hardware": safe_hardware,
+        }.items()
+        if value is not None and value != {}
+    }
 
 
 class RPCConnectionHandler(ConnectionHandler):
@@ -43,7 +69,7 @@ class RPCConnectionHandler(ConnectionHandler):
         #     "max_concurrent_requests": 16,
         #     "max_sequence_length": 1024,
         # }
-        logger.info(f"receive node_join request: {message}")
+        logger.info("receive node_join request: %s", node_log_summary(message))
         try:
             node = self.build_node(message)
             self.scheduler.enqueue_join(node)
@@ -57,7 +83,7 @@ class RPCConnectionHandler(ConnectionHandler):
 
     @rpc_method
     def node_leave(self, message):
-        logger.debug(f"receive node_leave request: {message}")
+        logger.debug("receive node_leave request: %s", node_log_summary(message))
         try:
             node = self.build_node(message)
             self.scheduler.enqueue_leave(node.node_id)
@@ -73,7 +99,7 @@ class RPCConnectionHandler(ConnectionHandler):
         first dict contains layer allocation result and
         second dict records weight refit information.
         """
-        logger.debug(f"receive node_update request: {message}")
+        logger.debug("receive node_update request: %s", node_log_summary(message))
         try:
             node = self.build_node(message)
             # Check if node exists in scheduler
@@ -109,6 +135,7 @@ class RPCConnectionHandler(ConnectionHandler):
                 direct_peer_ids=(
                     sorted(node.direct_peer_ids) if node.direct_peer_ids is not None else None
                 ),
+                account_hash=node.account_hash,
             )
             # Return current layer allocation to node
             layer_allocation = self.get_layer_allocation(node.node_id)
@@ -239,6 +266,7 @@ class RPCConnectionHandler(ConnectionHandler):
                 if node_json.get("direct_peer_ids") is not None
                 else None
             ),
+            account_hash=account_hash(node_json.get("account_token")),
         )
         if node_json.get("start_layer", None) is not None:
             node.start_layer = node_json.get("start_layer")

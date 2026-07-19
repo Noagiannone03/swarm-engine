@@ -443,6 +443,9 @@ class GradientServer:
         self.status = ServerState.JOINING
         self.manual_layer_assignment = block_end_index is not None and block_start_index is not None
         self.conn = conn
+        # Account credential is transported only over the encrypted scheduler
+        # RPC.  The scheduler immediately hashes it and never logs/stores it.
+        self.account_token = os.environ.get("FABI_ACCOUNT_TOKEN") or None
 
         self.scheduler_stub = None
         self.scheduler_peer_id = None
@@ -1065,6 +1068,8 @@ class GradientServer:
             "manual_layer_assignment": self.manual_layer_assignment,
             "last_refit_time": self.last_refit_time,
         }
+        if self.account_token:
+            info["account_token"] = self.account_token
         if runtime_kv_capacity is not None and runtime_kv_block_size is not None:
             info["kv_cache_token_capacity"] = int(runtime_kv_capacity)
             info["kv_cache_block_size"] = int(runtime_kv_block_size)

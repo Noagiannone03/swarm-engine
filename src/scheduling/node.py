@@ -227,6 +227,11 @@ class Node:
     # allowing routing to fail closed when Lattica only has a relayed path.
     direct_peer_ids: Optional[Set[str]] = None
 
+    # SHA-256 identifier derived from the local Fabi account credential.  The
+    # scheduler never stores the credential itself; this field only binds a
+    # ready, allocated worker to consumption admission for the same account.
+    account_hash: Optional[str] = None
+
     _force_max_concurrent_requests: bool = False
 
     def __post_init__(self):

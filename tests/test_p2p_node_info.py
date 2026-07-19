@@ -212,6 +212,34 @@ def test_worker_advertises_executor_measured_kv_geometry(monkeypatch):
     assert node_info["kv_cache_block_size"] == 64
 
 
+def test_worker_sends_account_credential_only_when_configured(monkeypatch):
+    credential = "ab" * 32
+    monkeypatch.setenv("FABI_ACCOUNT_TOKEN", credential)
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.rtt_last_update = time.time()
+    monkeypatch.setattr(
+        "parallax.p2p.server.detect_node_hardware",
+        lambda node_id: {"node_id": node_id, "device": "mlx"},
+    )
+
+    assert server.get_node_info()["account_token"] == credential
+
+    monkeypatch.delenv("FABI_ACCOUNT_TOKEN")
+    anonymous = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    anonymous.lattica = server.lattica
+    anonymous.rtt_last_update = time.time()
+    assert "account_token" not in anonymous.get_node_info()
+
+
 def test_worker_reports_only_outbound_peers_reachable_by_registered_rpc():
     server = GradientServer(
         recv_from_peer_addr="",

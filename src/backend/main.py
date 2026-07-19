@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.server.contribution_gate import ContributionAdmission, get_gate
 from backend.server.openai_compat import openai_error_response, openai_models_payload
 from backend.server.request_handler import RequestHandler
 from backend.server.scheduler_manage import SchedulerManage
@@ -37,6 +38,30 @@ logger = get_logger(__name__)
 
 scheduler_manage = None
 request_handler = RequestHandler()
+
+
+def bearer_credential(raw_request: Request):
+    authorization = raw_request.headers.get("authorization", "")
+    scheme, separator, credential = authorization.partition(" ")
+    if separator and scheme.lower() == "bearer":
+        return credential.strip() or None
+    return None
+
+
+def release_after_stream(response: StreamingResponse, admission: ContributionAdmission):
+    """Hold contribution concurrency until the response body actually finishes."""
+
+    original = response.body_iterator
+
+    async def guarded_iterator():
+        try:
+            async for chunk in original:
+                yield chunk
+        finally:
+            get_gate().release(admission)
+
+    response.body_iterator = guarded_iterator()
+    return response
 
 
 @app.post("/weight/refit")
@@ -193,11 +218,37 @@ async def cluster_status_json() -> JSONResponse:
     return JSONResponse(content=scheduler_manage.get_cluster_status(), status_code=200)
 
 
+@app.get("/v1/contribution/status")
+async def contribution_status(raw_request: Request) -> JSONResponse:
+    """Account-scoped admission state used by the IDE to reveal its prompt."""
+
+    gate = get_gate()
+    scheduler = scheduler_manage.scheduler if scheduler_manage is not None else None
+    status = gate.status(bearer_credential(raw_request), scheduler)
+    return JSONResponse(content=status.public_payload(enabled=gate.enabled), status_code=200)
+
+
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
+    gate = get_gate()
+    scheduler = scheduler_manage.scheduler if scheduler_manage is not None else None
+    admission = gate.admit(bearer_credential(raw_request), scheduler)
+    if not admission.allowed:
+        if admission.status.reason == "capacity_reached":
+            status_code = 429
+        elif admission.status.reason == "swarm_not_ready":
+            status_code = 503
+        else:
+            status_code = 403
+        return JSONResponse(
+            content=gate.denial_payload(admission.status),
+            status_code=status_code,
+            headers={"Retry-After": "1"} if status_code in {429, 503} else None,
+        )
     try:
         request_data = await raw_request.json()
     except Exception:
+        gate.release(admission)
         return openai_error_response(
             "Invalid request body",
             status_code=400,
@@ -205,6 +256,7 @@ async def openai_v1_chat_completions(raw_request: Request):
             code="invalid_request_error",
         )
     if not isinstance(request_data, dict):
+        gate.release(admission)
         return openai_error_response(
             "Request body must be a JSON object",
             status_code=400,
@@ -214,12 +266,20 @@ async def openai_v1_chat_completions(raw_request: Request):
 
     request_id = uuid.uuid4()
     received_ts = time.time()
-    return await request_handler.v1_chat_completions(
-        request_data,
-        request_id,
-        received_ts,
-        raw_request.is_disconnected,
-    )
+    try:
+        response = await request_handler.v1_chat_completions(
+            request_data,
+            request_id,
+            received_ts,
+            raw_request.is_disconnected,
+        )
+    except BaseException:
+        gate.release(admission)
+        raise
+    if isinstance(response, StreamingResponse):
+        return release_after_stream(response, admission)
+    gate.release(admission)
+    return response
 
 
 # Disable caching for index.html
