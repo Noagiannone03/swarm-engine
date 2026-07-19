@@ -119,6 +119,24 @@ def test_worker_advertises_frontend_capability(monkeypatch):
     assert node_info["supports_frontend"] is False
 
 
+def test_worker_cannot_report_ready_when_required_frontend_is_dead():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    values = {
+        "frontend_required": True,
+        "frontend_alive": False,
+    }
+    server._shared_state = SimpleNamespace(
+        get=lambda key, default=None: values.get(key, default),
+        get_status=lambda: ServerState.READY.value,
+    )
+
+    assert server._get_status() == ServerState.INITIALIZING.value
+
+
 def test_worker_advertises_runtime_chunked_prefill_capability(monkeypatch):
     server = GradientServer(
         recv_from_peer_addr="",

@@ -155,6 +155,8 @@ class SharedState:
         shared_dict["kv_cache_token_capacity"] = None
         shared_dict["kv_cache_block_size"] = None
         shared_dict["max_concurrent_requests"] = None
+        shared_dict["frontend_required"] = False
+        shared_dict["frontend_alive"] = False
         shared_dict["_layer_allocation_changed"] = False
         shared_dict["status"] = None
 

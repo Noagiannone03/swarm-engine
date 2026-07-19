@@ -116,6 +116,24 @@ def create_local_zmq_endpoints(count: int, platform: str | None = None) -> list[
             reservation.close()
 
 
+def cleanup_local_zmq_endpoints(endpoints: list[str]) -> None:
+    """Remove private POSIX IPC files created by ``create_local_zmq_endpoints``.
+
+    TCP endpoints have no filesystem artifact. The basename guard ensures this
+    helper never unlinks an arbitrary caller-provided IPC path.
+    """
+    for endpoint in endpoints:
+        if not endpoint.startswith("ipc://"):
+            continue
+        path = endpoint.removeprefix("ipc://")
+        if not os.path.basename(path).startswith("parallax-zmq-"):
+            continue
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool):
     """Create and configure a ZeroMQ socket.
 

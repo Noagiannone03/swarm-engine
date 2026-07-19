@@ -981,6 +981,12 @@ class GradientServer:
         if hasattr(self, "_shared_state") and self._shared_state is not None:
             shared_status = self._shared_state.get_status()
             if shared_status is not None:
+                if (
+                    shared_status == ServerState.READY.value
+                    and self._shared_state.get("frontend_required", False)
+                    and not self._shared_state.get("frontend_alive", False)
+                ):
+                    return ServerState.INITIALIZING.value
                 return shared_status
         # When running in same process, use local status
         return self.status.value

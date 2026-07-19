@@ -29,7 +29,12 @@ from parallax.server.vllm_rust_frontend import (
     stop_vllm_rust_frontend,
 )
 from parallax.utils.shared_state import SharedState
-from parallax.utils.utils import create_local_zmq_endpoints, initialize_nccl_port, load_config_only
+from parallax.utils.utils import (
+    cleanup_local_zmq_endpoints,
+    create_local_zmq_endpoints,
+    initialize_nccl_port,
+    load_config_only,
+)
 from parallax_utils.ascii_anime import display_parallax_join
 from parallax_utils.logging_config import get_logger, set_log_level
 from parallax_utils.version_check import check_latest_release
@@ -82,7 +87,48 @@ def _stop_executor_processes(executor_subprocs):
             stop_executor_process(executor_process)
 
 
-def _wait_executors_check_layer_change(shared_state: SharedState, executor_subprocs):
+def _prepare_engine_core_generation(args, shared_state: SharedState, frontend_required: bool):
+    """Create private engine-core endpoints and publish frontend readiness.
+
+    The Rust frontend binds both engine-core IPC endpoints. A frontend that has
+    to be killed during a layer reload can leave those filesystem endpoints
+    behind on POSIX, so an endpoint pair belongs to exactly one executor
+    generation and must never be reused.
+    """
+    args.executor_input_ipc, args.executor_output_ipc = create_local_zmq_endpoints(2)
+    logger.debug(f"executor_input_addr: {args.executor_input_ipc}")
+    logger.debug(f"executor_output_addr: {args.executor_output_ipc}")
+    shared_state.update(
+        frontend_required=bool(frontend_required),
+        frontend_alive=False,
+    )
+
+
+def _set_frontend_alive(shared_state: SharedState, frontend_process) -> None:
+    shared_state.set(
+        "frontend_alive",
+        frontend_process is not None and frontend_process.is_alive(),
+    )
+
+
+def _cleanup_engine_core_generation(args) -> None:
+    cleanup_local_zmq_endpoints(
+        [
+            endpoint
+            for endpoint in (
+                getattr(args, "executor_input_ipc", None),
+                getattr(args, "executor_output_ipc", None),
+            )
+            if endpoint is not None
+        ]
+    )
+
+
+def _wait_executors_check_layer_change(
+    shared_state: SharedState,
+    executor_subprocs,
+    frontend_process=None,
+):
     """Wait for executor processes and check if layer allocation changed.
 
     Returns:
@@ -90,9 +136,23 @@ def _wait_executors_check_layer_change(shared_state: SharedState, executor_subpr
         False if all executors exited normally.
     """
     while any(proc.is_alive() for proc in executor_subprocs):
+        if frontend_process is not None and not frontend_process.is_alive():
+            shared_state.update(
+                frontend_alive=False,
+                status=ServerState.INITIALIZING.value,
+            )
+            raise RuntimeError("vLLM Rust frontend exited while its executor was running")
+
+        poll_timeout = 1.0 / max(len(executor_subprocs), 1)
         for proc in executor_subprocs:
             if proc.is_alive():
-                proc.join(timeout=1.0)  # Check every second
+                proc.join(timeout=poll_timeout)
+            if frontend_process is not None and not frontend_process.is_alive():
+                shared_state.update(
+                    frontend_alive=False,
+                    status=ServerState.INITIALIZING.value,
+                )
+                raise RuntimeError("vLLM Rust frontend exited while its executor was running")
 
         if shared_state.get_layer_allocation_changed():
             return True
@@ -107,6 +167,7 @@ if __name__ == "__main__":
     p2p_server_process = None
     frontend_process = None
     executor_subprocs = []
+    args = None
     # Shared state for layer allocation info (used when P2P server is in subprocess)
     shared_state = SharedState.create()
     shared_state.set_status(ServerState.JOINING.value)
@@ -118,17 +179,13 @@ if __name__ == "__main__":
         (
             args.recv_from_peer_addr,
             args.send_to_peer_addr,
-            args.executor_input_ipc,
-            args.executor_output_ipc,
-        ) = create_local_zmq_endpoints(4)
+        ) = create_local_zmq_endpoints(2)
         if args.nccl_port is None:
             args.nccl_port = initialize_nccl_port()
 
         # Silence tokenizer warnings
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-        logger.debug(f"executor_input_addr: {args.executor_input_ipc}")
-        logger.debug(f"executor_output_addr: {args.executor_output_ipc}")
         logger.debug(f"nccl_port: {args.nccl_port}")
 
         # Pipe for subprocess communication
@@ -146,8 +203,10 @@ if __name__ == "__main__":
                 args.end_layer = config.get("num_hidden_layers")
 
             # Only launch the Rust HTTP frontend on head node.
+            _prepare_engine_core_generation(args, shared_state, args.start_layer == 0)
             if args.start_layer == 0:
                 frontend_process = launch_vllm_rust_frontend(args)
+                _set_frontend_alive(shared_state, frontend_process)
             # Launch P2P server as subprocess
             if not (args.start_layer == 0 and args.end_layer == config.get("num_hidden_layers")):
                 p2p_server_process = launch_p2p_server_process(
@@ -202,11 +261,16 @@ if __name__ == "__main__":
                 executor_subprocs.append(proc)
 
             time.sleep(2)  # Give executors time to start
+            if frontend_process is not None and not frontend_process.is_alive():
+                raise RuntimeError("vLLM Rust frontend exited during executor startup")
             shared_state.set_status(ServerState.READY.value)
 
-            # Wait for all executor processes
-            for proc in executor_subprocs:
-                proc.join()
+            # Wait for all executor processes while supervising ingress.
+            _wait_executors_check_layer_change(
+                shared_state,
+                executor_subprocs,
+                frontend_process,
+            )
         else:
             # Launch P2P server as subprocess (with scheduler)
             # Pass dict to subprocess (multiprocessing requires serializable objects)
@@ -272,8 +336,10 @@ if __name__ == "__main__":
             while True:
                 try:
                     # Only launch the Rust HTTP frontend on head node.
+                    _prepare_engine_core_generation(args, shared_state, args.start_layer == 0)
                     if args.start_layer == 0:
                         frontend_process = launch_vllm_rust_frontend(args)
+                        _set_frontend_alive(shared_state, frontend_process)
 
                     # Build connectors for tp communication
                     conn_tp_0 = [conn_refit]
@@ -299,17 +365,25 @@ if __name__ == "__main__":
                         executor_subprocs.append(proc)
 
                     # Wait for executors and restart if layer allocation changes
-                    if _wait_executors_check_layer_change(shared_state, executor_subprocs):
+                    if _wait_executors_check_layer_change(
+                        shared_state,
+                        executor_subprocs,
+                        frontend_process,
+                    ):
                         logger.warning("Layer allocation changed! Stopping executors to reload...")
                         # Reset flag and set status to INITIALIZING
                         shared_state.update(
                             _layer_allocation_changed=False,
                             status=ServerState.INITIALIZING.value,
+                            frontend_alive=False,
                         )
-                        _stop_executor_processes(executor_subprocs)
+                        # Stop ingress before the engine so the frontend cannot
+                        # accept work while its generation is being dismantled.
                         if frontend_process is not None:
                             stop_vllm_rust_frontend(frontend_process)
                             frontend_process = None
+                        _stop_executor_processes(executor_subprocs)
+                        _cleanup_engine_core_generation(args)
                         _update_args_from_shared_state(args, shared_state, force_update=True)
                         logger.info(
                             f"Reloading executor with layers [{args.start_layer}, {args.end_layer})"
@@ -336,17 +410,27 @@ if __name__ == "__main__":
         # Shutdown all processes
         logger.debug("Shutting down all processes...")
 
+        try:
+            shared_state.update(
+                status=ServerState.OFFLINE.value,
+                frontend_alive=False,
+            )
+        except (BrokenPipeError, EOFError, OSError):
+            logger.debug("Shared launch state was already unavailable during shutdown")
+
+        # Stop ingress before executors for the same reason as a reload.
+        if frontend_process is not None:
+            stop_vllm_rust_frontend(frontend_process)
+            frontend_process = None
+
         # Shutdown executor subprocesses
         for executor_process in executor_subprocs:
             if executor_process.is_alive():
                 stop_executor_process(executor_process)
+        _cleanup_engine_core_generation(args)
 
         # Shutdown P2P server subprocess
         if p2p_server_process is not None:
             stop_p2p_server(p2p_server_process)
-
-        # Shutdown Rust frontend
-        if frontend_process is not None:
-            stop_vllm_rust_frontend(frontend_process)
 
         logger.debug("All processes shut down.")

@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 import pytest
 import zmq
 
-from parallax.utils.utils import create_local_zmq_endpoints
+from parallax.utils.utils import cleanup_local_zmq_endpoints, create_local_zmq_endpoints
 
 
 def test_rejects_empty_endpoint_batch():
@@ -42,3 +42,21 @@ def test_windows_style_tcp_endpoints_bind_with_zmq():
         for sock in sockets:
             sock.close(linger=0)
         context.term()
+
+
+def test_cleanup_removes_only_owned_posix_ipc_files(tmp_path):
+    owned = tmp_path / "parallax-zmq-owned"
+    foreign = tmp_path / "foreign-service"
+    owned.touch()
+    foreign.touch()
+
+    cleanup_local_zmq_endpoints(
+        [
+            f"ipc://{owned}",
+            f"ipc://{foreign}",
+            "tcp://127.0.0.1:9999",
+        ]
+    )
+
+    assert not owned.exists()
+    assert foreign.exists()
