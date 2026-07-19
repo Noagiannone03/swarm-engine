@@ -146,6 +146,70 @@ def test_scheduler_releases_route_without_waiting_for_worker_heartbeat():
     assert available_path == [node.node_id]
 
 
+def test_worker_leave_invalidates_inflight_route_and_releases_surviving_shards():
+    model = build_model_info(12)
+    head = build_node("head", model, mem_gb=60.0, x=0, y=0)
+    tail = build_node("tail", model, mem_gb=60.0, x=1, y=0)
+    set_rtt_from_coords([head, tail])
+    for node in (head, tail):
+        node.max_concurrent_requests = 1
+        node.max_sequence_length = 32768
+        node.kv_cache_token_capacity = 32768
+        node.kv_cache_block_size = 16
+    sched = Scheduler(
+        model,
+        [head, tail],
+        strategy="greedy",
+        routing_strategy="rr",
+        min_nodes_bootstrapping=2,
+    )
+    assert sched.bootstrap()
+
+    request = RequestSignal(request_id="worker-loss", required_context_tokens=16384)
+    sched.receive_request(request)
+    _, path, _ = sched.dispatch_next_request()
+    assert path == [head.node_id, tail.node_id]
+    assert sched.is_request_route_active(request.request_id)
+    assert head.reserved_context_tokens == 16384
+    assert tail.reserved_context_tokens == 16384
+
+    sched.enqueue_leave(tail.node_id)
+    sched._process_leaves()
+
+    assert not sched.is_request_route_active(request.request_id)
+    assert head.reserved_context_tokens == 0
+    assert sched.node_manager.get(tail.node_id) is None
+
+
+def test_worker_leave_keeps_unrelated_inflight_route_active():
+    model = build_model_info(12)
+    failed = build_node("failed", model, mem_gb=400.0)
+    healthy = build_node("healthy", model, mem_gb=400.0)
+    for node in (failed, healthy):
+        node.max_concurrent_requests = 1
+        node.max_sequence_length = 32768
+        node.kv_cache_token_capacity = 32768
+        node.kv_cache_block_size = 16
+        node.set_layer_allocation(0, model.num_layers)
+    sched = Scheduler(model, [], strategy="dp", routing_strategy="dp")
+    sched.node_manager.upsert(failed)
+    sched.node_manager.upsert(healthy)
+    sched.node_manager.activate([failed.node_id, healthy.node_id])
+    sched._inflight_routes = {
+        "failed-request": ([failed.node_id], 4096),
+        "healthy-request": ([healthy.node_id], 4096),
+    }
+    failed.add_request(4096)
+    healthy.add_request(4096)
+
+    sched.enqueue_leave(failed.node_id)
+    sched._process_leaves()
+
+    assert not sched.is_request_route_active("failed-request")
+    assert sched.is_request_route_active("healthy-request")
+    assert healthy.reserved_context_tokens == 4096
+
+
 def test_cancelled_pending_request_cannot_reserve_recovered_pipeline():
     model = build_model_info(12)
     node = build_node("recovered", model, mem_gb=400.0)

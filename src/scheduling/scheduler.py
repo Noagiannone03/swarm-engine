@@ -479,6 +479,14 @@ class Scheduler:
         if node is None:
             raise ValueError(f"Node {node_id} not found in nodes")
         logger.info("Leaving node %s (start=%s, end=%s)", node_id, node.start_layer, node.end_layer)
+        invalidated = self._invalidate_routes_for_node(node_id)
+        if invalidated:
+            logger.warning(
+                "Invalidated %d in-flight route(s) after node %s left: %s",
+                len(invalidated),
+                node_id,
+                invalidated,
+            )
         self.node_manager.remove(node_id)
 
         # Snapshot at INFO after leave since allocations/pipelines may have changed.
@@ -582,6 +590,31 @@ class Scheduler:
         for node_id in path:
             self.node_manager.remove_request(node_id, required_context_tokens)
         return True
+
+    def _invalidate_routes_for_node(self, node_id: str) -> List[str]:
+        """Release every route containing a worker before removing that worker.
+
+        The HTTP handler monitors this registry while blocked on the Lattica
+        response. Removing a route therefore fences the failed pipeline and
+        gives the handler a deterministic signal to cancel its RPC stream.
+        """
+        with self._inflight_routes_lock:
+            affected = [
+                request_id
+                for request_id, (path, _) in self._inflight_routes.items()
+                if node_id in path
+            ]
+            for request_id in affected:
+                self._release_request_locked(request_id)
+        if affected:
+            with self._capacity_cv:
+                self._capacity_cv.notify_all()
+        return affected
+
+    def is_request_route_active(self, request_id: str) -> bool:
+        """Return whether a request still owns its originally dispatched route."""
+        with self._inflight_routes_lock:
+            return str(request_id) in self._inflight_routes
 
     def release_request(self, request_id: str) -> bool:
         """Release a dispatched route exactly once when its HTTP request ends."""

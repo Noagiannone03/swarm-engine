@@ -26,6 +26,10 @@ class ClientDisconnectedError(Exception):
     """Raised when the scheduler's HTTP client leaves before a reply is ready."""
 
 
+class DownstreamRouteLostError(Exception):
+    """Raised when a worker departure invalidates an in-flight scheduler route."""
+
+
 class RequestHandler:
     """HTTP request forwarder with scheduler-aware routing and retry logic.
 
@@ -57,6 +61,18 @@ class RequestHandler:
         if release is not None:
             release(str(request_id))
 
+    def _route_is_active(self, request_id: str) -> bool:
+        is_active = getattr(self.scheduler_manage, "is_routing_table_active", None)
+        if is_active is None:
+            # Preserve compatibility with scheduler managers that predate route
+            # liveness monitoring. Current schedulers always expose the method.
+            return True
+        try:
+            return bool(is_active(str(request_id)))
+        except Exception:
+            logger.exception("Unable to check scheduler route %s", request_id)
+            return True
+
     async def _wait_for_routing_capacity(self) -> None:
         wait = getattr(self.scheduler_manage, "wait_for_routing_capacity", None)
         if wait is None:
@@ -68,18 +84,21 @@ class RequestHandler:
         self,
         response,
         is_disconnected: Optional[Callable[[], Awaitable[bool]]],
+        request_id: str,
     ) -> bytes:
-        """Wait for one blocking RPC chunk while observing the inbound HTTP socket."""
+        """Wait for one RPC chunk while observing client and route liveness."""
         next_chunk = asyncio.create_task(anext(iterate_in_threadpool(response)))
-        if is_disconnected is None:
-            return await next_chunk
 
         try:
             while not next_chunk.done():
-                if await is_disconnected():
+                if is_disconnected is not None and await is_disconnected():
                     response.cancel()
                     next_chunk.cancel()
                     raise ClientDisconnectedError
+                if not self._route_is_active(request_id):
+                    response.cancel()
+                    next_chunk.cancel()
+                    raise DownstreamRouteLostError
                 await asyncio.sleep(0.1)
             return await next_chunk
         except BaseException:
@@ -217,7 +236,7 @@ class RequestHandler:
                         required_context_tokens,
                     )
                     logger.debug(
-                        f"get_routing_table for request {request_id} return: {routing_table} (attempt {attempts+1})"
+                        f"get_routing_table for request {request_id} return: {routing_table} (attempt {attempts + 1})"
                     )
                 except Exception as e:
                     logger.exception(f"get_routing_table error: {e}")
@@ -319,6 +338,7 @@ class RequestHandler:
                         content = await self._next_chunk_until_disconnect(
                             response,
                             is_disconnected,
+                            str(request_id),
                         )
                         decoded_response = decode_http_response_envelope(content)
                         if decoded_response is None:
@@ -339,6 +359,14 @@ class RequestHandler:
             except ClientDisconnectedError:
                 logger.info("Client disconnected before request %s completed", request_id)
                 return Response(status_code=499)
+            except DownstreamRouteLostError:
+                logger.warning("Worker route was lost during request %s", request_id)
+                return openai_error_response(
+                    "A worker assigned to this request became unavailable. Please retry.",
+                    status_code=502,
+                    err_type="upstream_error",
+                    code="upstream_worker_lost",
+                )
             except Exception as e:
                 self._release_route(request_id)
                 forward_attempts += 1

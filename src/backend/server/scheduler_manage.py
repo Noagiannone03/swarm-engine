@@ -395,6 +395,12 @@ class SchedulerManage:
             return False
         return self.scheduler.release_request(str(request_id))
 
+    def is_routing_table_active(self, request_id: str) -> bool:
+        """Return whether a dispatched request still owns a live worker route."""
+        if self.scheduler is None:
+            return False
+        return self.scheduler.is_request_route_active(str(request_id))
+
     def wait_for_routing_capacity(self, timeout: float) -> bool:
         """Block until a route can be admitted or the bounded wait expires."""
         if self.scheduler is None:

@@ -33,6 +33,7 @@ class ForwardingSchedulerManage(DummySchedulerManage):
         self.context_budget = context_budget
         self.max_context = max_context
         self.routing_requests = []
+        self.active_routes = set()
 
     def get_schedule_status(self):
         return self.status
@@ -45,11 +46,17 @@ class ForwardingSchedulerManage(DummySchedulerManage):
 
     def get_routing_table(self, request_id, received_ts, required_context_tokens=0):
         self.routing_requests.append((request_id, required_context_tokens))
+        if self.routing_table:
+            self.active_routes.add(str(request_id))
         return self.routing_table
 
     def release_routing_table(self, request_id):
         self.released.append(request_id)
+        self.active_routes.discard(str(request_id))
         return True
+
+    def is_routing_table_active(self, request_id):
+        return str(request_id) in self.active_routes
 
     def wait_for_routing_capacity(self, timeout):
         self.capacity_waits += 1
@@ -324,6 +331,36 @@ def test_non_stream_disconnect_cancels_rpc_and_releases_route():
     assert response.status_code == 499
     assert stub.response.cancelled
     assert scheduler_manage.released == ["disconnected-req"]
+
+
+def test_non_stream_worker_loss_cancels_rpc_and_returns_openai_error():
+    handler = RequestHandler()
+    scheduler_manage = ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    stub = BlockingStub()
+    handler.stubs["node-a"] = stub
+
+    async def lose_route():
+        task = asyncio.create_task(
+            handler.v1_chat_completions(
+                {"messages": [{"role": "user", "content": "hello"}]},
+                "lost-worker-req",
+                1.0,
+            )
+        )
+        while "lost-worker-req" not in scheduler_manage.active_routes:
+            await asyncio.sleep(0)
+        scheduler_manage.active_routes.remove("lost-worker-req")
+        return await task
+
+    response = asyncio.run(lose_route())
+
+    payload = json.loads(response.body)
+    assert response.status_code == 502
+    assert payload["error"]["type"] == "upstream_error"
+    assert payload["error"]["code"] == "upstream_worker_lost"
+    assert stub.response.cancelled
+    assert scheduler_manage.released == ["lost-worker-req"]
 
 
 def test_streaming_request_releases_route_after_completion():
