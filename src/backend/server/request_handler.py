@@ -309,6 +309,7 @@ class RequestHandler:
                         first_token_time = None
                         last_chunk = None
                         last_token_time = None
+                        stream_finished = False
                         try:
                             response = stub.chat_completion(backend_request)
                             iterator = iterate_in_threadpool(response)
@@ -321,6 +322,21 @@ class RequestHandler:
                                         iterator,
                                     )
                                 except StopAsyncIteration:
+                                    if not stream_finished:
+                                        logger.warning(
+                                            "Upstream stream ended without a terminal event "
+                                            "for request %s",
+                                            request_id,
+                                        )
+                                        yield self._stream_error_chunk(
+                                            (
+                                                "A worker assigned to this request ended the "
+                                                "stream unexpectedly. Please retry."
+                                            ),
+                                            err_type="upstream_error",
+                                            code="upstream_worker_lost",
+                                        )
+                                        yield b"data: [DONE]\n\n"
                                     break
                                 except ClientDisconnectedError:
                                     logger.info(
@@ -343,6 +359,8 @@ class RequestHandler:
                                     )
                                     yield b"data: [DONE]\n\n"
                                     return
+                                if chunk is not None and b"data: [DONE]" in chunk:
+                                    stream_finished = True
                                 last_token_time = time.time()
                                 if first_token_time is None:
                                     first_token_time = last_token_time

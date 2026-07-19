@@ -385,6 +385,32 @@ def test_streaming_request_releases_route_after_completion():
     assert scheduler_manage.released == ["stream-req"]
 
 
+def test_incomplete_upstream_stream_emits_error_and_terminal_event():
+    handler = RequestHandler()
+    scheduler_manage = ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    stub = StaticStub([b'data: {"choices":[]}\n\n'])
+    handler.stubs["node-a"] = stub
+
+    async def consume_stream():
+        response = await handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}], "stream": True},
+            "incomplete-stream-req",
+            1.0,
+        )
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    body = asyncio.run(consume_stream())
+
+    events = [line.removeprefix(b"data: ") for line in body.splitlines() if line]
+    error = json.loads(events[-2])
+    assert error["error"]["type"] == "upstream_error"
+    assert error["error"]["code"] == "upstream_worker_lost"
+    assert events[-1] == b"[DONE]"
+    assert stub.response.cancelled
+    assert scheduler_manage.released == ["incomplete-stream-req"]
+
+
 def test_streaming_worker_loss_cancels_rpc_emits_error_and_releases_route():
     handler = RequestHandler()
     scheduler_manage = ForwardingSchedulerManage()
