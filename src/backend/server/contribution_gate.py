@@ -150,19 +150,19 @@ class ContributionGate:
                 active_requests=active,
                 account_id=identity,
             )
-        if not serving_ready:
+        if active >= maximum:
             return ContributionStatus(
                 False,
-                "swarm_not_ready",
+                "capacity_reached",
                 eligible_workers=eligible,
                 active_requests=active,
                 max_concurrent_requests=maximum,
                 account_id=identity,
             )
-        if active >= maximum:
+        if not serving_ready:
             return ContributionStatus(
                 False,
-                "capacity_reached",
+                "swarm_not_ready",
                 eligible_workers=eligible,
                 active_requests=active,
                 max_concurrent_requests=maximum,

@@ -451,6 +451,7 @@ class GradientServer:
         self.scheduler_peer_id = None
         self.routing_table_updater = None
         self.announcer = None
+        self.direct_peer_prober = None
         self.connection_handler = None
         self.outbound_peer_ids = []
         self.direct_peer_ids = []
@@ -612,6 +613,8 @@ class GradientServer:
             notify_url=self.notify_url,
         )  # thread
 
+        if self.scheduler_addr is not None:
+            self.start_direct_peer_prober()
         self.start_node_announcer()  # thread
         self.start_node_sender()  # main loop
 
@@ -654,7 +657,7 @@ class GradientServer:
             return self.direct_peer_ids
 
         pending = {}
-        for peer_id in self.outbound_peer_ids:
+        for peer_id in list(self.outbound_peer_ids):
             try:
                 pending[peer_id] = self.get_stub(peer_id).rpc_health({})
             except Exception:
@@ -679,6 +682,69 @@ class GradientServer:
             )
         self.direct_peer_ids = direct
         return direct
+
+    def start_direct_peer_prober(self):
+        """Refresh route topology without ever delaying liveness heartbeats.
+
+        Direct-path qualification can wait several seconds per unavailable
+        candidate. It therefore runs independently from ``node_update``: a
+        worker doing useful inference must not be evicted just because topology
+        telemetry is slow. The initial empty snapshot remains fail-closed.
+        """
+
+        def _prober_thread():
+            while not self.stop_event.is_set():
+                try:
+                    self._probe_outbound_peers()
+                    self._refresh_peer_rtts()
+                except Exception:
+                    logger.warning("Network telemetry probe loop failed", exc_info=True)
+                self.stop_event.wait(5)
+
+        self.direct_peer_prober = threading.Thread(
+            target=_prober_thread,
+            name="DirectPeerProber",
+            daemon=True,
+        )
+        self.direct_peer_prober.start()
+
+    def _refresh_peer_rtts(self, peer_attempts: int = 1, rtt_attempts: int = 1) -> bool:
+        """Refresh latency telemetry outside the liveness-critical path.
+
+        The initial scheduler join may retry discovery because no heartbeat
+        exists yet. Periodic topology refreshes use the one-shot defaults and
+        must never hold up node liveness.
+        """
+
+        if time.time() - self.rtt_last_update <= self.rtt_update_interval:
+            return True
+
+        peers = None
+        for attempt in range(max(1, peer_attempts)):
+            peers = self.lattica.get_all_peers()
+            if peers and self.scheduler_peer_id in peers:
+                break
+            if attempt + 1 < peer_attempts:
+                time.sleep(1)
+        if not peers or self.scheduler_peer_id not in peers:
+            logger.warning("No peers found or scheduler peer id not found; keeping old RTTs")
+            return False
+
+        refreshed = {}
+        for peer_id in peers:
+            rtt = None
+            for attempt in range(max(1, rtt_attempts)):
+                try:
+                    rtt = self.lattica.get_peer_rtt(peer_id) * 1000
+                except Exception:
+                    logger.warning("Failed to get RTT to %s", peer_id, exc_info=True)
+                if rtt is not None or attempt + 1 >= rtt_attempts:
+                    break
+                time.sleep(1)
+            refreshed[peer_id] = rtt if rtt is not None else 100
+        self.rtts = refreshed
+        self.rtt_last_update = time.time()
+        return True
 
     def start_routing_table_updater(self):
         def _updater_thread():
@@ -967,7 +1033,7 @@ class GradientServer:
                             exc_info=True,
                         )
 
-                    time.sleep(10)
+                    self.stop_event.wait(10)
             except Exception as e:
                 logger.exception(f"Module announcer thread error: {e}")
 
@@ -995,41 +1061,11 @@ class GradientServer:
         return self.status.value
 
     def get_node_info(self, is_update: bool = False):
-        direct_peer_ids = self._probe_outbound_peers()
-        # update rtt to nodes
-        if time.time() - self.rtt_last_update > self.rtt_update_interval:
-            self.rtts = {}
-            all_peers = []
-            for _ in range(1 if is_update else 10):
-                all_peers = self.lattica.get_all_peers()
-                if len(all_peers) > 0 and self.scheduler_peer_id in all_peers:
-                    break
-                logger.warning(
-                    "No peers found or scheduler peer id not found, waiting for 1 second."
-                )
-                time.sleep(1)
-
-            if len(all_peers) == 0 or self.scheduler_peer_id not in all_peers:
-                logger.warning(
-                    "No peers found or scheduler peer id not found, return empty node info."
-                )
-                return {}
-
-            for peer_id in all_peers:
-                rtt = None
-                for _ in range(1 if is_update else 30):
-                    try:
-                        rtt = self.lattica.get_peer_rtt(peer_id) * 1000
-                    except Exception as e:
-                        logger.warning(f"Failed to get rtt to {peer_id}: {e}")
-                    if rtt is not None:
-                        break
-                    logger.warning(f"Failed to get rtt to {peer_id}, waiting for 1 second.")
-                    time.sleep(1)
-
-                self.rtts[peer_id] = rtt if rtt is not None else 100
-            self.rtt_last_update = time.time()
-
+        # A dedicated topology thread owns network probes. Heartbeats only read
+        # its last fail-closed result and therefore cannot be starved by probes.
+        if not is_update and not self._refresh_peer_rtts(peer_attempts=10, rtt_attempts=30):
+            return {}
+        direct_peer_ids = list(self.direct_peer_ids)
         hardware = detect_node_hardware(self.lattica.peer_id())
         runtime_backend = "mlx" if hardware.get("device") == "mlx" else self.gpu_backend
         self.supports_chunked_prefill = runtime_backend in {"mlx", "sglang"}
@@ -1125,6 +1161,8 @@ class GradientServer:
         try:
             if self.announcer is not None:
                 self.announcer.join(timeout=1)
+            if self.direct_peer_prober is not None:
+                self.direct_peer_prober.join(timeout=1)
             if self.routing_table_updater is not None:
                 self.routing_table_updater.join(timeout=1)
         except Exception:

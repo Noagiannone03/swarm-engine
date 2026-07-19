@@ -259,6 +259,29 @@ def test_worker_reports_only_outbound_peers_reachable_by_registered_rpc():
     assert server.direct_peer_ids == ["direct-peer"]
 
 
+def test_heartbeat_uses_cached_topology_without_running_network_probes(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+        max_batch_size=1,
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.rtt_last_update = time.time()
+    server.direct_peer_ids = ["qualified-peer"]
+    server._probe_outbound_peers = lambda: (_ for _ in ()).throw(
+        AssertionError("network probes must not run in the heartbeat path")
+    )
+    monkeypatch.setattr(
+        "parallax.p2p.server.detect_node_hardware",
+        lambda node_id: {"node_id": node_id, "device": "mlx"},
+    )
+
+    heartbeat = server.get_node_info(is_update=True)
+
+    assert heartbeat["direct_peer_ids"] == ["qualified-peer"]
+
+
 def test_transformer_health_rpc_returns_registered_peer_identity():
     handler = TransformerConnectionHandler.__new__(TransformerConnectionHandler)
     handler.lattica_instance = SimpleNamespace(peer_id=lambda: "worker-peer")

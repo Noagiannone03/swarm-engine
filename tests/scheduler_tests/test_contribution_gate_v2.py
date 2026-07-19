@@ -54,8 +54,12 @@ def test_only_ready_allocated_measured_workers_are_eligible(monkeypatch):
 
     assert gate.status(CREDENTIAL, scheduler(worker())).allowed is True
     assert gate.status(CREDENTIAL, scheduler(worker(ready=False))).reason == "no_eligible_worker"
-    assert gate.status(CREDENTIAL, scheduler(worker(allocated=False))).reason == "no_eligible_worker"
-    assert gate.status(CREDENTIAL, scheduler(worker(kv_capacity=None))).reason == "no_eligible_worker"
+    assert (
+        gate.status(CREDENTIAL, scheduler(worker(allocated=False))).reason == "no_eligible_worker"
+    )
+    assert (
+        gate.status(CREDENTIAL, scheduler(worker(kv_capacity=None))).reason == "no_eligible_worker"
+    )
     stale = worker(heartbeat=time.time() - 31)
     assert gate.status(CREDENTIAL, scheduler(stale)).reason == "no_eligible_worker"
 
@@ -85,7 +89,10 @@ def test_one_concurrent_request_per_ready_worker(monkeypatch):
     first = gate.admit(CREDENTIAL, live)
     assert first.allowed is True
     assert gate.admit(CREDENTIAL, live).status.reason == "capacity_reached"
+    live.serving_ready = lambda: False
+    assert gate.status(CREDENTIAL, live).reason == "capacity_reached"
     gate.release(first)
+    live.serving_ready = lambda: True
     assert gate.admit(CREDENTIAL, live).allowed is True
 
 
