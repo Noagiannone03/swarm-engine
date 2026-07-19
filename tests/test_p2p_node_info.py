@@ -1,7 +1,33 @@
 import time
 from types import SimpleNamespace
 
-from parallax.p2p.server import GradientServer, ServerState, _resolve_worker_key_path
+from parallax.p2p.server import (
+    GradientServer,
+    ServerState,
+    TransformerConnectionHandler,
+    _resolve_worker_key_path,
+)
+
+
+class ProbeFuture:
+    def __init__(self, value=None, error=None):
+        self.value = value
+        self.error = error
+
+    def result(self, timeout=None):
+        del timeout
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+class ProbeStub:
+    def __init__(self, future):
+        self.future = future
+
+    def rpc_health(self, request):
+        assert request == {}
+        return self.future
 
 
 def test_worker_key_path_is_persistent_and_private(monkeypatch, tmp_path):
@@ -166,3 +192,29 @@ def test_worker_advertises_executor_measured_kv_geometry(monkeypatch):
     assert node_info["max_concurrent_requests"] == 6
     assert node_info["kv_cache_token_capacity"] == 123456
     assert node_info["kv_cache_block_size"] == 64
+
+
+def test_worker_reports_only_outbound_peers_reachable_by_registered_rpc():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.connection_handler = object()
+    server.outbound_peer_ids = ["direct-peer", "relay-only-peer"]
+    stubs = {
+        "direct-peer": ProbeStub(ProbeFuture({"peer_id": "direct-peer"})),
+        "relay-only-peer": ProbeStub(ProbeFuture(error=RuntimeError("relay only"))),
+    }
+    server.get_stub = stubs.__getitem__
+
+    assert server._probe_outbound_peers() == ["direct-peer"]
+    assert server.direct_peer_ids == ["direct-peer"]
+
+
+def test_transformer_health_rpc_returns_registered_peer_identity():
+    handler = TransformerConnectionHandler.__new__(TransformerConnectionHandler)
+    handler.lattica_instance = SimpleNamespace(peer_id=lambda: "worker-peer")
+
+    assert handler.rpc_health({}) == {"peer_id": "worker-peer"}

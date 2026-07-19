@@ -106,6 +106,9 @@ class RPCConnectionHandler(ConnectionHandler):
                 kv_cache_token_capacity=node.kv_cache_token_capacity,
                 kv_cache_block_size=node.kv_cache_block_size,
                 max_concurrent_requests=node.max_concurrent_requests,
+                direct_peer_ids=(
+                    sorted(node.direct_peer_ids) if node.direct_peer_ids is not None else None
+                ),
             )
             # Return current layer allocation to node
             layer_allocation = self.get_layer_allocation(node.node_id)
@@ -189,8 +192,29 @@ class RPCConnectionHandler(ConnectionHandler):
                         "enable_weight_refit": self.scheduler.enable_weight_refit,
                         "weight_refit_mode": self.scheduler.weight_refit_mode,
                         "chunked_prefill_size": self.scheduler.negotiated_chunked_prefill_size(),
+                        "outbound_peer_ids": self._outbound_peer_ids(
+                            current_node_id,
+                            end_layer,
+                            list_node_allocations,
+                        ),
                     }
         return {}
+
+    def _outbound_peer_ids(
+        self,
+        current_node_id: str,
+        end_layer: int,
+        allocations,
+    ):
+        """Return every peer that can follow this shard in a cyclic pipeline."""
+        next_start = 0 if end_layer == self.scheduler.num_layers else end_layer
+        return sorted(
+            node_id
+            for node_id, candidate_start, candidate_end in allocations
+            if node_id != current_node_id
+            and candidate_start == next_start
+            and candidate_end > candidate_start
+        )
 
     def build_node(self, node_json: dict):
         node = Node(
@@ -210,6 +234,11 @@ class RPCConnectionHandler(ConnectionHandler):
             is_active=node_json.get("is_active", True),
             manual_layer_assignment=node_json.get("manual_layer_assignment", False),
             last_refit_time=node_json.get("last_refit_time", 0.0),
+            direct_peer_ids=(
+                set(node_json["direct_peer_ids"])
+                if node_json.get("direct_peer_ids") is not None
+                else None
+            ),
         )
         if node_json.get("start_layer", None) is not None:
             node.start_layer = node_json.get("start_layer")

@@ -305,6 +305,7 @@ class Scheduler:
         kv_cache_token_capacity: Optional[int] = None,
         kv_cache_block_size: Optional[int] = None,
         max_concurrent_requests: Optional[int] = None,
+        direct_peer_ids: Optional[List[str]] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
@@ -329,6 +330,8 @@ class Scheduler:
             node.kv_cache_block_size = int(kv_cache_block_size)
         if max_concurrent_requests is not None:
             node.max_concurrent_requests = int(max_concurrent_requests)
+        if direct_peer_ids is not None:
+            node.direct_peer_ids = set(direct_peer_ids)
         node.last_heartbeat = time.time()
 
     # Async-style event enqueuers for main loop
@@ -358,6 +361,7 @@ class Scheduler:
         kv_cache_token_capacity: Optional[int] = None,
         kv_cache_block_size: Optional[int] = None,
         max_concurrent_requests: Optional[int] = None,
+        direct_peer_ids: Optional[List[str]] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -374,6 +378,7 @@ class Scheduler:
                 kv_cache_token_capacity,
                 kv_cache_block_size,
                 max_concurrent_requests,
+                direct_peer_ids,
             )
         )
         self._wake_event.set()
@@ -763,6 +768,7 @@ class Scheduler:
                     kv_cache_token_capacity,
                     kv_cache_block_size,
                     max_concurrent_requests,
+                    direct_peer_ids,
                 ) = self._pending_node_updates.get_nowait()
             except queue.Empty:
                 break
@@ -783,6 +789,7 @@ class Scheduler:
                 kv_cache_token_capacity=kv_cache_token_capacity,
                 kv_cache_block_size=kv_cache_block_size,
                 max_concurrent_requests=max_concurrent_requests,
+                direct_peer_ids=direct_peer_ids,
             )
 
         # Manual allocations can complete before their executors finish loading.

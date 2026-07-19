@@ -12,7 +12,7 @@ Scheduling primitives for distributed LLM inference.
 import time
 from dataclasses import dataclass, field
 from math import floor, isfinite
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from parallax_utils.logging_config import get_logger
 from scheduling.model_info import ModelInfo
@@ -222,6 +222,10 @@ class Node:
     load_compensator: float = 0.05
 
     rtt_to_nodes: Optional[Dict[str, float]] = None
+    # ``None`` preserves compatibility with workers that predate direct-link
+    # qualification.  New workers publish an explicit set (possibly empty),
+    # allowing routing to fail closed when Lattica only has a relayed path.
+    direct_peer_ids: Optional[Set[str]] = None
 
     _force_max_concurrent_requests: bool = False
 
@@ -388,6 +392,8 @@ class Node:
             # The reloaded executor must measure and publish it again.
             self.kv_cache_token_capacity = None
             self.kv_cache_block_size = None
+            if self.direct_peer_ids is not None:
+                self.direct_peer_ids = set()
         self.start_layer = start_layer
         self.end_layer = end_layer
 
@@ -397,6 +403,8 @@ class Node:
         self.end_layer = None
         self.kv_cache_token_capacity = None
         self.kv_cache_block_size = None
+        if self.direct_peer_ids is not None:
+            self.direct_peer_ids = set()
 
     def clear_serving_state(self) -> None:
         """Clear serving/runtime state for this node.
@@ -458,6 +466,14 @@ class Node:
         """Update RTT measurement to another node."""
         self.rtt_to_nodes[target_node_id] = rtt_ms
 
+    def can_forward_to(self, other: "Node") -> bool:
+        """Return whether this worker has qualified a direct RPC path to ``other``."""
+        if self.node_id == other.node_id:
+            return True
+        if self.direct_peer_ids is None:
+            return True
+        return other.node_id in self.direct_peer_ids
+
     def get_rtt_to(self, other: "Node") -> float:
         """Get RTT to another node from cached RTTs.
 
@@ -492,7 +508,12 @@ class Node:
                         other_rtt = float(other.rtt_to_nodes[peer_id])
                     except (TypeError, ValueError):
                         continue
-                    if self_rtt >= 0 and other_rtt >= 0 and isfinite(self_rtt) and isfinite(other_rtt):
+                    if (
+                        self_rtt >= 0
+                        and other_rtt >= 0
+                        and isfinite(self_rtt)
+                        and isfinite(other_rtt)
+                    ):
                         estimates.append(self_rtt + other_rtt)
                 if estimates:
                     estimated_rtt = min(estimates)

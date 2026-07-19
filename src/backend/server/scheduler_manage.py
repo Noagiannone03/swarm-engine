@@ -197,6 +197,12 @@ class SchedulerManage:
             "kv_cache_block_size": getattr(node, "kv_cache_block_size", None),
             "reserved_context_tokens": getattr(node, "reserved_context_tokens", 0),
             "remaining_context_tokens": getattr(node, "remaining_context_tokens", None),
+            "direct_link_telemetry_ready": getattr(node, "direct_peer_ids", None) is not None,
+            "direct_peer_ids": (
+                sorted(node.direct_peer_ids)
+                if getattr(node, "direct_peer_ids", None) is not None
+                else None
+            ),
         }
 
     def _start_scheduler(self, model_name, init_nodes_num):

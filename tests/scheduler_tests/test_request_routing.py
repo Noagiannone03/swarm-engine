@@ -40,7 +40,12 @@ def test_optimal_path_simple_chain():
     node_ids, latency = router.find_optimal_path()
 
     assert node_ids == ["n1", "n2"]
-    expected = float(n1.layer_latency_ms) + float(n1.get_rtt_to(n2)) + float(n2.layer_latency_ms)
+    expected = (
+        float(n1.layer_latency_ms)
+        + float(n1.get_rtt_to(n2))
+        + float(n2.layer_latency_ms)
+        + float(n2.get_rtt_to(n1))
+    )
     assert latency == pytest.approx(expected, rel=1e-6)
 
 
@@ -140,6 +145,55 @@ def test_optimal_path_missing_rtt():
     assert latency == float("inf")
 
 
+@pytest.mark.parametrize(
+    ("head_direct", "tail_direct"),
+    [([], ["head"]), (["tail"], [])],
+)
+def test_dp_rejects_pipeline_with_unqualified_direct_hop(head_direct, tail_direct):
+    """Both the forward edge and cyclic return edge must pass the RPC probe."""
+    model = build_model(12)
+    head = build_node("head", model)
+    tail = build_node("tail", model)
+    head.set_layer_allocation(0, 6)
+    tail.set_layer_allocation(6, 12)
+    head.direct_peer_ids = set(head_direct)
+    tail.direct_peer_ids = set(tail_direct)
+    set_rtt_from_coords([head, tail])
+
+    node_manager = build_node_management([head, tail])
+    node_manager.activate([head.node_id, tail.node_id])
+
+    assert DynamicProgrammingRouting(node_manager, total_layers=12).find_optimal_path() == (
+        [],
+        float("inf"),
+    )
+
+
+def test_dp_selects_redundant_pipeline_with_complete_direct_cycle():
+    model = build_model(12)
+    broken_head = build_node("broken-head", model, tflops=1000.0, x=0.0, y=0.0)
+    broken_tail = build_node("broken-tail", model, tflops=1000.0, x=1.0, y=0.0)
+    ready_head = build_node("ready-head", model, tflops=100.0, x=0.0, y=1.0)
+    ready_tail = build_node("ready-tail", model, tflops=100.0, x=1.0, y=1.0)
+    for head in (broken_head, ready_head):
+        head.set_layer_allocation(0, 6)
+    for tail in (broken_tail, ready_tail):
+        tail.set_layer_allocation(6, 12)
+    broken_head.direct_peer_ids = {broken_tail.node_id}
+    broken_tail.direct_peer_ids = set()
+    ready_head.direct_peer_ids = {ready_tail.node_id}
+    ready_tail.direct_peer_ids = {ready_head.node_id}
+    nodes = [broken_head, broken_tail, ready_head, ready_tail]
+    set_rtt_from_coords(nodes)
+
+    node_manager = build_node_management(nodes)
+    node_manager.activate([node.node_id for node in nodes])
+    path, latency = DynamicProgrammingRouting(node_manager, total_layers=12).find_optimal_path()
+
+    assert path == [ready_head.node_id, ready_tail.node_id]
+    assert latency < float("inf")
+
+
 def test_rtt_cold_start_uses_best_common_peer_measurements():
     """A common Lattica peer makes a fresh worker pair routable."""
     model = build_model(12)
@@ -234,6 +288,10 @@ def test_optimal_path_parametrized(
         if i > 0:
             prev = next(n for n in nodes if n.node_id == node_ids[i - 1])
             total += float(prev.get_rtt_to(n))
+    if len(node_ids) > 1:
+        tail = next(n for n in nodes if n.node_id == node_ids[-1])
+        head = next(n for n in nodes if n.node_id == node_ids[0])
+        total += float(tail.get_rtt_to(head))
     assert latency == pytest.approx(total, rel=1e-6)
 
 
@@ -298,11 +356,14 @@ def test_round_robin_pipelines_cycle_between_two_complete_paths():
     for _ in range(4):
         node_ids, latency = rr.find_optimal_path()
         assert node_ids in (["a", "b"], ["c", "d"])
-        # Latency equals sum of node latencies plus one RTT
+        # Latency includes both directions of the cyclic pipeline.
         n0 = next(n for n in nodes if n.node_id == node_ids[0])
         n1 = next(n for n in nodes if n.node_id == node_ids[1])
         expected = (
-            float(n0.layer_latency_ms) + float(n0.get_rtt_to(n1)) + float(n1.layer_latency_ms)
+            float(n0.layer_latency_ms)
+            + float(n0.get_rtt_to(n1))
+            + float(n1.layer_latency_ms)
+            + float(n1.get_rtt_to(n0))
         )
         assert latency == pytest.approx(expected, rel=1e-6)
         paths.append(tuple(node_ids))
@@ -342,7 +403,10 @@ def test_round_robin_skips_overloaded_pipeline():
         assert node_ids == ["p2a", "p2b"]
         n0, n1 = p2a, p2b
         expected = (
-            float(n0.layer_latency_ms) + float(n0.get_rtt_to(n1)) + float(n1.layer_latency_ms)
+            float(n0.layer_latency_ms)
+            + float(n0.get_rtt_to(n1))
+            + float(n1.layer_latency_ms)
+            + float(n1.get_rtt_to(n0))
         )
         assert latency == pytest.approx(expected, rel=1e-6)
 

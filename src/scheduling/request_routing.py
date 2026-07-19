@@ -65,7 +65,8 @@ def estimate_pipeline_latency(
 ) -> float:
     """Estimate end-to-end latency for a node-id pipeline.
 
-    Returns `inf` if any node is missing, overloaded, or if any required RTT is missing.
+    Returns `inf` if any node is missing, overloaded, or if one hop in the
+    cyclic execution route has not been qualified as direct.
     """
     total = 0.0
     prev: Optional[Node] = None
@@ -78,11 +79,22 @@ def estimate_pipeline_latency(
             return float("inf")
         total += node_lat
         if prev is not None:
+            if not prev.can_forward_to(n):
+                return float("inf")
             hop = 0.0 if prev.node_id == n.node_id else float(prev.get_rtt_to(n))
             if hop == float("inf"):
                 return float("inf")
             total += hop
         prev = n
+    if len(pipeline_node_ids) > 1:
+        head = id_to_node[pipeline_node_ids[0]]
+        tail = id_to_node[pipeline_node_ids[-1]]
+        if not tail.can_forward_to(head):
+            return float("inf")
+        closure_rtt = float(tail.get_rtt_to(head))
+        if closure_rtt == float("inf"):
+            return float("inf")
+        total += closure_rtt
     return total
 
 
@@ -361,77 +373,91 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
         if num_layers <= 0 or not nodes:
             return [], 0.0
 
-        # Collect vertices from nodes with valid layer ranges
+        # Collect vertices from nodes with valid layer ranges.
         starts: Dict[int, List[int]] = {}
         ends: Dict[int, List[int]] = {}
+        eligible: List[int] = []
         for idx, n in enumerate(nodes):
             if (
                 n.start_layer is None
                 or n.end_layer is None
+                or n.end_layer <= n.start_layer
                 or n.is_active is False
                 or not n.can_accept_request(required_context_tokens)
             ):
                 continue
+            eligible.append(idx)
             starts.setdefault(n.start_layer, []).append(idx)
             ends.setdefault(n.end_layer, []).append(idx)
 
-        # DP over vertices sorted by (start, end)
+        # The first shard matters because the last shard forwards every decode
+        # step back to it. Run one DP per possible head so that the terminal
+        # cycle can be checked without losing head identity in merged states.
         order = [
             i
             for i, n in sorted(
-                [
-                    (i, n)
-                    for i, n in enumerate(nodes)
-                    if n.start_layer is not None
-                    and n.end_layer is not None
-                    and n.can_accept_request(required_context_tokens)
-                ],
+                [(i, nodes[i]) for i in eligible],
                 key=lambda p: (p[1].start_layer, p[1].end_layer),
             )
         ]
-
-        dp: Dict[int, float] = {i: float("inf") for i in order}
-        parent: Dict[int, Optional[int]] = {i: None for i in order}
-
-        # Initialize with nodes starting at layer 0
-        for i in starts.get(0, []):
-            dp[i] = float(nodes[i].layer_latency_ms)
-            parent[i] = None
-
-        # Transitions: j -> i if end(j) == start(i)
-        for i in order:
-            if dp[i] == float("inf"):
-                # Not reachable yet; still try to relax successors using INF + ... won't help
-                pass
-            n_i = nodes[i]
-            if n_i.start_layer is None:
-                continue
-            for j in ends.get(n_i.start_layer, []):
-                if dp[j] == float("inf"):
-                    continue
-                n_j = nodes[j]
-                trans = 0.0 if n_j.node_id == n_i.node_id else float(n_j.get_rtt_to(n_i))
-                cand = dp[j] + trans + float(n_i.layer_latency_ms)
-                if cand < dp[i]:
-                    dp[i] = cand
-                    parent[i] = j
-
-        # Pick best terminal node that ends at num_layers
         terminals = ends.get(num_layers, [])
-        if not terminals:
-            return [], float("inf")
-        end_idx = min(terminals, key=lambda k: dp.get(k, float("inf")))
-        if dp.get(end_idx, float("inf")) == float("inf"):
+        heads = starts.get(0, [])
+        if not terminals or not heads:
             return [], float("inf")
 
-        # Reconstruct path
-        path_indices: List[int] = []
-        cur: Optional[int] = end_idx
-        while cur is not None:
-            path_indices.append(cur)
-            cur = parent[cur]
-        path_indices.reverse()
-        return [nodes[i].node_id for i in path_indices], dp[end_idx]
+        best_path: List[str] = []
+        best_latency = float("inf")
+        for head_idx in heads:
+            dp: Dict[int, float] = {i: float("inf") for i in order}
+            parent: Dict[int, Optional[int]] = {i: None for i in order}
+            dp[head_idx] = float(nodes[head_idx].layer_latency_ms)
+
+            for i in order:
+                n_i = nodes[i]
+                if i == head_idx or n_i.start_layer is None:
+                    continue
+                for j in ends.get(n_i.start_layer, []):
+                    if dp[j] == float("inf"):
+                        continue
+                    n_j = nodes[j]
+                    if not n_j.can_forward_to(n_i):
+                        continue
+                    transition_rtt = float(n_j.get_rtt_to(n_i))
+                    if transition_rtt == float("inf"):
+                        continue
+                    candidate = dp[j] + transition_rtt + float(n_i.layer_latency_ms)
+                    if candidate < dp[i]:
+                        dp[i] = candidate
+                        parent[i] = j
+
+            for terminal_idx in terminals:
+                route_latency = dp.get(terminal_idx, float("inf"))
+                if route_latency == float("inf"):
+                    continue
+                tail = nodes[terminal_idx]
+                head = nodes[head_idx]
+                if terminal_idx != head_idx:
+                    if not tail.can_forward_to(head):
+                        continue
+                    closure_rtt = float(tail.get_rtt_to(head))
+                    if closure_rtt == float("inf"):
+                        continue
+                    route_latency += closure_rtt
+                if route_latency >= best_latency:
+                    continue
+
+                path_indices: List[int] = []
+                cur: Optional[int] = terminal_idx
+                while cur is not None:
+                    path_indices.append(cur)
+                    cur = parent[cur]
+                path_indices.reverse()
+                if not path_indices or path_indices[0] != head_idx:
+                    continue
+                best_path = [nodes[i].node_id for i in path_indices]
+                best_latency = route_latency
+
+        return best_path, best_latency
 
     def scheduler_format_snapshot(self) -> str:
         assignments = self.node_manager.list_node_allocations(self.total_layers)

@@ -19,6 +19,31 @@ class RecordingScheduler:
         return []
 
 
+class AllocationScheduler:
+    def __init__(self):
+        self.model_info = build_model_info(12)
+        self.num_layers = 12
+        self.enable_weight_refit = False
+        self.weight_refit_mode = "disk"
+        self.nodes = {
+            node_id: build_node(node_id, self.model_info)
+            for node_id in ("head-a", "head-b", "tail-a", "tail-b")
+        }
+        for node_id in ("head-a", "head-b"):
+            self.nodes[node_id].set_layer_allocation(0, 6)
+        for node_id in ("tail-a", "tail-b"):
+            self.nodes[node_id].set_layer_allocation(6, 12)
+
+    def list_node_allocations(self):
+        return [(node.node_id, node.start_layer, node.end_layer) for node in self.nodes.values()]
+
+    def get_node(self, node_id):
+        return self.nodes.get(node_id)
+
+    def negotiated_chunked_prefill_size(self):
+        return 0
+
+
 def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
     scheduler = RecordingScheduler()
     handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
@@ -47,6 +72,7 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
             "is_active": True,
             "start_layer": 0,
             "end_layer": 12,
+            "direct_peer_ids": ["downstream-worker"],
         }
     )
 
@@ -59,6 +85,18 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
     assert update["kv_cache_token_capacity"] == 131072
     assert update["kv_cache_block_size"] == 32
     assert update["max_concurrent_requests"] == 1
+    assert update["direct_peer_ids"] == ["downstream-worker"]
+
+
+def test_layer_allocation_returns_all_possible_cyclic_outbound_peers():
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = AllocationScheduler()
+
+    head = handler.get_layer_allocation("head-a")
+    tail = handler.get_layer_allocation("tail-a")
+
+    assert head["outbound_peer_ids"] == ["tail-a", "tail-b"]
+    assert tail["outbound_peer_ids"] == ["head-a", "head-b"]
 
 
 def test_build_node_preserves_frontend_capability():

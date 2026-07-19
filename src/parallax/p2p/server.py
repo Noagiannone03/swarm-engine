@@ -178,6 +178,12 @@ class TransformerConnectionHandler(ConnectionHandler):
         return forward_pb2.ForwardResponse()
 
     @rpc_method
+    def rpc_health(self, request):
+        """Return this peer's identity after Lattica qualified the RPC path."""
+        del request
+        return {"peer_id": self.lattica_instance.peer_id()}
+
+    @rpc_method
     def rpc_abort(
         self,
         request: forward_pb2.AbortRequest,
@@ -443,6 +449,8 @@ class GradientServer:
         self.routing_table_updater = None
         self.announcer = None
         self.connection_handler = None
+        self.outbound_peer_ids = []
+        self.direct_peer_ids = []
         self.stop_event = threading.Event()
         logger.debug(f"manual_layer_assignment: {self.manual_layer_assignment}")
         self._layer_allocation_changed = False
@@ -580,6 +588,7 @@ class GradientServer:
                 self.enable_weight_refit = response.get("enable_weight_refit")
                 self.weight_refit_mode = response.get("weight_refit_mode")
                 self.chunked_prefill_size = int(response.get("chunked_prefill_size", 0))
+                self._update_outbound_peers(response)
 
                 # Sync to shared state if available
                 self._sync_to_shared_state()
@@ -625,6 +634,48 @@ class GradientServer:
         if peer_id not in self.stubs:
             self.stubs[peer_id] = self.connection_handler.get_stub(peer_id)
         return self.stubs[peer_id]
+
+    def _update_outbound_peers(self, allocation):
+        """Store scheduler-selected candidates for this shard's next stage."""
+        peers = allocation.get("outbound_peer_ids") if isinstance(allocation, dict) else None
+        if peers is not None:
+            self.outbound_peer_ids = sorted(
+                {str(peer_id) for peer_id in peers if str(peer_id) != self.lattica.peer_id()}
+            )
+
+    def _probe_outbound_peers(self):
+        """Use the registered Parallax RPC service to qualify direct paths."""
+        if self.connection_handler is None:
+            return None
+        if self.stop_event.is_set():
+            return self.direct_peer_ids
+
+        pending = {}
+        for peer_id in self.outbound_peer_ids:
+            try:
+                pending[peer_id] = self.get_stub(peer_id).rpc_health({})
+            except Exception:
+                logger.debug("Could not start direct-path probe to %s", peer_id, exc_info=True)
+
+        direct = []
+        for peer_id, future in pending.items():
+            try:
+                response = future.result(timeout=5) if hasattr(future, "result") else future
+                if isinstance(response, dict) and response.get("peer_id") == peer_id:
+                    direct.append(peer_id)
+            except Exception:
+                # Lattica's official RPC client rejects relay-only connections.
+                logger.debug("Direct-path probe to %s failed", peer_id, exc_info=True)
+
+        direct.sort()
+        if direct != self.direct_peer_ids:
+            logger.info(
+                "Qualified direct outbound peers: %s/%s",
+                direct,
+                self.outbound_peer_ids,
+            )
+        self.direct_peer_ids = direct
+        return direct
 
     def start_routing_table_updater(self):
         def _updater_thread():
@@ -815,6 +866,7 @@ class GradientServer:
 
                             # Print layer allocation information
                             if response and isinstance(response, dict):
+                                self._update_outbound_peers(response)
                                 start_layer = response.get("start_layer")
                                 end_layer = response.get("end_layer")
                                 model_name = response.get("model_name")
@@ -934,6 +986,7 @@ class GradientServer:
         return self.status.value
 
     def get_node_info(self, is_update: bool = False):
+        direct_peer_ids = self._probe_outbound_peers()
         # update rtt to nodes
         if time.time() - self.rtt_last_update > self.rtt_update_interval:
             self.rtts = {}
@@ -1009,6 +1062,8 @@ class GradientServer:
         if runtime_kv_capacity is not None and runtime_kv_block_size is not None:
             info["kv_cache_token_capacity"] = int(runtime_kv_capacity)
             info["kv_cache_block_size"] = int(runtime_kv_block_size)
+        if direct_peer_ids is not None:
+            info["direct_peer_ids"] = direct_peer_ids
 
         # For manual layer assignment, always include start_layer and end_layer
         if self.manual_layer_assignment:
