@@ -214,7 +214,12 @@ async def openai_v1_chat_completions(raw_request: Request):
 
     request_id = uuid.uuid4()
     received_ts = time.time()
-    return await request_handler.v1_chat_completions(request_data, request_id, received_ts)
+    return await request_handler.v1_chat_completions(
+        request_data,
+        request_id,
+        received_ts,
+        raw_request.is_disconnected,
+    )
 
 
 # Disable caching for index.html

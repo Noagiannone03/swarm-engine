@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 
 from fastapi.testclient import TestClient
 
@@ -81,6 +82,31 @@ class CancellableResponse:
 
     def cancel(self):
         self.cancelled = True
+
+
+class BlockingCancellableResponse:
+    def __init__(self):
+        self.cancelled = False
+        self._cancelled = threading.Event()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._cancelled.wait(timeout=5)
+        return b'{"choices":[]}'
+
+    def cancel(self):
+        self.cancelled = True
+        self._cancelled.set()
+
+
+class BlockingStub:
+    def __init__(self):
+        self.response = BlockingCancellableResponse()
+
+    def chat_completion(self, request):
+        return self.response
 
 
 def test_prepare_backend_request_uses_vllm_xargs_for_parallax_metadata():
@@ -274,6 +300,30 @@ def test_forward_request_preserves_non_stream_downstream_status_and_content_type
     assert response.body == body
     assert response.headers["content-type"] == "application/json; charset=utf-8"
     assert scheduler_manage.released == ["scheduler-req"]
+
+
+def test_non_stream_disconnect_cancels_rpc_and_releases_route():
+    handler = RequestHandler()
+    scheduler_manage = ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    stub = BlockingStub()
+    handler.stubs["node-a"] = stub
+
+    async def disconnected():
+        return True
+
+    response = asyncio.run(
+        handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}]},
+            "disconnected-req",
+            1.0,
+            disconnected,
+        )
+    )
+
+    assert response.status_code == 499
+    assert stub.response.cancelled
+    assert scheduler_manage.released == ["disconnected-req"]
 
 
 def test_streaming_request_releases_route_after_completion():

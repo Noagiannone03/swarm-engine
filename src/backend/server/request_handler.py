@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
 from fastapi.responses import Response, StreamingResponse
@@ -20,6 +20,10 @@ logger = get_logger(__name__)
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 PARALLAX_ROUTING_TABLE_XARG = "parallax_routing_table"
 PARALLAX_SCHEDULER_REQUEST_ID_XARG = "parallax_scheduler_request_id"
+
+
+class ClientDisconnectedError(Exception):
+    """Raised when the scheduler's HTTP client leaves before a reply is ready."""
 
 
 class RequestHandler:
@@ -59,6 +63,29 @@ class RequestHandler:
             await asyncio.sleep(self.RETRY_DELAY_SEC)
             return
         await asyncio.to_thread(wait, self.RETRY_DELAY_SEC)
+
+    async def _next_chunk_until_disconnect(
+        self,
+        response,
+        is_disconnected: Optional[Callable[[], Awaitable[bool]]],
+    ) -> bytes:
+        """Wait for one blocking RPC chunk while observing the inbound HTTP socket."""
+        next_chunk = asyncio.create_task(anext(iterate_in_threadpool(response)))
+        if is_disconnected is None:
+            return await next_chunk
+
+        try:
+            while not next_chunk.done():
+                if await is_disconnected():
+                    response.cancel()
+                    next_chunk.cancel()
+                    raise ClientDisconnectedError
+                await asyncio.sleep(0.1)
+            return await next_chunk
+        except BaseException:
+            if not next_chunk.done():
+                next_chunk.cancel()
+            raise
 
     def _get_model_name_for_node(self, node_id: str) -> Optional[str]:
         try:
@@ -110,7 +137,13 @@ class RequestHandler:
         backend_request["vllm_xargs"] = vllm_xargs
         return backend_request
 
-    async def _forward_request(self, request_data: Dict, request_id: str, received_ts: int):
+    async def _forward_request(
+        self,
+        request_data: Dict,
+        request_id: str,
+        received_ts: int,
+        is_disconnected: Optional[Callable[[], Awaitable[bool]]] = None,
+    ):
         start_time = time.time()
         logger.debug(f"Forwarding request {request_id}; stream={request_data.get('stream', False)}")
         if (
@@ -283,7 +316,10 @@ class RequestHandler:
                 else:
                     try:
                         response = stub.chat_completion(backend_request)
-                        content = await anext(iterate_in_threadpool(response))
+                        content = await self._next_chunk_until_disconnect(
+                            response,
+                            is_disconnected,
+                        )
                         decoded_response = decode_http_response_envelope(content)
                         if decoded_response is None:
                             status_code = 200
@@ -300,6 +336,9 @@ class RequestHandler:
                         )
                     finally:
                         self._release_route(request_id)
+            except ClientDisconnectedError:
+                logger.info("Client disconnected before request %s completed", request_id)
+                return Response(status_code=499)
             except Exception as e:
                 self._release_route(request_id)
                 forward_attempts += 1
@@ -315,5 +354,16 @@ class RequestHandler:
             code="upstream_error",
         )
 
-    async def v1_chat_completions(self, request_data: Dict, request_id: str, received_ts: int):
-        return await self._forward_request(request_data, request_id, received_ts)
+    async def v1_chat_completions(
+        self,
+        request_data: Dict,
+        request_id: str,
+        received_ts: int,
+        is_disconnected: Optional[Callable[[], Awaitable[bool]]] = None,
+    ):
+        return await self._forward_request(
+            request_data,
+            request_id,
+            received_ts,
+            is_disconnected,
+        )
