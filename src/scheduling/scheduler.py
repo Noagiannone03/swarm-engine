@@ -257,7 +257,20 @@ class Scheduler:
             return False
 
         # Perform global allocation
-        success = self.layer_allocator.allocate_from_standby()
+        try:
+            success = self.layer_allocator.allocate_from_standby()
+        except Exception:
+            # A malformed or unexpectedly infeasible allocation must not strand
+            # a worker's synchronous join RPC.  Roll back any partial bootstrap
+            # so a later capacity update or node join can retry cleanly.
+            logger.exception("Global allocation raised; rolling back partial bootstrap")
+            for node in list(self.node_manager.active_nodes):
+                try:
+                    self.layer_allocator.deallocate(node)
+                except Exception:
+                    logger.exception("Failed to roll back allocation for node %s", node.node_id)
+            self._bootstrapped_event.clear()
+            return False
         if not success:
             logger.warning("Global allocation failed to produce a full pipeline")
             # Stay un-bootstrapped so future joins can retry bootstrap.

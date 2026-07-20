@@ -847,7 +847,10 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
         )
         num_nodes = len(available_nodes)
         total_cap = sum(node.get_decoder_layer_capacity() for node in available_nodes)
-        frontend_nodes = sum(node.supports_frontend for node in available_nodes)
+        frontend_nodes = sum(
+            node.supports_frontend and node.get_decoder_layer_capacity(include_input_embed=True) > 0
+            for node in available_nodes
+        )
 
         if num_layers <= 0 or num_nodes == 0 or frontend_nodes == 0 or total_cap < num_layers:
             logger.warning(
@@ -947,8 +950,26 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
                     c_start = available_nodes[i].get_decoder_layer_capacity(
                         include_input_embed=True
                     )
+                    # A pipeline head must fit the embedding and at least one
+                    # decoder layer.  Treating a zero/negative endpoint budget
+                    # as usable lets the DP produce a path which the
+                    # water-filling pass can never materialize.
+                    if c_start <= 0:
+                        path[(i, open_residuals, finished_pipes)] = best_action
+                        return best_cost
+
                     r_new = num_layers - c_start
                     if r_new <= 0:
+                        # A one-node pipeline also owns the LM head.  The input
+                        # embedding-only capacity is not a sufficient closing
+                        # test when the model does not tie those weights.
+                        c_single = available_nodes[i].get_decoder_layer_capacity(
+                            include_input_embed=True,
+                            include_lm_head=True,
+                        )
+                        if c_single < num_layers:
+                            path[(i, open_residuals, finished_pipes)] = best_action
+                            return best_cost
                         cost = 1 + dp(i + 1, open_residuals, finished_pipes + 1)
                         if cost < best_cost:
                             best_cost = cost

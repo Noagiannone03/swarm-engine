@@ -26,6 +26,34 @@ def test_scheduler_rejects_unknown_allocation_and_routing_strategies():
         Scheduler(model, [], routing_strategy="unknown")  # type: ignore[arg-type]
 
 
+def test_bootstrap_rolls_back_partial_allocation_after_allocator_exception(monkeypatch):
+    model = build_model_info(12)
+    node = build_node("partial", model, mem_gb=80.0)
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+
+    def fail_after_first_allocation():
+        sched.layer_allocator.allocate(node, 0, 6)
+        raise RuntimeError("synthetic allocator failure")
+
+    monkeypatch.setattr(
+        sched.layer_allocator,
+        "allocate_from_standby",
+        fail_after_first_allocation,
+    )
+
+    assert not sched.bootstrap()
+    assert sched.node_manager.num_active_nodes == 0
+    assert sched.node_manager.num_standby_nodes == 1
+    assert node.start_layer is None
+    assert node.end_layer is None
+
+
 def test_scheduler_initialize_and_dispatch():
     """Allocate, then enqueue one request and dispatch it."""
     model = build_model_info(12)

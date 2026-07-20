@@ -339,6 +339,102 @@ def test_dp_allocation_is_independent_of_frontend_worker_join_order():
     assert tail.end_layer == model.num_layers
 
 
+def test_dp_rejects_infeasible_frontend_then_recovers_with_safe_parameter_budget():
+    """The measured Mac/RTX topology stays retryable after an infeasible head budget."""
+    model = ModelInfo(
+        model_name="Qwen/Qwen3-1.7B",
+        mlx_model_name="Qwen/Qwen3-1.7B",
+        head_size=128,
+        hidden_dim=2048,
+        intermediate_dim=6144,
+        num_attention_heads=16,
+        num_kv_heads=8,
+        vocab_size=151936,
+        num_layers=28,
+        param_bytes_per_element=2,
+        mlx_param_bytes_per_element=2,
+        cache_bytes_per_element=2,
+        embedding_bytes_per_element=2,
+    )
+    mac_hardware = NodeHardwareInfo(
+        "mac",
+        1,
+        7.18,
+        "Apple M4",
+        16.0,
+        100.0,
+        "mlx",
+        usable_memory_bytes=4_388_208_640,
+    )
+    windows_hardware = NodeHardwareInfo(
+        "windows",
+        1,
+        50.0,
+        "NVIDIA GeForce RTX 4080 SUPER",
+        16.0,
+        600.0,
+        "cuda",
+        usable_memory_bytes=14_152_630_272,
+    )
+    head = Node(
+        node_id="mac",
+        hardware=mac_hardware,
+        model_info=model,
+        param_mem_ratio=0.05,
+        supports_frontend=True,
+    )
+    tail = Node(
+        node_id="windows",
+        hardware=windows_hardware,
+        model_info=model,
+        param_mem_ratio=0.65,
+        supports_frontend=False,
+    )
+    node_management = build_node_management([head, tail])
+    allocator = DynamicProgrammingLayerAllocator(
+        model_info=model,
+        node_management=node_management,
+        dynamic_pipelines_router=True,
+    )
+
+    assert head.get_decoder_layer_capacity() == 2
+    assert head.get_decoder_layer_capacity(include_input_embed=True) < 0
+    assert not allocator.allocate_from_standby()
+    assert node_management.num_active_nodes == 0
+    assert node_management.num_standby_nodes == 2
+
+    # The product default is 0.65.  The worker's live process envelope still
+    # caps the absolute bytes, while this split leaves enough of that envelope
+    # for the embedding and the Mac's decoder stage.
+    head.param_mem_ratio = 0.65
+    assert head.get_decoder_layer_capacity(include_input_embed=True) > 0
+    assert allocator.allocate_from_standby()
+    assert node_management.has_full_pipeline(model.num_layers)
+    assert head.start_layer == 0
+    assert tail.start_layer is not None and tail.start_layer > 0
+    assert tail.end_layer == model.num_layers
+
+
+def test_dp_single_node_requires_both_model_endpoints():
+    model = build_model_info(5)
+    node = _build_node("a100-40g", model)
+    node.param_mem_ratio = 0.41
+    assert node.get_decoder_layer_capacity(include_input_embed=True) >= model.num_layers
+    assert (
+        node.get_decoder_layer_capacity(include_input_embed=True, include_lm_head=True)
+        < model.num_layers
+    )
+    node_management = build_node_management([node])
+    allocator = DynamicProgrammingLayerAllocator(
+        model_info=model,
+        node_management=node_management,
+        trim_layers_on_turning_points=False,
+    )
+
+    assert not allocator.allocate_from_standby()
+    assert node_management.num_active_nodes == 0
+
+
 @pytest.mark.parametrize("strategy", ["greedy", "dp"])
 def test_allocator_refuses_cluster_without_frontend_capability(
     strategy: Literal["greedy", "dp"],
