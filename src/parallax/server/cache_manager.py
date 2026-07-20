@@ -9,6 +9,7 @@ from parallax.server.cache.dsa_cache import DeepSeekSparseCache
 from parallax.server.cache.kv_cache import KVCachePacked
 from parallax.server.cache.linear_cache import LinearCache
 from parallax.server.cache.msa_cache import MSACache
+from parallax.server.memory_budget import current_mlx_memory_budget
 from parallax.utils.layer_types import (
     ATTENTION,
     ATTENTION_LAYER_TYPES,
@@ -56,6 +57,7 @@ class CacheManager:
         enable_prefix_cache: bool = False,
         sliding_window: Optional[int] = None,
         chunked_prefill_size: Optional[int] = None,
+        mlx_process_limit_bytes: Optional[int] = None,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -85,6 +87,7 @@ class CacheManager:
         self.linear_num_k_heads = linear_num_k_heads
         self.linear_num_v_heads = linear_num_v_heads
         self.cache_memory_fraction = cache_memory_fraction
+        self.mlx_process_limit_bytes = mlx_process_limit_bytes
 
         # Determine layer types
         if layer_types is None:
@@ -356,10 +359,24 @@ class CacheManager:
         cache_memory_fraction: float,
         dtype: mx.Dtype,
     ) -> Tuple[int, int]:
-        total_mem = mx.device_info()["max_recommended_working_set_size"]
         current_mem = mx.get_active_memory()
-        free_mem = total_mem - current_mem
-        available_for_cache = free_mem * cache_memory_fraction
+        budget = current_mlx_memory_budget(
+            mx,
+            process_limit_cap_bytes=self.mlx_process_limit_bytes,
+        )
+        # The old implementation used MLX's complete recommended working set,
+        # ignoring desktop pressure and PARALLAX_SYSTEM_RESERVE_GB. Size the
+        # fixed cache only from memory that can still be allocated without
+        # pushing macOS into swap. The process limit remains stable and leaves
+        # room for transient activations inside the same envelope.
+        available_for_cache = budget.additional_bytes * cache_memory_fraction
+        logger.info(
+            "Sizing MLX cache from %.2f GB safe additional memory "
+            "(active %.2f GB, process limit %.2f GB)",
+            budget.additional_bytes / 1024**3,
+            current_mem / 1024**3,
+            budget.process_limit_bytes / 1024**3,
+        )
 
         dtype_size = self._dtype_size(dtype)
 

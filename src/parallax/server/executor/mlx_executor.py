@@ -12,6 +12,7 @@ import numpy as np
 
 from parallax.server.cache_manager import CacheManager
 from parallax.server.executor.base_executor import BaseExecutor
+from parallax.server.memory_budget import configure_mlx_memory_limits
 from parallax.server.request import (
     InitialRequest,
     IntermediateRequest,
@@ -110,9 +111,12 @@ class MLXExecutor(BaseExecutor):
         )
 
         try:
-            mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+            self.mlx_memory_budget = configure_mlx_memory_limits(mx)
+        except RuntimeError:
+            raise
         except Exception:
-            logger.warning("Using mlx without metal backend.")
+            self.mlx_memory_budget = None
+            logger.warning("Using mlx without configurable Metal memory limits.")
 
         self.shard_loader = MLXModelLoader(
             model_repo,
@@ -237,6 +241,11 @@ class MLXExecutor(BaseExecutor):
             enable_prefix_cache=enable_prefix_cache,
             sliding_window=sliding_window,
             chunked_prefill_size=normalized_chunked_prefill_size,
+            mlx_process_limit_bytes=(
+                self.mlx_memory_budget.process_limit_bytes
+                if self.mlx_memory_budget is not None
+                else None
+            ),
         )
 
         self.chunked_prefill_size = normalized_chunked_prefill_size
@@ -282,7 +291,7 @@ class MLXExecutor(BaseExecutor):
         #     page_size=1,
         # )
         logger.debug(
-            f"mlx_executor initialized; wired_limit set; prefix_cache={'on' if self.enable_prefix_cache else 'off'}, total memory usage: {mx.get_active_memory() / 1024**3:.3f} GB"
+            f"mlx_executor initialized; bounded memory limits set; prefix_cache={'on' if self.enable_prefix_cache else 'off'}, total memory usage: {mx.get_active_memory() / 1024**3:.3f} GB"
         )
 
     def _tensor_parallel_broadcast_pyobj(self, broadcast_obj):

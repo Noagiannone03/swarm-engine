@@ -8,6 +8,7 @@ from parallax.launch import (
     _wait_executors_check_layer_change,
 )
 from parallax.p2p.server import ServerState
+from parallax.server.memory_budget import GIB, MemoryPressureController
 from parallax.utils.shared_state import SharedState
 
 
@@ -177,3 +178,64 @@ def test_frontend_exit_marks_generation_unready():
 
     assert shared_state.get_status() == ServerState.INITIALIZING.value
     assert shared_state.get("frontend_alive") is False
+
+
+class _FiniteExecutor:
+    def __init__(self, iterations):
+        self.iterations = iterations
+        self.join_count = 0
+
+    def is_alive(self):
+        return self.join_count < self.iterations
+
+    def join(self, timeout=None):
+        del timeout
+        self.join_count += 1
+
+
+def test_memory_warning_pauses_then_resumes_without_layer_reallocation(monkeypatch):
+    monkeypatch.setattr("parallax.launch.DEFAULT_PRESSURE_POLL_SECONDS", 0)
+    samples = iter([4 * GIB, 4 * GIB, 4 * GIB, 6 * GIB, 6 * GIB])
+    controller = MemoryPressureController(
+        system_reserve_bytes=6 * GIB,
+        warning_samples=3,
+        recovery_samples=2,
+    )
+    shared_state = SharedState.create()
+    shared_state.set_status(ServerState.READY.value)
+
+    changed = _wait_executors_check_layer_change(
+        shared_state,
+        [_FiniteExecutor(iterations=5)],
+        memory_pressure_controller=controller,
+        memory_available_reader=lambda: next(samples),
+    )
+
+    assert changed is False
+    assert shared_state.get_status() == ServerState.READY.value
+    assert shared_state.get("memory_pressure") == "normal"
+    assert shared_state.get_layer_allocation_changed() is False
+    assert shared_state.get("_memory_shutdown_requested") is False
+
+
+def test_critical_memory_requests_one_shutdown_after_drain(monkeypatch):
+    monkeypatch.setattr("parallax.launch.DEFAULT_PRESSURE_POLL_SECONDS", 0)
+    controller = MemoryPressureController(
+        system_reserve_bytes=6 * GIB,
+        critical_samples=1,
+    )
+    shared_state = SharedState.create()
+    shared_state.set_status(ServerState.READY.value)
+
+    changed = _wait_executors_check_layer_change(
+        shared_state,
+        [_FiniteExecutor(iterations=10)],
+        memory_pressure_controller=controller,
+        memory_available_reader=lambda: GIB,
+    )
+
+    assert changed is False
+    assert shared_state.get_status() == ServerState.INITIALIZING.value
+    assert shared_state.get("memory_pressure") == "critical"
+    assert shared_state.get("_memory_shutdown_requested") is True
+    assert shared_state.get_layer_allocation_changed() is False

@@ -20,7 +20,14 @@ def node_log_summary(message: object) -> dict:
     hardware = message.get("hardware")
     safe_hardware = {}
     if isinstance(hardware, dict):
-        for key in ("gpu_name", "device", "memory_gb", "usable_memory_bytes"):
+        for key in (
+            "gpu_name",
+            "device",
+            "memory_gb",
+            "usable_memory_bytes",
+            "system_available_memory_bytes",
+            "system_reserve_bytes",
+        ):
             if key in hardware:
                 safe_hardware[key] = hardware[key]
     return {
@@ -31,6 +38,7 @@ def node_log_summary(message: object) -> dict:
             "start_layer": message.get("start_layer"),
             "end_layer": message.get("end_layer"),
             "current_requests": message.get("current_requests"),
+            "memory_pressure": message.get("memory_pressure"),
             "hardware": safe_hardware,
         }.items()
         if value is not None and value != {}
@@ -288,6 +296,7 @@ class RPCConnectionHandler(ConnectionHandler):
         memory_gb = hardware_json.get("memory_gb")
         memory_bandwidth_gbps = hardware_json.get("memory_bandwidth_gbps")
         device = hardware_json.get("device")
+        usable_memory_bytes = hardware_json.get("usable_memory_bytes")
         return NodeHardwareInfo(
             node_id=node_id,
             num_gpus=num_gpus,
@@ -296,4 +305,5 @@ class RPCConnectionHandler(ConnectionHandler):
             memory_gb=memory_gb,
             memory_bandwidth_gbps=memory_bandwidth_gbps,
             device=device,
+            usable_memory_bytes=usable_memory_bytes,
         )

@@ -42,8 +42,8 @@ def test_capacity_sanity_check():
     model = build_model_info(36)
     print(f"decoder layer flops: {model.decoder_layer_flops}")
     print(f"lm head flops: {model.lm_head_flops}")
-    print(f"decoder layer io in GB: {model.decoder_layer_io_bytes(roofline=False) / (1024 ** 3)}")
-    print(f"embedding table in GB: {model.embedding_io_bytes / (1024 ** 3)}")
+    print(f"decoder layer io in GB: {model.decoder_layer_io_bytes(roofline=False) / (1024**3)}")
+    print(f"embedding table in GB: {model.embedding_io_bytes / (1024**3)}")
 
     for gpu_type in ["a100-80g", "a100-40g", "rtx5090", "rtx4090"]:
         # (capacity, with embed) -> (13, 13), (6, 6), (5, 5), (4, 3)
@@ -51,6 +51,32 @@ def test_capacity_sanity_check():
         capacity = node.get_decoder_layer_capacity()
         capacity_with_embed = node.get_decoder_layer_capacity(include_input_embed=True)
         assert capacity_with_embed <= capacity
+
+
+def test_capacity_prefers_worker_usable_memory_over_physical_total():
+    model = build_model_info(36)
+    physical = NodeHardwareInfo("mac", 1, 10.0, "M4", 16.0, 100.0, "mlx")
+    bounded = NodeHardwareInfo(
+        "mac-safe",
+        1,
+        10.0,
+        "M4",
+        16.0,
+        100.0,
+        "mlx",
+        usable_memory_bytes=4 * 1024**3,
+    )
+    physical_node = Node(node_id="mac", hardware=physical, model_info=model)
+    bounded_node = Node(node_id="mac-safe", hardware=bounded, model_info=model)
+
+    assert bounded_node.get_decoder_layer_capacity() < physical_node.get_decoder_layer_capacity()
+
+    physical_node.set_layer_allocation(0, 2)
+    bounded_node.set_layer_allocation(0, 2)
+    assert (
+        bounded_node.per_decoder_layer_kv_cache_memory
+        < physical_node.per_decoder_layer_kv_cache_memory
+    )
 
 
 @pytest.mark.parametrize(
@@ -101,7 +127,7 @@ def _test_gap_patch_rebalance(allocator: BaseLayerAllocator):
 
     # Heap top should include a host with minimal per-layer KV memory
     per_node_mem = {
-        nid: ((allocator.node_management.get(nid).per_decoder_layer_kv_cache_memory or 0))  # type: ignore[union-attr]
+        nid: (allocator.node_management.get(nid).per_decoder_layer_kv_cache_memory or 0)  # type: ignore[union-attr]
         for nid in allocator.layer_loads_heap[0].hosting_nodes
         if allocator.node_management.get(nid) is not None
     }
@@ -231,9 +257,9 @@ def test_allocator(
     expected_total = sum(e - s for (s, e) in expected_ranges)
     assert sum(e - s for (s, e) in actual_trimmed) == expected_total
     # Order-insensitive comparison: ranges represent stages; allow pipeline reordering
-    assert Counter(actual_trimmed) == Counter(
-        expected_ranges
-    ), f"Stage ranges mismatch (order-insensitive):\nactual={actual_trimmed}\nexpected={expected_ranges}"
+    assert Counter(actual_trimmed) == Counter(expected_ranges), (
+        f"Stage ranges mismatch (order-insensitive):\nactual={actual_trimmed}\nexpected={expected_ranges}"
+    )
 
 
 @pytest.mark.parametrize("strategy", ["greedy", "dp"])
@@ -418,6 +444,6 @@ def test_allocator_does_not_duplicate_leftover_nodes(strategy: Literal["greedy",
     )
     ok = alloc.allocate_from_standby()
     assert ok is True
-    assert (
-        node_management.num_nodes == expected_node_count
-    ), "Should not duplicate nodes during allocation"
+    assert node_management.num_nodes == expected_node_count, (
+        "Should not duplicate nodes during allocation"
+    )

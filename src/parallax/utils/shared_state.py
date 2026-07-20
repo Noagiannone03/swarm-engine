@@ -158,6 +158,9 @@ class SharedState:
         shared_dict["frontend_required"] = False
         shared_dict["frontend_alive"] = False
         shared_dict["_layer_allocation_changed"] = False
+        shared_dict["_memory_shutdown_requested"] = False
+        shared_dict["memory_pressure"] = "normal"
+        shared_dict["system_available_memory_bytes"] = None
         shared_dict["status"] = None
 
         # Create nested shared dict for metrics

@@ -9,6 +9,8 @@ import subprocess
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional
 
+from parallax.server.memory_budget import current_mlx_memory_budget
+
 if TYPE_CHECKING:
     from mlx import nn
 
@@ -206,12 +208,29 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
     if isinstance(hw, AppleSiliconHardwareInfo):
         # Use unified memory size as memory_gb; bandwidth rough estimate per family
         est_bandwidth = 100.0
+        usable_memory_bytes = None
+        system_available_memory_bytes = None
+        system_reserve_bytes = None
+        try:
+            import mlx.core as mx
+
+            budget = current_mlx_memory_budget(mx, psutil_module=psutil)
+            usable_memory_bytes = budget.process_limit_bytes
+            system_available_memory_bytes = budget.available_bytes
+            system_reserve_bytes = budget.system_reserve_bytes
+        except Exception:
+            # Detection remains best-effort for environments without Metal. A
+            # real Apple worker has MLX and will publish the pressure-aware cap.
+            pass
         return {
             "node_id": node_id,
             "num_gpus": hw.num_gpus,
             "tflops_fp16": hw.tflops_fp16,
             "gpu_name": hw.chip,
             "memory_gb": hw.total_ram_gb,
+            "usable_memory_bytes": usable_memory_bytes,
+            "system_available_memory_bytes": system_available_memory_bytes,
+            "system_reserve_bytes": system_reserve_bytes,
             "memory_bandwidth_gbps": est_bandwidth,
             "device": "mlx",
         }
@@ -251,7 +270,8 @@ class ShardedModelInfo:
 
     @classmethod
     def from_sharded_model(
-        cls, sharded_model_instance: "nn.Module"  # Instance of your ShardedModel
+        cls,
+        sharded_model_instance: "nn.Module",  # Instance of your ShardedModel
     ) -> "ShardedModelInfo":
         """
         Constructs ShardedModelInfo from a loaded ShardedModel instance.

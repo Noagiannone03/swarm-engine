@@ -19,10 +19,18 @@ python src/parallax/launch.py \
 import argparse
 import multiprocessing
 import os
+import platform
 import time
 
 from parallax.p2p.server import ServerState, launch_p2p_server_process, stop_p2p_server
 from parallax.server.executor.factory import run_executor_process, stop_executor_process
+from parallax.server.memory_budget import (
+    DEFAULT_PRESSURE_POLL_SECONDS,
+    GIB,
+    MemoryPressureController,
+    MemoryPressureLevel,
+    configured_system_reserve_bytes,
+)
 from parallax.server.server_args import parse_args
 from parallax.server.vllm_rust_frontend import (
     launch_vllm_rust_frontend,
@@ -128,6 +136,8 @@ def _wait_executors_check_layer_change(
     shared_state: SharedState,
     executor_subprocs,
     frontend_process=None,
+    memory_pressure_controller: MemoryPressureController | None = None,
+    memory_available_reader=None,
 ):
     """Wait for executor processes and check if layer allocation changed.
 
@@ -135,6 +145,8 @@ def _wait_executors_check_layer_change(
         True if layer allocation changed (need to reload executors),
         False if all executors exited normally.
     """
+    pressure_paused_admission = False
+    last_pressure_poll = 0.0
     while any(proc.is_alive() for proc in executor_subprocs):
         if frontend_process is not None and not frontend_process.is_alive():
             shared_state.update(
@@ -157,8 +169,69 @@ def _wait_executors_check_layer_change(
         if shared_state.get_layer_allocation_changed():
             return True
 
+        now = time.monotonic()
+        if (
+            memory_pressure_controller is not None
+            and memory_available_reader is not None
+            and now - last_pressure_poll >= DEFAULT_PRESSURE_POLL_SECONDS
+        ):
+            last_pressure_poll = now
+            available = int(memory_available_reader())
+            observation = memory_pressure_controller.observe(available)
+            shared_state.update(
+                memory_pressure=observation.level.value,
+                system_available_memory_bytes=available,
+            )
+            if observation.changed:
+                logger.warning(
+                    "System memory pressure changed to %s (available=%.2f GB, reserve=%.2f GB)",
+                    observation.level.value,
+                    available / GIB,
+                    memory_pressure_controller.system_reserve_bytes / GIB,
+                )
+
+            if observation.level is MemoryPressureLevel.WARNING:
+                pressure_paused_admission = True
+                shared_state.set_status(ServerState.INITIALIZING.value)
+            elif observation.level is MemoryPressureLevel.NORMAL and pressure_paused_admission:
+                # Recovery is deliberately slow and only resumes the exact same
+                # generation. It never grows memory or changes layer ownership.
+                if not shared_state.get_layer_allocation_changed():
+                    shared_state.set_status(ServerState.READY.value)
+                    pressure_paused_admission = False
+            elif observation.level is MemoryPressureLevel.CRITICAL:
+                pressure_paused_admission = True
+                shared_state.set_status(ServerState.INITIALIZING.value)
+                current_requests = shared_state.get_metrics().get("current_requests", 0)
+                if memory_pressure_controller.should_shutdown(current_requests):
+                    shared_state.set("_memory_shutdown_requested", True)
+                    logger.error(
+                        "Sustained critical memory pressure: stopping this worker generation "
+                        "after drain (current_requests=%d)",
+                        current_requests,
+                    )
+                    return False
+
     # Check race condition: layer allocation changed after all processes exited
     return shared_state.get_layer_allocation_changed()
+
+
+def _build_memory_pressure_guard():
+    """Create the Apple unified-memory guard and its live sampler."""
+
+    if platform.system() != "Darwin" or not platform.machine().startswith("arm"):
+        return None, None
+    try:
+        import psutil
+
+        total = int(psutil.virtual_memory().total)
+        controller = MemoryPressureController(
+            system_reserve_bytes=configured_system_reserve_bytes(total)
+        )
+        return controller, lambda: int(psutil.virtual_memory().available)
+    except Exception:
+        logger.warning("Could not initialize the Apple memory-pressure guard", exc_info=True)
+        return None, None
 
 
 if __name__ == "__main__":
@@ -187,6 +260,7 @@ if __name__ == "__main__":
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
         logger.debug(f"nccl_port: {args.nccl_port}")
+        memory_pressure_controller, memory_available_reader = _build_memory_pressure_guard()
 
         # Pipe for subprocess communication
         conn_main, conn_refit = multiprocessing.Pipe()
@@ -369,6 +443,8 @@ if __name__ == "__main__":
                         shared_state,
                         executor_subprocs,
                         frontend_process,
+                        memory_pressure_controller,
+                        memory_available_reader,
                     ):
                         logger.warning("Layer allocation changed! Stopping executors to reload...")
                         # Reset flag and set status to INITIALIZING
@@ -389,6 +465,13 @@ if __name__ == "__main__":
                             f"Reloading executor with layers [{args.start_layer}, {args.end_layer})"
                         )
                         continue
+
+                    if shared_state.get("_memory_shutdown_requested", False):
+                        logger.error(
+                            "Worker generation is leaving the swarm to protect the desktop; "
+                            "a supervisor may restart it with a smaller live-memory envelope"
+                        )
+                        break
 
                     # All processes exited normally
                     break

@@ -36,6 +36,10 @@ class NodeHardwareInfo:
     memory_gb: float
     memory_bandwidth_gbps: float
     device: str
+    # Pressure-aware allocation cap. ``memory_gb`` remains the physical total
+    # for diagnostics; schedulers must prefer this value when a worker reports
+    # it. Optional for backward compatibility with older workers.
+    usable_memory_bytes: Optional[int] = None
 
 
 @dataclass
@@ -343,14 +347,16 @@ class Node:
 
         Capacity is measured using the parameter memory budget on the device.
         """
-        available_memory_bytes = floor(
-            self.hardware.num_gpus
-            * self.hardware.memory_gb
-            * 1024
-            * 1024
-            * 1024
-            * self.param_mem_ratio
+        physical_memory_bytes = floor(
+            self.hardware.num_gpus * self.hardware.memory_gb * 1024 * 1024 * 1024
         )
+        reported_usable = self.hardware.usable_memory_bytes
+        capacity_memory_bytes = (
+            min(physical_memory_bytes, int(reported_usable))
+            if reported_usable is not None and int(reported_usable) >= 0
+            else physical_memory_bytes
+        )
+        available_memory_bytes = floor(capacity_memory_bytes * self.param_mem_ratio)
         if include_input_embed:
             available_memory_bytes -= self.model_info.embedding_io_bytes
         if include_lm_head:
@@ -376,17 +382,16 @@ class Node:
         """Return the available memory for kv cache per layer."""
         if self.num_current_layers == 0:
             return None
-        return floor(
-            (
-                self.hardware.num_gpus
-                * self.hardware.memory_gb
-                * 1024
-                * 1024
-                * 1024
-                * self.kvcache_mem_ratio
-            )
-            / self.num_current_layers
+        physical_memory_bytes = floor(
+            self.hardware.num_gpus * self.hardware.memory_gb * 1024 * 1024 * 1024
         )
+        reported_usable = self.hardware.usable_memory_bytes
+        capacity_memory_bytes = (
+            min(physical_memory_bytes, int(reported_usable))
+            if reported_usable is not None and int(reported_usable) >= 0
+            else physical_memory_bytes
+        )
+        return floor(capacity_memory_bytes * self.kvcache_mem_ratio / self.num_current_layers)
 
     def set_layer_allocation(self, start_layer: int, end_layer: int) -> None:
         """Set the layer range allocated to this node."""

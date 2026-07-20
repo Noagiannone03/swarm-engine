@@ -28,6 +28,19 @@ ref_model, ref_config = load_model(model_path)
 ref_tokenizer = load_tokenizer(model_path, eos_token_ids=ref_config.get("eos_token_id", None))
 
 
+@pytest.fixture(autouse=True)
+def _disable_desktop_reserve_for_multi_executor_unit_test(monkeypatch):
+    """Keep this synthetic three-executor process independent of desktop load.
+
+    Production workers run one MLX executor generation and preserve the live
+    system reserve.  This test deliberately packs three shards plus a reference
+    model into one Python process, so its explicit zero reserve is a test-only
+    capacity contract.
+    """
+
+    monkeypatch.setenv("PARALLAX_SYSTEM_RESERVE_GB", "0")
+
+
 def create_executor(start_layer, end_layer, device, kv_cache_memory_fraction=0.3):
     """Create a pipeline sharded executor
 
@@ -280,9 +293,9 @@ def test_decode_pipeline_multiple_steps(pipeline_devices, pp_end_layers, num_dec
         # Check if they start with similar content (at least 3 characters match)
         min_len = min(len(ref_clean), len(output_clean), 5)
         if min_len >= 3:
-            assert (
-                ref_clean[:min_len].lower() == output_clean[:min_len].lower()
-            ), f"Output mismatch: ref='{ref_clean[:20]}' vs pipeline='{output_clean[:20]}'"
+            assert ref_clean[:min_len].lower() == output_clean[:min_len].lower(), (
+                f"Output mismatch: ref='{ref_clean[:20]}' vs pipeline='{output_clean[:20]}'"
+            )
 
     # 6. Release resources for next tests
     executor_peer1.shutdown()
