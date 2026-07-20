@@ -33,7 +33,10 @@ dependencies = [
   "uvloop; sys_platform != 'win32'",
   "fastapi",
   "pydantic",
-  "protobuf==6.31.1",
+  # vLLM 0.16 excludes the protobuf 6.31 family and current grpcio-reflection
+  # requires the 7.35 runtime.  Generated Parallax messages remain compatible
+  # with the supported protobuf 7 major line.
+  "protobuf>=7.35.1,<8",
   "dijkstar==2.6.0",
   "lattica==1.0.21",
   "orjson",
