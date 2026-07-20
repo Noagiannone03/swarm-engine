@@ -2,6 +2,7 @@
 # Install Parallax from source and build the vLLM Rust frontend binary.
 # Usage:
 #   ./install.sh [--extras EXTRAS] [--python PYTHON_VERSION]
+#   PARALLAX_VENV_DIR=/path/to/venv ./install.sh --frontend-only
 #
 # By default, installs mac extras on macOS and gpu extras on Linux, then
 # builds vllm-rs in release mode.
@@ -12,9 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 EXTRAS="${PARALLAX_EXTRAS:-}"
 PYTHON_VERSION="${PARALLAX_PYTHON_VERSION:-3.12}"
-VENV_DIR="$SCRIPT_DIR/.venv"
+VENV_DIR="${PARALLAX_VENV_DIR:-$SCRIPT_DIR/.venv}"
 VLLM_REF="${VLLM_REF:-v0.24.0}"
 VLLM_MINIJINJA_VERSION="${VLLM_MINIJINJA_VERSION-2.20.0}"
+FRONTEND_ONLY=false
 
 show_help() {
     cat <<'EOF'
@@ -22,15 +24,19 @@ Install Parallax from source and build the vLLM Rust frontend binary.
 
 Usage:
   ./install.sh [--extras EXTRAS] [--python PYTHON_VERSION]
+  PARALLAX_VENV_DIR=/path/to/venv ./install.sh --frontend-only
 
 Options:
   --extras EXTRAS         Python extras to install, for example "mac", "gpu",
                           or "mac,dev". Defaults to mac on macOS and gpu on Linux.
   --python PYTHON_VERSION Python version for uv venv. Defaults to 3.12.
+  --frontend-only         Build vllm-rs into an existing POSIX virtualenv.
+                          Does not create a venv or install Python packages.
 
 Environment:
   PARALLAX_EXTRAS         Same as --extras.
   PARALLAX_PYTHON_VERSION Same as --python.
+  PARALLAX_VENV_DIR       Virtualenv to create/use. Defaults to ./.venv.
   VLLM_REF                vLLM git branch, tag, or full commit hash to clone.
   VLLM_MINIJINJA_VERSION  MiniJinja/minijinja-contrib version to use when
                           building vllm-rs. Defaults to 2.20.0.
@@ -62,6 +68,10 @@ parse_args() {
                 ;;
             --python=*)
                 PYTHON_VERSION="${1#*=}"
+                shift
+                ;;
+            --frontend-only)
+                FRONTEND_ONLY=true
                 shift
                 ;;
             --help|-h)
@@ -351,6 +361,17 @@ main() {
     normalize_config
 
     cd "$SCRIPT_DIR"
+
+    if [[ "$FRONTEND_ONLY" == true ]]; then
+        if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+            echo "Existing POSIX virtualenv is required for --frontend-only: $VENV_DIR" >&2
+            exit 1
+        fi
+        ensure_git
+        build_vllm_rust_frontend
+        echo "vllm-rs frontend build complete."
+        return
+    fi
 
     ensure_uv
     ensure_venv
