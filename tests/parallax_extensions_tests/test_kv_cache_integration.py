@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import mlx.core as mx
 import numpy as np
@@ -8,7 +10,6 @@ from parallax_extensions.ops import reshape_and_cache
 
 
 class TestPagedKVIntegration(unittest.TestCase):
-
     def setUp(self):
         self.num_layers = 1
         self.num_kv_heads = 4
@@ -18,18 +19,26 @@ class TestPagedKVIntegration(unittest.TestCase):
 
         # Initialize Cache Manager
         # (Key Cache shape [blocks, heads, dim/x, block_size, x])
-        self.cache_manager = CacheManager(
-            num_layers=self.num_layers,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            dtype=self.dtype,
-            block_size=self.block_size,
-            cache_memory_fraction=0.5,
-        )
+        # Cache sizing is intentionally based on live desktop memory in the
+        # product. Keep this kernel integration test deterministic and small.
+        active = int(mx.get_active_memory())
+        with patch(
+            "parallax.server.cache_manager.current_mlx_memory_budget",
+            return_value=SimpleNamespace(
+                additional_bytes=1024**2,
+                process_limit_bytes=active + 1024**2,
+            ),
+        ):
+            self.cache_manager = CacheManager(
+                num_layers=self.num_layers,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                dtype=self.dtype,
+                block_size=self.block_size,
+                cache_memory_fraction=0.5,
+            )
 
-        # Ensure we have enough blocks for testing
-        if self.cache_manager.num_gpu_blocks < 100:
-            pass
+        self.assertGreaterEqual(self.cache_manager.num_gpu_blocks, 2)
 
     def test_prefill_slot_mapping(self):
         """
@@ -71,9 +80,9 @@ class TestPagedKVIntegration(unittest.TestCase):
         )
 
         for b in range(batch_size):
-            for l in range(seq_lens[b]):
-                keys_np[b, l, :, :] = b * 1000 + l
-                values_np[b, l, :, :] = -(b * 1000 + l)
+            for token_idx in range(seq_lens[b]):
+                keys_np[b, token_idx, :, :] = b * 1000 + token_idx
+                values_np[b, token_idx, :, :] = -(b * 1000 + token_idx)
 
         keys = mx.array(keys_np)
         values = mx.array(values_np)

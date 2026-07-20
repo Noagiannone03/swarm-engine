@@ -41,6 +41,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.workspace import current_workspace_manager, init_workspace_manager
 from vllm.utils.hashing import get_hash_fn_by_name
 
+from parallax.server.memory_budget import current_cuda_memory_budget
 from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     apply_weight_loader_filter_patch,
     set_layer_range_for_filtering,
@@ -52,6 +53,24 @@ from parallax_utils.logging_config import get_logger
 from parallax_utils.prepare_adapter import download_adapter_config
 
 logger = get_logger(__name__)
+
+
+def _cuda_budgeted_bytes(device: torch.device, fraction: float, purpose: str) -> int:
+    """Return a fraction of global free VRAM after the product reserve."""
+
+    budget = current_cuda_memory_budget(torch, device.index)
+    available = int(budget.usable_bytes * fraction)
+    logger.info(
+        "%s CUDA budget: %.2f GB (%.1f%% of %.2f GB usable; %.2f GB globally free; "
+        "%.2f GB reserved)",
+        purpose,
+        available / 1024**3,
+        fraction * 100,
+        budget.usable_bytes / 1024**3,
+        budget.available_bytes / 1024**3,
+        budget.device_reserve_bytes / 1024**3,
+    )
+    return available
 
 
 def _use_eager_execution() -> bool:
@@ -135,20 +154,15 @@ def _create_kv_cache_config_from_specs(
     kv_cache_memory_fraction: float,
     device: torch.device,
 ) -> KVCacheConfig:
-    free_memory, total_memory = torch.cuda.mem_get_info(device.index)
-    available_memory = int(free_memory * kv_cache_memory_fraction)
-
-    logger.info(
-        f"Available GPU memory for KV cache: "
-        f"{available_memory / (1024**3):.2f} GB "
-        f"({kv_cache_memory_fraction:.1%} of {free_memory / (1024**3):.2f} GB)"
-    )
+    available_memory = _cuda_budgeted_bytes(device, kv_cache_memory_fraction, "KV cache")
 
     page_size_bytes = kv_cache_group.kv_cache_spec.page_size_bytes
 
     max_blocks_by_memory = available_memory // page_size_bytes
+    if max_blocks_by_memory <= 0:
+        raise RuntimeError("No CUDA memory remains for one KV-cache block after the device reserve")
 
-    num_blocks = max(100, min(1000, int(max_blocks_by_memory * 0.8)))
+    num_blocks = min(1000, max_blocks_by_memory, max(1, int(max_blocks_by_memory * 0.8)))
 
     logger.debug(f"Calculated KV cache blocks: {num_blocks} (max possible: {max_blocks_by_memory})")
 
@@ -169,7 +183,6 @@ def _create_kv_cache_config_from_specs(
 
 
 class ParallaxVLLMModelRunner(GPUModelRunner):
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -220,20 +233,12 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
             )
             kv_cache_specs = None
 
-        free_memory, total_memory = torch.cuda.mem_get_info(self.device.index or 0)
-
         memory_fraction = (
             kv_cache_memory_fraction
             if kv_cache_memory_fraction is not None
             else self.cache_config.gpu_memory_utilization
         )
-        available_memory = int(free_memory * memory_fraction)
-
-        logger.debug(
-            f"Available GPU memory for KV cache: "
-            f"{available_memory / (1024**3):.2f} GB "
-            f"({memory_fraction:.1%} of {free_memory / (1024**3):.2f} GB)"
-        )
+        available_memory = _cuda_budgeted_bytes(self.device, memory_fraction, "KV cache")
 
         if kv_cache_specs is not None:
             kv_cache_configs = get_kv_cache_configs(
@@ -379,7 +384,6 @@ class ParallaxVLLMModelRunner(GPUModelRunner):
 
 
 def _init_and_reserve_workspace(device: torch.device, max_num_tokens: int) -> None:
-
     init_workspace_manager(device)
 
     try:
@@ -387,13 +391,16 @@ def _init_and_reserve_workspace(device: torch.device, max_num_tokens: int) -> No
         per_token_workspace = 24 * 1024
         estimated_workspace = max_num_tokens * per_token_workspace
         reserve_size = max(512 * _MB, min(estimated_workspace, 8192 * _MB))
-        free_mem, _ = torch.cuda.mem_get_info(device.index)
-        if reserve_size > free_mem * 0.5:
+        budget = current_cuda_memory_budget(torch, device.index)
+        max_workspace = budget.usable_bytes // 2
+        if reserve_size > max_workspace:
             logger.warning(
-                f"Estimated workspace ({reserve_size / _MB:.0f}MB) is >50% of free memory "
-                f"({free_mem / _MB:.0f}MB). Clamping to 4GB to preserve memory for KV cache."
+                f"Estimated workspace ({reserve_size / _MB:.0f}MB) is >50% of usable VRAM "
+                f"({budget.usable_bytes / _MB:.0f}MB after reserve). Clamping."
             )
-            reserve_size = min(reserve_size, 4096 * _MB)
+            reserve_size = min(reserve_size, max_workspace)
+        if reserve_size <= 0:
+            raise RuntimeError("No CUDA workspace memory remains after the device reserve")
 
         current_workspace_manager()._ensure_workspace_size(reserve_size)
         logger.info(
@@ -426,7 +433,7 @@ def initialize_vllm_model_runner(
     from parallax.utils.model_download import selective_model_download
 
     logger.info(
-        f"Initializing vLLM model runner for {model_repo}, " f"layers=[{start_layer}, {end_layer})"
+        f"Initializing vLLM model runner for {model_repo}, layers=[{start_layer}, {end_layer})"
     )
 
     model_path = selective_model_download(
@@ -686,14 +693,7 @@ def initialize_vllm_model_runner(
         if not kv_cache_specs:
             raise RuntimeError("No KV cache specs found in the loaded model")
 
-        free_memory, _ = torch.cuda.mem_get_info(device.index)
-        available_memory = int(free_memory * kv_cache_memory_fraction)
-
-        logger.info(
-            f"Available GPU memory for KV cache: "
-            f"{available_memory / (1024**3):.2f} GB "
-            f"({kv_cache_memory_fraction:.1%} of {free_memory / (1024**3):.2f} GB)"
-        )
+        available_memory = _cuda_budgeted_bytes(device, kv_cache_memory_fraction, "KV cache")
 
         kv_cache_configs = get_kv_cache_configs(
             vllm_config=model_runner.vllm_config,
@@ -776,9 +776,9 @@ def refit_vllm_model(
         # Release old loras if needed
         before_loras = model_runner.list_loras()
         history = model_runner.lora_history
-        assert len(before_loras) == len(
-            history
-        ), "Before lora refit, number of loaded lora mismatch!"
+        assert len(before_loras) == len(history), (
+            "Before lora refit, number of loaded lora mismatch!"
+        )
         logger.info(f"Before lora refit number of lora adapters: {len(before_loras)}")
         while len(history) > 1:
             _, old_lora_id, _ = history.pop(0)
@@ -794,9 +794,9 @@ def refit_vllm_model(
         # Check lora slots
         after_loras = model_runner.list_loras()
         after_history = model_runner.lora_history
-        assert len(after_loras) == len(
-            after_history
-        ), "After lora refit, number of loaded lora mismatch!"
+        assert len(after_loras) == len(after_history), (
+            "After lora refit, number of loaded lora mismatch!"
+        )
         logger.info(f"After lora refit number of lora adapters: {len(after_loras)}")
     else:
         assert False, "Weight refit needs host tensors or weight path"

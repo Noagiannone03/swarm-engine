@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional
 
-from parallax.server.memory_budget import current_mlx_memory_budget
+from parallax.server.memory_budget import current_cuda_memory_budget, current_mlx_memory_budget
 
 if TYPE_CHECKING:
     from mlx import nn
@@ -196,12 +196,30 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
         }
 
     if isinstance(hw, NvidiaHardwareInfo):
+        usable_memory_bytes = None
+        device_available_memory_bytes = None
+        device_reserve_bytes = None
+        try:
+            budgets = [
+                current_cuda_memory_budget(torch, device)
+                for device in range(torch.cuda.device_count())
+            ]
+            usable_memory_bytes = sum(budget.usable_bytes for budget in budgets)
+            device_available_memory_bytes = sum(budget.available_bytes for budget in budgets)
+            device_reserve_bytes = sum(budget.device_reserve_bytes for budget in budgets)
+        except Exception:
+            # Older CUDA/PyTorch environments remain compatible, but qualified
+            # workers expose cudaMemGetInfo-backed capacity.
+            pass
         return {
             "node_id": node_id,
             "num_gpus": hw.num_gpus,
             "tflops_fp16": hw.tflops_fp16,
             "gpu_name": hw.chip,
             "memory_gb": hw.vram_gb,
+            "usable_memory_bytes": usable_memory_bytes,
+            "device_available_memory_bytes": device_available_memory_bytes,
+            "device_reserve_bytes": device_reserve_bytes,
             "memory_bandwidth_gbps": hw.memory_bandwidth_gbps,
             "device": "cuda",
         }

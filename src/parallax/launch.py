@@ -19,8 +19,9 @@ python src/parallax/launch.py \
 import argparse
 import multiprocessing
 import os
-import platform
 import time
+from dataclasses import dataclass
+from typing import Callable
 
 from parallax.p2p.server import ServerState, launch_p2p_server_process, stop_p2p_server
 from parallax.server.executor.factory import run_executor_process, stop_executor_process
@@ -29,6 +30,8 @@ from parallax.server.memory_budget import (
     GIB,
     MemoryPressureController,
     MemoryPressureLevel,
+    MemoryPressureObservation,
+    configured_cuda_reserve_bytes,
     configured_system_reserve_bytes,
 )
 from parallax.server.server_args import parse_args
@@ -48,6 +51,13 @@ from parallax_utils.logging_config import get_logger, set_log_level
 from parallax_utils.version_check import check_latest_release
 
 logger = get_logger("parallax.launch")
+
+
+@dataclass(frozen=True)
+class MemoryPressureGuard:
+    name: str
+    controller: MemoryPressureController
+    available_reader: Callable[[], int]
 
 
 def _update_args_from_shared_state(args, shared_state: SharedState, force_update: bool):
@@ -136,8 +146,7 @@ def _wait_executors_check_layer_change(
     shared_state: SharedState,
     executor_subprocs,
     frontend_process=None,
-    memory_pressure_controller: MemoryPressureController | None = None,
-    memory_available_reader=None,
+    memory_pressure_guards=None,
 ):
     """Wait for executor processes and check if layer allocation changed.
 
@@ -170,40 +179,87 @@ def _wait_executors_check_layer_change(
             return True
 
         now = time.monotonic()
-        if (
-            memory_pressure_controller is not None
-            and memory_available_reader is not None
-            and now - last_pressure_poll >= DEFAULT_PRESSURE_POLL_SECONDS
-        ):
+        if memory_pressure_guards and now - last_pressure_poll >= DEFAULT_PRESSURE_POLL_SECONDS:
             last_pressure_poll = now
-            available = int(memory_available_reader())
-            observation = memory_pressure_controller.observe(available)
-            shared_state.update(
-                memory_pressure=observation.level.value,
-                system_available_memory_bytes=available,
-            )
-            if observation.changed:
-                logger.warning(
-                    "System memory pressure changed to %s (available=%.2f GB, reserve=%.2f GB)",
-                    observation.level.value,
-                    available / GIB,
-                    memory_pressure_controller.system_reserve_bytes / GIB,
-                )
+            resource_telemetry = {}
+            observations = []
+            for guard in memory_pressure_guards:
+                try:
+                    available = int(guard.available_reader())
+                except Exception:
+                    logger.warning(
+                        "Could not sample %s memory pressure; keeping its last stable state",
+                        guard.name,
+                        exc_info=True,
+                    )
+                    resource_telemetry[guard.name] = {
+                        "level": guard.controller.level.value,
+                        "sample_error": True,
+                        "reserve_bytes": guard.controller.system_reserve_bytes,
+                    }
+                    observations.append(
+                        (
+                            guard,
+                            MemoryPressureObservation(
+                                level=guard.controller.level,
+                                changed=False,
+                                available_bytes=0,
+                            ),
+                        )
+                    )
+                    continue
+                observation = guard.controller.observe(available)
+                observations.append((guard, observation))
+                resource_telemetry[guard.name] = {
+                    "level": observation.level.value,
+                    "available_bytes": available,
+                    "reserve_bytes": guard.controller.system_reserve_bytes,
+                }
+                if observation.changed:
+                    logger.warning(
+                        "%s memory pressure changed to %s (available=%.2f GB, reserve=%.2f GB)",
+                        guard.name,
+                        observation.level.value,
+                        available / GIB,
+                        guard.controller.system_reserve_bytes / GIB,
+                    )
 
-            if observation.level is MemoryPressureLevel.WARNING:
+            levels = [observation.level for _, observation in observations]
+            aggregate_level = (
+                MemoryPressureLevel.CRITICAL
+                if MemoryPressureLevel.CRITICAL in levels
+                else (
+                    MemoryPressureLevel.WARNING
+                    if MemoryPressureLevel.WARNING in levels
+                    else MemoryPressureLevel.NORMAL
+                )
+            )
+            shared_state.update(
+                memory_pressure=aggregate_level.value,
+                memory_pressure_resources=resource_telemetry,
+            )
+
+            if aggregate_level is MemoryPressureLevel.WARNING:
                 pressure_paused_admission = True
                 shared_state.set_status(ServerState.INITIALIZING.value)
-            elif observation.level is MemoryPressureLevel.NORMAL and pressure_paused_admission:
+            elif aggregate_level is MemoryPressureLevel.NORMAL and pressure_paused_admission:
                 # Recovery is deliberately slow and only resumes the exact same
                 # generation. It never grows memory or changes layer ownership.
                 if not shared_state.get_layer_allocation_changed():
                     shared_state.set_status(ServerState.READY.value)
                     pressure_paused_admission = False
-            elif observation.level is MemoryPressureLevel.CRITICAL:
+            elif aggregate_level is MemoryPressureLevel.CRITICAL:
                 pressure_paused_admission = True
                 shared_state.set_status(ServerState.INITIALIZING.value)
                 current_requests = shared_state.get_metrics().get("current_requests", 0)
-                if memory_pressure_controller.should_shutdown(current_requests):
+                critical_guards = [
+                    guard
+                    for guard, observation in observations
+                    if observation.level is MemoryPressureLevel.CRITICAL
+                ]
+                if any(
+                    guard.controller.should_shutdown(current_requests) for guard in critical_guards
+                ):
                     shared_state.set("_memory_shutdown_requested", True)
                     logger.error(
                         "Sustained critical memory pressure: stopping this worker generation "
@@ -216,22 +272,46 @@ def _wait_executors_check_layer_change(
     return shared_state.get_layer_allocation_changed()
 
 
-def _build_memory_pressure_guard():
-    """Create the Apple unified-memory guard and its live sampler."""
+def _build_memory_pressure_guards():
+    """Create host-RAM and CUDA-VRAM guards from maintained OS/runtime APIs."""
 
-    if platform.system() != "Darwin" or not platform.machine().startswith("arm"):
-        return None, None
+    guards = []
     try:
         import psutil
 
         total = int(psutil.virtual_memory().total)
-        controller = MemoryPressureController(
-            system_reserve_bytes=configured_system_reserve_bytes(total)
+        guards.append(
+            MemoryPressureGuard(
+                name="host",
+                controller=MemoryPressureController(
+                    system_reserve_bytes=configured_system_reserve_bytes(total)
+                ),
+                available_reader=lambda: int(psutil.virtual_memory().available),
+            )
         )
-        return controller, lambda: int(psutil.virtual_memory().available)
     except Exception:
-        logger.warning("Could not initialize the Apple memory-pressure guard", exc_info=True)
-        return None, None
+        logger.warning("Could not initialize the host memory-pressure guard", exc_info=True)
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            for device in range(torch.cuda.device_count()):
+                _, total = torch.cuda.mem_get_info(device)
+                guards.append(
+                    MemoryPressureGuard(
+                        name=f"cuda:{device}",
+                        controller=MemoryPressureController(
+                            system_reserve_bytes=configured_cuda_reserve_bytes(total)
+                        ),
+                        available_reader=lambda device=device: int(
+                            torch.cuda.mem_get_info(device)[0]
+                        ),
+                    )
+                )
+    except Exception:
+        logger.warning("Could not initialize the CUDA memory-pressure guard", exc_info=True)
+    return guards
 
 
 if __name__ == "__main__":
@@ -260,7 +340,7 @@ if __name__ == "__main__":
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
         logger.debug(f"nccl_port: {args.nccl_port}")
-        memory_pressure_controller, memory_available_reader = _build_memory_pressure_guard()
+        memory_pressure_guards = _build_memory_pressure_guards()
 
         # Pipe for subprocess communication
         conn_main, conn_refit = multiprocessing.Pipe()
@@ -443,8 +523,7 @@ if __name__ == "__main__":
                         shared_state,
                         executor_subprocs,
                         frontend_process,
-                        memory_pressure_controller,
-                        memory_available_reader,
+                        memory_pressure_guards,
                     ):
                         logger.warning("Layer allocation changed! Stopping executors to reload...")
                         # Reset flag and set status to INITIALIZING

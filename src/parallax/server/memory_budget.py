@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 GIB = 1024**3
 MIB = 1024**2
 DEFAULT_SYSTEM_RESERVE_GB = 6.0
+DEFAULT_CUDA_RESERVE_GB = 1.5
 DEFAULT_MLX_CACHE_LIMIT_MB = 256.0
 DEFAULT_PRESSURE_POLL_SECONDS = 1.0
 DEFAULT_PRESSURE_DRAIN_SECONDS = 30.0
@@ -37,6 +38,14 @@ class MlxMemoryBudget:
     process_limit_bytes: int
     additional_bytes: int
     cache_limit_bytes: int
+
+
+@dataclass(frozen=True)
+class CudaMemoryBudget:
+    total_bytes: int
+    available_bytes: int
+    device_reserve_bytes: int
+    usable_bytes: int
 
 
 class MemoryPressureLevel(str, Enum):
@@ -169,6 +178,41 @@ def configured_system_reserve_bytes(total_bytes: int) -> int:
     configured = _positive_env_bytes("PARALLAX_SYSTEM_RESERVE_GB", GIB)
     reserve = configured if configured is not None else int(DEFAULT_SYSTEM_RESERVE_GB * GIB)
     return min(max(0, reserve), max(0, int(total_bytes)))
+
+
+def configured_cuda_reserve_bytes(total_bytes: int) -> int:
+    """Return VRAM kept free for the display driver and other GPU apps."""
+
+    configured = _positive_env_bytes("PARALLAX_CUDA_SYSTEM_RESERVE_GB", GIB)
+    reserve = configured if configured is not None else int(DEFAULT_CUDA_RESERVE_GB * GIB)
+    return min(max(0, reserve), max(0, int(total_bytes)))
+
+
+def calculate_cuda_memory_budget(
+    *, total_bytes: int, available_bytes: int, device_reserve_bytes: int
+) -> CudaMemoryBudget:
+    """Build a CUDA capacity envelope from cudaMemGetInfo counters."""
+
+    total = max(0, int(total_bytes))
+    available = min(total, max(0, int(available_bytes)))
+    reserve = min(total, max(0, int(device_reserve_bytes)))
+    return CudaMemoryBudget(
+        total_bytes=total,
+        available_bytes=available,
+        device_reserve_bytes=reserve,
+        usable_bytes=max(0, available - reserve),
+    )
+
+
+def current_cuda_memory_budget(torch_module, device=None) -> CudaMemoryBudget:
+    """Read global device availability through PyTorch's cudaMemGetInfo API."""
+
+    available, total = torch_module.cuda.mem_get_info(device)
+    return calculate_cuda_memory_budget(
+        total_bytes=total,
+        available_bytes=available,
+        device_reserve_bytes=configured_cuda_reserve_bytes(total),
+    )
 
 
 def calculate_mlx_memory_budget(

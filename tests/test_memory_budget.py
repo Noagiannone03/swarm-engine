@@ -6,6 +6,7 @@ from parallax.server.memory_budget import (
     GIB,
     MemoryPressureController,
     MemoryPressureLevel,
+    calculate_cuda_memory_budget,
     calculate_mlx_memory_budget,
     configure_mlx_memory_limits,
     current_mlx_memory_budget,
@@ -27,6 +28,28 @@ def test_budget_uses_live_available_memory_not_total_ram():
 
     assert budget.process_limit_bytes == gb(4)
     assert budget.additional_bytes == gb(4)
+
+
+def test_cuda_budget_uses_global_free_vram_and_keeps_driver_reserve():
+    budget = calculate_cuda_memory_budget(
+        total_bytes=gb(16),
+        available_bytes=gb(11),
+        device_reserve_bytes=gb(1.5),
+    )
+
+    assert budget.total_bytes == gb(16)
+    assert budget.available_bytes == gb(11)
+    assert budget.usable_bytes == gb(9.5)
+
+
+def test_cuda_budget_refuses_capacity_when_other_apps_consume_the_reserve():
+    budget = calculate_cuda_memory_budget(
+        total_bytes=gb(16),
+        available_bytes=gb(1),
+        device_reserve_bytes=gb(1.5),
+    )
+
+    assert budget.usable_bytes == 0
 
 
 def test_budget_is_stable_after_its_own_allocations_reduce_available_memory():

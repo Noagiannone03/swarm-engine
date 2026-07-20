@@ -27,6 +27,8 @@ def node_log_summary(message: object) -> dict:
             "usable_memory_bytes",
             "system_available_memory_bytes",
             "system_reserve_bytes",
+            "device_available_memory_bytes",
+            "device_reserve_bytes",
         ):
             if key in hardware:
                 safe_hardware[key] = hardware[key]

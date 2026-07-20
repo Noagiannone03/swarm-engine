@@ -1131,9 +1131,9 @@ class GradientServer:
                 info["layer_latency_ms"] = metrics.get("layer_latency_ms")
             if hasattr(self, "_shared_state") and self._shared_state is not None:
                 info["memory_pressure"] = self._shared_state.get("memory_pressure", "normal")
-                available = self._shared_state.get("system_available_memory_bytes")
-                if available is not None:
-                    info["system_available_memory_bytes"] = int(available)
+                info["memory_pressure_resources"] = self._shared_state.get(
+                    "memory_pressure_resources", {}
+                )
             # In update mode, always include current allocation
             if not self.manual_layer_assignment:
                 info["start_layer"] = self.block_start_index
