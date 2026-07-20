@@ -1,15 +1,19 @@
 """Logging configuration for Parallax."""
 
 import logging
+import logging.handlers
 import os
+import re
 import sys
 import threading
+from pathlib import Path
 from typing import Optional
 
 __all__ = ["get_logger", "use_parallax_log_handler", "set_log_level"]
 
 _init_lock = threading.Lock()
 _default_handler: logging.Handler | None = None
+_diagnostic_handler: logging.Handler | None = None
 
 
 class _Ansi:
@@ -83,7 +87,7 @@ def _enable_default_handler(target_module_prefix):
 
 
 def _initialize_if_necessary():
-    global _default_handler
+    global _default_handler, _diagnostic_handler
 
     with _init_lock:
         if _default_handler is not None:
@@ -104,6 +108,30 @@ def _initialize_if_necessary():
 
         # Allow logs from our main packages by default
         _enable_default_handler(("parallax", "scheduling", "backend", "sglang", "vllm", "router"))
+
+        diagnostic_dir = os.environ.get("PARALLAX_PROCESS_LOG_DIR", "").strip()
+        if diagnostic_dir:
+            log_dir = Path(diagnostic_dir).expanduser()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            session = os.environ.get("FABI_WORKER_SESSION_ID", "worker")
+            safe_session = re.sub(r"[^A-Za-z0-9_.-]+", "-", session).strip(".-") or "worker"
+            log_path = log_dir / f"parallax-{safe_session[:80]}-{os.getpid()}.log"
+            _diagnostic_handler = logging.handlers.RotatingFileHandler(
+                log_path,
+                maxBytes=16 * 1024 * 1024,
+                backupCount=2,
+                encoding="utf-8",
+                delay=True,
+            )
+            _diagnostic_handler.setFormatter(
+                logging.Formatter(
+                    "{asctime}.{msecs:03.0f} pid={process} process={processName} "
+                    "[{name}] [{levelname}] {pathname}:{lineno} {message}",
+                    style="{",
+                    datefmt="%Y-%m-%dT%H:%M:%S",
+                )
+            )
+            logging.getLogger().addHandler(_diagnostic_handler)
 
 
 def set_log_level(level_name: str):

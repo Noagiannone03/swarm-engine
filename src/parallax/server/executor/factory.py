@@ -3,6 +3,7 @@ Creates executor from factory for different backends.
 """
 
 import argparse
+import os
 from typing import Any, List, Optional
 
 from parallax.utils.utils import get_current_device
@@ -94,6 +95,10 @@ def create_from_args(
 
             executor = SGLExecutor(**config)
         elif args.gpu_backend == "vllm":
+            # Parallax owns the process-wide logging configuration. vLLM otherwise
+            # installs its own handlers at import time, which can hide executor
+            # exceptions after a Windows ``spawn``. Keep user overrides available.
+            os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
             from parallax.server.executor.vllm_executor import VLLMExecutor
 
             executor = VLLMExecutor(**config)

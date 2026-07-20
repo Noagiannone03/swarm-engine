@@ -540,6 +540,42 @@ def test_retried_join_preserves_scheduler_owned_serving_state():
     assert original.last_heartbeat >= heartbeat_before
 
 
+def test_full_join_repairs_heartbeat_auto_registration_after_scheduler_restart():
+    """A full join must restore worker capabilities without losing registry identity."""
+    model = build_model_info(12)
+    heartbeat_registration = build_node(
+        "mac-head",
+        model,
+        mem_gb=400.0,
+        supports_frontend=False,
+    )
+    sched = Scheduler(
+        model,
+        [heartbeat_registration],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+    assert not sched.bootstrap()
+
+    full_join = build_node(
+        "mac-head",
+        model,
+        mem_gb=420.0,
+        supports_frontend=True,
+    )
+    full_join.max_sequence_length = 32768
+    sched.enqueue_join(full_join)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    registered = sched.get_node("mac-head")
+    assert registered is heartbeat_registration
+    assert registered.supports_frontend is True
+    assert registered.hardware.memory_gb == 420.0
+    assert registered.max_sequence_length == 32768
+    assert sched.has_full_pipeline()
+
+
 def test_scheduler_snapshot_handles_unallocated_standby_nodes():
     """A joined standby node has no layer allocation yet; snapshot must not divide by zero."""
     model = build_model_info(12)

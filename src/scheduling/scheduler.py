@@ -429,12 +429,15 @@ class Scheduler:
             # response channel closes after the scheduler has already handled
             # the request.  Replacing the registered Node here used to discard
             # its scheduler-owned layer range, KV telemetry, and reservations.
-            # Treat a repeated join as an idempotent reconnect: the worker gets
-            # the existing assignment from ``wait_layer_allocation`` and its
-            # following heartbeat refreshes all mutable runtime telemetry.
-            existing.last_heartbeat = time.time()
+            # Treat a repeated join as an idempotent reconnect: preserve the
+            # scheduler-owned serving state while refreshing worker-owned live
+            # capacity and protocol capabilities. This is also required when a
+            # heartbeat auto-registers a worker just before its full join after
+            # a scheduler restart.
+            existing.refresh_registration(node)
             logger.info(
-                "Node %s is already registered; preserving layers [%s, %s) on repeated join",
+                "Node %s is already registered; refreshed capabilities and preserving "
+                "layers [%s, %s) on repeated join",
                 node.node_id,
                 existing.start_layer,
                 existing.end_layer,

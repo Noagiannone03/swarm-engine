@@ -244,6 +244,29 @@ class Node:
         if self.rtt_to_nodes is None:
             self.rtt_to_nodes = {}
 
+    def refresh_registration(self, registration: "Node") -> None:
+        """Refresh worker-owned capabilities without replacing serving state.
+
+        Layer ranges, request/KV reservations and measured scheduler telemetry
+        belong to the scheduler and survive a retried ``node_join``. Hardware
+        envelopes and protocol capabilities belong to the worker and must be
+        refreshed, notably when a full join follows heartbeat auto-registration
+        after a scheduler restart.
+        """
+
+        self.hardware = registration.hardware
+        self.model_info = registration.model_info
+        self.kvcache_mem_ratio = registration.kvcache_mem_ratio
+        self.param_mem_ratio = registration.param_mem_ratio
+        self.max_concurrent_requests = registration.max_concurrent_requests
+        self.max_sequence_length = registration.max_sequence_length
+        self.supports_frontend = registration.supports_frontend
+        self.supports_chunked_prefill = registration.supports_chunked_prefill
+        self.preferred_chunked_prefill_size = registration.preferred_chunked_prefill_size
+        self.account_hash = registration.account_hash
+
+        self.last_heartbeat = time.time()
+
     @property
     def max_requests(self) -> int:
         """Executor request-count limit.
