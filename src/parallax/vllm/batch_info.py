@@ -12,6 +12,7 @@ from parallax.server.sampling.sampling_params import (
     SamplingParams as ParallaxSamplingParams,
 )
 from parallax.vllm.prefix_cache import count_uncached_prefill_tokens
+from parallax.vllm.request_compat import create_vllm_request
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -111,7 +112,8 @@ def _build_vllm_request(
         lora_req = getattr(model_runner, "default_lora_req", None)
         logger.debug(f"Using default LoRA request: {lora_req}")
 
-    vllm_req = VLLMRequest(
+    vllm_req = create_vllm_request(
+        VLLMRequest,
         request_id=req.request_id,
         prompt_token_ids=getattr(req, "input_ids", None),
         sampling_params=sampling_params,
