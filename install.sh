@@ -282,10 +282,18 @@ build_vllm_rust_frontend() {
     ensure_protoc
     update_vllm_minijinja "$rust_dir" "$toolchain"
 
-    cargo +"$toolchain" build --release \
+    # pcre2-sys préfère la bibliothèque dynamique trouvée sur la machine de
+    # build. Sur macOS/Homebrew cela grave /opt/homebrew/... dans vllm-rs et le
+    # binaire ne démarre plus sur une machine sans ce keg. Le crate documente
+    # PCRE2_SYS_STATIC=1 comme contrat officiel pour builder PCRE2 depuis les
+    # sources et le lier statiquement.
+    PCRE2_SYS_STATIC=1 cargo +"$toolchain" build --release \
         --manifest-path "$rust_dir/Cargo.toml" \
         --bin vllm-rs \
         --features native-tls-vendored
+
+    bash "$SCRIPT_DIR/scripts/check-vllm-rs-portability.sh" \
+        "$rust_dir/target/release/vllm-rs"
 
     mkdir -p "$(dirname "$target_path")"
     cp "$rust_dir/target/release/vllm-rs" "$target_path"
