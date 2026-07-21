@@ -481,6 +481,46 @@ def test_scheduler_dynamic_join_keeps_zero_capacity_node_standby_after_bootstrap
     assert sched.node_manager.has_full_pipeline(model.num_layers)
 
 
+def test_rejoin_refreshes_waiting_node_capabilities_and_retries_bootstrap():
+    model = build_model_info(12)
+    heartbeat_stub = build_node(
+        "mac",
+        model,
+        tflops=10.0,
+        mem_gb=16.0,
+        supports_frontend=False,
+    )
+    rtx = build_node(
+        "rtx",
+        model,
+        tflops=200.0,
+        mem_gb=80.0,
+        supports_frontend=False,
+    )
+    sched = Scheduler(model, [], strategy="dp", routing_strategy="dp", min_nodes_bootstrapping=1)
+
+    sched.enqueue_join(heartbeat_stub)
+    sched.enqueue_join(rtx)
+    sched._process_joins()  # type: ignore[attr-defined]
+    assert not sched.node_manager.has_full_pipeline(model.num_layers)
+    assert heartbeat_stub in sched.node_manager.standby_nodes
+
+    full_mac_join = build_node(
+        "mac",
+        model,
+        tflops=10.0,
+        mem_gb=16.0,
+        supports_frontend=True,
+    )
+    sched.enqueue_join(full_mac_join)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    registered_mac = sched.node_manager.get("mac")
+    assert registered_mac is heartbeat_stub
+    assert registered_mac.supports_frontend is True
+    assert sched.node_manager.has_full_pipeline(model.num_layers)
+
+
 def test_bootstrap_starts_a_fresh_heartbeat_lease_for_waiting_nodes():
     """A worker must not expire immediately after waiting for the cluster bootstrap."""
     model = build_model_info(12)

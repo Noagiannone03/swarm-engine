@@ -9,9 +9,17 @@ class RecordingScheduler:
         self.model_info = build_model_info(12)
         self.node = build_node("worker", self.model_info, mem_gb=16.0)
         self.update = None
+        self.joined = None
+        self.full_pipeline = True
 
     def get_node(self, node_id):
         return self.node if node_id == self.node.node_id else None
+
+    def has_full_pipeline(self):
+        return self.full_pipeline
+
+    def enqueue_join(self, node):
+        self.joined = node
 
     def enqueue_node_update(self, node_id, **update):
         self.update = (node_id, update)
@@ -89,6 +97,42 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
     assert update["max_concurrent_requests"] == 1
     assert update["direct_peer_ids"] == ["downstream-worker"]
     assert update["account_hash"] == account_hash("ab" * 32)
+
+
+def test_node_update_refreshes_registration_when_bootstrap_is_incomplete():
+    scheduler = RecordingScheduler()
+    scheduler.full_pipeline = False
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = scheduler
+
+    response = handler.node_update(
+        {
+            "node_id": "worker",
+            "hardware": {
+                "node_id": "worker",
+                "num_gpus": 1,
+                "tflops_fp16": 8.52,
+                "gpu_name": "Apple M4",
+                "memory_gb": 16.0,
+                "memory_bandwidth_gbps": 100.0,
+                "device": "mlx",
+                "usable_memory_bytes": 8 * 1024**3,
+            },
+            "kvcache_mem_ratio": 0.25,
+            "param_mem_ratio": 0.65,
+            "max_concurrent_requests": 1,
+            "max_sequence_length": 65536,
+            "supports_frontend": True,
+            "account_token": "ab" * 32,
+        }
+    )
+
+    assert response == ({}, {})
+    assert scheduler.update is None
+    assert scheduler.joined is not None
+    assert scheduler.joined.node_id == "worker"
+    assert scheduler.joined.supports_frontend is True
+    assert scheduler.joined.hardware.usable_memory_bytes == 8 * 1024**3
 
 
 def test_layer_allocation_returns_all_possible_cyclic_outbound_peers():

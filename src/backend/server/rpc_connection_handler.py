@@ -125,6 +125,22 @@ class RPCConnectionHandler(ConnectionHandler):
                 layer_allocation = self.wait_layer_allocation(node.node_id, wait_seconds=5)
                 return layer_allocation, {}
 
+            if not self.scheduler.has_full_pipeline():
+                # A scheduler restart can receive lightweight heartbeats before a
+                # full node_join.  That auto-registers a STANDBY node, then later
+                # node_update carries the complete worker-owned capabilities
+                # (frontend support, live hardware envelope, account binding).
+                # Re-route through join so the existing node is refreshed and the
+                # scheduler retries bootstrap once the cluster has become eligible.
+                logger.info(
+                    f"Node {node.node_id} update arrived before bootstrap completed; "
+                    "refreshing registration via join"
+                )
+                self.scheduler.enqueue_join(node)
+                time.sleep(0.1)
+                layer_allocation = self.wait_layer_allocation(node.node_id, wait_seconds=5)
+                return layer_allocation, {}
+
             # Node exists, update its info
             self.scheduler.enqueue_node_update(
                 node.node_id,
