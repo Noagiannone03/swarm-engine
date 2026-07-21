@@ -405,7 +405,7 @@ class Scheduler:
 
     def checking_node_heartbeat(self) -> None:
         """Check the heartbeat of all nodes."""
-        for node in self.node_manager.active_nodes:
+        for node in self.node_manager.nodes:
             if time.time() - node.last_heartbeat > self.heartbeat_timeout:
                 logger.debug(f"Node {node.node_id} heartbeat timeout")
                 # Route leave through the event loop so global rebalance/reboot is serialized.
