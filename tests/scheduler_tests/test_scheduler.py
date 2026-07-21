@@ -532,6 +532,47 @@ def test_fast_decoder_join_repartitions_full_frontend_at_idle_boundary():
     assert not sched.serving_ready()
 
 
+def test_bootstrap_skipped_fast_decoder_gets_one_drained_rebalance():
+    """Arrival order cannot strand a useful decoder behind a full frontend."""
+
+    model = build_model_info(28)
+    mac = build_node(
+        "mac",
+        model,
+        tflops=10.0,
+        mem_gb=200.0,
+        mem_bandwidth_gbps=100.0,
+        supports_frontend=True,
+    )
+    rtx = build_node(
+        "rtx",
+        model,
+        tflops=200.0,
+        mem_gb=400.0,
+        mem_bandwidth_gbps=1000.0,
+        supports_frontend=False,
+    )
+    set_rtt_from_coords([mac, rtx])
+    sched = Scheduler(
+        model,
+        [rtx, mac],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+
+    assert sched.bootstrap()
+    # Upstream's stage-count objective closes the model on the Mac and skips
+    # the decoder. Fabi preserves that valid route until the drained planner
+    # has enough network information to publish an improvement atomically.
+    assert sched.list_node_allocations() == [("mac", 0, 28)]
+    assert sched._pending_rebalance_node_ids == {"rtx"}  # type: ignore[attr-defined]
+
+    assert sched._process_pending_rebalance(force=True)  # type: ignore[attr-defined]
+    assert set(sched.list_node_allocations()) == {("mac", 0, 1), ("rtx", 1, 28)}
+    assert sched.node_manager.num_standby_nodes == 0
+
+
 def test_fast_decoder_join_waits_for_inflight_request_to_finish():
     """A topology change never invalidates a generation already in flight."""
 

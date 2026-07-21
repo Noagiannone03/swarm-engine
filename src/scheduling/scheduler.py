@@ -338,6 +338,7 @@ class Scheduler:
         for node in self.node_manager.active_nodes:
             node.last_heartbeat = lease_started_at
         self._bootstrapped_event.set()
+        self._queue_bootstrap_standby_rebalances()
         # Snapshot at INFO after bootstrap since allocations/pipelines may have materially changed.
         self.emit_alloc_log_snapshot(reason="Post Bootstrap")
         return True
@@ -1016,6 +1017,50 @@ class Scheduler:
                 )
 
         self._process_pending_rebalance()
+
+    def _queue_bootstrap_standby_rebalances(self) -> None:
+        """Reconsider useful workers skipped by the initial DP solution.
+
+        The upstream DP objective minimizes stage count before it has runtime
+        measurements.  A frontend node capable of hosting the whole model can
+        therefore close a one-node pipeline while a much faster decoder-only
+        worker, which may even have joined first, is left in STANDBY.  The
+        allocator's lightweight dynamic join cannot activate that worker when
+        its proposed overlap is not already an exact-boundary route.
+
+        Treat that leftover exactly like a route-dead late join: keep the live
+        bootstrap intact, then let the existing drained, RTT-aware planner
+        decide once whether the worker improves the route.  Capacity-invalid
+        workers are not queued, and telemetry updates never call this method,
+        so host-memory fluctuations cannot create reload oscillations.
+        """
+
+        if not self.dynamic_pipelines_router:
+            return
+        allocations = self.list_node_allocations()
+        queued: List[str] = []
+        for node in self.node_manager.standby_nodes:
+            if node.manual_layer_assignment:
+                continue
+            candidate = self.layer_allocator.dynamic_join_candidate(node)
+            if candidate is None:
+                continue
+            proposed = [*allocations, (node.node_id, *candidate)]
+            participants = self.node_manager.full_pipeline_segment_ids(
+                proposed, self.num_layers
+            )
+            if node.node_id in participants:
+                # ``allocate_standby_nodes`` should already have admitted an
+                # exact-route shard. Avoid scheduling a reload if a custom
+                # allocator left one behind for another reason.
+                continue
+            self._pending_rebalance_node_ids.add(node.node_id)
+            queued.append(node.node_id)
+        if queued:
+            logger.info(
+                "Queued one drained global rebalance for bootstrap-skipped node(s): %s",
+                sorted(queued),
+            )
 
     def _plan_global_rebalance(self) -> Dict[str, Tuple[int, int]]:
         """Trim proposed late overlaps into exact boundaries on detached copies.
