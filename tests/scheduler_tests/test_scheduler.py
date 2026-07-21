@@ -458,6 +458,29 @@ def test_scheduler_bootstrap_wait_and_dynamic_events():
     sched._process_leaves()  # type: ignore[attr-defined]
 
 
+def test_scheduler_dynamic_join_keeps_zero_capacity_node_standby_after_bootstrap():
+    model = build_model_info(12)
+    n1 = build_node("a100-0", model, tflops=312.0, mem_gb=80.0, x=0, y=0)
+    set_rtt_from_coords([n1])
+    sched = Scheduler(model, [n1], strategy="dp", routing_strategy="dp", min_nodes_bootstrapping=1)
+
+    assert sched.bootstrap()
+    assert sched.node_manager.has_full_pipeline(model.num_layers)
+
+    low_memory = build_node("local-low-memory", model, tflops=10.0, mem_gb=16.0, x=1, y=1)
+    low_memory.hardware.usable_memory_bytes = 0
+
+    sched.enqueue_join(low_memory)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    registered = sched.node_manager.get(low_memory.node_id)
+    assert registered is low_memory
+    assert low_memory.start_layer is None
+    assert low_memory.end_layer is None
+    assert low_memory in sched.node_manager.standby_nodes
+    assert sched.node_manager.has_full_pipeline(model.num_layers)
+
+
 def test_bootstrap_starts_a_fresh_heartbeat_lease_for_waiting_nodes():
     """A worker must not expire immediately after waiting for the cluster bootstrap."""
     model = build_model_info(12)
@@ -660,9 +683,9 @@ def test_scheduler_single_node_leave_then_rejoin_reassigns_layers():
     sched._process_joins()  # type: ignore[attr-defined]
 
     # Expected behavior: after re-join with min_nodes_bootstrapping=1, layers are assigned again
-    assert n1_rejoin.start_layer is not None and n1_rejoin.end_layer is not None, (
-        "After re-join, single node should be assigned a full layer range"
-    )
+    assert (
+        n1_rejoin.start_layer is not None and n1_rejoin.end_layer is not None
+    ), "After re-join, single node should be assigned a full layer range"
 
 
 def test_scheduler_three_nodes_sequential_join_leave_rejoin():

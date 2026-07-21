@@ -452,11 +452,28 @@ class Scheduler:
             if bootstrapped:
                 if self.dynamic_pipelines_router:
                     # for dynamic pipelines router, join the node to the lightest layer
-                    self.layer_allocator.dynamic_join(node)
-                try:
-                    self.request_router.expand_pipelines()
-                except NotImplementedError:
-                    pass
+                    try:
+                        joined = self.layer_allocator.dynamic_join(node)
+                    except ValueError:
+                        logger.exception(
+                            "Dynamic join rejected node %s; keeping it in standby",
+                            node.node_id,
+                        )
+                        self.node_manager.standby([node.node_id])
+                        node.clear_serving_state()
+                        joined = False
+                    if not joined:
+                        logger.info(
+                            "Node %s remains standby after dynamic join rejection",
+                            node.node_id,
+                        )
+                else:
+                    joined = True
+                if joined:
+                    try:
+                        self.request_router.expand_pipelines()
+                    except NotImplementedError:
+                        pass
 
         # Manual layer assignment bypasses bootstrap waiting
         if node.manual_layer_assignment:
@@ -957,9 +974,9 @@ class Scheduler:
 
         # Move active nodes to standby and re-bootstrap (reboot) once.
         self.node_manager.standby([n.node_id for n in self.node_manager.active_nodes])
-        assert self.node_manager.num_standby_nodes == self.node_manager.num_nodes, (
-            "All active nodes should be moved to standby"
-        )
+        assert (
+            self.node_manager.num_standby_nodes == self.node_manager.num_nodes
+        ), "All active nodes should be moved to standby"
         assert self.node_manager.num_active_nodes == 0, "No active nodes before re-bootstrap"
         logger.warning("Re-bootstrapping for global rebalance")
         try:

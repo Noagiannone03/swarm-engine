@@ -156,6 +156,29 @@ def _test_gap_patch_rebalance(allocator: BaseLayerAllocator):
     assert restored_mem == before_mem
 
 
+def test_dynamic_join_rejects_zero_usable_memory_node_without_invalid_allocation():
+    model = build_model_info(12)
+    primary = _build_node("a100-80g", model, id_suffix="-primary")
+    node_management = build_node_management([primary])
+    allocator = DynamicProgrammingLayerAllocator(
+        model_info=model,
+        node_management=node_management,
+        dynamic_pipelines_router=True,
+    )
+    assert allocator.allocate_from_standby()
+    assert node_management.has_full_pipeline(model.num_layers)
+
+    low_memory = _build_node("a100-40g", model, id_suffix="-low-memory")
+    low_memory.hardware.usable_memory_bytes = 0
+    node_management.upsert(low_memory, state=NodeState.STANDBY)
+
+    assert allocator.dynamic_join(low_memory) is False
+    assert low_memory.start_layer is None
+    assert low_memory.end_layer is None
+    assert low_memory in node_management.standby_nodes
+    assert node_management.has_full_pipeline(model.num_layers)
+
+
 @pytest.mark.parametrize(
     "num_layers,counts,expected_ranges,strategy",
     [
@@ -257,9 +280,9 @@ def test_allocator(
     expected_total = sum(e - s for (s, e) in expected_ranges)
     assert sum(e - s for (s, e) in actual_trimmed) == expected_total
     # Order-insensitive comparison: ranges represent stages; allow pipeline reordering
-    assert Counter(actual_trimmed) == Counter(expected_ranges), (
-        f"Stage ranges mismatch (order-insensitive):\nactual={actual_trimmed}\nexpected={expected_ranges}"
-    )
+    assert Counter(actual_trimmed) == Counter(
+        expected_ranges
+    ), f"Stage ranges mismatch (order-insensitive):\nactual={actual_trimmed}\nexpected={expected_ranges}"
 
 
 @pytest.mark.parametrize("strategy", ["greedy", "dp"])
@@ -540,6 +563,6 @@ def test_allocator_does_not_duplicate_leftover_nodes(strategy: Literal["greedy",
     )
     ok = alloc.allocate_from_standby()
     assert ok is True
-    assert node_management.num_nodes == expected_node_count, (
-        "Should not duplicate nodes during allocation"
-    )
+    assert (
+        node_management.num_nodes == expected_node_count
+    ), "Should not duplicate nodes during allocation"

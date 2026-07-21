@@ -214,6 +214,26 @@ class BaseLayerAllocator:
             start_layer,
             end_layer,
         )
+        if not self._validate_allocation(start_layer, end_layer):
+            capacity_without_endpoints = node.get_decoder_layer_capacity()
+            capacity_with_input = node.get_decoder_layer_capacity(include_input_embed=True)
+            capacity_with_input_and_head = node.get_decoder_layer_capacity(
+                include_input_embed=True,
+                include_lm_head=True,
+            )
+            logger.warning(
+                "[LayerAllocator] Rejecting dynamic join for node %s: invalid candidate "
+                "[%d, %d), usable_memory_bytes=%s, decoder_capacity=%d, "
+                "decoder_capacity_with_input=%d, decoder_capacity_with_input_and_head=%d",
+                node.node_id,
+                start_layer,
+                end_layer,
+                node.hardware.usable_memory_bytes,
+                capacity_without_endpoints,
+                capacity_with_input,
+                capacity_with_input_and_head,
+            )
+            return False
         self.allocate(node, start_layer, end_layer)
         return True
 
@@ -581,11 +601,15 @@ class BaseLayerAllocator:
         """Adjust the number of layers to host for tail nodes."""
         include_input_embed = proposed_start_layer == 0
         node_capacity = node.get_decoder_layer_capacity(include_input_embed=include_input_embed)
+        if node_capacity <= 0:
+            return proposed_start_layer
         end_layer = min(proposed_start_layer + node_capacity, self.num_total_layers)
         if end_layer == self.num_total_layers:
             adjusted_capacity = node.get_decoder_layer_capacity(
                 include_lm_head=True, include_input_embed=include_input_embed
             )
+            if adjusted_capacity <= 0:
+                return proposed_start_layer
             end_layer = min(proposed_start_layer + adjusted_capacity, self.num_total_layers)
 
         return end_layer
