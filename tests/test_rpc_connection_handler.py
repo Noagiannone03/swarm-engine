@@ -127,12 +127,61 @@ def test_node_update_refreshes_registration_when_bootstrap_is_incomplete():
         }
     )
 
-    assert response == ({}, {})
+    assert response == (
+        {
+            "node_id": "worker",
+            "status": "waiting",
+            "start_layer": None,
+            "end_layer": None,
+            "chunked_prefill_size": 0,
+            "outbound_peer_ids": [],
+        },
+        {},
+    )
     assert scheduler.update is None
     assert scheduler.joined is not None
     assert scheduler.joined.node_id == "worker"
     assert scheduler.joined.supports_frontend is True
     assert scheduler.joined.hardware.usable_memory_bytes == 8 * 1024**3
+
+
+def test_initial_join_acknowledges_registration_before_dp_allocation():
+    scheduler = RecordingScheduler()
+    scheduler.full_pipeline = False
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = scheduler
+
+    response = handler.wait_join_registration("worker", wait_seconds=0.01)
+
+    assert response["node_id"] == "worker"
+    assert response["status"] == "waiting"
+    assert response["start_layer"] is None
+    assert response["end_layer"] is None
+
+
+def test_node_join_starts_heartbeat_phase_before_full_dp_pipeline(monkeypatch):
+    scheduler = RecordingScheduler()
+    scheduler.full_pipeline = False
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = scheduler
+    monkeypatch.setattr(handler, "build_node", lambda _message: scheduler.node)
+
+    response = handler.node_join({"node_id": "worker"})
+
+    assert scheduler.joined is scheduler.node
+    assert response["node_id"] == "worker"
+    assert response["status"] == "waiting"
+
+
+def test_initial_join_still_returns_ready_allocation_immediately():
+    scheduler = AllocationScheduler()
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = scheduler
+
+    response = handler.wait_join_registration("head-a", wait_seconds=0.01)
+
+    assert response["start_layer"] == 0
+    assert response["end_layer"] == 6
 
 
 def test_layer_allocation_returns_all_possible_cyclic_outbound_peers():

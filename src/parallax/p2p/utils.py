@@ -1,4 +1,4 @@
-﻿"""
+"""
 Utility functions for P2P server.
 
 This module contains utility functions for the P2P server.
@@ -8,12 +8,37 @@ import asyncio
 import os
 from concurrent.futures import Future
 from threading import Thread
-from typing import Awaitable
+from typing import Awaitable, Collection
 
 try:
     import uvloop
 except ImportError:  # uvloop does not support Windows.
     uvloop = None
+
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def mdns_enabled_for_topology(
+    *,
+    initial_peers: Collection[str] = (),
+    relay_servers: Collection[str] = (),
+) -> bool:
+    """Choose mDNS only for LAN discovery unless explicitly overridden.
+
+    Lattica enables mDNS by default. That is useful for an isolated local swarm,
+    but redundant (and noisy on virtual interfaces) once the node has explicit
+    DHT bootstraps or public relay servers. ``PARALLAX_ENABLE_MDNS`` remains an
+    operator override for unusual mixed LAN/public deployments.
+    """
+
+    configured = os.environ.get("PARALLAX_ENABLE_MDNS", "").strip().lower()
+    if configured in _TRUE_VALUES:
+        return True
+    if configured in _FALSE_VALUES:
+        return False
+    return not initial_peers and not relay_servers
 
 
 def switch_to_uvloop() -> asyncio.AbstractEventLoop:

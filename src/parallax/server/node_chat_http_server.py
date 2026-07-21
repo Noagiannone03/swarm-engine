@@ -1,7 +1,7 @@
 import asyncio
 import json
-import os
 import time
+import uuid
 from typing import Dict
 
 import fastapi
@@ -14,12 +14,11 @@ from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import State
 
 from backend.server.rpc_connection_handler import RPCConnectionHandler
+from parallax.p2p.utils import mdns_enabled_for_topology
 from parallax_utils.file_util import get_project_root
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
-
-import uuid
 
 # Fast API
 app = fastapi.FastAPI(
@@ -74,7 +73,6 @@ app.mount(
 
 
 class NodeChatHttpServer:
-
     def __init__(self, args):
         self.host = args.host
         self.port = args.node_chat_port
@@ -93,7 +91,12 @@ class NodeChatHttpServer:
 
     def build_lattica(self):
         self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs)
-        if os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() != "1":
+        mdns_enabled = mdns_enabled_for_topology(
+            initial_peers=self.initial_peers,
+            relay_servers=self.relay_servers,
+        )
+        logger.info("mDNS discovery enabled: %s", mdns_enabled)
+        if not mdns_enabled:
             self.lattica.with_mdns(False)
 
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":

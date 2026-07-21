@@ -84,7 +84,13 @@ class RPCConnectionHandler(ConnectionHandler):
             node = self.build_node(message)
             self.scheduler.enqueue_join(node)
 
-            response = self.wait_layer_allocation(node.node_id, wait_seconds=300)
+            # A full DP pipeline may require several workers. A blocking join
+            # prevented the worker from starting its announcer until allocation,
+            # while the scheduler expired that waiting node after 30 seconds.
+            # Acknowledge registration as soon as the event loop has accepted it;
+            # periodic node_update calls then keep the lease alive and deliver the
+            # eventual layer allocation.
+            response = self.wait_join_registration(node.node_id, wait_seconds=5)
             logger.debug(f"node_join response: {response}")
             return response
         except Exception as e:
@@ -119,11 +125,11 @@ class RPCConnectionHandler(ConnectionHandler):
                     f"Node {node.node_id} not found in scheduler, auto-joining via node_update"
                 )
                 self.scheduler.enqueue_join(node)
-                # Wait a bit for join to be processed
-                time.sleep(0.1)
-                # Return layer allocation after join
-                layer_allocation = self.wait_layer_allocation(node.node_id, wait_seconds=5)
-                return layer_allocation, {}
+                # A scheduler restart must also acknowledge the registration
+                # before a full pipeline exists, so this already-running worker
+                # keeps sending heartbeats while its peers reconnect.
+                response = self.wait_join_registration(node.node_id, wait_seconds=5)
+                return response, {}
 
             if not self.scheduler.has_full_pipeline():
                 # A scheduler restart can receive lightweight heartbeats before a
@@ -137,9 +143,7 @@ class RPCConnectionHandler(ConnectionHandler):
                     "refreshing registration via join"
                 )
                 self.scheduler.enqueue_join(node)
-                time.sleep(0.1)
-                layer_allocation = self.wait_layer_allocation(node.node_id, wait_seconds=5)
-                return layer_allocation, {}
+                return self.pending_join_response(node.node_id), {}
 
             # Node exists, update its info
             self.scheduler.enqueue_node_update(
@@ -225,6 +229,33 @@ class RPCConnectionHandler(ConnectionHandler):
             if time.time() - start_time > wait_seconds:
                 return {}
             time.sleep(0.5)
+
+    def wait_join_registration(self, current_node_id, wait_seconds):
+        """Return an allocation or a non-empty pending registration response."""
+
+        start_time = time.monotonic()
+        while time.monotonic() - start_time <= wait_seconds:
+            layer_allocation = self.get_layer_allocation(current_node_id)
+            if layer_allocation:
+                return layer_allocation
+            if self.scheduler.get_node(current_node_id) is not None:
+                return self.pending_join_response(current_node_id)
+            time.sleep(0.05)
+        return {}
+
+    def pending_join_response(self, current_node_id):
+        """Acknowledge a live worker whose DP layer range is not ready yet."""
+
+        if self.scheduler.get_node(current_node_id) is None:
+            return {}
+        return {
+            "node_id": current_node_id,
+            "status": "waiting",
+            "start_layer": None,
+            "end_layer": None,
+            "chunked_prefill_size": 0,
+            "outbound_peer_ids": [],
+        }
 
     def get_layer_allocation(self, current_node_id):
         list_node_allocations = self.scheduler.list_node_allocations()

@@ -1,4 +1,3 @@
-import os
 import threading
 import time
 from typing import List, Literal
@@ -11,6 +10,7 @@ from backend.server.rpc_connection_handler import RPCConnectionHandler
 from backend.server.static_config import get_model_info, get_node_join_command
 from parallax.cli import PUBLIC_INITIAL_PEERS, PUBLIC_RELAY_SERVERS
 from parallax.p2p.server import TransformerConnectionHandler
+from parallax.p2p.utils import mdns_enabled_for_topology
 from parallax_utils.logging_config import get_logger
 from scheduling.node import RequestSignal
 from scheduling.scheduler import Scheduler
@@ -267,7 +267,10 @@ class SchedulerManage:
                 logger.debug("Created connection handler with existing Lattica")
             return
 
-        mdns_enabled = os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() == "1"
+        mdns_enabled = mdns_enabled_for_topology(
+            initial_peers=self.initial_peers,
+            relay_servers=self.relay_servers,
+        )
         logger.debug(
             f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns={mdns_enabled}, dht_prefix={self.dht_prefix}"
         )

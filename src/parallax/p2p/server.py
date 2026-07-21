@@ -25,7 +25,7 @@ from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stre
 from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 from parallax.p2p.proto import forward_pb2
-from parallax.p2p.utils import AsyncWorker
+from parallax.p2p.utils import AsyncWorker, mdns_enabled_for_topology
 from parallax.server.server_info import detect_node_hardware
 from parallax.server.vllm_rust_frontend import vllm_rust_frontend_available
 from parallax.utils.shared_state import SharedState
@@ -495,7 +495,12 @@ class GradientServer:
             .with_listen_addrs(self.host_maddrs)
             .with_key_path(_resolve_worker_key_path())
         )
-        if os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() != "1":
+        mdns_enabled = mdns_enabled_for_topology(
+            initial_peers=self.initial_peers,
+            relay_servers=self.relay_servers,
+        )
+        logger.info("mDNS discovery enabled: %s", mdns_enabled)
+        if not mdns_enabled:
             self.lattica.with_mdns(False)
 
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":
