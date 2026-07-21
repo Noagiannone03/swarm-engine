@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from typing import Dict
 
@@ -92,6 +93,8 @@ class NodeChatHttpServer:
 
     def build_lattica(self):
         self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs)
+        if os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() != "1":
+            self.lattica.with_mdns(False)
 
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":
             if self.scheduler_addr.startswith("/"):

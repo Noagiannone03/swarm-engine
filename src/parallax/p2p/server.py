@@ -495,6 +495,8 @@ class GradientServer:
             .with_listen_addrs(self.host_maddrs)
             .with_key_path(_resolve_worker_key_path())
         )
+        if os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() != "1":
+            self.lattica.with_mdns(False)
 
         if self.scheduler_addr is not None and self.scheduler_addr != "auto":
             if self.scheduler_addr.startswith("/"):

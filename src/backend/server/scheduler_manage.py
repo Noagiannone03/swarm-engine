@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from typing import List, Literal
@@ -266,10 +267,13 @@ class SchedulerManage:
                 logger.debug("Created connection handler with existing Lattica")
             return
 
+        mdns_enabled = os.environ.get("PARALLAX_ENABLE_MDNS", "").strip() == "1"
         logger.debug(
-            f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns=False, dht_prefix={self.dht_prefix}"
+            f"Starting Lattica with host_maddrs={self.host_maddrs}, mdns={mdns_enabled}, dht_prefix={self.dht_prefix}"
         )
         self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs).with_key_path(".")
+        if not mdns_enabled:
+            self.lattica.with_mdns(False)
 
         if len(self.relay_servers) > 0:
             logger.info(f"Using relay servers: {self.relay_servers}")
