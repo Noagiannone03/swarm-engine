@@ -24,18 +24,21 @@ def test_budget_uses_live_available_memory_not_total_ram():
         available_bytes=gb(10),
         active_bytes=0,
         max_working_set_bytes=gb(12),
-        system_reserve_bytes=gb(3.2),
+        system_reserve_bytes=gb(2),
     )
 
-    assert budget.process_limit_bytes == gb(10) - gb(3.2)
-    assert budget.additional_bytes == gb(10) - gb(3.2)
+    assert budget.process_limit_bytes == gb(8)
+    assert budget.additional_bytes == gb(8)
 
 
 def test_adaptive_system_reserve_tracks_pressure_without_a_fixed_six_gb_floor():
-    assert adaptive_system_reserve_bytes(gb(16), gb(10)) == gb(3.2)
-    assert adaptive_system_reserve_bytes(gb(16), gb(5)) == gb(4)
-    assert adaptive_system_reserve_bytes(gb(16), gb(3)) == gb(4.8)
-    assert adaptive_system_reserve_bytes(gb(64), gb(40)) == gb(12)
+    assert adaptive_system_reserve_bytes(gb(8), gb(4)) == gb(1.25)
+    assert adaptive_system_reserve_bytes(gb(8), gb(2.4)) == gb(1.5)
+    assert adaptive_system_reserve_bytes(gb(8), gb(1.2)) == gb(2)
+    assert adaptive_system_reserve_bytes(gb(16), gb(10)) == gb(2)
+    assert adaptive_system_reserve_bytes(gb(16), gb(4.5)) == gb(2.5)
+    assert adaptive_system_reserve_bytes(gb(16), gb(3)) == gb(3)
+    assert adaptive_system_reserve_bytes(gb(64), gb(40)) == gb(6.4)
 
 
 def test_cuda_budget_uses_global_free_vram_and_keeps_driver_reserve():
@@ -129,8 +132,8 @@ def test_configure_applies_one_cap_to_memory_and_wired_limits(monkeypatch):
 
     budget = configure_mlx_memory_limits(mlx, psutil_module=psutil)
 
-    assert budget.process_limit_bytes == gb(10) - gb(3.2)
-    assert mlx.calls[0:2] == [("memory", gb(10) - gb(3.2)), ("wired", gb(10) - gb(3.2))]
+    assert budget.process_limit_bytes == gb(8)
+    assert mlx.calls[0:2] == [("memory", gb(8)), ("wired", gb(8))]
     assert mlx.calls[2][0] == "cache"
     assert mlx.calls[2][1] <= 256 * 1024**2
 
@@ -142,8 +145,8 @@ def test_configure_applies_one_cap_to_memory_and_wired_limits(monkeypatch):
         psutil_module=psutil,
         process_limit_cap_bytes=budget.process_limit_bytes,
     )
-    assert later.process_limit_bytes == gb(10) - gb(3.2)
-    assert later.additional_bytes == gb(10) - gb(3.2) - gb(3)
+    assert later.process_limit_bytes == gb(8)
+    assert later.additional_bytes == gb(5)
 
 
 def test_explicit_system_reserve_override_still_wins(monkeypatch):

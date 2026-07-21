@@ -25,7 +25,7 @@ DEFAULT_CUDA_RESERVE_GB = 1.5
 DEFAULT_MLX_CACHE_LIMIT_MB = 256.0
 DEFAULT_PRESSURE_POLL_SECONDS = 1.0
 DEFAULT_PRESSURE_DRAIN_SECONDS = 30.0
-MIN_ADAPTIVE_SYSTEM_RESERVE_GB = 2.0
+MIN_ADAPTIVE_SYSTEM_RESERVE_GB = 1.25
 MAX_ADAPTIVE_SYSTEM_RESERVE_GB = 12.0
 
 
@@ -185,35 +185,44 @@ def adaptive_system_reserve_bytes(
     reserve is sampled only at startup/restart, while ``MemoryPressureController``
     handles later pressure without reallocating continuously.
 
-    Policy:
-    - green desktop: reserve ~20% of RAM (bounded 2-12 GiB);
-    - elevated pressure: raise to ~25%;
-    - critical pressure: raise to ~30%.
+    Policy follows the usual OS/orchestrator pattern: keep an absolute
+    ``memory.available`` safety floor and stop/drain when that floor is crossed,
+    rather than reserving a large percentage of the whole machine.  Small Macs
+    need this especially: on an 8 GiB host, a 25-30% reserve can make every
+    useful contribution impossible even while macOS is still in a recoverable
+    pressure state.
 
-    This removes the old hard 6 GiB floor that made 16 GiB Apple Silicon hosts
-    look unusable under moderate load, without allowing allocations while the OS
-    is already under visible pressure.
+    The floor is intentionally lower than the old fixed 6 GiB default, while
+    ``MemoryPressureController`` still prevents a live worker from continuing
+    through sustained critical pressure.
     """
 
     total = max(0, int(total_bytes))
     if total <= 0:
         return 0
 
-    green = min(
-        int(MAX_ADAPTIVE_SYSTEM_RESERVE_GB * GIB),
-        max(int(MIN_ADAPTIVE_SYSTEM_RESERVE_GB * GIB), int(total * 0.20)),
-    )
+    total_gib = total / GIB
+    if total_gib <= 10:
+        normal_gb, elevated_gb, critical_gb = 1.25, 1.5, 2.0
+    elif total_gib <= 20:
+        normal_gb, elevated_gb, critical_gb = 2.0, 2.5, 3.0
+    else:
+        normal_gb = min(8.0, max(3.0, total_gib * 0.10))
+        elevated_gb = min(10.0, max(4.0, total_gib * 0.125))
+        critical_gb = min(12.0, max(5.0, total_gib * 0.15))
+
+    normal = int(min(MAX_ADAPTIVE_SYSTEM_RESERVE_GB, max(MIN_ADAPTIVE_SYSTEM_RESERVE_GB, normal_gb)) * GIB)
     if available_bytes is None:
-        return min(green, total)
+        return min(normal, total)
 
     available = min(total, max(0, int(available_bytes)))
     available_ratio = available / total
-    if available_ratio < 0.25:
-        reserve = max(green, int(total * 0.30))
-    elif available_ratio < 0.40:
-        reserve = max(green, int(total * 0.25))
+    if available_ratio < 0.20:
+        reserve = int(critical_gb * GIB)
+    elif available_ratio < 0.35:
+        reserve = int(elevated_gb * GIB)
     else:
-        reserve = green
+        reserve = normal
     return min(reserve, total)
 
 
