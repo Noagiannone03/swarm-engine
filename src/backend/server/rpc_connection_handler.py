@@ -275,6 +275,9 @@ class RPCConnectionHandler(ConnectionHandler):
                         "tp_size": node.hardware.num_gpus,
                         "enable_weight_refit": self.scheduler.enable_weight_refit,
                         "weight_refit_mode": self.scheduler.weight_refit_mode,
+                        "model_max_sequence_length": getattr(
+                            self.scheduler.model_info, "max_context_length", None
+                        ),
                         "chunked_prefill_size": self.scheduler.chunked_prefill_size_for_node(
                             node_id
                         ),

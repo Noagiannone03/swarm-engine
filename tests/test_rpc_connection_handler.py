@@ -31,6 +31,7 @@ class RecordingScheduler:
 class AllocationScheduler:
     def __init__(self):
         self.model_info = build_model_info(12)
+        self.model_info.max_context_length = 40960
         self.num_layers = 12
         self.enable_weight_refit = False
         self.weight_refit_mode = "disk"
@@ -197,6 +198,8 @@ def test_layer_allocation_returns_all_possible_cyclic_outbound_peers():
 
     assert head["outbound_peer_ids"] == ["tail-a", "tail-b"]
     assert tail["outbound_peer_ids"] == ["head-a", "head-b"]
+    assert head["model_max_sequence_length"] == 40960
+    assert tail["model_max_sequence_length"] == 40960
 
 
 def test_build_node_preserves_frontend_capability():

@@ -1,34 +1,11 @@
 import concurrent.futures
 import math
 
-from parallax.utils.utils import load_config_only
+from parallax.utils.utils import get_model_context_limit, load_config_only
 from parallax_utils.logging_config import get_logger
 from scheduling.model_info import ModelInfo
 
 logger = get_logger(__name__)
-
-
-def get_model_context_limit(config) -> int | None:
-    """Read the model's declared total sequence limit without backend imports."""
-    candidates = [
-        config.get("max_position_embeddings"),
-        config.get("model_max_length"),
-    ]
-    text_config = config.get("text_config")
-    if isinstance(text_config, dict):
-        candidates.extend(
-            [
-                text_config.get("max_position_embeddings"),
-                text_config.get("model_max_length"),
-            ]
-        )
-    limits = [
-        int(value)
-        for value in candidates
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < 2**63
-    ]
-    return min(limits) if limits else None
-
 
 # Supported model list - key: model name, value: MLX model name (same as key if no MLX variant)
 MODELS = {

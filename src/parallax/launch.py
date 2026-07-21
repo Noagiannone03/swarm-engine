@@ -85,6 +85,29 @@ def _update_args_from_shared_state(args, shared_state: SharedState, force_update
         logger.debug(f"Updated model_path to: {args.model_path}")
     else:
         assert False, "Neither scheduler nor worker provides a valid model path!"
+
+    # A worker advertises its hardware/runtime ceiling before it knows which
+    # model the scheduler will assign.  Keep that original ceiling stable and
+    # derive an effective value for each model generation.  This prevents a
+    # low-context model from being started with an unsafe larger window while
+    # still allowing a later model switch to restore the worker's capability.
+    if not hasattr(args, "_worker_max_sequence_length"):
+        args._worker_max_sequence_length = getattr(args, "max_sequence_length", None)
+    worker_limit = args._worker_max_sequence_length
+    model_limit = model_info.get("model_max_sequence_length")
+    if worker_limit is None:
+        args.max_sequence_length = model_limit
+    elif model_limit is None:
+        args.max_sequence_length = worker_limit
+    else:
+        args.max_sequence_length = min(int(worker_limit), int(model_limit))
+        if args.max_sequence_length < int(worker_limit):
+            logger.info(
+                "Clamped worker context from %s to model limit %s for %s",
+                worker_limit,
+                model_limit,
+                model_info["model_name"],
+            )
     # Update tp_size if provided, otherwise keep current value
     args.tp_size = model_info["tp_size"] or args.tp_size
     # Update weight refit switch
@@ -152,7 +175,7 @@ def _wait_executors_check_layer_change(
 
     Returns:
         True if layer allocation changed (need to reload executors),
-        False if all executors exited normally.
+        False if all executors exited without a reallocation request.
     """
     pressure_paused_admission = False
     last_pressure_poll = 0.0
@@ -267,7 +290,17 @@ def _wait_executors_check_layer_change(
                         current_requests,
                     )
                     return False
-
+    failed = [
+        (getattr(proc, "pid", None), getattr(proc, "exitcode", None))
+        for proc in executor_subprocs
+        if getattr(proc, "exitcode", None) not in (None, 0)
+    ]
+    if failed:
+        shared_state.update(
+            frontend_alive=False,
+            status=ServerState.INITIALIZING.value,
+        )
+        raise RuntimeError(f"Executor subprocess exited unexpectedly: {failed}")
     # Check race condition: layer allocation changed after all processes exited
     return shared_state.get_layer_allocation_changed()
 

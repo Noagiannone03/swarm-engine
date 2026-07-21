@@ -401,6 +401,49 @@ def load_config_only(name: str, local_files_only: bool = False):
         return normalize_model_config(json.load(f))
 
 
+def get_model_context_limit(config: dict) -> int | None:
+    """Return the finite total-sequence limit declared by a model config.
+
+    Hugging Face text models usually expose ``max_position_embeddings`` while
+    some tokenizers/models use ``model_max_length``.  VLM repositories can put
+    the same fields under ``text_config``.  Ignore the very large sentinels
+    used by tokenizers to mean "unknown" and keep the most conservative real
+    limit when several variants are present.
+    """
+
+    candidates = [
+        config.get("max_position_embeddings"),
+        config.get("model_max_length"),
+    ]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        candidates.extend(
+            [
+                text_config.get("max_position_embeddings"),
+                text_config.get("model_max_length"),
+            ]
+        )
+    limits = [
+        int(value)
+        for value in candidates
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0 < value < 2**63
+    ]
+    return min(limits) if limits else None
+
+
+def clamp_model_sequence_length(requested: int | None, config: dict) -> int | None:
+    """Clamp a worker request to the model's declared safe context window."""
+
+    model_limit = get_model_context_limit(config)
+    if requested is None:
+        return model_limit
+    if model_limit is None:
+        return int(requested)
+    return min(int(requested), model_limit)
+
+
 def _normalize_quantization_key(key: str) -> str:
     """Map VLM text tower quantization keys to the text-only key layout."""
     prefixes = ("model.language_model.", "language_model.")

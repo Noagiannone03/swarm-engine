@@ -95,6 +95,39 @@ def test_worker_without_local_model_path_tracks_scheduler_model():
     assert args.served_model_name == "Qwen/Qwen3-1.7B"
 
 
+def test_model_context_limit_clamps_each_generation_without_losing_worker_capability():
+    args = Namespace(
+        model_path=None,
+        max_sequence_length=65536,
+        tp_size=1,
+        enable_weight_refit=False,
+        weight_refit_mode=None,
+    )
+    shared_state = SharedState(
+        {
+            "model_name": "Qwen/Qwen3-1.7B",
+            "model_max_sequence_length": 40960,
+            "block_start_index": 0,
+            "block_end_index": 28,
+            "tp_size": 1,
+            "enable_weight_refit": False,
+            "weight_refit_mode": None,
+        }
+    )
+
+    _update_args_from_shared_state(args, shared_state, force_update=False)
+    assert args.max_sequence_length == 40960
+
+    shared_state.update(
+        model_name="long-context/model",
+        model_max_sequence_length=131072,
+    )
+    _update_args_from_shared_state(args, shared_state, force_update=True)
+
+    assert args.max_sequence_length == 65536
+    assert args._worker_max_sequence_length == 65536
+
+
 def test_explicit_model_alias_wins_before_manual_scheduler_assignment_arrives():
     args = Namespace(
         model_path="/models/Qwen3-0.6B-bf16",
@@ -193,6 +226,25 @@ class _FiniteExecutor:
     def join(self, timeout=None):
         del timeout
         self.join_count += 1
+
+
+def test_executor_failure_is_not_treated_as_a_normal_worker_shutdown():
+    class FailedExecutor:
+        pid = 1234
+        exitcode = 1
+
+        @staticmethod
+        def is_alive():
+            return False
+
+    shared_state = SharedState.create()
+    shared_state.set_status(ServerState.READY.value)
+
+    with pytest.raises(RuntimeError, match=r"1234.*1"):
+        _wait_executors_check_layer_change(shared_state, [FailedExecutor()])
+
+    assert shared_state.get_status() == ServerState.INITIALIZING.value
+    assert shared_state.get("frontend_alive") is False
 
 
 def test_memory_warning_pauses_then_resumes_without_layer_reallocation(monkeypatch):

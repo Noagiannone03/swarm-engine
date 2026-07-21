@@ -47,7 +47,11 @@ from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
 from parallax.utils.tokenizer_utils import load_tokenizer
-from parallax.utils.utils import load_local_model_config
+from parallax.utils.utils import (
+    clamp_model_sequence_length,
+    load_local_model_config,
+    normalize_model_config,
+)
 from parallax.vllm.monkey_patch import apply_parallax_vllm_monkey_patch
 from parallax_utils.logging_config import get_logger
 from parallax_utils.prepare_adapter import download_adapter_config
@@ -442,7 +446,7 @@ def initialize_vllm_model_runner(
         end_layer=end_layer,
     )
 
-    config = load_local_model_config(model_path)
+    config = normalize_model_config(load_local_model_config(model_path))
     tokenizer = load_tokenizer(model_path, eos_token_ids=config.get("eos_token_id", None))
     dtype = config.get("torch_dtype", "bfloat16")
 
@@ -547,10 +551,15 @@ def initialize_vllm_model_runner(
             f"num_hidden_layers ({num_hidden_layers})"
         )
 
-    if max_sequence_length is not None:
-        max_len = max_sequence_length
-    else:
-        max_len = getattr(config, "max_position_embeddings", 4096)
+    max_len = clamp_model_sequence_length(max_sequence_length, config)
+    if max_len is None:
+        max_len = 4096
+    if max_sequence_length is not None and max_len < max_sequence_length:
+        logger.warning(
+            "Clamping requested max sequence length from %s to model-declared limit %s",
+            max_sequence_length,
+            max_len,
+        )
 
     model_config = ModelConfig(
         model=str(model_path),

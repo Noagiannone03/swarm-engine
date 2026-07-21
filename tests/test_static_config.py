@@ -4,7 +4,7 @@ from backend.server.static_config import (
     get_model_context_limit,
     get_model_info,
 )
-from parallax.utils.utils import normalize_model_config
+from parallax.utils.utils import clamp_model_sequence_length, normalize_model_config
 
 
 def test_glm_5_1_uses_mlx_community_model():
@@ -30,6 +30,14 @@ def test_model_context_limit_reads_nested_text_config_and_ignores_sentinel():
         )
         == 32768
     )
+
+
+def test_model_sequence_limit_is_a_safe_cap_not_a_permanent_worker_override():
+    config = {"max_position_embeddings": 40960}
+
+    assert clamp_model_sequence_length(65536, config) == 40960
+    assert clamp_model_sequence_length(32768, config) == 32768
+    assert clamp_model_sequence_length(None, config) == 40960
 
 
 def test_model_info_uses_common_context_limit_across_runtime_variants(monkeypatch):

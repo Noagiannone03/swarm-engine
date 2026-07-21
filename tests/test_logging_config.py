@@ -6,6 +6,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from parallax.server.executor import factory
 
 
@@ -79,3 +81,15 @@ def test_vllm_backend_preserves_explicit_logging_override(monkeypatch):
     )
 
     assert os.environ["VLLM_CONFIGURE_LOGGING"] == "1"
+
+
+def test_executor_process_propagates_initialization_failure(monkeypatch):
+    monkeypatch.setattr(factory, "set_log_level", lambda _level: None)
+    monkeypatch.setattr(
+        factory,
+        "create_from_args",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("invalid model contract")),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid model contract"):
+        factory.run_executor_process(SimpleNamespace(log_level="DEBUG"))

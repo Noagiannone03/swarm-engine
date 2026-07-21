@@ -417,6 +417,7 @@ class GradientServer:
         self.model_name = model_name
         self.max_batch_size = max_batch_size
         self.max_sequence_length = max_sequence_length
+        self.model_max_sequence_length = None
         self.supports_frontend = vllm_rust_frontend_available()
         self.param_mem_ratio = param_mem_ratio
         self.kvcache_mem_ratio = kvcache_mem_ratio
@@ -470,6 +471,7 @@ class GradientServer:
                 tp_size=self.tp_size,
                 enable_weight_refit=self.enable_weight_refit,
                 weight_refit_mode=self.weight_refit_mode,
+                model_max_sequence_length=self.model_max_sequence_length,
                 chunked_prefill_size=self.chunked_prefill_size,
                 status=self.status.value,
                 _layer_allocation_changed=self._layer_allocation_changed,
@@ -598,6 +600,7 @@ class GradientServer:
                 self.tp_size = response.get("tp_size")
                 self.enable_weight_refit = response.get("enable_weight_refit")
                 self.weight_refit_mode = response.get("weight_refit_mode")
+                self.model_max_sequence_length = response.get("model_max_sequence_length")
                 self.chunked_prefill_size = int(response.get("chunked_prefill_size", 0))
                 self._update_outbound_peers(response)
 
@@ -946,6 +949,10 @@ class GradientServer:
                                 start_layer = response.get("start_layer")
                                 end_layer = response.get("end_layer")
                                 model_name = response.get("model_name")
+                                model_max_sequence_length = response.get(
+                                    "model_max_sequence_length"
+                                )
+                                has_model_context = "model_max_sequence_length" in response
                                 negotiated_chunk_size = response.get("chunked_prefill_size")
                                 if start_layer is not None and end_layer is not None:
                                     logger.debug(
@@ -962,7 +969,16 @@ class GradientServer:
                                         negotiated_chunk_size is not None
                                         and int(negotiated_chunk_size) != self.chunked_prefill_size
                                     )
-                                    if allocation_changed or prefill_contract_changed:
+                                    model_context_changed = (
+                                        has_model_context
+                                        and model_max_sequence_length
+                                        != self.model_max_sequence_length
+                                    )
+                                    if (
+                                        allocation_changed
+                                        or prefill_contract_changed
+                                        or model_context_changed
+                                    ):
                                         logger.warning(
                                             f"Worker serving contract changed! "
                                             f"Current: [{self.block_start_index}, {self.block_end_index}) -> "
@@ -976,6 +992,12 @@ class GradientServer:
                                         self.block_end_index = end_layer
                                         if model_name:
                                             self.model_name = model_name
+                                        if has_model_context:
+                                            self.model_max_sequence_length = (
+                                                None
+                                                if model_max_sequence_length is None
+                                                else int(model_max_sequence_length)
+                                            )
                                         if negotiated_chunk_size is not None:
                                             self.chunked_prefill_size = int(negotiated_chunk_size)
                                         # Set flag to trigger executor reload

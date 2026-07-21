@@ -122,8 +122,9 @@ def run_executor_process(args, shared_state=None, conn=None):
         executor.run_loop()
     except KeyboardInterrupt:
         logger.debug("Executor received interrupt signal, shutting down...")
-    except Exception as e:
-        logger.exception(e)
+    except Exception:
+        logger.exception("Executor subprocess failed")
+        raise
     finally:
         if executor is not None:
             executor.shutdown()
