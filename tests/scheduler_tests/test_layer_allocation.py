@@ -387,7 +387,10 @@ def test_dp_rejects_infeasible_frontend_then_recovers_with_safe_parameter_budget
         16.0,
         100.0,
         "mlx",
-        usable_memory_bytes=4_388_208_640,
+        # Live pressure-aware envelope from the Windows-first public-network
+        # lab run.  In this exact window the Mac can fit embedding + every
+        # decoder layer, but not embedding + decoders + lm_head.
+        usable_memory_bytes=5_688_672_256,
     )
     windows_hardware = NodeHardwareInfo(
         "windows",
@@ -413,7 +416,8 @@ def test_dp_rejects_infeasible_frontend_then_recovers_with_safe_parameter_budget
         param_mem_ratio=0.65,
         supports_frontend=False,
     )
-    node_management = build_node_management([head, tail])
+    # Reproduce the actual join order: tail-only Windows first, Mac second.
+    node_management = build_node_management([tail, head])
     allocator = DynamicProgrammingLayerAllocator(
         model_info=model,
         node_management=node_management,
@@ -430,7 +434,11 @@ def test_dp_rejects_infeasible_frontend_then_recovers_with_safe_parameter_budget
     # caps the absolute bytes, while this split leaves enough of that envelope
     # for the embedding and the Mac's decoder stage.
     head.param_mem_ratio = 0.65
-    assert head.get_decoder_layer_capacity(include_input_embed=True) > 0
+    assert head.get_decoder_layer_capacity(include_input_embed=True) >= model.num_layers
+    assert (
+        head.get_decoder_layer_capacity(include_input_embed=True, include_lm_head=True)
+        < model.num_layers
+    )
     assert allocator.allocate_from_standby()
     assert node_management.has_full_pipeline(model.num_layers)
     assert head.start_layer == 0

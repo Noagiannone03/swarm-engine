@@ -992,12 +992,24 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
                             include_lm_head=True,
                         )
                         if c_single < num_layers:
-                            path[(i, open_residuals, finished_pipes)] = best_action
-                            return best_cost
-                        cost = 1 + dp(i + 1, open_residuals, finished_pipes + 1)
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_action = ("start", 0, True)
+                            # The head can still start a multi-node pipeline.
+                            # Keep at least one decoder layer for a later node
+                            # which can own that layer together with lm_head.
+                            # Treating this as an infeasible start rejects the
+                            # valid endpoint split where embedding + all
+                            # decoders fit here but both model endpoints do not.
+                            r_new = 1
+                            new_open = list(open_residuals) + [r_new]
+                            new_open.sort()
+                            cost = 1 + dp(i + 1, tuple(new_open), finished_pipes)
+                            if cost < best_cost:
+                                best_cost = cost
+                                best_action = ("start", r_new, False)
+                        else:
+                            cost = 1 + dp(i + 1, open_residuals, finished_pipes + 1)
+                            if cost < best_cost:
+                                best_cost = cost
+                                best_action = ("start", 0, True)
                     else:
                         new_open = list(open_residuals) + [r_new]
                         new_open.sort()
