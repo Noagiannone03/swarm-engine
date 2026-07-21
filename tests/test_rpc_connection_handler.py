@@ -52,6 +52,10 @@ class AllocationScheduler:
     def negotiated_chunked_prefill_size(self):
         return 0
 
+    def chunked_prefill_size_for_node(self, node_id):
+        assert node_id in self.nodes
+        return self.negotiated_chunked_prefill_size()
+
 
 def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
     scheduler = RecordingScheduler()

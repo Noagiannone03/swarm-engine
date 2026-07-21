@@ -275,7 +275,9 @@ class RPCConnectionHandler(ConnectionHandler):
                         "tp_size": node.hardware.num_gpus,
                         "enable_weight_refit": self.scheduler.enable_weight_refit,
                         "weight_refit_mode": self.scheduler.weight_refit_mode,
-                        "chunked_prefill_size": self.scheduler.negotiated_chunked_prefill_size(),
+                        "chunked_prefill_size": self.scheduler.chunked_prefill_size_for_node(
+                            node_id
+                        ),
                         "outbound_peer_ids": self._outbound_peer_ids(
                             current_node_id,
                             end_layer,

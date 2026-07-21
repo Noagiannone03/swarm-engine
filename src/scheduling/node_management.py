@@ -7,7 +7,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from parallax_utils.logging_config import get_logger
 from scheduling.node import Node
@@ -242,7 +242,6 @@ class NodeManager:
 
     def remove(self, node_id: str) -> Optional[Node]:
         """Remove a node; returns removed node if present."""
-        pipeline_to_detach: Optional[Pipeline] = None
         with self._lock:
             self._state.pop(node_id, None)
             removed = self._nodes.pop(node_id, None)
@@ -388,6 +387,42 @@ class NodeManager:
     def has_full_pipeline(self, num_total_layers: int, ready_only: bool = False) -> bool:
         """Check if there is a full pipeline among ACTIVE nodes."""
         return self.num_full_pipelines(num_total_layers, ready_only) > 0
+
+    def full_pipeline_node_ids(
+        self, total_layers: int, ready_only: bool = False
+    ) -> Set[str]:
+        """Return nodes that belong to at least one complete ``[0, L)`` path.
+
+        Dynamic allocation can leave useful future shards ACTIVE even though
+        they do not currently connect a head to a tail.  Those orphan ranges
+        must not affect a serving pipeline's wire-level runtime contract.
+
+        A segment ``[start, end)`` belongs to a full path iff ``start`` is
+        reachable from layer 0 and ``end`` can reach ``total_layers``.  The two
+        linear DAG passes avoid enumerating an exponential number of paths.
+        """
+
+        segments = self.list_node_allocations(total_layers, ready_only)
+        if not segments:
+            return set()
+
+        reachable_from_head = {0}
+        for _, start, end in sorted(segments, key=lambda item: (item[1], item[2])):
+            if start in reachable_from_head:
+                reachable_from_head.add(end)
+
+        reaches_tail = {total_layers}
+        for _, start, end in sorted(
+            segments, key=lambda item: (item[1], item[2]), reverse=True
+        ):
+            if end in reaches_tail:
+                reaches_tail.add(start)
+
+        return {
+            node_id
+            for node_id, start, end in segments
+            if start in reachable_from_head and end in reaches_tail
+        }
 
     def add_request(self, node_id: str, required_context_tokens: int = 0) -> None:
         """Atomically reserve request-count and KV-token capacity on a node."""

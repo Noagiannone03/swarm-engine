@@ -133,6 +133,13 @@ class Scheduler:
         self._stop_event: threading.Event = threading.Event()
         self._wake_event: threading.Event = threading.Event()
         self._bootstrapped_event: threading.Event = threading.Event()
+        # Engine construction parameters are immutable in upstream Parallax,
+        # vLLM and SGLang.  Keep the negotiated wire contract monotonic within
+        # one allocation generation: compatibility may force it down, but a
+        # transient node departure must not upgrade it and reload healthy
+        # executors.  A deliberate global rebootstrap starts a new generation.
+        self._prefill_contract_lock = threading.Lock()
+        self._prefill_contract: Optional[int] = None
         self._node_count_cv: threading.Condition = threading.Condition()
         self._event_thread: Optional[threading.Thread] = None
         self._dispatch_thread: Optional[threading.Thread] = None
@@ -173,39 +180,76 @@ class Scheduler:
     def negotiated_chunked_prefill_size(self) -> int:
         """Return the cluster-wide chunked-prefill contract.
 
-        Dynamic DP routing may combine any compatible allocated ranges into a
-        pipeline, so the activation chunk size must be common to every allocated
-        worker. A worker that cannot chunk (currently the Parallax vLLM adapter),
-        or one that explicitly prefers chunking disabled, safely lowers the
-        whole cluster contract to 0.
+        Only nodes belonging to at least one complete structural pipeline can
+        carry activations, so orphan dynamic ranges do not influence the live
+        wire contract.  Within an allocation generation the contract can only
+        become more conservative.  This mirrors the immutable executor startup
+        configuration in upstream runtimes and prevents a node departure from
+        causing an opportunistic cluster-wide reload.
         """
-        allocated = [
+
+        participant_ids = self.node_manager.full_pipeline_node_ids(self.num_layers)
+        participants = [
             node
             for node in self.node_manager.active_nodes
-            if node.start_layer is not None and node.end_layer is not None
+            if node.node_id in participant_ids
         ]
-        if not allocated:
-            return 0
+        if not participants:
+            with self._prefill_contract_lock:
+                return 0 if self._prefill_contract is None else self._prefill_contract
 
         preferred_sizes: List[int] = []
-        for node in allocated:
+        desired = 0
+        for node in participants:
             preferred = node.preferred_chunked_prefill_size
             if not node.supports_chunked_prefill or preferred is None or preferred <= 0:
-                return 0
+                break
             preferred_sizes.append(int(preferred))
-        return min(preferred_sizes)
+        else:
+            desired = min(preferred_sizes)
+
+        with self._prefill_contract_lock:
+            if self._prefill_contract is None or desired < self._prefill_contract:
+                self._prefill_contract = desired
+            return self._prefill_contract
+
+    def chunked_prefill_size_for_node(self, node_id: str) -> int:
+        """Return the contract an allocated node should materialize.
+
+        Nodes outside every complete path are not part of the activation wire.
+        They keep a backend-safe local setting until a later allocation makes
+        them routeable, at which point normal negotiation may request one
+        intentional reload.
+        """
+
+        participant_ids = self.node_manager.full_pipeline_node_ids(self.num_layers)
+        if node_id in participant_ids:
+            return self.negotiated_chunked_prefill_size()
+
+        node = self.get_node(node_id)
+        if node is None or not node.supports_chunked_prefill:
+            return 0
+        preferred = node.preferred_chunked_prefill_size
+        return int(preferred) if preferred is not None and preferred > 0 else 0
+
+    def _reset_prefill_contract(self) -> None:
+        """Start a fresh immutable contract generation after a full reboot."""
+
+        with self._prefill_contract_lock:
+            self._prefill_contract = None
 
     def prefill_contract_ready(self) -> bool:
         """Whether every allocated worker runs the negotiated prefill contract."""
-        allocated = [
+        participant_ids = self.node_manager.full_pipeline_node_ids(self.num_layers)
+        participants = [
             node
             for node in self.node_manager.active_nodes
-            if node.start_layer is not None and node.end_layer is not None
+            if node.node_id in participant_ids
         ]
-        if not allocated:
+        if not participants:
             return False
         negotiated = self.negotiated_chunked_prefill_size()
-        return all(node.chunked_prefill_size == negotiated for node in allocated)
+        return all(node.chunked_prefill_size == negotiated for node in participants)
 
     def serving_ready(self) -> bool:
         """Whether a live full pipeline is safe to receive requests."""
@@ -238,6 +282,7 @@ class Scheduler:
             # Clear any fixed pipeline registrations; they are no longer valid.
             # This also detaches member nodes and clears their layer allocations.
             logger.info("[Scheduler] Rebooting, moving every node to standby")
+            self._reset_prefill_contract()
             self.node_manager.clear_registered_pipelines()
             self._bootstrapped_event.clear()
             overide_min_node_check = True
@@ -541,6 +586,9 @@ class Scheduler:
                 invalidated,
             )
         self.node_manager.remove(node_id)
+
+        if not self.node_manager.list_node_allocations(self.num_layers):
+            self._reset_prefill_contract()
 
         # Bootstrap state means that at least one complete [0, L) route exists,
         # not merely that bootstrap succeeded at some point in the past.  Clear

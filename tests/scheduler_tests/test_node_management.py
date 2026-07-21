@@ -34,6 +34,23 @@ def test_num_full_pipelines_counts_paths_over_active_allocations():
     # - [b, c1]
     # - [b, c2]
     assert reg.num_full_pipelines(4) == 3
+    assert reg.full_pipeline_node_ids(4) == {"a", "b", "c1", "c2"}
+
+
+def test_full_pipeline_node_ids_excludes_orphan_dynamic_ranges():
+    model = build_model_info(4)
+    whole = build_node("whole", model, mem_gb=80.0)
+    orphan_head = build_node("orphan-head", model, mem_gb=80.0)
+    orphan_tail = build_node("orphan-tail", model, mem_gb=80.0)
+
+    whole.set_layer_allocation(0, 4)
+    orphan_head.set_layer_allocation(0, 1)
+    orphan_tail.set_layer_allocation(2, 4)
+
+    reg = NodeManager(initial_nodes=[whole, orphan_head, orphan_tail])
+    reg.activate([whole.node_id, orphan_head.node_id, orphan_tail.node_id])
+
+    assert reg.full_pipeline_node_ids(4) == {"whole"}
 
 
 def test_list_full_pipelines_respects_max_pipelines_cap():

@@ -7,11 +7,11 @@ def test_mdns_defaults_to_lan_discovery_without_public_topology(monkeypatch):
     assert mdns_enabled_for_topology() is True
 
 
-def test_mdns_is_disabled_for_bootstrap_or_relay_discovery(monkeypatch):
+def test_mdns_coexists_with_bootstrap_and_relay_discovery(monkeypatch):
     monkeypatch.delenv("PARALLAX_ENABLE_MDNS", raising=False)
 
-    assert mdns_enabled_for_topology(initial_peers=["bootstrap"]) is False
-    assert mdns_enabled_for_topology(relay_servers=["relay"]) is False
+    assert mdns_enabled_for_topology(initial_peers=["bootstrap"]) is True
+    assert mdns_enabled_for_topology(relay_servers=["relay"]) is True
 
 
 def test_mdns_operator_override_wins_for_mixed_topologies(monkeypatch):

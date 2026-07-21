@@ -25,12 +25,15 @@ def mdns_enabled_for_topology(
     initial_peers: Collection[str] = (),
     relay_servers: Collection[str] = (),
 ) -> bool:
-    """Choose mDNS only for LAN discovery unless explicitly overridden.
+    """Preserve Lattica's hybrid discovery default unless explicitly overridden.
 
-    Lattica enables mDNS by default. That is useful for an isolated local swarm,
-    but redundant (and noisy on virtual interfaces) once the node has explicit
-    DHT bootstraps or public relay servers. ``PARALLAX_ENABLE_MDNS`` remains an
-    operator override for unusual mixed LAN/public deployments.
+    mDNS and public bootstrap/relay discovery solve different topologies and
+    intentionally coexist upstream.  Keeping mDNS enabled lets peers on the
+    same LAN establish a direct path without relying on NAT hairpinning, while
+    relay + DCUtR remains available when no local peer is discovered.
+
+    The topology arguments remain part of this compatibility helper because
+    existing callers pass them, but they must not silently disable discovery.
     """
 
     configured = os.environ.get("PARALLAX_ENABLE_MDNS", "").strip().lower()
@@ -38,7 +41,7 @@ def mdns_enabled_for_topology(
         return True
     if configured in _FALSE_VALUES:
         return False
-    return not initial_peers and not relay_servers
+    return True
 
 
 def switch_to_uvloop() -> asyncio.AbstractEventLoop:
