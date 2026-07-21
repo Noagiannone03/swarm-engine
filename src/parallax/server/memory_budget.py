@@ -21,11 +21,12 @@ logger = get_logger(__name__)
 
 GIB = 1024**3
 MIB = 1024**2
-DEFAULT_SYSTEM_RESERVE_GB = 6.0
 DEFAULT_CUDA_RESERVE_GB = 1.5
 DEFAULT_MLX_CACHE_LIMIT_MB = 256.0
 DEFAULT_PRESSURE_POLL_SECONDS = 1.0
 DEFAULT_PRESSURE_DRAIN_SECONDS = 30.0
+MIN_ADAPTIVE_SYSTEM_RESERVE_GB = 2.0
+MAX_ADAPTIVE_SYSTEM_RESERVE_GB = 12.0
 
 
 @dataclass(frozen=True)
@@ -172,11 +173,61 @@ def _positive_env_bytes(name: str, unit: int) -> Optional[int]:
     return int(value * unit)
 
 
-def configured_system_reserve_bytes(total_bytes: int) -> int:
-    """Return the RAM kept away from MLX for the OS and foreground apps."""
+def adaptive_system_reserve_bytes(
+    total_bytes: int, available_bytes: Optional[int] = None
+) -> int:
+    """Return a pressure-aware host RAM reserve for shared-memory inference.
+
+    The input signal is the maintained cross-platform OS estimate exposed by
+    psutil as ``virtual_memory().available``.  That maps to ``MemAvailable`` on
+    Linux, GlobalMemoryStatusEx-style availability on Windows, and VM counters
+    on macOS.  We keep the layer contract immutable for a worker generation; the
+    reserve is sampled only at startup/restart, while ``MemoryPressureController``
+    handles later pressure without reallocating continuously.
+
+    Policy:
+    - green desktop: reserve ~20% of RAM (bounded 2-12 GiB);
+    - elevated pressure: raise to ~25%;
+    - critical pressure: raise to ~30%.
+
+    This removes the old hard 6 GiB floor that made 16 GiB Apple Silicon hosts
+    look unusable under moderate load, without allowing allocations while the OS
+    is already under visible pressure.
+    """
+
+    total = max(0, int(total_bytes))
+    if total <= 0:
+        return 0
+
+    green = min(
+        int(MAX_ADAPTIVE_SYSTEM_RESERVE_GB * GIB),
+        max(int(MIN_ADAPTIVE_SYSTEM_RESERVE_GB * GIB), int(total * 0.20)),
+    )
+    if available_bytes is None:
+        return min(green, total)
+
+    available = min(total, max(0, int(available_bytes)))
+    available_ratio = available / total
+    if available_ratio < 0.25:
+        reserve = max(green, int(total * 0.30))
+    elif available_ratio < 0.40:
+        reserve = max(green, int(total * 0.25))
+    else:
+        reserve = green
+    return min(reserve, total)
+
+
+def configured_system_reserve_bytes(
+    total_bytes: int, available_bytes: Optional[int] = None
+) -> int:
+    """Return host RAM kept away from inference for the OS and foreground apps."""
 
     configured = _positive_env_bytes("PARALLAX_SYSTEM_RESERVE_GB", GIB)
-    reserve = configured if configured is not None else int(DEFAULT_SYSTEM_RESERVE_GB * GIB)
+    reserve = (
+        configured
+        if configured is not None
+        else adaptive_system_reserve_bytes(total_bytes, available_bytes)
+    )
     return min(max(0, reserve), max(0, int(total_bytes)))
 
 
@@ -289,7 +340,7 @@ def current_mlx_memory_budget(
         available_bytes=available,
         active_bytes=active,
         max_working_set_bytes=working_set,
-        system_reserve_bytes=configured_system_reserve_bytes(total),
+        system_reserve_bytes=configured_system_reserve_bytes(total, available),
         explicit_process_limit_bytes=explicit_limit,
         cache_limit_bytes=(
             configured_cache

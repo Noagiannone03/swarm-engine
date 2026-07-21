@@ -279,12 +279,14 @@ def _build_memory_pressure_guards():
     try:
         import psutil
 
-        total = int(psutil.virtual_memory().total)
+        memory = psutil.virtual_memory()
+        total = int(memory.total)
+        available = int(memory.available)
         guards.append(
             MemoryPressureGuard(
                 name="host",
                 controller=MemoryPressureController(
-                    system_reserve_bytes=configured_system_reserve_bytes(total)
+                    system_reserve_bytes=configured_system_reserve_bytes(total, available)
                 ),
                 available_reader=lambda: int(psutil.virtual_memory().available),
             )
