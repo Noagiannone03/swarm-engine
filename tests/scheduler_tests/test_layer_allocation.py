@@ -120,8 +120,8 @@ def test_water_filling_rebalance(num_layers: int, gpu_types: list[str], expected
         assert actual_layers[i] <= cap
 
 
-def _test_gap_patch_rebalance(allocator: BaseLayerAllocator):
-    """Sanity checks for gap-patch dynamic rebalancing using allocator state."""
+def _test_route_dead_dynamic_join_stays_standby(allocator: BaseLayerAllocator):
+    """A fixed overlap that cannot join a full path must not consume memory."""
     assert allocator.layer_loads_heap, "Layer loads heap should not be empty"
     model_info = allocator.model_info
 
@@ -138,22 +138,21 @@ def _test_gap_patch_rebalance(allocator: BaseLayerAllocator):
     top_hosts_min = min(per_node_mem.get(h, float("inf")) for h in top_load.hosting_nodes)
     assert top_hosts_min == min_mem
 
-    # Join a new small GPU and verify hosting set updates
+    # A small late GPU overlaps the lightest layer but cannot connect its end
+    # to another exact boundary. Upstream used to activate this orphan shard.
     before_layer_id = top_load.layer_id
     before_mem = allocator.layer_to_load[before_layer_id].current_kv_size
 
     new_node = _build_node("rtx4090", model_info, id_suffix="-gap")
     allocator.node_management.upsert(new_node, state=NodeState.STANDBY)
-    allocator.dynamic_join(new_node)
+    assert allocator.dynamic_join(new_node) is False
 
     after_mem = allocator.layer_to_load[before_layer_id].current_kv_size
-    assert after_mem >= before_mem
-    assert new_node.node_id in allocator.layer_to_load[before_layer_id].hosting_nodes
-
-    allocator.deallocate(new_node)
-    restored_mem = allocator.layer_to_load[before_layer_id].current_kv_size
+    assert after_mem == before_mem
     assert new_node.node_id not in allocator.layer_to_load[before_layer_id].hosting_nodes
-    assert restored_mem == before_mem
+    assert new_node.start_layer is None
+    assert new_node.end_layer is None
+    assert new_node in allocator.node_management.standby_nodes
 
 
 def test_dynamic_join_rejects_zero_usable_memory_node_without_invalid_allocation():
@@ -167,6 +166,32 @@ def test_dynamic_join_rejects_zero_usable_memory_node_without_invalid_allocation
     )
     assert allocator.allocate_from_standby()
     assert node_management.has_full_pipeline(model.num_layers)
+
+
+def test_dynamic_join_accepts_shard_that_extends_an_exact_head_boundary():
+    """Useful replica capacity remains a zero-reload lightweight join."""
+
+    model = build_model_info(12)
+    head = _build_node("a100-80g", model, id_suffix="-head")
+    tail = _build_node("a100-80g", model, id_suffix="-tail")
+    tail.supports_frontend = False
+    node_management = build_node_management([head, tail])
+    allocator = DynamicProgrammingLayerAllocator(
+        model_info=model,
+        node_management=node_management,
+        dynamic_pipelines_router=True,
+    )
+    allocator.allocate(head, 0, 4)
+    allocator.allocate(tail, 4, 12)
+
+    replica_tail = _build_node("a100-80g", model, id_suffix="-replica-tail")
+    replica_tail.supports_frontend = False
+    node_management.upsert(replica_tail, state=NodeState.STANDBY)
+
+    assert allocator.dynamic_join_candidate(replica_tail) == (4, 12)
+    assert allocator.dynamic_join(replica_tail)
+    assert (replica_tail.start_layer, replica_tail.end_layer) == (4, 12)
+    assert replica_tail.node_id in node_management.full_pipeline_node_ids(model.num_layers)
 
     low_memory = _build_node("a100-40g", model, id_suffix="-low-memory")
     low_memory.hardware.usable_memory_bytes = 0
@@ -265,7 +290,7 @@ def test_allocator(
         )
     )
     allocator.allocate_from_standby()
-    _test_gap_patch_rebalance(allocator)
+    _test_route_dead_dynamic_join_stays_standby(allocator)
 
     # Collect (start,end) per node in creation order
     actual_ranges: list[tuple[int, int]] = []
@@ -280,9 +305,9 @@ def test_allocator(
     expected_total = sum(e - s for (s, e) in expected_ranges)
     assert sum(e - s for (s, e) in actual_trimmed) == expected_total
     # Order-insensitive comparison: ranges represent stages; allow pipeline reordering
-    assert Counter(actual_trimmed) == Counter(
-        expected_ranges
-    ), f"Stage ranges mismatch (order-insensitive):\nactual={actual_trimmed}\nexpected={expected_ranges}"
+    assert Counter(actual_trimmed) == Counter(expected_ranges), (
+        f"Stage ranges mismatch (order-insensitive):\nactual={actual_trimmed}\nexpected={expected_ranges}"
+    )
 
 
 @pytest.mark.parametrize("strategy", ["greedy", "dp"])
@@ -333,9 +358,11 @@ def test_frontend_incapable_worker_is_allocated_away_from_layer_zero(
 
     assert head.start_layer == 0
     assert head.end_layer == model.num_layers
-    assert tail.start_layer is not None and tail.start_layer > 0
-    assert tail.end_layer == model.num_layers
-    assert node_management.num_standby_nodes == 0
+    # The head already covers the model. Loading a tail-only overlap starting
+    # inside that fixed shard would not create an executable boundary.
+    assert tail.start_layer is None
+    assert tail.end_layer is None
+    assert node_management.num_standby_nodes == 1
 
 
 def test_dp_allocation_is_independent_of_frontend_worker_join_order():
@@ -571,6 +598,6 @@ def test_allocator_does_not_duplicate_leftover_nodes(strategy: Literal["greedy",
     )
     ok = alloc.allocate_from_standby()
     assert ok is True
-    assert (
-        node_management.num_nodes == expected_node_count
-    ), "Should not duplicate nodes during allocation"
+    assert node_management.num_nodes == expected_node_count, (
+        "Should not duplicate nodes during allocation"
+    )

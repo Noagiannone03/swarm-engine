@@ -192,12 +192,13 @@ class BaseLayerAllocator:
         self.deallocate(node)
         self.allocate(node, start_layer, end_layer)
 
-    def dynamic_join(self, node: Node) -> bool:
-        """In case of using Dynamic Programming request router, a node is joined dynamically to the lightest layers."""
+    def dynamic_join_candidate(self, node: Node) -> Optional[Tuple[int, int]]:
+        """Plan a light-weight join without mutating the live allocation."""
+
         lightest_layer = self.get_lightest_layer(allow_head=node.supports_frontend)
         if lightest_layer is None:
             logger.warning("No compatible layers to assign to node %s", node.node_id)
-            return False
+            return None
         logger.info(
             "[LayerAllocator] Dynamically Join node %s with the lightest layer %d",
             node.node_id,
@@ -232,6 +233,37 @@ class BaseLayerAllocator:
                 capacity_without_endpoints,
                 capacity_with_input,
                 capacity_with_input_and_head,
+            )
+            return None
+        return start_layer, end_layer
+
+    def dynamic_join(self, node: Node) -> bool:
+        """Join a node only when its fixed shard belongs to a complete route.
+
+        Upstream Parallax assigns late nodes to the lightest overlapping range.
+        Its runtime and shard-level router, however, can hand off only where one
+        fixed allocation ends and the next begins.  Rejecting a route-dead
+        overlap keeps the worker in STANDBY until the scheduler can perform one
+        drained global reconfiguration.
+        """
+
+        candidate = self.dynamic_join_candidate(node)
+        if candidate is None:
+            return False
+        start_layer, end_layer = candidate
+        proposed_segments = self.node_management.list_node_allocations(self.num_total_layers) + [
+            (node.node_id, start_layer, end_layer)
+        ]
+        participants = self.node_management.full_pipeline_segment_ids(
+            proposed_segments, self.num_total_layers
+        )
+        if node.node_id not in participants:
+            logger.info(
+                "[LayerAllocator] Deferring dynamic join for node %s: candidate "
+                "[%d, %d) belongs to no complete exact-boundary route",
+                node.node_id,
+                start_layer,
+                end_layer,
             )
             return False
         self.allocate(node, start_layer, end_layer)

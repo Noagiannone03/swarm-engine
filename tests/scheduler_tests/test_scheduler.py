@@ -386,7 +386,7 @@ def test_layer_reallocation_invalidates_old_executor_kv_geometry():
 
 
 def test_scheduler_join_and_leave():
-    """New node can join and be assigned; leave removes it and may rebalance."""
+    """A route-dead late node stays standby and can leave cleanly."""
     model = build_model_info(12)
     n1 = build_node("a100-0", model, tflops=312.0, mem_gb=80.0, x=0, y=0)
     n2 = build_node("a100-1", model, tflops=312.0, mem_gb=80.0, x=1, y=0)
@@ -399,7 +399,8 @@ def test_scheduler_join_and_leave():
     n3 = build_node("rtx4090-x", model, tflops=82.6, mem_gb=24.0, x=0, y=1)
     sched.enqueue_join(n3)
     sched._process_joins()
-    assert n3.start_layer is not None and n3.end_layer is not None
+    assert n3.start_layer is None and n3.end_layer is None
+    assert n3 in sched.node_manager.standby_nodes
 
     # Leave
     sched.enqueue_leave(n3.node_id)
@@ -432,11 +433,15 @@ def test_scheduler_bootstrap_wait_and_dynamic_events():
     assert ok
     assert sched.node_manager.has_full_pipeline(model.num_layers)
 
-    # Dynamic join after bootstrap should assign immediately
+    # This weak late shard cannot improve an exact-boundary route and remains
+    # standby instead of loading unusable weights.
     n3 = build_node("rtx4090-x", model, tflops=82.6, mem_gb=24.0, x=0, y=1)
+    set_rtt_from_coords([*sched.node_manager.nodes, n3])
     sched.enqueue_join(n3)
     sched._process_joins()  # type: ignore[attr-defined]
-    assert n3.start_layer is not None and n3.end_layer is not None
+    sched._process_pending_rebalance(force=True)  # type: ignore[attr-defined]
+    assert n3.start_layer is None and n3.end_layer is None
+    assert n3 in sched.node_manager.standby_nodes
     print(sched.node_manager.list_node_allocations(model.num_layers))
 
     # Leave a non-critical node; if still full pipeline, no global rebalance forced
@@ -479,6 +484,171 @@ def test_scheduler_dynamic_join_keeps_zero_capacity_node_standby_after_bootstrap
     assert low_memory.end_layer is None
     assert low_memory in sched.node_manager.standby_nodes
     assert sched.node_manager.has_full_pipeline(model.num_layers)
+
+
+def test_fast_decoder_join_repartitions_full_frontend_at_idle_boundary():
+    """Mac-first then RTX produces one useful exact-boundary pipeline."""
+
+    model = build_model_info(28)
+    mac = build_node(
+        "mac",
+        model,
+        tflops=10.0,
+        mem_gb=200.0,
+        mem_bandwidth_gbps=100.0,
+        supports_frontend=True,
+    )
+    rtx = build_node(
+        "rtx",
+        model,
+        tflops=200.0,
+        mem_gb=400.0,
+        mem_bandwidth_gbps=1000.0,
+        supports_frontend=False,
+    )
+    set_rtt_from_coords([mac, rtx])
+    sched = Scheduler(
+        model,
+        [mac],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+
+    assert sched.bootstrap()
+    assert sched.list_node_allocations() == [("mac", 0, 28)]
+
+    sched.enqueue_join(rtx)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    allocations = sched.list_node_allocations()
+    assert allocations == [("mac", 0, 1), ("rtx", 1, 28)]
+    assert sched.node_manager.full_pipeline_node_ids(model.num_layers) == {"mac", "rtx"}
+    assert sched.node_manager.num_standby_nodes == 0
+    # Changed executors must re-advertise READY and measured KV geometry before
+    # the new structural route can receive traffic.
+    assert not mac.is_active
+    assert not rtx.is_active
+    assert not sched.serving_ready()
+
+
+def test_fast_decoder_join_waits_for_inflight_request_to_finish():
+    """A topology change never invalidates a generation already in flight."""
+
+    model = build_model_info(28)
+    mac = build_node(
+        "mac",
+        model,
+        tflops=10.0,
+        mem_gb=200.0,
+        mem_bandwidth_gbps=100.0,
+    )
+    rtx = build_node(
+        "rtx",
+        model,
+        tflops=200.0,
+        mem_gb=400.0,
+        mem_bandwidth_gbps=1000.0,
+        supports_frontend=False,
+    )
+    set_rtt_from_coords([mac, rtx])
+    sched = Scheduler(model, [mac], strategy="dp", routing_strategy="dp")
+    assert sched.bootstrap()
+
+    request = RequestSignal(request_id="active", required_context_tokens=1024)
+    sched.receive_request(request)
+    dispatched = sched.dispatch_next_request()
+    assert dispatched is not None and dispatched[1] == ["mac"]
+
+    sched.enqueue_join(rtx)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    assert sched.list_node_allocations() == [("mac", 0, 28)]
+    assert rtx in sched.node_manager.standby_nodes
+    assert sched._pending_rebalance_node_ids == {"rtx"}  # type: ignore[attr-defined]
+
+    assert sched.release_request("active")
+    assert sched._process_pending_rebalance(force=True)  # type: ignore[attr-defined]
+    assert sched.list_node_allocations() == [("mac", 0, 1), ("rtx", 1, 28)]
+
+
+def test_fast_decoder_join_waits_for_rtt_before_planning():
+    """Join registration preceding network probes must remain retryable."""
+
+    model = build_model_info(28)
+    mac = build_node(
+        "mac",
+        model,
+        tflops=10.0,
+        mem_gb=200.0,
+        mem_bandwidth_gbps=100.0,
+    )
+    rtx = build_node(
+        "rtx",
+        model,
+        tflops=200.0,
+        mem_gb=400.0,
+        mem_bandwidth_gbps=1000.0,
+        supports_frontend=False,
+    )
+    sched = Scheduler(model, [mac], strategy="dp", routing_strategy="dp")
+    assert sched.bootstrap()
+
+    sched.enqueue_join(rtx)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    assert sched.list_node_allocations() == [("mac", 0, 28)]
+    assert sched._pending_rebalance_node_ids == {"rtx"}  # type: ignore[attr-defined]
+
+    set_rtt_from_coords([mac, rtx])
+    assert sched._process_pending_rebalance(force=True)  # type: ignore[attr-defined]
+    assert sched.list_node_allocations() == [("mac", 0, 1), ("rtx", 1, 28)]
+
+
+def test_drained_rebalance_restores_previous_shape_on_commit_failure(monkeypatch):
+    """A failed publication never leaves a partial layer graph active."""
+
+    model = build_model_info(28)
+    mac = build_node(
+        "mac",
+        model,
+        tflops=10.0,
+        mem_gb=200.0,
+        mem_bandwidth_gbps=100.0,
+    )
+    rtx = build_node(
+        "rtx",
+        model,
+        tflops=200.0,
+        mem_gb=400.0,
+        mem_bandwidth_gbps=1000.0,
+        supports_frontend=False,
+    )
+    sched = Scheduler(model, [mac], strategy="dp", routing_strategy="dp")
+    assert sched.bootstrap()
+
+    sched.enqueue_join(rtx)
+    sched._process_joins()  # type: ignore[attr-defined]
+    set_rtt_from_coords([mac, rtx])
+
+    original_allocate = sched.layer_allocator.allocate
+    failed_once = False
+
+    def fail_first_rtx_commit(node, start_layer, end_layer):
+        nonlocal failed_once
+        if node.node_id == "rtx" and not failed_once:
+            failed_once = True
+            raise RuntimeError("synthetic publication failure")
+        return original_allocate(node, start_layer, end_layer)
+
+    monkeypatch.setattr(sched.layer_allocator, "allocate", fail_first_rtx_commit)
+
+    assert not sched._process_pending_rebalance(force=True)  # type: ignore[attr-defined]
+    assert failed_once
+    assert sched.list_node_allocations() == [("mac", 0, 28)]
+    assert sched.node_manager.full_pipeline_node_ids(model.num_layers) == {"mac"}
+    assert rtx in sched.node_manager.standby_nodes
+    assert sched._bootstrapped_event.is_set()  # type: ignore[attr-defined]
 
 
 def test_rejoin_refreshes_waiting_node_capabilities_and_retries_bootstrap():
@@ -747,9 +917,9 @@ def test_scheduler_single_node_leave_then_rejoin_reassigns_layers():
     sched._process_joins()  # type: ignore[attr-defined]
 
     # Expected behavior: after re-join with min_nodes_bootstrapping=1, layers are assigned again
-    assert (
-        n1_rejoin.start_layer is not None and n1_rejoin.end_layer is not None
-    ), "After re-join, single node should be assigned a full layer range"
+    assert n1_rejoin.start_layer is not None and n1_rejoin.end_layer is not None, (
+        "After re-join, single node should be assigned a full layer range"
+    )
 
 
 def test_decoder_only_join_after_last_pipeline_leave_waits_for_frontend():
@@ -842,14 +1012,19 @@ def test_scheduler_three_nodes_sequential_join_leave_rejoin():
     assert sched.node_manager.num_active_nodes == 2
     assert sched.node_manager.num_standby_nodes == 0
 
-    # Step 3: n3 joins (dynamic join after bootstrap)
+    def assert_only_complete_route_nodes_are_active() -> None:
+        assert sched.node_manager.has_full_pipeline(model.num_layers)
+        assert {
+            node.node_id for node in sched.node_manager.active_nodes
+        } == sched.node_manager.full_pipeline_node_ids(model.num_layers)
+
+    # Step 3: an equivalent third node need not disturb the healthy route.
+    set_rtt_from_coords([*sched.node_manager.nodes, n3])
     sched.enqueue_join(n3)
     sched._process_joins()  # type: ignore[attr-defined]
-    set_rtt_from_coords(sched.node_manager.nodes)
-    assert n3.start_layer is not None and n3.end_layer is not None
     assert sched.node_manager.num_nodes == 3
-    assert sched.node_manager.num_active_nodes == 3
-    assert sched.node_manager.num_standby_nodes == 0
+    assert sched.node_manager.num_standby_nodes == 1
+    assert_only_complete_route_nodes_are_active()
     print(sched.node_manager.list_node_allocations(model.num_layers))
 
     # Step 4: n1 leaves and rejoins
@@ -859,16 +1034,15 @@ def test_scheduler_three_nodes_sequential_join_leave_rejoin():
     assert n1 not in sched.node_manager.nodes
     assert sched.node_manager.num_nodes == 2
     print(sched.node_manager.list_node_allocations(model.num_layers))
-    assert sched.node_manager.has_full_pipeline(model.num_layers)
+    assert_only_complete_route_nodes_are_active()
 
     # Rejoin n1
     n1_rejoin = build_node("n1", model, tflops=312.0, mem_gb=138.0, x=0, y=0)
+    set_rtt_from_coords([*sched.node_manager.nodes, n1_rejoin])
     sched.enqueue_join(n1_rejoin)
     sched._process_joins()  # type: ignore[attr-defined]
-    set_rtt_from_coords(sched.node_manager.nodes)
-    assert n1_rejoin.start_layer is not None and n1_rejoin.end_layer is not None
     assert sched.node_manager.num_nodes == 3
-    assert sched.node_manager.has_full_pipeline(model.num_layers)
+    assert_only_complete_route_nodes_are_active()
 
     # Step 5: n2 leaves and rejoins
     n2_id = n2.node_id
@@ -876,16 +1050,15 @@ def test_scheduler_three_nodes_sequential_join_leave_rejoin():
     sched._process_leaves()  # type: ignore[attr-defined]
     assert n2 not in sched.node_manager.nodes
     assert sched.node_manager.num_nodes == 2
-    assert sched.node_manager.has_full_pipeline(model.num_layers)
+    assert_only_complete_route_nodes_are_active()
 
     # Rejoin n2
     n2_rejoin = build_node("n2", model, tflops=312.0, mem_gb=138.0, x=1, y=0)
+    set_rtt_from_coords([*sched.node_manager.nodes, n2_rejoin])
     sched.enqueue_join(n2_rejoin)
     sched._process_joins()  # type: ignore[attr-defined]
-    set_rtt_from_coords(sched.node_manager.nodes)
-    assert n2_rejoin.start_layer is not None and n2_rejoin.end_layer is not None
     assert sched.node_manager.num_nodes == 3
-    assert sched.node_manager.has_full_pipeline(model.num_layers)
+    assert_only_complete_route_nodes_are_active()
 
     # Step 6: n3 leaves and rejoins
     n3_id = n3.node_id
@@ -893,20 +1066,20 @@ def test_scheduler_three_nodes_sequential_join_leave_rejoin():
     sched._process_leaves()
     assert n3 not in sched.node_manager.nodes
     assert sched.node_manager.num_nodes == 2
-    assert sched.node_manager.has_full_pipeline(model.num_layers)
+    assert_only_complete_route_nodes_are_active()
 
     # Rejoin n3
     n3_rejoin = build_node("n3", model, tflops=312.0, mem_gb=138.0, x=2, y=0)
+    set_rtt_from_coords([*sched.node_manager.nodes, n3_rejoin])
     sched.enqueue_join(n3_rejoin)
     sched._process_joins()  # type: ignore[attr-defined]
-    set_rtt_from_coords(sched.node_manager.nodes)
-    assert n3_rejoin.start_layer is not None and n3_rejoin.end_layer is not None
     assert sched.node_manager.num_nodes == 3
-    assert sched.node_manager.has_full_pipeline(model.num_layers)
+    assert_only_complete_route_nodes_are_active()
 
-    # Final verification: all nodes should have layer assignments
+    # Final verification: every allocated node belongs to a complete route;
+    # surplus equivalent capacity is allowed to remain standby.
     allocations = sched.node_manager.list_node_allocations(model.num_layers)
-    assert len(allocations) == 3, "All 3 nodes should have layer assignments"
+    assert 2 <= len(allocations) <= 3
     # Verify full pipeline coverage
     total_covered = sum(e - s for _, s, e in allocations)
     assert total_covered >= model.num_layers, "All layers should be covered"

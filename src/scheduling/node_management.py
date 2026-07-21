@@ -388,9 +388,7 @@ class NodeManager:
         """Check if there is a full pipeline among ACTIVE nodes."""
         return self.num_full_pipelines(num_total_layers, ready_only) > 0
 
-    def full_pipeline_node_ids(
-        self, total_layers: int, ready_only: bool = False
-    ) -> Set[str]:
+    def full_pipeline_node_ids(self, total_layers: int, ready_only: bool = False) -> Set[str]:
         """Return nodes that belong to at least one complete ``[0, L)`` path.
 
         Dynamic allocation can leave useful future shards ACTIVE even though
@@ -403,6 +401,23 @@ class NodeManager:
         """
 
         segments = self.list_node_allocations(total_layers, ready_only)
+        return self.full_pipeline_segment_ids(segments, total_layers)
+
+    @staticmethod
+    def full_pipeline_segment_ids(
+        segments: Sequence[Tuple[str, int, int]], total_layers: int
+    ) -> Set[str]:
+        """Return segment ids that belong to a complete contiguous path.
+
+        This pure variant is also used to qualify a proposed allocation before
+        mutating the live registry.  In particular, a late dynamic shard must
+        not be materialized merely because it overlaps an existing pipeline:
+        the node-granular Parallax runtime can only hand off at exact shard
+        boundaries.
+        """
+
+        if total_layers <= 0:
+            return set()
         if not segments:
             return set()
 
@@ -412,9 +427,7 @@ class NodeManager:
                 reachable_from_head.add(end)
 
         reaches_tail = {total_layers}
-        for _, start, end in sorted(
-            segments, key=lambda item: (item[1], item[2]), reverse=True
-        ):
+        for _, start, end in sorted(segments, key=lambda item: (item[1], item[2]), reverse=True):
             if end in reaches_tail:
                 reaches_tail.add(start)
 

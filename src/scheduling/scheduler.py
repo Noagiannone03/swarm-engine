@@ -4,10 +4,12 @@ Scheduler for Layer Allocation and Request Routing.
 
 from __future__ import annotations
 
+import copy
 import queue
 import threading
 import time
 from collections import deque
+from math import isfinite
 from typing import Deque, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 from parallax_utils.logging_config import get_logger
@@ -128,11 +130,18 @@ class Scheduler:
         self._pending_joins: "queue.Queue[Node]" = queue.Queue()
         self._pending_leaves: "queue.Queue[str]" = queue.Queue()
         self._pending_node_updates: "queue.Queue[NodeUpdate]" = queue.Queue()
+        # A late DP node whose fixed shard cannot join an exact-boundary route
+        # requests one drained global allocation.  Membership changes set this
+        # flag; memory-pressure samples deliberately do not, preventing reload
+        # oscillations on desktop contributors.
+        self._pending_rebalance_node_ids: set[str] = set()
+        self._next_rebalance_attempt_at: float = 0.0
 
         # Concurrency controls
         self._stop_event: threading.Event = threading.Event()
         self._wake_event: threading.Event = threading.Event()
         self._bootstrapped_event: threading.Event = threading.Event()
+        self._admission_paused: bool = False
         # Engine construction parameters are immutable in upstream Parallax,
         # vLLM and SGLang.  Keep the negotiated wire contract monotonic within
         # one allocation generation: compatibility may force it down, but a
@@ -190,9 +199,7 @@ class Scheduler:
 
         participant_ids = self.node_manager.full_pipeline_node_ids(self.num_layers)
         participants = [
-            node
-            for node in self.node_manager.active_nodes
-            if node.node_id in participant_ids
+            node for node in self.node_manager.active_nodes if node.node_id in participant_ids
         ]
         if not participants:
             with self._prefill_contract_lock:
@@ -242,9 +249,7 @@ class Scheduler:
         """Whether every allocated worker runs the negotiated prefill contract."""
         participant_ids = self.node_manager.full_pipeline_node_ids(self.num_layers)
         participants = [
-            node
-            for node in self.node_manager.active_nodes
-            if node.node_id in participant_ids
+            node for node in self.node_manager.active_nodes if node.node_id in participant_ids
         ]
         if not participants:
             return False
@@ -254,7 +259,8 @@ class Scheduler:
     def serving_ready(self) -> bool:
         """Whether a live full pipeline is safe to receive requests."""
         return (
-            self.node_manager.has_full_pipeline(self.num_layers, ready_only=True)
+            not self._admission_paused
+            and self.node_manager.has_full_pipeline(self.num_layers, ready_only=True)
             and self.prefill_contract_ready()
             and self.request_router.routing_ready()
         )
@@ -510,6 +516,7 @@ class Scheduler:
             if bootstrapped:
                 if self.dynamic_pipelines_router:
                     # for dynamic pipelines router, join the node to the lightest layer
+                    candidate = self.layer_allocator.dynamic_join_candidate(node)
                     try:
                         joined = self.layer_allocator.dynamic_join(node)
                     except ValueError:
@@ -525,6 +532,12 @@ class Scheduler:
                             "Node %s remains standby after dynamic join rejection",
                             node.node_id,
                         )
+                        if candidate is not None:
+                            self._pending_rebalance_node_ids.add(node.node_id)
+                            logger.info(
+                                "Queued one drained global rebalance for late node %s",
+                                node.node_id,
+                            )
                 else:
                     joined = True
                 if joined:
@@ -629,20 +642,21 @@ class Scheduler:
         If `timeout` is provided, blocks up to `timeout` seconds waiting for a request.
         """
         # Don't dequeue requests until routing is actually possible.
-        if not self.serving_ready():
-            return None
-        try:
-            req = (
-                self._request_queue.get(timeout=timeout)
-                if timeout is not None
-                else self._request_queue.get_nowait()
-            )
-        except queue.Empty:
-            return None
-        request_key = str(req.request_id)
-        # Route selection and reservations form one transaction. Without this
-        # lock, concurrent dispatchers can both observe the same last KV blocks.
+        # Admission, dequeue, route selection and reservations share the same
+        # transaction as a topology rebalance.  This prevents a request from
+        # entering the old allocation after the reconfiguration drain passed.
         with self._inflight_routes_lock:
+            if not self.serving_ready():
+                return None
+            try:
+                req = (
+                    self._request_queue.get(timeout=timeout)
+                    if timeout is not None
+                    else self._request_queue.get_nowait()
+                )
+            except queue.Empty:
+                return None
+            request_key = str(req.request_id)
             if req.cancelled:
                 logger.debug("Discarded cancelled request %s before dispatch", request_key)
                 req.routing_table = []
@@ -871,6 +885,7 @@ class Scheduler:
             self._process_node_updates()
             self._process_joins()
             self._process_leaves()
+            self._process_pending_rebalance()
             now = time.time()
             if now - last_hb_check >= max(0.5, poll_interval):
                 self.checking_node_heartbeat()
@@ -1000,6 +1015,169 @@ class Scheduler:
                     self.min_nodes_bootstrapping,
                 )
 
+        self._process_pending_rebalance()
+
+    def _plan_global_rebalance(self) -> Dict[str, Tuple[int, int]]:
+        """Trim proposed late overlaps into exact boundaries on detached copies.
+
+        Parallax already contains a layer-level turning-point optimizer for its
+        warm-up phase.  Reuse it here after adding the late shard hypothetically:
+        if the new worker improves the path, the optimizer trims the old tail
+        and new prefix into a contiguous route; otherwise the live allocation
+        remains untouched.
+        """
+
+        planned_nodes = [copy.deepcopy(node) for node in self.node_manager.nodes]
+        for node in planned_nodes:
+            node.clear_serving_state()
+            node.is_active = False
+        planned_manager = NodeManager(initial_nodes=planned_nodes)
+        planned_by_id = {node.node_id: node for node in planned_nodes}
+        allocator_type = type(self.layer_allocator)
+        planned_allocator = allocator_type(
+            model_info=self.model_info,
+            node_management=planned_manager,
+            dynamic_pipelines_router=self.dynamic_pipelines_router,
+            rebalance_threshold=self.layer_allocator.rebalance_threshold,
+            water_filling_max_iterations=self.layer_allocator.water_filling_max_iterations,
+            trim_layers_on_turning_points=self.layer_allocator.trim_layers_on_turning_points,
+        )
+        for node_id, start_layer, end_layer in self.list_node_allocations():
+            planned_allocator.allocate(planned_by_id[node_id], start_layer, end_layer)
+        for node_id in sorted(self._pending_rebalance_node_ids):
+            node = planned_by_id.get(node_id)
+            if node is None:
+                continue
+            candidate = planned_allocator.dynamic_join_candidate(node)
+            if candidate is not None:
+                planned_allocator.allocate(node, *candidate)
+        planned_allocator.adjust_for_turning_points(self.num_layers)
+        allocations = planned_manager.list_node_allocations(self.num_layers)
+        participants = planned_manager.full_pipeline_segment_ids(allocations, self.num_layers)
+        return {
+            node_id: (start_layer, end_layer)
+            for node_id, start_layer, end_layer in allocations
+            if node_id in participants
+        }
+
+    def _apply_rebalance_plan(self, plan: Dict[str, Tuple[int, int]]) -> bool:
+        """Publish a precomputed allocation, restoring the old shape on error."""
+
+        previous = {
+            node_id: (start_layer, end_layer)
+            for node_id, start_layer, end_layer in self.list_node_allocations()
+        }
+
+        def restore_previous() -> None:
+            for node in list(self.node_manager.active_nodes):
+                try:
+                    self.layer_allocator.deallocate(node)
+                except Exception:
+                    logger.exception(
+                        "Failed to clear partial rebalance allocation on %s", node.node_id
+                    )
+            for node_id, (start_layer, end_layer) in previous.items():
+                node = self.node_manager.get(node_id)
+                if node is None:
+                    continue
+                try:
+                    self.layer_allocator.allocate(node, start_layer, end_layer)
+                except Exception:
+                    logger.exception("Failed to restore previous allocation on %s", node_id)
+            if self.has_full_pipeline():
+                self._bootstrapped_event.set()
+
+        self._bootstrapped_event.clear()
+        self._reset_prefill_contract()
+        try:
+            for node in self.node_manager.nodes:
+                node.is_active = False
+            for node in list(self.node_manager.active_nodes):
+                self.layer_allocator.deallocate(node)
+            for node_id, (start_layer, end_layer) in plan.items():
+                node = self.node_manager.get(node_id)
+                if node is None:
+                    raise ValueError(f"Planned node {node_id} disappeared before commit")
+                self.layer_allocator.allocate(node, start_layer, end_layer)
+            if not self.has_full_pipeline():
+                raise RuntimeError("Committed rebalance has no complete pipeline")
+            self.request_router.bootstrap()
+        except Exception:
+            logger.exception("Drained global rebalance failed; restoring previous allocation")
+            restore_previous()
+            return False
+
+        lease_started_at = time.time()
+        for node in self.node_manager.active_nodes:
+            node.last_heartbeat = lease_started_at
+        self._bootstrapped_event.set()
+        self.emit_alloc_log_snapshot(reason="after drained global rebalance")
+        return True
+
+    def _process_pending_rebalance(self, *, force: bool = False) -> bool:
+        """Repartition once after a useful late join, only at an idle boundary."""
+
+        if not self._pending_rebalance_node_ids or not self.dynamic_pipelines_router:
+            return False
+        now = time.monotonic()
+        if not force and now < self._next_rebalance_attempt_at:
+            return False
+        if any(node.manual_layer_assignment for node in self.node_manager.nodes):
+            logger.warning("Skipping automatic rebalance for mixed/manual assignments")
+            self._pending_rebalance_node_ids.clear()
+            return False
+
+        with self._inflight_routes_lock:
+            if self._inflight_routes or any(
+                node.routing_load > 0 or node.current_requests > 0
+                for node in self.node_manager.active_nodes
+            ):
+                return False
+            active_nodes = self.node_manager.active_nodes
+            pending_nodes = [
+                node
+                for node_id in self._pending_rebalance_node_ids
+                if (node := self.node_manager.get(node_id)) is not None
+            ]
+            if any(
+                not any(isfinite(node.get_rtt_to(active)) for active in active_nodes)
+                for node in pending_nodes
+            ):
+                # A join is acknowledged before its heartbeat RTT probes settle.
+                # Planning with infinite edges would permanently reject an
+                # otherwise useful worker. Keep it standby and retry at a
+                # bounded cadence instead of spinning the event loop.
+                self._next_rebalance_attempt_at = now + 1.0
+                logger.debug(
+                    "Deferring late-node rebalance until RTT telemetry is available: %s",
+                    sorted(self._pending_rebalance_node_ids),
+                )
+                return False
+            self._admission_paused = True
+            try:
+                plan = self._plan_global_rebalance()
+                useful_pending = self._pending_rebalance_node_ids.intersection(plan)
+                if not plan or not useful_pending:
+                    logger.info(
+                        "Keeping late node(s) in standby because the global plan "
+                        "does not place them on a complete route: %s",
+                        sorted(self._pending_rebalance_node_ids),
+                    )
+                    self._pending_rebalance_node_ids.clear()
+                    self._next_rebalance_attempt_at = 0.0
+                    return False
+                if not self._apply_rebalance_plan(plan):
+                    return False
+                logger.info(
+                    "Drained global rebalance admitted late node(s): %s",
+                    sorted(useful_pending),
+                )
+                self._pending_rebalance_node_ids.clear()
+                self._next_rebalance_attempt_at = 0.0
+                return True
+            finally:
+                self._admission_paused = False
+
     def _process_leaves(self) -> None:
         """Handle pending leave events safely.
 
@@ -1046,9 +1224,9 @@ class Scheduler:
 
         # Move active nodes to standby and re-bootstrap (reboot) once.
         self.node_manager.standby([n.node_id for n in self.node_manager.active_nodes])
-        assert (
-            self.node_manager.num_standby_nodes == self.node_manager.num_nodes
-        ), "All active nodes should be moved to standby"
+        assert self.node_manager.num_standby_nodes == self.node_manager.num_nodes, (
+            "All active nodes should be moved to standby"
+        )
         assert self.node_manager.num_active_nodes == 0, "No active nodes before re-bootstrap"
         logger.warning("Re-bootstrapping for global rebalance")
         try:
