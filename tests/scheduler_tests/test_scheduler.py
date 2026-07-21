@@ -752,6 +752,50 @@ def test_scheduler_single_node_leave_then_rejoin_reassigns_layers():
     ), "After re-join, single node should be assigned a full layer range"
 
 
+def test_decoder_only_join_after_last_pipeline_leave_waits_for_frontend():
+    """A stale bootstrap flag must not create an orphan decoder-only range."""
+    model = build_model_info(12)
+    frontend = build_node(
+        "frontend",
+        model,
+        tflops=100.0,
+        mem_gb=400.0,
+        supports_frontend=True,
+    )
+    sched = Scheduler(
+        model,
+        [frontend],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+
+    assert sched.bootstrap()
+    assert sched._bootstrapped_event.is_set()  # type: ignore[attr-defined]
+
+    sched.enqueue_leave(frontend.node_id)
+    sched._process_leaves()  # type: ignore[attr-defined]
+
+    assert not sched.has_full_pipeline()
+    assert not sched._bootstrapped_event.is_set()  # type: ignore[attr-defined]
+
+    decoder = build_node(
+        "decoder-only",
+        model,
+        tflops=200.0,
+        mem_gb=400.0,
+        supports_frontend=False,
+    )
+    sched.enqueue_join(decoder)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    assert decoder.start_layer is None
+    assert decoder.end_layer is None
+    assert decoder in sched.node_manager.standby_nodes
+    assert not sched.has_full_pipeline()
+    assert not sched._bootstrapped_event.is_set()  # type: ignore[attr-defined]
+
+
 def test_scheduler_three_nodes_sequential_join_leave_rejoin():
     """Test scheduler with 28-layer model, 3 nodes each capable of 22 layers.
 

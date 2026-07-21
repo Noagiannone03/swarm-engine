@@ -415,6 +415,19 @@ class Scheduler:
     def join(self, node: Node) -> None:
         """Add a node to allocation and refresh plan and materialized nodes."""
         bootstrapped = self._bootstrapped_event.is_set()
+        # ``bootstrapped`` is only a cache of the allocation invariant.  A
+        # scheduler that lost its last complete route must never treat the next
+        # worker as a lightweight dynamic join: doing so can hand a decoder-only
+        # node an orphan range such as [1, L).  Keep this guard at the mutation
+        # boundary as well as in ``leave`` so direct/test callers cannot observe
+        # a stale event either.
+        if bootstrapped and not self.has_full_pipeline():
+            logger.warning(
+                "Clearing stale bootstrap state before joining %s: no full pipeline remains",
+                node.node_id,
+            )
+            self._bootstrapped_event.clear()
+            bootstrapped = False
         logger.info(
             "Joining node %s (kv_ratio=%.2f, param_ratio=%.2f, manual_assignment=%s, bootstrapped=%s)",
             node.node_id,
@@ -528,6 +541,17 @@ class Scheduler:
                 invalidated,
             )
         self.node_manager.remove(node_id)
+
+        # Bootstrap state means that at least one complete [0, L) route exists,
+        # not merely that bootstrap succeeded at some point in the past.  Clear
+        # it synchronously when the last complete route disappears so a join
+        # queued immediately after this leave goes through global bootstrap.
+        if self._bootstrapped_event.is_set() and not self.has_full_pipeline():
+            logger.info(
+                "Full pipeline coverage lost after node %s left; clearing bootstrap state",
+                node_id,
+            )
+            self._bootstrapped_event.clear()
 
         # Snapshot at INFO after leave since allocations/pipelines may have changed.
         self.emit_alloc_log_snapshot(reason=f"after leave {node_id}")
