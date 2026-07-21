@@ -1,11 +1,16 @@
 import time
+import threading
 from types import SimpleNamespace
 
+import pytest
+
+from parallax.p2p.proto import forward_pb2
 from parallax.p2p.server import (
     GradientServer,
     ServerState,
     TransformerConnectionHandler,
     _resolve_worker_key_path,
+    send_notify,
 )
 
 
@@ -28,6 +33,57 @@ class ProbeStub:
     def rpc_health(self, request):
         assert request == {}
         return self.future
+
+
+class RecordingSocket:
+    def __init__(self, error=None):
+        self.error = error
+        self.messages = []
+
+    def send_multipart(self, message):
+        if self.error is not None:
+            raise self.error
+        self.messages.append(message)
+
+
+def build_forward_handler(socket):
+    handler = object.__new__(TransformerConnectionHandler)
+    handler._recv_from_peer_lock = threading.Lock()
+    handler._recv_from_peer = socket
+    handler.notify_url = None
+    handler.block_start_index = None
+    handler.block_end_index = None
+    return handler
+
+
+def test_disabled_notification_does_not_require_an_assigned_span():
+    request = forward_pb2.ForwardRequest()
+    request.reqs.add(rid="request-1")
+
+    assert send_notify(None, None, None, request, "started") is None
+
+
+def test_dynamic_span_handler_enqueues_after_standby_assignment():
+    socket = RecordingSocket()
+    handler = build_forward_handler(socket)
+    handler.update_serving_span(1, 28)
+    request = forward_pb2.ForwardRequest()
+    request.reqs.add(rid="request-1")
+
+    handler.rpc_pp_forward(request)
+
+    assert handler.block_start_index == 1
+    assert handler.block_end_index == 28
+    assert socket.messages == [[b"forward", request.SerializeToString()]]
+
+
+def test_forward_enqueue_failure_is_not_reported_as_success():
+    handler = build_forward_handler(RecordingSocket(error=RuntimeError("enqueue failed")))
+    request = forward_pb2.ForwardRequest()
+    request.reqs.add(rid="request-1")
+
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        handler.rpc_pp_forward(request)
 
 
 def test_worker_key_path_is_persistent_and_private(monkeypatch, tmp_path):

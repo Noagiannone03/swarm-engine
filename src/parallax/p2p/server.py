@@ -99,6 +99,18 @@ class ServerInfo:
 
 
 def send_notify(notify_url, block_start_index, block_end_index, request, status):
+    # Notifications are optional observability. In scheduler mode a worker can
+    # start in standby without a layer span, so do not evaluate span-derived
+    # fields unless a notification sink is actually configured.
+    if notify_url is None:
+        return
+    if block_start_index is None or block_end_index is None:
+        logger.warning(
+            "Skipping %s notification because the serving span is not assigned",
+            status,
+        )
+        return
+
     payload = [
         {
             "session_id": req.rid,
@@ -112,18 +124,16 @@ def send_notify(notify_url, block_start_index, block_end_index, request, status)
 
     logger.info(f"Send {status} notification, batch size: {len(payload)}")
 
-    if notify_url is not None:
+    async def send_async(notify_url, payload):
+        try:
+            client = await get_http_client()
+            await client.post(notify_url, json=payload)
+        except Exception as e:
+            logger.exception(f"Error in send_async: {e}")
 
-        async def send_async(notify_url, payload):
-            try:
-                client = await get_http_client()
-                await client.post(notify_url, json=payload)
-            except Exception as e:
-                logger.exception(f"Error in send_async: {e}")
-
-        if not hasattr(send_notify, "async_worker"):
-            send_notify.async_worker = AsyncWorker()
-        send_notify.async_worker.run_coroutine(send_async(notify_url, payload), return_future=True)
+    if not hasattr(send_notify, "async_worker"):
+        send_notify.async_worker = AsyncWorker()
+    send_notify.async_worker.run_coroutine(send_async(notify_url, payload), return_future=True)
 
 
 class TransformerConnectionHandler(ConnectionHandler):
@@ -161,20 +171,32 @@ class TransformerConnectionHandler(ConnectionHandler):
             )
         return self._recv_from_peer
 
+    def update_serving_span(self, block_start_index: int, block_end_index: int) -> None:
+        """Atomically refresh metadata copied into the long-lived RPC handler."""
+        with self._recv_from_peer_lock:
+            self.block_start_index = block_start_index
+            self.block_end_index = block_end_index
+
     @rpc_stream
     def rpc_pp_forward(
         self,
         request: forward_pb2.ForwardRequest,
     ) -> forward_pb2.ForwardResponse:
         """Handle forward pass request with explicit proxy tensors support"""
+        # The local enqueue is the data-plane operation. Do it before optional
+        # telemetry and let failures propagate to the remote RPC caller instead
+        # of returning a false successful response.
+        with self._recv_from_peer_lock:
+            self.recv_from_peer.send_multipart([b"forward", request.SerializeToString()])
+            block_start_index = self.block_start_index
+            block_end_index = self.block_end_index
+
         try:
             send_notify(
-                self.notify_url, self.block_start_index, self.block_end_index, request, "started"
+                self.notify_url, block_start_index, block_end_index, request, "started"
             )
-            with self._recv_from_peer_lock:
-                self.recv_from_peer.send_multipart([b"forward", request.SerializeToString()])
         except Exception as e:
-            logger.exception(f"Error in rpc_pp_forward: {e}")
+            logger.warning("Failed to emit forward notification: %s", e, exc_info=True)
         return forward_pb2.ForwardResponse()
 
     @rpc_method
@@ -188,11 +210,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         self,
         request: forward_pb2.AbortRequest,
     ) -> forward_pb2.AbortResponse:
-        try:
-            with self._recv_from_peer_lock:
-                self.recv_from_peer.send_multipart([b"abort", request.SerializeToString()])
-        except Exception as e:
-            logger.exception(f"Error in rpc_abort: {e}")
+        with self._recv_from_peer_lock:
+            self.recv_from_peer.send_multipart([b"abort", request.SerializeToString()])
         return forward_pb2.AbortResponse()
 
     def ipc_weight_refit(
@@ -990,6 +1009,11 @@ class GradientServer:
                                         # Update layer allocation
                                         self.block_start_index = start_layer
                                         self.block_end_index = end_layer
+                                        if self.connection_handler is not None:
+                                            self.connection_handler.update_serving_span(
+                                                start_layer,
+                                                end_layer,
+                                            )
                                         if model_name:
                                             self.model_name = model_name
                                         if has_model_context:
