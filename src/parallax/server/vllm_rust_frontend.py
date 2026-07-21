@@ -90,6 +90,22 @@ def _runtime_args_json(args) -> str:
         "model_tag": args.model_path,
         "language_model_only": True,
     }
+    # The official Rust frontend parses ``--args-json`` with serde. Clap's
+    # ``VLLM_ENGINE_READY_TIMEOUT_S`` binding is therefore bypassed on this
+    # Python-supervised path (see vLLM ``parse_runtime_args_json``). Forward the
+    # maintained vLLM setting explicitly so slow cold model downloads can use a
+    # deliberate startup window instead of always dying at the 600 s default.
+    ready_timeout = os.environ.get("VLLM_ENGINE_READY_TIMEOUT_S")
+    if ready_timeout is not None:
+        try:
+            ready_timeout_seconds = int(ready_timeout)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_ENGINE_READY_TIMEOUT_S must be a non-negative integer"
+            ) from exc
+        if ready_timeout_seconds < 0:
+            raise ValueError("VLLM_ENGINE_READY_TIMEOUT_S must be a non-negative integer")
+        runtime_args["engine_ready_timeout_secs"] = ready_timeout_seconds
     served_model_name = getattr(args, "served_model_name", None)
     if served_model_name and served_model_name != args.model_path:
         runtime_args["served_model_name"] = [served_model_name]
