@@ -13,5 +13,6 @@ build/
 .vscode/
 hosts.json
 uv.lock
+native/fabi-network/target/
 
 AGENTS.md

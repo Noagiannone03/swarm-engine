@@ -41,6 +41,8 @@ NodeUpdate: TypeAlias = Tuple[
     Optional[int],
     Optional[int],
     Optional[List[str]],
+    Optional[List[str]],
+    Optional[List[str]],
     Optional[str],
 ]
 
@@ -373,6 +375,8 @@ class Scheduler:
         kv_cache_block_size: Optional[int] = None,
         max_concurrent_requests: Optional[int] = None,
         direct_peer_ids: Optional[List[str]] = None,
+        reachable_peer_ids: Optional[List[str]] = None,
+        relayed_peer_ids: Optional[List[str]] = None,
         account_hash: Optional[str] = None,
     ) -> None:
         """Update the info of a node."""
@@ -400,6 +404,10 @@ class Scheduler:
             node.max_concurrent_requests = int(max_concurrent_requests)
         if direct_peer_ids is not None:
             node.direct_peer_ids = set(direct_peer_ids)
+        if reachable_peer_ids is not None:
+            node.reachable_peer_ids = set(reachable_peer_ids)
+        if relayed_peer_ids is not None:
+            node.relayed_peer_ids = set(relayed_peer_ids)
         if account_hash is not None:
             node.account_hash = account_hash
         node.last_heartbeat = time.time()
@@ -432,6 +440,8 @@ class Scheduler:
         kv_cache_block_size: Optional[int] = None,
         max_concurrent_requests: Optional[int] = None,
         direct_peer_ids: Optional[List[str]] = None,
+        reachable_peer_ids: Optional[List[str]] = None,
+        relayed_peer_ids: Optional[List[str]] = None,
         account_hash: Optional[str] = None,
     ) -> None:
         """Enqueue a node update event."""
@@ -450,6 +460,8 @@ class Scheduler:
                 kv_cache_block_size,
                 max_concurrent_requests,
                 direct_peer_ids,
+                reachable_peer_ids,
+                relayed_peer_ids,
                 account_hash,
             )
         )
@@ -930,6 +942,8 @@ class Scheduler:
                     kv_cache_block_size,
                     max_concurrent_requests,
                     direct_peer_ids,
+                    reachable_peer_ids,
+                    relayed_peer_ids,
                     account_hash,
                 ) = self._pending_node_updates.get_nowait()
             except queue.Empty:
@@ -952,6 +966,8 @@ class Scheduler:
                 kv_cache_block_size=kv_cache_block_size,
                 max_concurrent_requests=max_concurrent_requests,
                 direct_peer_ids=direct_peer_ids,
+                reachable_peer_ids=reachable_peer_ids,
+                relayed_peer_ids=relayed_peer_ids,
                 account_hash=account_hash,
             )
 
@@ -1046,9 +1062,7 @@ class Scheduler:
             if candidate is None:
                 continue
             proposed = [*allocations, (node.node_id, *candidate)]
-            participants = self.node_manager.full_pipeline_segment_ids(
-                proposed, self.num_layers
-            )
+            participants = self.node_manager.full_pipeline_segment_ids(proposed, self.num_layers)
             if node.node_id in participants:
                 # ``allocate_standby_nodes`` should already have admitted an
                 # exact-route shard. Avoid scheduling a reload if a custom
@@ -1269,9 +1283,9 @@ class Scheduler:
 
         # Move active nodes to standby and re-bootstrap (reboot) once.
         self.node_manager.standby([n.node_id for n in self.node_manager.active_nodes])
-        assert self.node_manager.num_standby_nodes == self.node_manager.num_nodes, (
-            "All active nodes should be moved to standby"
-        )
+        assert (
+            self.node_manager.num_standby_nodes == self.node_manager.num_nodes
+        ), "All active nodes should be moved to standby"
         assert self.node_manager.num_active_nodes == 0, "No active nodes before re-bootstrap"
         logger.warning("Re-bootstrapping for global rebalance")
         try:

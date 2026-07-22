@@ -1,0 +1,46 @@
+[package]
+name = "fabi-network"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Authenticated, relay-capable QUIC transport for Fabi workers"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python = ["dep:pyo3"]
+python-extension = ["python", "pyo3/extension-module"]
+
+[dependencies]
+anyhow = "1.0"
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+data-encoding = "2.9"
+iroh = { version = "=1.0.3", default-features = true }
+n0-future = "0.3"
+pyo3 = { version = "0.27.2", optional = true, features = ["abi3-py310"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.20"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+assert_matches = "1.5"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -14,6 +14,7 @@ packages = [
   { include = "scheduling", from = "src" },
   { include = "parallax_utils", from = "src" },
   { include = "parallax_extensions", from = "src" },
+  { include = "fabi_network", from = "src" },
 ]
 
 dependencies = [

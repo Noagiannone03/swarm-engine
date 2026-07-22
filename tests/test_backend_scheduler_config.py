@@ -92,6 +92,36 @@ def test_cluster_node_info_exposes_measured_kv_capacity():
     assert info["rtt_to_nodes_ms"] == {"next-worker": 12.5}
 
 
+def test_scheduler_starts_and_reuses_iroh_rpc_handler(monkeypatch):
+    registered = []
+    transport = SimpleNamespace(
+        register=registered.append,
+        peer_id=lambda: "scheduler-endpoint",
+    )
+    manager = SchedulerManage(http_port=3001)
+    first_scheduler = object()
+    manager.scheduler = first_scheduler
+    monkeypatch.setattr(
+        scheduler_manage_module.IrohTransport,
+        "from_environment",
+        lambda role: transport,
+    )
+
+    manager._start_iroh()
+
+    assert manager.get_peer_id() == "scheduler-endpoint"
+    assert len(registered) == 1
+    assert registered[0].scheduler is first_scheduler
+    assert registered[0].http_port == 3001
+
+    second_scheduler = object()
+    manager.scheduler = second_scheduler
+    manager._start_iroh()
+
+    assert len(registered) == 1
+    assert registered[0].scheduler is second_scheduler
+
+
 def test_context_tokenizer_is_canonical_cached_and_offline_aware():
     manager = SchedulerManage(use_hfcache=True)
     manager.model_name = "Qwen/Qwen3-0.6B"

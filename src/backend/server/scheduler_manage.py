@@ -8,6 +8,7 @@ from backend.server.constants import NODE_STATUS_AVAILABLE, NODE_STATUS_WAITING
 from backend.server.context_admission import ContextBudget, build_context_budget
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 from backend.server.static_config import get_model_info, get_node_join_command
+from fabi_network.transport import IrohTransport, using_iroh
 from parallax.cli import PUBLIC_INITIAL_PEERS, PUBLIC_RELAY_SERVERS
 from parallax.p2p.server import TransformerConnectionHandler
 from parallax.p2p.utils import log_nat_traversal_preflight, mdns_enabled_for_topology
@@ -57,6 +58,7 @@ class SchedulerManage:
         self.scheduler = None
         self.node_id = f"{dht_prefix}_announce"
         self.lattica = None
+        self.iroh_transport = None
         self.stubs = {}
         self.is_local_network = False
         self._context_tokenizer = None
@@ -78,7 +80,12 @@ class SchedulerManage:
             self.routing_strategy,
         )
         self.is_local_network = is_local_network
-        if not is_local_network and not self.initial_peers and not self.relay_servers:
+        if (
+            not using_iroh()
+            and not is_local_network
+            and not self.initial_peers
+            and not self.relay_servers
+        ):
             logger.debug("Using public relay servers")
             self.initial_peers = PUBLIC_INITIAL_PEERS
             self.relay_servers = PUBLIC_RELAY_SERVERS
@@ -86,11 +93,12 @@ class SchedulerManage:
         self._start_scheduler(model_name, init_nodes_num)
         self._start_lattica()
         self.completion_handler = TransformerConnectionHandler(
-            lattica=self.lattica,
+            lattica=None if self.iroh_transport is not None else self.lattica,
             recv_from_peer_addr="",
             send_to_peer_addr="",
             block_start_index=0,
             block_end_index=1,
+            iroh_transport=self.iroh_transport,
         )
 
     def is_running(self):
@@ -204,6 +212,19 @@ class SchedulerManage:
                 if getattr(node, "direct_peer_ids", None) is not None
                 else None
             ),
+            "reachable_link_telemetry_ready": (
+                getattr(node, "reachable_peer_ids", None) is not None
+            ),
+            "reachable_peer_ids": (
+                sorted(node.reachable_peer_ids)
+                if getattr(node, "reachable_peer_ids", None) is not None
+                else None
+            ),
+            "relayed_peer_ids": (
+                sorted(node.relayed_peer_ids)
+                if getattr(node, "relayed_peer_ids", None) is not None
+                else None
+            ),
             "rtt_to_nodes_ms": dict(getattr(node, "rtt_to_nodes", {}) or {}),
         }
 
@@ -251,6 +272,10 @@ class SchedulerManage:
         Initialize and start the Lattica P2P node used for RPCs.
         If Lattica already exists, it will be reused (no restart), but connection_handler will be updated.
         """
+        if using_iroh():
+            self._start_iroh()
+            return
+
         # Reuse existing Lattica if running
         if self.lattica is not None:
             logger.debug("Lattica already running, reusing existing instance")
@@ -324,6 +349,28 @@ class SchedulerManage:
             http_port=self.http_port,
         )
         logger.debug("RPCConnectionHandler initialized")
+
+    def _start_iroh(self):
+        """Start or reuse the centrally scheduled Iroh RPC endpoint."""
+
+        if self.iroh_transport is not None:
+            self.connection_handler.scheduler = self.scheduler
+            logger.debug("Updated Iroh scheduler RPC handler")
+            return
+
+        transport = IrohTransport.from_environment("scheduler")
+        handler = RPCConnectionHandler(
+            lattica=None,
+            scheduler=self.scheduler,
+            http_port=self.http_port,
+        )
+        transport.register(handler)
+        self.iroh_transport = transport
+        # Keep the legacy attribute during the staged migration; callers only
+        # depend on peer_id/close in central scheduler mode.
+        self.lattica = transport
+        self.connection_handler = handler
+        logger.info("Iroh scheduler endpoint ready: %s", transport.peer_id())
 
     def _get_context_tokenizer(self):
         """Lazily load the canonical tokenizer used by the scheduler's model."""

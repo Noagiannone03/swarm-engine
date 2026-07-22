@@ -14,6 +14,7 @@ from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import State
 
 from backend.server.rpc_connection_handler import RPCConnectionHandler
+from fabi_network.transport import IrohTransport, using_iroh
 from parallax.p2p.utils import log_nat_traversal_preflight, mdns_enabled_for_topology
 from parallax_utils.file_util import get_project_root
 from parallax_utils.logging_config import get_logger
@@ -88,8 +89,18 @@ class NodeChatHttpServer:
         self.scheduler_peer_id = None
         self.scheduler_stub = None
         self.lattica = None
+        self.iroh_transport = None
 
     def build_lattica(self):
+        if using_iroh():
+            if self.scheduler_addr in {None, "auto"}:
+                raise ValueError("Iroh chat clients require an explicit scheduler endpoint ID")
+            self.iroh_transport = IrohTransport.from_environment("chat")
+            self.lattica = self.iroh_transport
+            self.scheduler_peer_id = str(self.scheduler_addr)
+            logger.info("Iroh chat endpoint ready: %s", self.iroh_transport.peer_id())
+            return True
+
         self.lattica = Lattica.builder().with_listen_addrs(self.host_maddrs)
         mdns_enabled = mdns_enabled_for_topology(
             initial_peers=self.initial_peers,
@@ -158,9 +169,14 @@ class NodeChatHttpServer:
         if self.scheduler_addr is not None:  # central scheduler mode
             try:
                 if self.scheduler_stub is None:
-                    self.scheduler_stub = RPCConnectionHandler(self.lattica, None, None).get_stub(
-                        self.scheduler_peer_id
-                    )
+                    if self.iroh_transport is not None:
+                        self.scheduler_stub = self.iroh_transport.stub(
+                            self.scheduler_peer_id, RPCConnectionHandler
+                        )
+                    else:
+                        self.scheduler_stub = RPCConnectionHandler(
+                            self.lattica, None, None
+                        ).get_stub(self.scheduler_peer_id)
                 stub = self.scheduler_stub
                 is_stream = request_data.get("stream", False)
                 try:
@@ -216,9 +232,14 @@ class NodeChatHttpServer:
         if self.scheduler_addr is not None:  # central scheduler mode
             try:
                 if self.scheduler_stub is None:
-                    self.scheduler_stub = RPCConnectionHandler(self.lattica, None, None).get_stub(
-                        self.scheduler_peer_id
-                    )
+                    if self.iroh_transport is not None:
+                        self.scheduler_stub = self.iroh_transport.stub(
+                            self.scheduler_peer_id, RPCConnectionHandler
+                        )
+                    else:
+                        self.scheduler_stub = RPCConnectionHandler(
+                            self.lattica, None, None
+                        ).get_stub(self.scheduler_peer_id)
                 stub = self.scheduler_stub
                 try:
 
@@ -303,9 +324,12 @@ class NodeChatHttpServer:
         2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
         """
         while not self.build_lattica():
-            logger.error("Failed to build lattica, waiting for 10 seconds")
+            logger.error("Failed to build network transport, waiting for 10 seconds")
             time.sleep(10)
-        logger.info("Lattica built successfully")
+        logger.info(
+            "%s transport built successfully",
+            "Iroh" if self.iroh_transport is not None else "Lattica",
+        )
 
         asyncio.run(
             init_app_states(

@@ -194,6 +194,48 @@ def test_dp_selects_redundant_pipeline_with_complete_direct_cycle():
     assert latency < float("inf")
 
 
+def test_dp_accepts_qualified_relay_cycle_with_iroh_reachability():
+    """Relay-only Iroh paths remain valid while direct telemetry stays explicit."""
+    model = build_model(12)
+    head = build_node("head", model)
+    tail = build_node("tail", model)
+    head.set_layer_allocation(0, 6)
+    tail.set_layer_allocation(6, 12)
+    head.direct_peer_ids = set()
+    tail.direct_peer_ids = set()
+    head.reachable_peer_ids = {tail.node_id}
+    tail.reachable_peer_ids = {head.node_id}
+    head.relayed_peer_ids = {tail.node_id}
+    tail.relayed_peer_ids = {head.node_id}
+    set_rtt_from_coords([head, tail])
+
+    node_manager = build_node_management([head, tail])
+    node_manager.activate([head.node_id, tail.node_id])
+    path, latency = DynamicProgrammingRouting(node_manager, total_layers=12).find_optimal_path()
+
+    assert path == [head.node_id, tail.node_id]
+    assert latency < float("inf")
+
+
+def test_dp_rejects_unqualified_iroh_relay_edge():
+    model = build_model(12)
+    head = build_node("head", model)
+    tail = build_node("tail", model)
+    head.set_layer_allocation(0, 6)
+    tail.set_layer_allocation(6, 12)
+    head.reachable_peer_ids = {tail.node_id}
+    tail.reachable_peer_ids = set()
+    set_rtt_from_coords([head, tail])
+
+    node_manager = build_node_management([head, tail])
+    node_manager.activate([head.node_id, tail.node_id])
+
+    assert DynamicProgrammingRouting(node_manager, total_layers=12).find_optimal_path() == (
+        [],
+        float("inf"),
+    )
+
+
 def test_rtt_cold_start_uses_best_common_peer_measurements():
     """A common Lattica peer makes a fresh worker pair routable."""
     model = build_model(12)

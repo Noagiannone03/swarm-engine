@@ -24,6 +24,7 @@ from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stre
 
 from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.rpc_connection_handler import RPCConnectionHandler
+from fabi_network.transport import IrohTransport, using_iroh
 from parallax.p2p.proto import forward_pb2
 from parallax.p2p.utils import AsyncWorker, log_nat_traversal_preflight, mdns_enabled_for_topology
 from parallax.server.server_info import detect_node_hardware
@@ -144,16 +145,20 @@ class TransformerConnectionHandler(ConnectionHandler):
 
     def __init__(
         self,
-        lattica: Lattica,
+        lattica: Optional[Lattica],
         recv_from_peer_addr: str,
         send_to_peer_addr: str,
         block_start_index: int,
         block_end_index: int,
         http_port: Optional[int] = None,
         notify_url: Optional[str] = None,
+        iroh_transport: Optional[IrohTransport] = None,
     ):
-        # Initialize the base class
-        super().__init__(lattica)
+        if lattica is not None:
+            super().__init__(lattica)
+        if lattica is None and iroh_transport is None:
+            raise ValueError("either lattica or iroh_transport must be provided")
+        self.iroh_transport = iroh_transport
         self.recv_from_peer_addr = recv_from_peer_addr
         self.send_to_peer_addr = send_to_peer_addr
         self.block_start_index = block_start_index
@@ -162,6 +167,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         self.notify_url = notify_url
         self._recv_from_peer = None
         self._recv_from_peer_lock = threading.Lock()
+
+    def get_stub(self, peer_id: str):
+        if getattr(self, "iroh_transport", None) is not None:
+            return self.iroh_transport.stub(peer_id, type(self))
+        return super().get_stub(peer_id)
 
     @property
     def recv_from_peer(self):
@@ -192,17 +202,17 @@ class TransformerConnectionHandler(ConnectionHandler):
             block_end_index = self.block_end_index
 
         try:
-            send_notify(
-                self.notify_url, block_start_index, block_end_index, request, "started"
-            )
+            send_notify(self.notify_url, block_start_index, block_end_index, request, "started")
         except Exception as e:
             logger.warning("Failed to emit forward notification: %s", e, exc_info=True)
         return forward_pb2.ForwardResponse()
 
     @rpc_method
     def rpc_health(self, request):
-        """Return this peer's identity after Lattica qualified the RPC path."""
+        """Return this peer's authenticated transport identity."""
         del request
+        if getattr(self, "iroh_transport", None) is not None:
+            return {"peer_id": self.iroh_transport.peer_id()}
         return {"peer_id": self.lattica_instance.peer_id()}
 
     @rpc_method
@@ -453,6 +463,7 @@ class GradientServer:
         self.refit_timestamp_history = []
         self.prefix_id = f"{dht_prefix}_announce"
         self.lattica = None
+        self.iroh_transport = None
         self.routing_table = None
         self.routing_table_update_interval = 10
         self.server_info = ServerInfo(state=ServerState.JOINING)
@@ -475,6 +486,8 @@ class GradientServer:
         self.connection_handler = None
         self.outbound_peer_ids = []
         self.direct_peer_ids = []
+        self.reachable_peer_ids = []
+        self.relayed_peer_ids = []
         self.stop_event = threading.Event()
         logger.debug(f"manual_layer_assignment: {self.manual_layer_assignment}")
         self._layer_allocation_changed = False
@@ -511,6 +524,9 @@ class GradientServer:
                 logger.warning(f"Folder '{weight_dir}' does not exist.")
 
     def build_lattica(self):
+        if using_iroh():
+            return self._build_iroh()
+
         self.lattica = (
             Lattica.builder()
             .with_listen_addrs(self.host_maddrs)
@@ -571,18 +587,43 @@ class GradientServer:
 
         return True
 
+    def _build_iroh(self):
+        """Build the worker endpoint for central scheduler mode."""
+
+        if self.scheduler_addr in {None, "auto"}:
+            raise ValueError("Iroh workers require an explicit scheduler endpoint ID")
+        if str(self.scheduler_addr).startswith("/"):
+            raise ValueError("Iroh workers require an endpoint ID, not a Lattica multiaddress")
+        self.iroh_transport = IrohTransport.from_environment("worker")
+        self.lattica = self.iroh_transport
+        self.scheduler_peer_id = str(self.scheduler_addr)
+        logger.info(
+            "Iroh worker endpoint ready: %s (scheduler %s)",
+            self.iroh_transport.peer_id(),
+            self.scheduler_peer_id,
+        )
+        return True
+
     def run(self):
         if self.build_lattica():
-            logger.info("Lattica built successfully")
+            logger.info(
+                "%s transport built successfully",
+                "Iroh" if self.iroh_transport is not None else "Lattica",
+            )
         else:
-            logger.error("Failed to build lattica")
+            logger.error("Failed to build network transport")
             exit(1)
 
         if self.scheduler_addr is not None:  # central scheduler mode
             try:
-                self.scheduler_stub = RPCConnectionHandler(self.lattica, None, None).get_stub(
-                    self.scheduler_peer_id
-                )
+                if self.iroh_transport is not None:
+                    self.scheduler_stub = self.iroh_transport.stub(
+                        self.scheduler_peer_id, RPCConnectionHandler
+                    )
+                else:
+                    self.scheduler_stub = RPCConnectionHandler(self.lattica, None, None).get_stub(
+                        self.scheduler_peer_id
+                    )
                 node_info = self.get_node_info()
                 if node_info == {}:
                     logger.error("Failed to get node info, try again after 10 seconds")
@@ -608,6 +649,10 @@ class GradientServer:
                 self.model_name = response.get("model_name")
                 self.tp_size = response.get("tp_size")
                 self.enable_weight_refit = response.get("enable_weight_refit")
+                if self.iroh_transport is not None and self.enable_weight_refit:
+                    raise RuntimeError(
+                        "weight refit needs a qualified Iroh content plane and cannot use RPC fallback"
+                    )
                 self.weight_refit_mode = response.get("weight_refit_mode")
                 self.model_max_sequence_length = response.get("model_max_sequence_length")
                 self.chunked_prefill_size = int(response.get("chunked_prefill_size", 0))
@@ -623,14 +668,17 @@ class GradientServer:
             self.start_routing_table_updater()  # thread
 
         self.connection_handler = TransformerConnectionHandler(
-            lattica=self.lattica,
+            lattica=None if self.iroh_transport is not None else self.lattica,
             recv_from_peer_addr=self.recv_from_peer_addr,
             send_to_peer_addr=self.send_to_peer_addr,
             block_start_index=self.block_start_index,
             block_end_index=self.block_end_index,
             http_port=self.http_port,
             notify_url=self.notify_url,
+            iroh_transport=self.iroh_transport,
         )  # thread
+        if self.iroh_transport is not None:
+            self.iroh_transport.register(self.connection_handler)
 
         if self.scheduler_addr is not None:
             self.start_direct_peer_prober()
@@ -673,7 +721,7 @@ class GradientServer:
         if self.connection_handler is None:
             return None
         if self.stop_event.is_set():
-            return self.direct_peer_ids
+            return self.reachable_peer_ids
 
         pending = {}
         for peer_id in list(self.outbound_peer_ids):
@@ -683,24 +731,43 @@ class GradientServer:
                 logger.debug("Could not start direct-path probe to %s", peer_id, exc_info=True)
 
         direct = []
+        reachable = []
+        relayed = []
         for peer_id, future in pending.items():
             try:
                 response = future.result(timeout=5) if hasattr(future, "result") else future
                 if isinstance(response, dict) and response.get("peer_id") == peer_id:
-                    direct.append(peer_id)
+                    reachable.append(peer_id)
+                    if self.iroh_transport is None:
+                        direct.append(peer_id)
+                    else:
+                        path = self.iroh_transport.selected_path(peer_id)
+                        if path is not None and path.get("kind") == "direct":
+                            direct.append(peer_id)
+                        elif path is not None and path.get("kind") == "relay":
+                            relayed.append(peer_id)
             except Exception:
-                # Lattica's official RPC client rejects relay-only connections.
-                logger.debug("Direct-path probe to %s failed", peer_id, exc_info=True)
+                logger.debug("Transport probe to %s failed", peer_id, exc_info=True)
 
         direct.sort()
-        if direct != self.direct_peer_ids:
+        reachable.sort()
+        relayed.sort()
+        if (
+            direct != self.direct_peer_ids
+            or reachable != self.reachable_peer_ids
+            or relayed != self.relayed_peer_ids
+        ):
             logger.info(
-                "Qualified direct outbound peers: %s/%s",
+                "Qualified outbound peers: reachable=%s direct=%s relay=%s expected=%s",
+                reachable,
                 direct,
+                relayed,
                 self.outbound_peer_ids,
             )
         self.direct_peer_ids = direct
-        return direct
+        self.reachable_peer_ids = reachable
+        self.relayed_peer_ids = relayed
+        return reachable
 
     def start_direct_peer_prober(self):
         """Refresh route topology without ever delaying liveness heartbeats.
@@ -846,9 +913,9 @@ class GradientServer:
                     for req in forward_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert self.block_start_index == 0, (
-                                "Request routing table is not set for non-head rank"
-                            )
+                            assert (
+                                self.block_start_index == 0
+                            ), "Request routing table is not set for non-head rank"
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -899,9 +966,9 @@ class GradientServer:
                     for req in abort_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert self.block_start_index == 0, (
-                                "Request routing table is not set for non-head rank"
-                            )
+                            assert (
+                                self.block_start_index == 0
+                            ), "Request routing table is not set for non-head rank"
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -1109,6 +1176,8 @@ class GradientServer:
         if not is_update and not self._refresh_peer_rtts(peer_attempts=10, rtt_attempts=30):
             return {}
         direct_peer_ids = list(self.direct_peer_ids)
+        reachable_peer_ids = list(self.reachable_peer_ids)
+        relayed_peer_ids = list(self.relayed_peer_ids)
         hardware = detect_node_hardware(self.lattica.peer_id())
         runtime_backend = "mlx" if hardware.get("device") == "mlx" else self.gpu_backend
         self.supports_chunked_prefill = runtime_backend in {"mlx", "sglang"}
@@ -1154,6 +1223,10 @@ class GradientServer:
             info["kv_cache_block_size"] = int(runtime_kv_block_size)
         if direct_peer_ids is not None:
             info["direct_peer_ids"] = direct_peer_ids
+        if reachable_peer_ids is not None:
+            info["reachable_peer_ids"] = reachable_peer_ids
+        if relayed_peer_ids is not None:
+            info["relayed_peer_ids"] = relayed_peer_ids
 
         # For manual layer assignment, always include start_layer and end_layer
         if self.manual_layer_assignment:
@@ -1202,7 +1275,9 @@ class GradientServer:
             if self.scheduler_addr is not None and self.scheduler_stub is not None:
                 peer_id = self.lattica.peer_id() if self.lattica is not None else "unknown"
                 logger.info(f"Leave scheduler: {peer_id}")
-                self.scheduler_stub.node_leave(self.get_node_info(is_update=True))
+                response = self.scheduler_stub.node_leave(self.get_node_info(is_update=True))
+                if hasattr(response, "result"):
+                    response.result(timeout=5)
         except Exception:
             logger.warning("Failed to notify scheduler that the worker is leaving", exc_info=True)
 

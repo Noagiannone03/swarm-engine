@@ -87,6 +87,8 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
             "start_layer": 0,
             "end_layer": 12,
             "direct_peer_ids": ["downstream-worker"],
+            "reachable_peer_ids": ["downstream-worker", "relay-worker"],
+            "relayed_peer_ids": ["relay-worker"],
             "account_token": "ab" * 32,
         }
     )
@@ -101,6 +103,8 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
     assert update["kv_cache_block_size"] == 32
     assert update["max_concurrent_requests"] == 1
     assert update["direct_peer_ids"] == ["downstream-worker"]
+    assert update["reachable_peer_ids"] == ["downstream-worker", "relay-worker"]
+    assert update["relayed_peer_ids"] == ["relay-worker"]
     assert update["account_hash"] == account_hash("ab" * 32)
 
 

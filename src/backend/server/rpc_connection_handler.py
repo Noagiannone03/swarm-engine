@@ -55,12 +55,12 @@ class RPCConnectionHandler(ConnectionHandler):
 
     def __init__(
         self,
-        lattica: Lattica,
+        lattica: Lattica | None,
         scheduler: Scheduler,
         http_port: int,
     ):
-        # Initialize the base class
-        super().__init__(lattica)
+        if lattica is not None:
+            super().__init__(lattica)
         self.scheduler = scheduler
         self.http_port = http_port
 
@@ -164,6 +164,12 @@ class RPCConnectionHandler(ConnectionHandler):
                 max_concurrent_requests=node.max_concurrent_requests,
                 direct_peer_ids=(
                     sorted(node.direct_peer_ids) if node.direct_peer_ids is not None else None
+                ),
+                reachable_peer_ids=(
+                    sorted(node.reachable_peer_ids) if node.reachable_peer_ids is not None else None
+                ),
+                relayed_peer_ids=(
+                    sorted(node.relayed_peer_ids) if node.relayed_peer_ids is not None else None
                 ),
                 account_hash=node.account_hash,
             )
@@ -326,6 +332,16 @@ class RPCConnectionHandler(ConnectionHandler):
             direct_peer_ids=(
                 set(node_json["direct_peer_ids"])
                 if node_json.get("direct_peer_ids") is not None
+                else None
+            ),
+            reachable_peer_ids=(
+                set(node_json["reachable_peer_ids"])
+                if node_json.get("reachable_peer_ids") is not None
+                else None
+            ),
+            relayed_peer_ids=(
+                set(node_json["relayed_peer_ids"])
+                if node_json.get("relayed_peer_ids") is not None
                 else None
             ),
             account_hash=account_hash(node_json.get("account_token")),

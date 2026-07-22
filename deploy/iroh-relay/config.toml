@@ -1,0 +1,29 @@
+# Fabi qualification relay. The shared token is supplied through
+# IROH_RELAY_ACCESS_TOKEN so it never appears in this file or source control.
+enable_relay = true
+http_bind_addr = "[::]:4442"
+enable_quic_addr_discovery = true
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9091"
+key_cache_capacity = 8192
+
+# This placeholder is replaced at runtime by IROH_RELAY_ACCESS_TOKEN.
+access.shared_token = ["environment-required"]
+
+[limits]
+accept_conn_limit = 50.0
+accept_conn_burst = 100
+
+# One gigabit/s per endpoint with a 128 MiB burst accommodates representative
+# prefill activations while bounding abusive relay use.
+[limits.client.rx]
+bytes_per_second = 125000000
+max_burst_bytes = 134217728
+
+[tls]
+https_bind_addr = "[::]:4443"
+quic_bind_addr = "[::]:7842"
+hostname = ["server.undefinedstudio.fr"]
+cert_mode = "Reloading"
+manual_cert_path = "/var/lib/docker/volumes/edge-proxy_caddy_data/_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/server.undefinedstudio.fr/server.undefinedstudio.fr.crt"
+manual_key_path = "/var/lib/docker/volumes/edge-proxy_caddy_data/_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/server.undefinedstudio.fr/server.undefinedstudio.fr.key"

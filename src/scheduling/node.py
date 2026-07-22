@@ -230,6 +230,11 @@ class Node:
     # qualification.  New workers publish an explicit set (possibly empty),
     # allowing routing to fail closed when Lattica only has a relayed path.
     direct_peer_ids: Optional[Set[str]] = None
+    # Iroh qualifies reachability independently from the selected path. Relay
+    # peers remain usable and are tracked separately so routing can prefer a
+    # direct path without declaring a healthy relay-only edge impossible.
+    reachable_peer_ids: Optional[Set[str]] = None
+    relayed_peer_ids: Optional[Set[str]] = None
 
     # SHA-256 identifier derived from the local Fabi account credential.  The
     # scheduler never stores the credential itself; this field only binds a
@@ -263,6 +268,9 @@ class Node:
         self.supports_frontend = registration.supports_frontend
         self.supports_chunked_prefill = registration.supports_chunked_prefill
         self.preferred_chunked_prefill_size = registration.preferred_chunked_prefill_size
+        self.direct_peer_ids = registration.direct_peer_ids
+        self.reachable_peer_ids = registration.reachable_peer_ids
+        self.relayed_peer_ids = registration.relayed_peer_ids
         self.account_hash = registration.account_hash
 
         self.last_heartbeat = time.time()
@@ -427,6 +435,10 @@ class Node:
             self.kv_cache_block_size = None
             if self.direct_peer_ids is not None:
                 self.direct_peer_ids = set()
+            if self.reachable_peer_ids is not None:
+                self.reachable_peer_ids = set()
+            if self.relayed_peer_ids is not None:
+                self.relayed_peer_ids = set()
         self.start_layer = start_layer
         self.end_layer = end_layer
 
@@ -438,6 +450,10 @@ class Node:
         self.kv_cache_block_size = None
         if self.direct_peer_ids is not None:
             self.direct_peer_ids = set()
+        if self.reachable_peer_ids is not None:
+            self.reachable_peer_ids = set()
+        if self.relayed_peer_ids is not None:
+            self.relayed_peer_ids = set()
 
     def clear_serving_state(self) -> None:
         """Clear serving/runtime state for this node.
@@ -500,9 +516,11 @@ class Node:
         self.rtt_to_nodes[target_node_id] = rtt_ms
 
     def can_forward_to(self, other: "Node") -> bool:
-        """Return whether this worker has qualified a direct RPC path to ``other``."""
+        """Return whether this worker has a qualified RPC path to ``other``."""
         if self.node_id == other.node_id:
             return True
+        if self.reachable_peer_ids is not None:
+            return other.node_id in self.reachable_peer_ids
         if self.direct_peer_ids is None:
             return True
         return other.node_id in self.direct_peer_ids

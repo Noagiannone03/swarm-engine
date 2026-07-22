@@ -343,3 +343,27 @@ def test_transformer_health_rpc_returns_registered_peer_identity():
     handler.lattica_instance = SimpleNamespace(peer_id=lambda: "worker-peer")
 
     assert handler.rpc_health({}) == {"peer_id": "worker-peer"}
+
+
+def test_worker_builds_iroh_with_explicit_scheduler_endpoint(monkeypatch):
+    transport = SimpleNamespace(peer_id=lambda: "worker-endpoint")
+    monkeypatch.setattr(
+        "parallax.p2p.server.IrohTransport.from_environment",
+        lambda role: transport,
+    )
+    server = GradientServer.__new__(GradientServer)
+    server.scheduler_addr = "scheduler-endpoint"
+
+    assert server._build_iroh() is True
+    assert server.iroh_transport is transport
+    assert server.lattica is transport
+    assert server.scheduler_peer_id == "scheduler-endpoint"
+
+
+@pytest.mark.parametrize("scheduler_addr", [None, "auto", "/ip4/127.0.0.1/tcp/1"])
+def test_worker_iroh_rejects_implicit_or_lattica_scheduler_address(scheduler_addr):
+    server = GradientServer.__new__(GradientServer)
+    server.scheduler_addr = scheduler_addr
+
+    with pytest.raises(ValueError, match="explicit scheduler endpoint ID|not a Lattica"):
+        server._build_iroh()

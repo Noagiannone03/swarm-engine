@@ -18,6 +18,7 @@ import time
 
 import requests
 
+from fabi_network.transport import using_iroh
 from parallax_utils.file_util import get_project_root
 from parallax_utils.logging_config import get_logger
 from parallax_utils.version_check import get_current_version
@@ -117,6 +118,7 @@ def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None =
     logger.info(f"Running command: {' '.join(cmd)}")
 
     sub_process = None
+
     # L IDE / Docker arretent le worker avec SIGTERM (pas SIGINT). Sans ce
     # handler, SIGTERM tue le process sans declencher le nettoyage gracieux
     # (except KeyboardInterrupt ci-dessous) -> le node_leave n est jamais envoye
@@ -124,6 +126,7 @@ def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None =
     # pour reutiliser exactement le meme chemin propre.
     def _sigterm_to_kbi(signum, frame):
         raise KeyboardInterrupt()
+
     try:
         signal.signal(signal.SIGTERM, _sigterm_to_kbi)
     except Exception:
@@ -185,7 +188,9 @@ def _execute_with_graceful_shutdown(cmd: list[str], env: dict[str, str] | None =
                             sub_process.kill()
                         sub_process.wait()
                 if not _wait_for_process_group_exit(sub_process.pid, timeout=5):
-                    logger.warning("Subprocess descendants are still alive; forcing process group exit")
+                    logger.warning(
+                        "Subprocess descendants are still alive; forcing process group exit"
+                    )
                     try:
                         os.killpg(sub_process.pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -235,7 +240,7 @@ def run_command(args, passthrough_args: list[str] | None = None):
         cmd.extend(["--init-nodes-num", str(args.init_nodes_num)])
     cmd.extend(["--allocation-strategy", args.allocation_strategy])
     cmd.extend(["--routing-strategy", args.routing_strategy])
-    if args.use_relay:
+    if args.use_relay and not using_iroh():
         cmd.extend(_get_relay_params())
         logger.info(
             "Using public relay server to help nodes and the scheduler establish a connection (remote mode). Your IP address will be reported to the relay server to help establish the connection."
@@ -275,8 +280,9 @@ def join_command(args, passthrough_args: list[str] | None = None):
     cmd.extend(["--scheduler-addr", args.scheduler_addr])
 
     # Relay logic based on effective scheduler address
-    if args.use_relay or (
-        args.scheduler_addr != "auto" and not str(args.scheduler_addr).startswith("/")
+    if not using_iroh() and (
+        args.use_relay
+        or (args.scheduler_addr != "auto" and not str(args.scheduler_addr).startswith("/"))
     ):
         cmd.extend(_get_relay_params())
         logger.info(
@@ -335,8 +341,9 @@ def chat_command(args, passthrough_args: list[str] | None = None):
     cmd.extend(["--scheduler-addr", args.scheduler_addr])
 
     # Relay logic based on effective scheduler address
-    if args.use_relay or (
-        args.scheduler_addr != "auto" and not str(args.scheduler_addr).startswith("/")
+    if not using_iroh() and (
+        args.use_relay
+        or (args.scheduler_addr != "auto" and not str(args.scheduler_addr).startswith("/"))
     ):
         cmd.extend(_get_relay_params())
         logger.info(
