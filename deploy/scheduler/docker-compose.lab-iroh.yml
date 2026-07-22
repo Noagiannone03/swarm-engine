@@ -1,0 +1,11 @@
+services:
+  parallax-scheduler:
+    image: local/parallax-scheduler:iroh-qualified
+    environment:
+      FABI_NETWORK_TRANSPORT: "iroh"
+      FABI_RELAY_URL: "https://server.undefinedstudio.fr:4443"
+      FABI_RELAY_TOKEN_FILE: "/run/secrets/fabi-iroh-relay-token"
+      FABI_NETWORK_IDENTITY_PATH: "/opt/parallax-runtime/network/scheduler.key"
+      FABI_FORCE_RELAY: "0"
+    volumes:
+      - /etc/fabi-iroh-relay/relay.env:/run/secrets/fabi-iroh-relay-token:ro

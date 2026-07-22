@@ -50,7 +50,8 @@ COPY --from=native-builder /opt/wheels /opt/fabi-network-wheels
 
 RUN pip install /opt/fabi-network-wheels/fabi_network_native-*.whl \
     && pip install /opt/parallax \
-    && python -c "import fabi_network_native; assert fabi_network_native.PROTOCOL_VERSION == 1"
+    && python -c "import fabi_network_native; assert fabi_network_native.PROTOCOL_VERSION == 1" \
+    && python -c "from pathlib import Path; from parallax_utils.file_util import get_project_root; root = get_project_root(); assert root == Path('/opt/parallax'); assert (root / 'src/backend/main.py').is_file()"
 
 COPY deploy/scheduler/entrypoint.sh /usr/local/bin/parallax-scheduler-entrypoint
 RUN chmod +x /usr/local/bin/parallax-scheduler-entrypoint
