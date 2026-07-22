@@ -16,7 +16,7 @@ from mlx.utils import tree_unflatten
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
 from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
-from mlx_lm.utils import _download, load_config
+from mlx_lm.utils import load_config
 
 from parallax.server.model import ShardedModel
 from parallax.utils.model_download import download_model_snapshot
@@ -54,6 +54,7 @@ class MLXModelLoader:
         self,
         model_path_or_hf_repo: str,
         *,
+        revision: Optional[str] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         use_hfcache: bool = False,
@@ -71,6 +72,7 @@ class MLXModelLoader:
             use_hfcache (bool): If True, use local Hugging Face cache only (no network download).
         """
         self.model_path_str = model_path_or_hf_repo
+        self.revision = revision
         self.start_layer = start_layer
         self.end_layer = end_layer
         self.use_hfcache = use_hfcache
@@ -367,9 +369,14 @@ class MLXModelLoader:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 local_files_only=self.use_hfcache,
+                revision=self.revision,
             )
         else:
-            model_path = _download(self.model_path_str)
+            model_path = download_model_snapshot(
+                self.model_path_str,
+                local_files_only=self.use_hfcache,
+                revision=self.revision,
+            )
 
         config = normalize_model_config(load_config(model_path))
         self.config = config

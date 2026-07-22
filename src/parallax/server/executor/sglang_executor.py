@@ -42,6 +42,7 @@ class SGLExecutor(BaseExecutor):
         model_repo: str,
         start_layer: int,
         end_layer: int,
+        model_revision: Optional[str] = None,
         dtype: str = "float16",
         # Device override
         device: Optional[str] = None,
@@ -94,6 +95,7 @@ class SGLExecutor(BaseExecutor):
         enable_weight_refit: Optional[bool] = False,
         weight_refit_mode: Optional[str] = "disk",
         chunked_prefill_size: Optional[int] = None,
+        planned_context_tokens: Optional[int] = None,
         # Pipe communication
         conn: Optional[List[Any]] = [],
     ):
@@ -117,6 +119,7 @@ class SGLExecutor(BaseExecutor):
 
         model_runner_params = {
             "model_repo": model_repo,
+            "model_revision": model_revision,
             "start_layer": start_layer,
             "end_layer": end_layer,
             "kv_cache_memory_fraction": kv_cache_memory_fraction,
@@ -141,6 +144,7 @@ class SGLExecutor(BaseExecutor):
             "lora_eviction_policy": self.lora_eviction_policy,
             "lora_backend": self.lora_backend,
             "max_lora_chunk_size": self.max_lora_chunk_size,
+            "minimum_kv_tokens": planned_context_tokens,
         }
         logger.debug(
             f"Initializing SGLang model runner for repo={model_repo}, layers=[{start_layer}, {end_layer})"
@@ -274,9 +278,9 @@ class SGLExecutor(BaseExecutor):
                                 lora_name=lora_path, lora_path=lora_path, pinned=False
                             )
                     elif isinstance(lora_path, dict):
-                        assert "lora_name" in lora_path and "lora_path" in lora_path, (
-                            f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
-                        )
+                        assert (
+                            "lora_name" in lora_path and "lora_path" in lora_path
+                        ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
                         lora_ref = LoRARef(
                             lora_name=lora_path["lora_name"],
                             lora_path=lora_path["lora_path"],
@@ -305,15 +309,15 @@ class SGLExecutor(BaseExecutor):
             if self.lora_target_modules:
                 self.lora_target_modules = set(self.lora_target_modules)
                 if "all" in self.lora_target_modules:
-                    assert len(self.lora_target_modules) == 1, (
-                        "If 'all' is specified in --lora-target-modules, it should be the only module specified."
-                    )
+                    assert (
+                        len(self.lora_target_modules) == 1
+                    ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
 
             # Ensure sufficient information is provided for LoRA initialization.
-            assert self.lora_paths or (self.max_lora_rank and self.lora_target_modules), (
-                "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
-            )
+            assert self.lora_paths or (
+                self.max_lora_rank and self.lora_target_modules
+            ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
             # Validate max_loaded_loras
             if self.max_loaded_loras is not None:
@@ -392,9 +396,9 @@ class SGLExecutor(BaseExecutor):
         else:
             # Intermediate and Last peers receive IntermediateRequests from the previous peer.
             for req in requests:
-                assert isinstance(req, IntermediateRequest), (
-                    "Non-first peers must receive IntermediateRequests."
-                )
+                assert isinstance(
+                    req, IntermediateRequest
+                ), "Non-first peers must receive IntermediateRequests."
                 if req.is_finished or req.hidden_states is None:
                     self.release_and_evict_request(req.request_id)
                     if not self.is_last_peer and not req.abort:
@@ -406,9 +410,9 @@ class SGLExecutor(BaseExecutor):
     def process_batch(self, prepared_inputs: Dict[str, Any], return_decoded_tokens: bool = True):
         """Process a batch of requests in SGLang."""
         assert "forward_batch" in prepared_inputs, "forward_batch should be in cuda prepared inputs"
-        assert "pp_proxy_tensors" in prepared_inputs, (
-            "pp_proxy_tensors should be in cuda prepared inputs"
-        )
+        assert (
+            "pp_proxy_tensors" in prepared_inputs
+        ), "pp_proxy_tensors should be in cuda prepared inputs"
 
         forward_batch = prepared_inputs["forward_batch"]
         pp_proxy_tensors = prepared_inputs["pp_proxy_tensors"]

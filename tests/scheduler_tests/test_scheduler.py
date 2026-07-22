@@ -10,7 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from scheduling.node import RequestSignal
+from scheduling.model_info import ModelInfo, ModelWeightProfile
+from scheduling.node import Node, NodeHardwareInfo, RequestSignal
 from scheduling.scheduler import Scheduler
 
 from .test_utils import build_model_info, build_node, set_rtt_from_coords
@@ -52,6 +53,83 @@ def test_bootstrap_rolls_back_partial_allocation_after_allocator_exception(monke
     assert sched.node_manager.num_standby_nodes == 1
     assert node.start_layer is None
     assert node.end_layer is None
+
+
+def test_runtime_memory_feedback_downgrades_once_and_advances_allocation_epoch():
+    model = ModelInfo(
+        model_name="tiered",
+        mlx_model_name="tiered",
+        head_size=1,
+        hidden_dim=1,
+        intermediate_dim=1,
+        num_attention_heads=1,
+        num_kv_heads=1,
+        vocab_size=1,
+        num_layers=4,
+        cache_bytes_per_element=1,
+        weight_profile=ModelWeightProfile((100, 100, 100, 100), 200, 200),
+    )
+    head = Node(
+        "head",
+        NodeHardwareInfo(
+            "head", 1, 1.0, "head", 1.0, 1.0, "cuda", usable_memory_bytes=140_000
+        ),
+        model,
+        supports_frontend=True,
+    )
+    tail = Node(
+        "tail",
+        NodeHardwareInfo(
+            "tail", 1, 1.0, "tail", 1.0, 1.0, "cuda", usable_memory_bytes=140_000
+        ),
+        model,
+        supports_frontend=False,
+    )
+    sched = Scheduler(
+        model,
+        [tail, head],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=2,
+        planning_context_tokens=16_384,
+        preferred_context_tokens=65_536,
+        require_exact_weight_metadata=True,
+    )
+
+    assert sched.bootstrap()
+    assert sched.allocation_epoch == 1
+    assert sched.layer_allocator.selected_context_tokens == 32_768
+
+    sched.update_node_info(
+        head,
+        is_active=False,
+        memory_contract_failure={
+            "kind": "kv_materialization",
+            "backend": "vllm",
+            "allocation_epoch": 1,
+            "requested_tokens": 32_768,
+            "supported_tokens": 24_000,
+        },
+    )
+
+    assert sched._process_pending_context_replan()
+    assert sched.allocation_epoch == 2
+    assert sched.layer_allocator.selected_context_tokens == 16_384
+    assert sched._pending_context_replan is None
+
+    # A stale retry from the old executor generation cannot trigger another replan.
+    sched.update_node_info(
+        head,
+        is_active=False,
+        memory_contract_failure={
+            "kind": "kv_materialization",
+            "backend": "vllm",
+            "allocation_epoch": 1,
+            "requested_tokens": 32_768,
+            "supported_tokens": 24_000,
+        },
+    )
+    assert sched._pending_context_replan is None
 
 
 def test_scheduler_initialize_and_dispatch():

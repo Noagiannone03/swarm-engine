@@ -10,6 +10,7 @@ from parallax.server.cache.kv_cache import KVCachePacked
 from parallax.server.cache.linear_cache import LinearCache
 from parallax.server.cache.msa_cache import MSACache
 from parallax.server.memory_budget import current_mlx_memory_budget
+from parallax.server.memory_contract import MemoryContractError
 from parallax.utils.layer_types import (
     ATTENTION,
     ATTENTION_LAYER_TYPES,
@@ -58,6 +59,7 @@ class CacheManager:
         sliding_window: Optional[int] = None,
         chunked_prefill_size: Optional[int] = None,
         mlx_process_limit_bytes: Optional[int] = None,
+        minimum_kv_tokens: Optional[int] = None,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -88,6 +90,9 @@ class CacheManager:
         self.linear_num_v_heads = linear_num_v_heads
         self.cache_memory_fraction = cache_memory_fraction
         self.mlx_process_limit_bytes = mlx_process_limit_bytes
+        self.minimum_kv_tokens = (
+            None if minimum_kv_tokens is None else max(0, int(minimum_kv_tokens))
+        )
 
         # Determine layer types
         if layer_types is None:
@@ -369,7 +374,7 @@ class CacheManager:
         # fixed cache only from memory that can still be allocated without
         # pushing macOS into swap. The process limit remains stable and leaves
         # room for transient activations inside the same envelope.
-        available_for_cache = budget.additional_bytes * cache_memory_fraction
+        preferred_cache_bytes = budget.additional_bytes * cache_memory_fraction
         logger.info(
             "Sizing MLX cache from %.2f GB safe additional memory "
             "(active %.2f GB, process limit %.2f GB)",
@@ -399,6 +404,27 @@ class CacheManager:
             return 0, 0
 
         # Remaining memory for KV cache
+        required_blocks = 0
+        if self.minimum_kv_tokens:
+            required_blocks = (self.minimum_kv_tokens + self.block_size - 1) // self.block_size
+        required_kv_bytes = required_blocks * total_block_bytes
+        required_cache_bytes = active_linear_cache_bytes + required_kv_bytes
+        if required_cache_bytes > budget.additional_bytes:
+            available_for_kv = max(0, budget.additional_bytes - active_linear_cache_bytes)
+            supported_tokens = (available_for_kv // total_block_bytes) * self.block_size
+            raise MemoryContractError(
+                backend="mlx",
+                requested_tokens=self.minimum_kv_tokens,
+                supported_tokens=supported_tokens,
+                detail=(
+                    f"required {required_cache_bytes / 1024**3:.2f} GB, "
+                    f"available {budget.additional_bytes / 1024**3:.2f} GB"
+                ),
+            )
+        available_for_cache = min(
+            budget.additional_bytes,
+            max(preferred_cache_bytes, required_cache_bytes),
+        )
         available_for_kv = available_for_cache - active_linear_cache_bytes
         if available_for_kv <= 0:
             logger.warning("Linear cache uses all available memory. No room for KV cache blocks.")

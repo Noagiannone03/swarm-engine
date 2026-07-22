@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from typing import List, Literal
@@ -64,6 +65,17 @@ class SchedulerManage:
         self._context_tokenizer = None
         self._context_tokenizer_model = None
         self._context_tokenizer_lock = threading.Lock()
+
+    @staticmethod
+    def _positive_context_env(name: str, default: int) -> int:
+        raw = os.environ.get(name, str(default))
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+        return value
 
     def run(self, model_name, init_nodes_num, is_local_network=True):
         """
@@ -171,6 +183,15 @@ class SchedulerManage:
                 "prefill_contract_ready": (
                     self.scheduler.prefill_contract_ready() if self.scheduler else False
                 ),
+                "planned_context_tokens": (
+                    self.scheduler.layer_allocator.selected_context_tokens if self.scheduler else 0
+                ),
+                "allocation_epoch": (
+                    int(self.scheduler.allocation_epoch) if self.scheduler else None
+                ),
+                "runtime_memory_contract_ready": (
+                    self.scheduler.runtime_memory_contract_ready() if self.scheduler else False
+                ),
                 "max_supported_context_tokens": self.max_supported_context_tokens(),
                 "node_join_command": get_node_join_command(
                     self.get_peer_id(), self.is_local_network
@@ -245,7 +266,11 @@ class SchedulerManage:
             self._context_tokenizer = None
             self._context_tokenizer_model = None
 
-        model_info = get_model_info(model_name, self.use_hfcache)
+        model_info = get_model_info(
+            model_name,
+            self.use_hfcache,
+            load_weight_metadata=True,
+        )
         self.scheduler = Scheduler(
             model_info,
             [],
@@ -254,6 +279,13 @@ class SchedulerManage:
             weight_refit_mode=self.weight_refit_mode,
             strategy=self.allocation_strategy,
             routing_strategy=self.routing_strategy,
+            planning_context_tokens=self._positive_context_env(
+                "PARALLAX_PLANNING_CONTEXT_TOKENS", 16_384
+            ),
+            preferred_context_tokens=self._positive_context_env(
+                "PARALLAX_PREFERRED_CONTEXT_TOKENS", 32_768
+            ),
+            require_exact_weight_metadata=True,
         )
 
         # Run the scheduler's event/dispatch loops in background so the process

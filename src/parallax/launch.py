@@ -69,6 +69,9 @@ def _update_args_from_shared_state(args, shared_state: SharedState, force_update
     # from a local path. The Rust frontend uses it as the OpenAI API alias.
     if not getattr(args, "served_model_name", None) or force_update:
         args.served_model_name = model_info["model_name"]
+    args.planned_context_tokens = model_info.get("planned_context_tokens")
+    args.allocation_epoch = model_info.get("allocation_epoch")
+    args.model_revision = model_info.get("model_revision")
 
     # A worker may load an optimized local artifact (for example an MLX model on
     # macOS) while serving the scheduler's public model name. Preserve that
@@ -300,9 +303,41 @@ def _wait_executors_check_layer_change(
             frontend_alive=False,
             status=ServerState.INITIALIZING.value,
         )
+        if shared_state.get("memory_contract_failure") is not None:
+            # This is a qualified backend measurement, not an arbitrary crash.
+            # Keep the P2P heartbeat alive so the scheduler can lower one tier
+            # and publish a new fenced allocation generation.
+            return True
         raise RuntimeError(f"Executor subprocess exited unexpectedly: {failed}")
     # Check race condition: layer allocation changed after all processes exited
     return shared_state.get_layer_allocation_changed()
+
+
+def _wait_for_contract_replan(
+    shared_state: SharedState,
+    p2p_server_process,
+    *,
+    timeout_seconds: float = 300.0,
+) -> None:
+    """Wait for a new scheduler epoch while the heartbeat process stays alive."""
+
+    failed_epoch = shared_state.get("allocation_epoch")
+    started_at = time.monotonic()
+    while not shared_state.get_layer_allocation_changed():
+        if p2p_server_process is not None and not p2p_server_process.is_alive():
+            raise RuntimeError("P2P heartbeat exited while waiting for memory-contract replan")
+        if time.monotonic() - started_at >= timeout_seconds:
+            raise RuntimeError(
+                "Scheduler did not replace failed memory contract epoch "
+                f"{failed_epoch} within {timeout_seconds:.0f}s"
+            )
+        time.sleep(0.25)
+
+    new_epoch = shared_state.get("allocation_epoch")
+    if failed_epoch is not None and new_epoch is not None and int(new_epoch) <= int(failed_epoch):
+        raise RuntimeError(
+            f"Memory-contract replan was not fenced by a newer epoch: {failed_epoch} -> {new_epoch}"
+        )
 
 
 def _build_memory_pressure_guards():
@@ -560,10 +595,26 @@ if __name__ == "__main__":
                         frontend_process,
                         memory_pressure_guards,
                     ):
-                        logger.warning("Layer allocation changed! Stopping executors to reload...")
+                        contract_failure = shared_state.get("memory_contract_failure")
+                        if (
+                            contract_failure is not None
+                            and not shared_state.get_layer_allocation_changed()
+                        ):
+                            logger.warning(
+                                "Runtime rejected allocation epoch %s at %s tokens; waiting "
+                                "for one fenced scheduler downgrade",
+                                contract_failure.get("allocation_epoch"),
+                                contract_failure.get("requested_tokens"),
+                            )
+                            _wait_for_contract_replan(
+                                shared_state,
+                                p2p_server_process,
+                            )
+                        logger.warning("Serving contract changed; stopping executors to reload")
                         # Reset flag and set status to INITIALIZING
                         shared_state.update(
                             _layer_allocation_changed=False,
+                            memory_contract_failure=None,
                             status=ServerState.INITIALIZING.value,
                             frontend_alive=False,
                         )

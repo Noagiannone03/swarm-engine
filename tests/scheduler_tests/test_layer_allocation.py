@@ -18,7 +18,7 @@ from scheduling.layer_allocation import (
     DynamicProgrammingLayerAllocator,
     GreedyLayerAllocator,
 )
-from scheduling.model_info import ModelInfo
+from scheduling.model_info import ModelInfo, ModelWeightProfile
 from scheduling.node import Node, NodeHardwareInfo
 from scheduling.node_management import NodeState
 
@@ -77,6 +77,103 @@ def test_capacity_prefers_worker_usable_memory_over_physical_total():
         bounded_node.per_decoder_layer_kv_cache_memory
         < physical_node.per_decoder_layer_kv_cache_memory
     )
+
+
+def test_exact_capacity_combines_checkpoint_weights_and_context_kv_without_ratios():
+    model = ModelInfo(
+        model_name="exact",
+        mlx_model_name="exact",
+        head_size=1,
+        hidden_dim=1,
+        intermediate_dim=1,
+        num_attention_heads=1,
+        num_kv_heads=1,
+        vocab_size=1,
+        num_layers=4,
+        cache_bytes_per_element=1,
+        weight_profile=ModelWeightProfile((100, 100, 100, 100), 200, 200),
+    )
+    hardware = NodeHardwareInfo(
+        "exact-node",
+        1,
+        1.0,
+        "test",
+        1.0,
+        1.0,
+        "cuda",
+        usable_memory_bytes=800,
+    )
+    node = Node(
+        node_id="exact-node",
+        hardware=hardware,
+        model_info=model,
+        # Exact mode deliberately ignores this legacy partition.
+        param_mem_ratio=0.01,
+        kvcache_mem_ratio=0.01,
+    )
+
+    # 3 * (100 weight + 20 KV) + 2 * 200 endpoints = 760 bytes.
+    assert (
+        node.get_decoder_layer_capacity(
+            include_input_embed=True,
+            include_lm_head=True,
+            context_tokens=10,
+        )
+        == 3
+    )
+    # A larger context changes the same joint byte constraint directly.
+    assert (
+        node.get_decoder_layer_capacity(
+            include_input_embed=True,
+            include_lm_head=True,
+            context_tokens=100,
+        )
+        == 1
+    )
+
+
+def test_exact_dp_selects_highest_stable_context_tier_that_forms_a_route():
+    model = ModelInfo(
+        model_name="tiered",
+        mlx_model_name="tiered",
+        head_size=1,
+        hidden_dim=1,
+        intermediate_dim=1,
+        num_attention_heads=1,
+        num_kv_heads=1,
+        vocab_size=1,
+        num_layers=4,
+        cache_bytes_per_element=1,
+        weight_profile=ModelWeightProfile((100, 100, 100, 100), 200, 200),
+    )
+    head = Node(
+        "head",
+        NodeHardwareInfo("head", 1, 1.0, "head", 1.0, 1.0, "cuda", usable_memory_bytes=140_000),
+        model,
+        supports_frontend=True,
+    )
+    tail = Node(
+        "tail",
+        NodeHardwareInfo("tail", 1, 1.0, "tail", 1.0, 1.0, "cuda", usable_memory_bytes=140_000),
+        model,
+        supports_frontend=False,
+    )
+    allocator = DynamicProgrammingLayerAllocator(
+        model_info=model,
+        node_management=build_node_management([tail, head]),
+        planning_context_tokens=16_384,
+        preferred_context_tokens=65_536,
+        require_exact_weight_metadata=True,
+    )
+
+    assert allocator.allocate_from_standby()
+    assert allocator.selected_context_tokens == 32_768
+    assert (head.start_layer, head.end_layer) == (0, 2)
+    assert (tail.start_layer, tail.end_layer) == (2, 4)
+
+    assert allocator.fence_one_runtime_context_downgrade(32_768) == 16_384
+    assert allocator._context_tiers() == [16_384]
+    assert allocator.fence_one_runtime_context_downgrade(16_384) is None
 
 
 @pytest.mark.parametrize(
@@ -305,9 +402,9 @@ def test_allocator(
     expected_total = sum(e - s for (s, e) in expected_ranges)
     assert sum(e - s for (s, e) in actual_trimmed) == expected_total
     # Order-insensitive comparison: ranges represent stages; allow pipeline reordering
-    assert Counter(actual_trimmed) == Counter(expected_ranges), (
-        f"Stage ranges mismatch (order-insensitive):\nactual={actual_trimmed}\nexpected={expected_ranges}"
-    )
+    assert Counter(actual_trimmed) == Counter(
+        expected_ranges
+    ), f"Stage ranges mismatch (order-insensitive):\nactual={actual_trimmed}\nexpected={expected_ranges}"
 
 
 @pytest.mark.parametrize("strategy", ["greedy", "dp"])
@@ -598,6 +695,6 @@ def test_allocator_does_not_duplicate_leftover_nodes(strategy: Literal["greedy",
     )
     ok = alloc.allocate_from_standby()
     assert ok is True
-    assert node_management.num_nodes == expected_node_count, (
-        "Should not duplicate nodes during allocation"
-    )
+    assert (
+        node_management.num_nodes == expected_node_count
+    ), "Should not duplicate nodes during allocation"

@@ -1,14 +1,61 @@
 from backend.server import static_config
+from backend.server import model_weight_metadata
 from backend.server.static_config import (
     MODELS,
     get_model_context_limit,
     get_model_info,
 )
 from parallax.utils.utils import clamp_model_sequence_length, normalize_model_config
+from scheduling.model_info import ModelWeightProfile
 
 
 def test_glm_5_1_uses_mlx_community_model():
     assert MODELS["zai-org/GLM-5.1"] == "mlx-community/GLM-5.1"
+
+
+def test_exact_metadata_pins_config_and_weights_to_the_same_revision(monkeypatch):
+    config_calls = []
+    profile_calls = []
+
+    monkeypatch.setitem(MODELS, "test/model", "test/model")
+    monkeypatch.setattr(
+        model_weight_metadata,
+        "resolve_hub_revision",
+        lambda repo_id: "immutable-sha",
+    )
+
+    def fake_load_config(model_name, local_files_only=False, revision=None):
+        config_calls.append((model_name, revision))
+        return {
+            "head_dim": 1,
+            "hidden_size": 1,
+            "intermediate_size": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "vocab_size": 1,
+            "num_hidden_layers": 2,
+            "tie_word_embeddings": True,
+        }
+
+    def fake_profile(repo_id, **kwargs):
+        profile_calls.append((repo_id, kwargs["revision"]))
+        return ModelWeightProfile(
+            (100, 100),
+            10,
+            10,
+            shared_endpoint_bytes=10,
+            source_revision=kwargs["revision"],
+        )
+
+    monkeypatch.setattr(static_config, "load_config_only", fake_load_config)
+    monkeypatch.setattr(model_weight_metadata, "load_hub_weight_profile", fake_profile)
+
+    info = get_model_info("test/model", load_weight_metadata=True)
+
+    assert config_calls == [("test/model", "immutable-sha")]
+    assert profile_calls == [("test/model", "immutable-sha")]
+    assert info.model_revision == "immutable-sha"
+    assert info.mlx_model_revision == "immutable-sha"
 
 
 def test_glm_5_2_uses_mlx_community_mxfp4_model():
@@ -41,7 +88,7 @@ def test_model_sequence_limit_is_a_safe_cap_not_a_permanent_worker_override():
 
 
 def test_model_info_uses_common_context_limit_across_runtime_variants(monkeypatch):
-    def fake_load_config_only(model_name, local_files_only=False):
+    def fake_load_config_only(model_name, local_files_only=False, revision=None):
         max_context = 40960 if model_name == "Qwen/Qwen3-1.7B" else 65536
         return {
             "head_dim": 128,
@@ -71,7 +118,7 @@ def test_minimax_m3_uses_mlx_community_4bit_model():
 
 
 def test_qwen3_6_mxfp4_model_info_uses_text_config(monkeypatch):
-    def fake_load_config_only(model_name, local_files_only=False):
+    def fake_load_config_only(model_name, local_files_only=False, revision=None):
         assert model_name in {
             "Qwen/Qwen3.6-27B",
             "mlx-community/Qwen3.6-27B-mxfp4",
@@ -108,7 +155,7 @@ def test_qwen3_6_mxfp4_model_info_uses_text_config(monkeypatch):
 
 
 def test_minimax_m3_model_info_uses_text_config(monkeypatch):
-    def fake_load_config_only(model_name, local_files_only=False):
+    def fake_load_config_only(model_name, local_files_only=False, revision=None):
         assert model_name in {
             "MiniMaxAI/MiniMax-M3",
             "mlx-community/MiniMax-M3-4bit",
@@ -158,7 +205,7 @@ def test_minimax_m3_model_info_uses_text_config(monkeypatch):
 
 
 def test_qwen3_5_moe_4bit_model_info_uses_text_config(monkeypatch):
-    def fake_load_config_only(model_name, local_files_only=False):
+    def fake_load_config_only(model_name, local_files_only=False, revision=None):
         assert model_name in {
             "Qwen/Qwen3.5-35B-A3B",
             "mlx-community/Qwen3.5-35B-A3B-4bit",

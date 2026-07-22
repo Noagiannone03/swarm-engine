@@ -104,6 +104,11 @@ class BaseLayerAllocator:
         rebalance_threshold: float = 0.25,
         water_filling_max_iterations: int = 40,
         trim_layers_on_turning_points: bool = False,
+        planning_context_tokens: int = 16_384,
+        preferred_context_tokens: int = 32_768,
+        require_exact_weight_metadata: bool = False,
+        context_ceiling_tokens: Optional[int] = None,
+        runtime_context_downgrade_used: bool = False,
     ) -> None:
         self.model_info = model_info
         self.num_total_layers = model_info.num_layers
@@ -119,6 +124,18 @@ class BaseLayerAllocator:
         self.rebalance_threshold = rebalance_threshold
         # Maximum number of iterations to run the water-filling algorithm
         self.water_filling_max_iterations = water_filling_max_iterations
+        self.planning_context_tokens = max(0, int(planning_context_tokens))
+        self.preferred_context_tokens = max(
+            self.planning_context_tokens, int(preferred_context_tokens)
+        )
+        self.selected_context_tokens = self.planning_context_tokens
+        self.require_exact_weight_metadata = bool(require_exact_weight_metadata)
+        self.context_ceiling_tokens = (
+            self.preferred_context_tokens
+            if context_ceiling_tokens is None
+            else max(self.planning_context_tokens, int(context_ceiling_tokens))
+        )
+        self.runtime_context_downgrade_used = bool(runtime_context_downgrade_used)
 
         # True if using DP request router, False for fixed pipelines
         self.dynamic_pipelines_router = dynamic_pipelines_router
@@ -129,6 +146,150 @@ class BaseLayerAllocator:
             layer_load = LayerLoad(layer_id=layer_id, current_kv_size=0)
             self.layer_to_load[layer_id] = layer_load
         self._update_layer_loads_heap()
+
+    def _has_required_weight_metadata(self, nodes: List[Node]) -> bool:
+        if not self.require_exact_weight_metadata:
+            return True
+        missing = [
+            node.node_id
+            for node in nodes
+            if node.model_info.exact_weight_profile(using_mlx=node.hardware.device == "mlx") is None
+        ]
+        if missing:
+            logger.error(
+                "Refusing allocation without exact safetensors weight metadata for node(s): %s",
+                missing,
+            )
+            return False
+        return True
+
+    def _node_capacity(
+        self,
+        node: Node,
+        *,
+        include_input_embed: bool = False,
+        include_lm_head: bool = False,
+    ) -> int:
+        """Return capacity under the allocator's product context contract."""
+
+        return node.get_decoder_layer_capacity(
+            include_input_embed=include_input_embed,
+            include_lm_head=include_lm_head,
+            context_tokens=self.selected_context_tokens,
+        )
+
+    def _node_capacity_at_context(
+        self,
+        node: Node,
+        context_tokens: int,
+        *,
+        include_input_embed: bool = False,
+        include_lm_head: bool = False,
+    ) -> int:
+        return node.get_decoder_layer_capacity(
+            include_input_embed=include_input_embed,
+            include_lm_head=include_lm_head,
+            context_tokens=context_tokens,
+        )
+
+    def _can_form_single_pipeline(self, nodes: List[Node], context_tokens: int) -> bool:
+        """Pure feasibility check for one ordered pipeline at a context tier."""
+
+        ordered = sorted(
+            nodes,
+            key=lambda node: (
+                not node.supports_frontend,
+                -self._node_capacity_at_context(node, context_tokens),
+                node.node_id,
+            ),
+        )
+        residuals: Set[int] = set()
+        for node in ordered:
+            next_residuals = set(residuals)  # skipping this worker is always valid
+            for residual in residuals:
+                close_capacity = self._node_capacity_at_context(
+                    node, context_tokens, include_lm_head=True
+                )
+                if close_capacity >= residual:
+                    return True
+                plain_capacity = self._node_capacity_at_context(node, context_tokens)
+                if plain_capacity > 0:
+                    next_residuals.add(max(1, residual - plain_capacity))
+
+            if node.supports_frontend:
+                start_capacity = self._node_capacity_at_context(
+                    node, context_tokens, include_input_embed=True
+                )
+                if start_capacity >= self.num_total_layers:
+                    single_capacity = self._node_capacity_at_context(
+                        node,
+                        context_tokens,
+                        include_input_embed=True,
+                        include_lm_head=True,
+                    )
+                    if single_capacity >= self.num_total_layers:
+                        return True
+                    next_residuals.add(1)
+                elif start_capacity > 0:
+                    next_residuals.add(self.num_total_layers - start_capacity)
+            residuals = next_residuals
+        return False
+
+    def _context_tiers(self) -> List[int]:
+        model_limit = self.model_info.max_context_length
+        preferred = min(self.preferred_context_tokens, self.context_ceiling_tokens)
+        if model_limit is not None:
+            preferred = min(preferred, int(model_limit))
+        minimum = min(self.planning_context_tokens, preferred)
+        tiers: List[int] = []
+        candidate = preferred
+        while candidate > minimum:
+            tiers.append(candidate)
+            candidate //= 2
+        tiers.append(minimum)
+        return list(dict.fromkeys(tier for tier in tiers if tier > 0))
+
+    def fence_one_runtime_context_downgrade(self, failed_tokens: int) -> Optional[int]:
+        """Lower the context ceiling once for this scheduler allocation lifetime.
+
+        The failure comes from backend materialization after weights/workspace
+        initialization. It is accepted only as a monotonic downward fence; OS
+        pressure samples can never call this method or grow the contract again.
+        """
+
+        failed = int(failed_tokens)
+        if self.runtime_context_downgrade_used:
+            return None
+        lower_tiers = [tier for tier in self._context_tiers() if tier < failed]
+        if not lower_tiers:
+            return None
+        selected = max(lower_tiers)
+        self.context_ceiling_tokens = selected
+        self.selected_context_tokens = selected
+        self.runtime_context_downgrade_used = True
+        return selected
+
+    def _select_context_tier(self, nodes: List[Node]) -> bool:
+        """Choose the highest stable context tier with a complete byte-feasible route."""
+
+        if not self.require_exact_weight_metadata:
+            self.selected_context_tokens = self.planning_context_tokens
+            return True
+        for context_tokens in self._context_tiers():
+            if self._can_form_single_pipeline(nodes, context_tokens):
+                self.selected_context_tokens = context_tokens
+                logger.info(
+                    "Selected memory planning context tier: %d tokens (minimum=%d, preferred=%d)",
+                    context_tokens,
+                    self.planning_context_tokens,
+                    self.preferred_context_tokens,
+                )
+                return True
+        logger.warning(
+            "No complete route satisfies the minimum memory planning context of %d tokens",
+            self.planning_context_tokens,
+        )
+        return False
 
     def _validate_allocation(self, start_layer: int, end_layer: int):
         """Validate the allocation."""
@@ -216,9 +377,10 @@ class BaseLayerAllocator:
             end_layer,
         )
         if not self._validate_allocation(start_layer, end_layer):
-            capacity_without_endpoints = node.get_decoder_layer_capacity()
-            capacity_with_input = node.get_decoder_layer_capacity(include_input_embed=True)
-            capacity_with_input_and_head = node.get_decoder_layer_capacity(
+            capacity_without_endpoints = self._node_capacity(node)
+            capacity_with_input = self._node_capacity(node, include_input_embed=True)
+            capacity_with_input_and_head = self._node_capacity(
+                node,
                 include_input_embed=True,
                 include_lm_head=True,
             )
@@ -361,7 +523,7 @@ class BaseLayerAllocator:
         nodes = list(pipeline_nodes)
         if not assume_sorted:
             nodes.sort(
-                key=lambda n: (n.supports_frontend, n.get_decoder_layer_capacity()),
+                key=lambda n: (n.supports_frontend, self._node_capacity(n)),
                 reverse=True,
             )
         if not nodes[0].supports_frontend:
@@ -377,11 +539,11 @@ class BaseLayerAllocator:
         compute_powers: List[float] = []
         for i, node in enumerate(nodes):
             if i == 0:
-                cap = node.get_decoder_layer_capacity(include_input_embed=True)
+                cap = self._node_capacity(node, include_input_embed=True)
             elif i == n - 1:
-                cap = node.get_decoder_layer_capacity(include_lm_head=True)
+                cap = self._node_capacity(node, include_lm_head=True)
             else:
-                cap = node.get_decoder_layer_capacity()
+                cap = self._node_capacity(node)
             if cap <= 0:
                 raise ValueError(f"Node {node.node_id} has non-positive capacity: {cap}")
             caps.append(cap)
@@ -492,12 +654,12 @@ class BaseLayerAllocator:
             include_input_embed = start_layer == 0
 
             # Base capacity without LM head
-            base_cap = node.get_decoder_layer_capacity(include_input_embed=include_input_embed)
+            base_cap = self._node_capacity(node, include_input_embed=include_input_embed)
 
             # If this node will be the tail that closes the pipeline, allow LM head
             if base_cap >= remaining_layers:
-                tail_cap = node.get_decoder_layer_capacity(
-                    include_input_embed=include_input_embed, include_lm_head=True
+                tail_cap = self._node_capacity(
+                    node, include_input_embed=include_input_embed, include_lm_head=True
                 )
                 assign_layers = min(tail_cap, remaining_layers)
             else:
@@ -632,13 +794,13 @@ class BaseLayerAllocator:
     def _adjust_end_layer_for_tail(self, node: Node, proposed_start_layer: int) -> int:
         """Adjust the number of layers to host for tail nodes."""
         include_input_embed = proposed_start_layer == 0
-        node_capacity = node.get_decoder_layer_capacity(include_input_embed=include_input_embed)
+        node_capacity = self._node_capacity(node, include_input_embed=include_input_embed)
         if node_capacity <= 0:
             return proposed_start_layer
         end_layer = min(proposed_start_layer + node_capacity, self.num_total_layers)
         if end_layer == self.num_total_layers:
-            adjusted_capacity = node.get_decoder_layer_capacity(
-                include_lm_head=True, include_input_embed=include_input_embed
+            adjusted_capacity = self._node_capacity(
+                node, include_lm_head=True, include_input_embed=include_input_embed
             )
             if adjusted_capacity <= 0:
                 return proposed_start_layer
@@ -720,6 +882,10 @@ class GreedyLayerAllocator(BaseLayerAllocator):
         num_total_layers = self.model_info.num_layers
 
         available_nodes = self.node_management.standby_nodes
+        if not self._has_required_weight_metadata(available_nodes):
+            return False
+        if not self._select_context_tier(available_nodes):
+            return False
         logger.info(
             "[Greedy LayerAllocator] Starting allocate_from_standby with %d nodes for %d layers",
             len(available_nodes),
@@ -728,7 +894,7 @@ class GreedyLayerAllocator(BaseLayerAllocator):
 
         for n in available_nodes:
             logger.info(
-                f"[Greedy LayerAllocator] Node {n.node_id} has capacity {n.get_decoder_layer_capacity()}"
+                f"[Greedy LayerAllocator] Node {n.node_id} has capacity {self._node_capacity(n)}"
             )
         any_assigned = False
 
@@ -737,9 +903,7 @@ class GreedyLayerAllocator(BaseLayerAllocator):
         rebalance_strategy = getattr(self, "_pipeline_rebalance_strategy", "water_filling")
 
         while available_nodes:
-            total_remaining_capacity = sum(
-                node.get_decoder_layer_capacity() for node in available_nodes
-            )
+            total_remaining_capacity = sum(self._node_capacity(node) for node in available_nodes)
             if total_remaining_capacity < num_total_layers:
                 logger.debug(
                     "[Greedy] Remaining capacity %d < total layers %d; stop",
@@ -773,7 +937,7 @@ class GreedyLayerAllocator(BaseLayerAllocator):
                     # Find smallest node that can complete the pipeline while leaving enough for another full pipeline
                     for i in compatible_indices:
                         node = available_nodes[i]
-                        node_i_capacity = node.get_decoder_layer_capacity(include_lm_head=True)
+                        node_i_capacity = self._node_capacity(node, include_lm_head=True)
                         if node_i_capacity >= remaining_layers:
                             remaining_nodes_capacity = (
                                 current_pipeline_total_capacity - node_i_capacity
@@ -791,13 +955,13 @@ class GreedyLayerAllocator(BaseLayerAllocator):
 
                 pipeline_nodes.append(node_to_add)
                 # Update running totals with appropriate capacity at this position
-                node_capacity = node_to_add.get_decoder_layer_capacity(include_input_embed=is_start)
+                node_capacity = self._node_capacity(node_to_add, include_input_embed=is_start)
                 remaining_layers -= node_capacity
                 if remaining_layers <= 0:
                     # Tail node can include LM head allowance
                     remaining_layers += node_capacity
-                    node_capacity = node_to_add.get_decoder_layer_capacity(
-                        include_input_embed=is_start, include_lm_head=True
+                    node_capacity = self._node_capacity(
+                        node_to_add, include_input_embed=is_start, include_lm_head=True
                     )
                     remaining_layers -= node_capacity
 
@@ -892,9 +1056,22 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
             self.node_management.standby_nodes,
             key=lambda node: (
                 not node.supports_frontend,
-                -node.get_decoder_layer_capacity(),
+                -self._node_capacity(node),
                 node.node_id,
             ),
+        )
+        if not self._has_required_weight_metadata(available_nodes):
+            return False
+        if not self._select_context_tier(available_nodes):
+            return False
+        # Context selection changes byte capacities, so restore canonical order
+        # under the selected tier.
+        available_nodes.sort(
+            key=lambda node: (
+                not node.supports_frontend,
+                -self._node_capacity(node),
+                node.node_id,
+            )
         )
         logger.info(
             "[DPLayerAllocator] Starting allocate_from_standby with %d nodes for %d layers",
@@ -902,9 +1079,9 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
             num_layers,
         )
         num_nodes = len(available_nodes)
-        total_cap = sum(node.get_decoder_layer_capacity() for node in available_nodes)
+        total_cap = sum(self._node_capacity(node) for node in available_nodes)
         frontend_nodes = sum(
-            node.supports_frontend and node.get_decoder_layer_capacity(include_input_embed=True) > 0
+            node.supports_frontend and self._node_capacity(node, include_input_embed=True) > 0
             for node in available_nodes
         )
 
@@ -920,15 +1097,17 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
             return False
         else:
             logger.info(
-                "[DPLayerAllocator] Sufficient resources: nodes=%d, layers=%d, total_cap=%d",
+                "[DPLayerAllocator] Capacity upper bound passed; validating endpoint-feasible "
+                "DP: nodes=%d, layers=%d, total_cap=%d, planning_context_tokens=%d",
                 num_nodes,
                 num_layers,
                 total_cap,
+                self.selected_context_tokens,
             )
         # used for pruning
         suffix_sum = [0] * (num_nodes + 1)
         for i in range(num_nodes - 1, -1, -1):
-            suffix_sum[i] = suffix_sum[i + 1] + available_nodes[i].get_decoder_layer_capacity()
+            suffix_sum[i] = suffix_sum[i + 1] + self._node_capacity(available_nodes[i])
 
         max_num_pipes = min(num_nodes, frontend_nodes, total_cap // num_layers)
         best_num_pipes = 0
@@ -969,13 +1148,11 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
 
                 # Option 2: Assign to existing open pipeline
                 for j, rj in enumerate(open_residuals):
-                    c_norm = available_nodes[i].get_decoder_layer_capacity()
+                    c_norm = self._node_capacity(available_nodes[i])
                     r_after = rj - c_norm
                     if r_after <= 0:
                         # try closing with LM head allowance
-                        c_close = available_nodes[i].get_decoder_layer_capacity(
-                            include_lm_head=True
-                        )
+                        c_close = self._node_capacity(available_nodes[i], include_lm_head=True)
                         r_after_close = rj - c_close
                         if r_after_close <= 0:
                             new_open = list(open_residuals)
@@ -1003,9 +1180,7 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
 
                 # Option 3: start a new pipeline (if we still need more)
                 if new_needed > 0 and available_nodes[i].supports_frontend:
-                    c_start = available_nodes[i].get_decoder_layer_capacity(
-                        include_input_embed=True
-                    )
+                    c_start = self._node_capacity(available_nodes[i], include_input_embed=True)
                     # A pipeline head must fit the embedding and at least one
                     # decoder layer.  Treating a zero/negative endpoint budget
                     # as usable lets the DP produce a path which the
@@ -1019,7 +1194,8 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
                         # A one-node pipeline also owns the LM head.  The input
                         # embedding-only capacity is not a sufficient closing
                         # test when the model does not tie those weights.
-                        c_single = available_nodes[i].get_decoder_layer_capacity(
+                        c_single = self._node_capacity(
+                            available_nodes[i],
                             include_input_embed=True,
                             include_lm_head=True,
                         )
@@ -1110,10 +1286,10 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
                 # ensure open_list sorted like open_tuple
                 open_list.sort(key=lambda x: x[0])
                 rj, nodes_seq = open_list[j]
-                c_norm = node.get_decoder_layer_capacity()
+                c_norm = self._node_capacity(node)
                 r_after = rj - c_norm
                 if r_after <= 0:
-                    c_close = node.get_decoder_layer_capacity(include_lm_head=True)
+                    c_close = self._node_capacity(node, include_lm_head=True)
                     r_after = rj - c_close
                 nodes_seq.append(node)
                 if r_after <= 0 or closed:

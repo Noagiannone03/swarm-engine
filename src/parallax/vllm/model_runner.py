@@ -42,6 +42,7 @@ from vllm.v1.worker.workspace import current_workspace_manager, init_workspace_m
 from vllm.utils.hashing import get_hash_fn_by_name
 
 from parallax.server.memory_budget import current_cuda_memory_budget
+from parallax.server.memory_contract import MemoryContractError
 from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     apply_weight_loader_filter_patch,
     set_layer_range_for_filtering,
@@ -444,6 +445,7 @@ def initialize_vllm_model_runner(
         model_repo,
         start_layer=start_layer,
         end_layer=end_layer,
+        revision=kwargs.get("model_revision"),
     )
 
     config = normalize_model_config(load_local_model_config(model_path))
@@ -702,7 +704,39 @@ def initialize_vllm_model_runner(
         if not kv_cache_specs:
             raise RuntimeError("No KV cache specs found in the loaded model")
 
-        available_memory = _cuda_budgeted_bytes(device, kv_cache_memory_fraction, "KV cache")
+        safe_available_memory = _cuda_budgeted_bytes(device, 1.0, "KV cache maximum")
+        preferred_memory = int(safe_available_memory * kv_cache_memory_fraction)
+        required_memory = 0
+        minimum_kv_tokens = kwargs.get("minimum_kv_tokens")
+        if minimum_kv_tokens is not None and int(minimum_kv_tokens) > 0:
+            required_blocks = (int(minimum_kv_tokens) + kv_block_size - 1) // kv_block_size
+            try:
+                per_block_bytes = sum(int(spec.page_size_bytes) for spec in kv_cache_specs.values())
+            except (AttributeError, TypeError) as exc:
+                raise RuntimeError(
+                    "vLLM KV specs do not expose exact page sizes; refusing an "
+                    "unqualified context contract"
+                ) from exc
+            required_memory = required_blocks * per_block_bytes
+            if required_memory > safe_available_memory:
+                supported_blocks = safe_available_memory // per_block_bytes
+                raise MemoryContractError(
+                    backend="vllm",
+                    requested_tokens=int(minimum_kv_tokens),
+                    supported_tokens=supported_blocks * kv_block_size,
+                    detail=(
+                        f"required {required_memory / 1024**3:.2f} GB, "
+                        f"available {safe_available_memory / 1024**3:.2f} GB after "
+                        "model/workspace initialization"
+                    ),
+                )
+        available_memory = max(preferred_memory, required_memory)
+        logger.info(
+            "Qualified CUDA KV budget: %.2f GB (preferred %.2f GB, contract minimum %.2f GB)",
+            available_memory / 1024**3,
+            preferred_memory / 1024**3,
+            required_memory / 1024**3,
+        )
 
         kv_cache_configs = get_kv_cache_configs(
             vllm_config=model_runner.vllm_config,
@@ -785,9 +819,9 @@ def refit_vllm_model(
         # Release old loras if needed
         before_loras = model_runner.list_loras()
         history = model_runner.lora_history
-        assert len(before_loras) == len(history), (
-            "Before lora refit, number of loaded lora mismatch!"
-        )
+        assert len(before_loras) == len(
+            history
+        ), "Before lora refit, number of loaded lora mismatch!"
         logger.info(f"Before lora refit number of lora adapters: {len(before_loras)}")
         while len(history) > 1:
             _, old_lora_id, _ = history.pop(0)
@@ -803,9 +837,9 @@ def refit_vllm_model(
         # Check lora slots
         after_loras = model_runner.list_loras()
         after_history = model_runner.lora_history
-        assert len(after_loras) == len(after_history), (
-            "After lora refit, number of loaded lora mismatch!"
-        )
+        assert len(after_loras) == len(
+            after_history
+        ), "After lora refit, number of loaded lora mismatch!"
         logger.info(f"After lora refit number of lora adapters: {len(after_loras)}")
     else:
         assert False, "Weight refit needs host tensors or weight path"

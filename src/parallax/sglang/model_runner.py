@@ -38,6 +38,7 @@ from sglang.srt.utils import (
 )
 
 from parallax.sglang.monkey_patch import apply_parallax_sglang_monkey_patch
+from parallax.server.memory_contract import MemoryContractError
 from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
@@ -260,7 +261,11 @@ def form_sgl_server_args(
         lora_backend=lora_backend,
         max_lora_chunk_size=max_lora_chunk_size,
         dp_size=dp_size,
-        max_total_tokens=max_num_tokens_per_batch,
+        # SGLang distinguishes the per-prefill batch ceiling from the physical
+        # KV pool. Let its maintained post-weight memory profiler size the pool;
+        # the caller validates that measured pool against the scheduler tier.
+        max_total_tokens=None,
+        max_prefill_tokens=max_num_tokens_per_batch,
     )
     return sgl_server_args
 
@@ -309,7 +314,11 @@ def initialize_sgl_model_runner(
         f"Downloading model with selective weight files for layers [{start_layer}, {end_layer})"
     )
     model_path = selective_model_download(
-        model_repo, start_layer=start_layer, end_layer=end_layer, local_files_only=use_hfcache
+        model_repo,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        local_files_only=use_hfcache,
+        revision=kwargs.get("model_revision"),
     )
 
     config = normalize_model_config(load_config(model_path))
@@ -330,7 +339,7 @@ def initialize_sgl_model_runner(
 
     architectures = config.get("architectures", [])
     if architectures and any("Qwen3Next" in arch for arch in architectures):
-        logger.debug(f"Qwen3-Next model detected, setting kv_block_size to 1")
+        logger.debug("Qwen3-Next model detected, setting kv_block_size to 1")
         kv_block_size = 1
 
     server_args = form_sgl_server_args(
@@ -400,6 +409,20 @@ def initialize_sgl_model_runner(
         dp_rank=dp_rank,
         dp_size=dp_size,
     )
+    minimum_kv_tokens = kwargs.get("minimum_kv_tokens")
+    if minimum_kv_tokens is not None and int(minimum_kv_tokens) > 0:
+        allocator = model_runner.token_to_kv_pool_allocator
+        supported_tokens = int(allocator.size)
+        if supported_tokens < int(minimum_kv_tokens):
+            raise MemoryContractError(
+                backend="sglang",
+                requested_tokens=int(minimum_kv_tokens),
+                supported_tokens=supported_tokens,
+                detail=(
+                    "SGLang's post-weight memory profiler materialized a smaller "
+                    "physical token pool"
+                ),
+            )
     return model_runner, config, tokenizer
 
 
@@ -410,13 +433,13 @@ def refit_sgl_model(
 ):
     """Runtime weight refit from disk"""
     if tensors is not None:
-        logger.info(f"Executor begins weight refit from host memory")
+        logger.info("Executor begins weight refit from host memory")
         for x in tensors.keys():
             refit_tensors = [(x, tensors.get(x))]
             model_runner.update_weights_from_tensor(named_tensors=refit_tensors, load_format=None)
     elif refit_weight_path is not None:
-        logger.info(f"Executor begins weight refit from disk files")
+        logger.info("Executor begins weight refit from disk files")
         model_runner.update_weights_from_disk(model_path=refit_weight_path, load_format="auto")
     else:
         assert False, "Weight refit needs host tensors or weight path"
-    logger.info(f"Finish weight refit")
+    logger.info("Finish weight refit")

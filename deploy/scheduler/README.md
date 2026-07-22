@@ -33,3 +33,42 @@ secret file. Promote a commit-addressed image to the local
 `local/parallax-scheduler:iroh-qualified` tag only after its smoke tests pass;
 the immutable commit remains available in the image revision label. The
 scheduler identity persists in its existing state volume.
+
+To qualify the existing Qwen3-8B service on Iroh, apply its dedicated override:
+
+```shell
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.lab-iroh-qwen3-8b.yml \
+  up -d --no-deps --force-recreate parallax-scheduler-qwen3-8b
+```
+
+The 8B service keeps a separate persistent scheduler identity in the existing
+`parallax-state-qwen3-8b` volume. Workers must use the endpoint reported by
+that service, not the Qwen3-1.7B endpoint.
+
+The legacy fixed parameter/KV split could not fit the 8B model endpoints and
+decoder layers inside the 16 GB Mac/RTX live envelopes. The exact adaptive
+planner can form a context-qualified split when both live envelopes allow it.
+Use the dedicated 4B service first for a deterministic two-worker network and
+runtime qualification:
+
+```shell
+docker compose \
+  -f docker-compose.lab-iroh-qwen3-4b.yml \
+  up -d --no-deps parallax-scheduler-qwen3-4b
+```
+
+This service is deliberately isolated on HTTP `3015`, keeps its own scheduler
+identity and uses the same commit-addressed qualified image.
+
+Product scheduler context tiers can be configured without changing worker
+ratios:
+
+```shell
+PARALLAX_PLANNING_CONTEXT_TOKENS=16384
+PARALLAX_PREFERRED_CONTEXT_TOKENS=32768
+```
+
+The scheduler publishes its selected tier, and a worker is not READY until its
+runtime-measured KV pages satisfy that contract.

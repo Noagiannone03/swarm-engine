@@ -43,6 +43,9 @@ def test_scheduler_manager_forwards_dynamic_dp_configuration():
         weight_refit_mode="disk",
         strategy="dp",
         routing_strategy="dp",
+        planning_context_tokens=16_384,
+        preferred_context_tokens=32_768,
+        require_exact_weight_metadata=True,
     )
     thread_class.return_value.start.assert_called_once_with()
 

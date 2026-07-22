@@ -9,7 +9,7 @@ import socket
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 import numpy as np
 import psutil
@@ -383,17 +383,25 @@ def load_local_model_config(model_path: Path) -> dict:
     return config
 
 
-def load_config_only(name: str, local_files_only: bool = False):
+def load_config_only(
+    name: str,
+    local_files_only: bool = False,
+    revision: Optional[str] = None,
+):
     """Load only config.json from a local path or Hugging Face repo."""
     local_path = Path(name)
     if local_path.exists():
         config_file = local_path / "config.json"
     else:
+        download_kwargs = {}
+        if revision is not None:
+            download_kwargs["revision"] = revision
         config_file = Path(
             download_model_file(
                 repo_id=name,
                 filename="config.json",
                 local_files_only=local_files_only,
+                **download_kwargs,
             )
         )
 
@@ -426,9 +434,7 @@ def get_model_context_limit(config: dict) -> int | None:
     limits = [
         int(value)
         for value in candidates
-        if isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and 0 < value < 2**63
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < 2**63
     ]
     return min(limits) if limits else None
 

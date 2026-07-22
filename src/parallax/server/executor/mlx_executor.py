@@ -46,6 +46,7 @@ class MLXExecutor(BaseExecutor):
         model_repo: str,
         start_layer: int,
         end_layer: int,
+        model_revision: Optional[str] = None,
         dtype: str = "float16",
         # Device override
         device: Optional[str] = None,
@@ -99,6 +100,7 @@ class MLXExecutor(BaseExecutor):
         enable_weight_refit: Optional[bool] = False,
         weight_refit_mode: Optional[str] = "disk",
         chunked_prefill_size: Optional[int] = None,
+        planned_context_tokens: Optional[int] = None,
         # Pipe communication
         conn: Optional[List[Any]] = [],
     ):
@@ -120,6 +122,7 @@ class MLXExecutor(BaseExecutor):
 
         self.shard_loader = MLXModelLoader(
             model_repo,
+            revision=model_revision,
             start_layer=start_layer,
             end_layer=end_layer,
             use_hfcache=use_hfcache,
@@ -246,6 +249,7 @@ class MLXExecutor(BaseExecutor):
                 if self.mlx_memory_budget is not None
                 else None
             ),
+            minimum_kv_tokens=planned_context_tokens,
         )
 
         self.chunked_prefill_size = normalized_chunked_prefill_size
@@ -392,9 +396,9 @@ class MLXExecutor(BaseExecutor):
         else:
             # Intermediate and Last peers receive IntermediateRequests from the previous peer.
             for req in requests:
-                assert isinstance(req, IntermediateRequest), (
-                    "Non-first peers must receive IntermediateRequests."
-                )
+                assert isinstance(
+                    req, IntermediateRequest
+                ), "Non-first peers must receive IntermediateRequests."
                 if req.is_finished or req.hidden_states is None:
                     self.cache_manager.release_request(req.request_id)
                     logger.debug(

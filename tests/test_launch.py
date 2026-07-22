@@ -247,6 +247,30 @@ def test_executor_failure_is_not_treated_as_a_normal_worker_shutdown():
     assert shared_state.get("frontend_alive") is False
 
 
+def test_memory_contract_failure_keeps_heartbeat_generation_alive_for_replan():
+    class FailedExecutor:
+        pid = 1234
+        exitcode = 1
+
+        @staticmethod
+        def is_alive():
+            return False
+
+    shared_state = SharedState.create()
+    shared_state.update(
+        status=ServerState.READY.value,
+        memory_contract_failure={
+            "kind": "kv_materialization",
+            "allocation_epoch": 3,
+            "requested_tokens": 32_768,
+            "supported_tokens": 24_000,
+        },
+    )
+
+    assert _wait_executors_check_layer_change(shared_state, [FailedExecutor()]) is True
+    assert shared_state.get_status() == ServerState.INITIALIZING.value
+
+
 def test_memory_warning_pauses_then_resumes_without_layer_reallocation(monkeypatch):
     monkeypatch.setattr("parallax.launch.DEFAULT_PRESSURE_POLL_SECONDS", 0)
     samples = iter([4 * GIB, 4 * GIB, 4 * GIB, 6 * GIB, 6 * GIB])

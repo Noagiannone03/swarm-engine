@@ -129,17 +129,46 @@ def get_param_bytes_per_element(config, model_name: str) -> float:
         return 1
 
 
-def get_model_info(model_name, use_hfcache: bool = False):
-    config = load_config_only(model_name, local_files_only=use_hfcache)
+def get_model_info(
+    model_name,
+    use_hfcache: bool = False,
+    *,
+    load_weight_metadata: bool = False,
+):
+    mlx_model_name = MODELS.get(model_name, model_name)
+    model_revision = None
+    mlx_model_revision = None
+    metadata_resolution_error = None
+    if load_weight_metadata:
+        from backend.server.model_weight_metadata import resolve_hub_revision
+
+        try:
+            model_revision = resolve_hub_revision(model_name)
+            mlx_model_revision = (
+                model_revision
+                if mlx_model_name == model_name
+                else resolve_hub_revision(mlx_model_name)
+            )
+        except Exception as exc:
+            metadata_resolution_error = exc
+
+    config = load_config_only(
+        model_name,
+        local_files_only=use_hfcache,
+        revision=model_revision,
+    )
     context_limits = [get_model_context_limit(config)]
 
     param_bytes_per_element = get_param_bytes_per_element(config, model_name)
 
     mlx_param_bytes_per_element = param_bytes_per_element
-    mlx_model_name = MODELS.get(model_name, model_name)
-
+    mlx_config = config
     if mlx_model_name != model_name:
-        mlx_config = load_config_only(mlx_model_name, local_files_only=use_hfcache)
+        mlx_config = load_config_only(
+            mlx_model_name,
+            local_files_only=use_hfcache,
+            revision=mlx_model_revision,
+        )
         mlx_param_bytes_per_element = get_param_bytes_per_element(mlx_config, mlx_model_name)
         context_limits.append(get_model_context_limit(mlx_config))
 
@@ -176,10 +205,49 @@ def get_model_info(model_name, use_hfcache: bool = False):
         cache_bytes_per_element=2,
         embedding_bytes_per_element=2,
         max_context_length=max_context_length,
+        tie_embedding=bool(config.get("tie_word_embeddings", False)),
+        model_revision=model_revision,
+        mlx_model_revision=mlx_model_revision,
         num_local_experts=num_local_experts,
         num_experts_per_tok=config.get("num_experts_per_tok", None),
         moe_intermediate_dim=config.get("moe_intermediate_size", None),
     )
+    if load_weight_metadata:
+        from backend.server.model_weight_metadata import load_hub_weight_profile
+
+        try:
+            if metadata_resolution_error is not None:
+                raise metadata_resolution_error
+            model_info.weight_profile = load_hub_weight_profile(
+                model_name,
+                num_layers=model_info.num_layers,
+                tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
+                revision=model_revision,
+            )
+            if mlx_model_name == model_name:
+                model_info.mlx_weight_profile = model_info.weight_profile
+            else:
+                model_info.mlx_weight_profile = load_hub_weight_profile(
+                    mlx_model_name,
+                    num_layers=model_info.num_layers,
+                    tie_word_embeddings=bool(mlx_config.get("tie_word_embeddings", False)),
+                    revision=mlx_model_revision,
+                )
+            logger.info(
+                "Loaded exact safetensors weight metadata for %s (revision=%s) and %s "
+                "(revision=%s)",
+                model_name,
+                model_info.weight_profile.source_revision,
+                mlx_model_name,
+                model_info.mlx_weight_profile.source_revision,
+            )
+        except Exception as exc:
+            # The scheduler remains inspectable for unsupported legacy/bin or
+            # offline repositories, but the exact-memory planner will fail
+            # closed instead of silently treating formulas as exact bytes.
+            model_info.weight_profile = None
+            model_info.mlx_weight_profile = None
+            logger.warning("Exact weight metadata unavailable for %s: %s", model_name, exc)
     return model_info
 
 

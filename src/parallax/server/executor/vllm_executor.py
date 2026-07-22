@@ -42,6 +42,7 @@ class VLLMExecutor(BaseExecutor):
         model_repo: str,
         start_layer: int,
         end_layer: int,
+        model_revision: Optional[str] = None,
         dtype: str = "float16",
         # Device override
         device: Optional[str] = None,
@@ -92,6 +93,7 @@ class VLLMExecutor(BaseExecutor):
         enable_weight_refit: Optional[bool] = False,
         weight_refit_mode: Optional[str] = "disk",
         chunked_prefill_size: Optional[int] = None,
+        planned_context_tokens: Optional[int] = None,
         # Routed experts
         enable_return_routed_experts: bool = False,
         # Pipe communication
@@ -122,6 +124,7 @@ class VLLMExecutor(BaseExecutor):
 
         model_runner_params = {
             "model_repo": model_repo,
+            "model_revision": model_revision,
             "start_layer": start_layer,
             "end_layer": end_layer,
             "kv_cache_memory_fraction": kv_cache_memory_fraction,
@@ -145,6 +148,7 @@ class VLLMExecutor(BaseExecutor):
             "fully_sharded_loras": fully_sharded_loras,
             "enable_return_routed_experts": self.enable_return_routed_experts,
             "instance_id": self.routed_experts_instance_id,
+            "minimum_kv_tokens": planned_context_tokens,
         }
         logger.debug(
             f"Initializing vLLM model runner for repo={model_repo}, layers=[{start_layer}, {end_layer})"
@@ -271,9 +275,9 @@ class VLLMExecutor(BaseExecutor):
         else:
             # Intermediate and Last peers receive IntermediateRequests from the previous peer.
             for req in requests:
-                assert isinstance(req, IntermediateRequest), (
-                    "Non-first peers must receive IntermediateRequests."
-                )
+                assert isinstance(
+                    req, IntermediateRequest
+                ), "Non-first peers must receive IntermediateRequests."
                 if req.is_finished or req.hidden_states is None:
                     self.release_and_evict_request(req.request_id)
                     if not self.is_last_peer:
@@ -284,12 +288,12 @@ class VLLMExecutor(BaseExecutor):
 
     def process_batch(self, prepared_inputs: Dict[str, Any], return_decoded_tokens: bool = True):
         """Process a batch of requests in vLLM."""
-        assert "scheduler_output" in prepared_inputs, (
-            "scheduler_output should be provided for vLLM backend"
-        )
-        assert "pp_proxy_tensors" in prepared_inputs, (
-            "pp_proxy_tensors should be in cuda prepared inputs"
-        )
+        assert (
+            "scheduler_output" in prepared_inputs
+        ), "scheduler_output should be provided for vLLM backend"
+        assert (
+            "pp_proxy_tensors" in prepared_inputs
+        ), "pp_proxy_tensors should be in cuda prepared inputs"
         scheduler_output = prepared_inputs["scheduler_output"]
         pp_proxy_tensors = prepared_inputs["pp_proxy_tensors"]
         # For vLLM, pp_proxy_tensors is already an IntermediateTensors object

@@ -44,6 +44,7 @@ NodeUpdate: TypeAlias = Tuple[
     Optional[List[str]],
     Optional[List[str]],
     Optional[str],
+    Optional[Dict[str, object]],
 ]
 
 
@@ -65,6 +66,9 @@ class Scheduler:
         water_filling_max_iterations: int = 40,
         heartbeat_timeout: float = 30.0,
         trim_layers_on_turning_points: bool = False,
+        planning_context_tokens: int = 16_384,
+        preferred_context_tokens: int = 32_768,
+        require_exact_weight_metadata: bool = False,
     ) -> None:
         """Initialize the scheduler.
 
@@ -107,6 +111,9 @@ class Scheduler:
             rebalance_threshold=rebalance_threshold,
             water_filling_max_iterations=water_filling_max_iterations,
             trim_layers_on_turning_points=trim_layers_on_turning_points,
+            planning_context_tokens=planning_context_tokens,
+            preferred_context_tokens=preferred_context_tokens,
+            require_exact_weight_metadata=require_exact_weight_metadata,
         )
         # Ensure Scheduler and allocator share the same node list to avoid divergence.
         self.min_nodes_bootstrapping = min_nodes_bootstrapping
@@ -138,6 +145,8 @@ class Scheduler:
         # oscillations on desktop contributors.
         self._pending_rebalance_node_ids: set[str] = set()
         self._next_rebalance_attempt_at: float = 0.0
+        self._pending_context_replan: Optional[Dict[str, object]] = None
+        self.allocation_epoch: int = 0
 
         # Concurrency controls
         self._stop_event: threading.Event = threading.Event()
@@ -265,7 +274,16 @@ class Scheduler:
             and self.node_manager.has_full_pipeline(self.num_layers, ready_only=True)
             and self.prefill_contract_ready()
             and self.request_router.routing_ready()
+            and self.runtime_memory_contract_ready()
         )
+
+    def runtime_memory_contract_ready(self) -> bool:
+        """Require executor-measured KV geometry to satisfy the selected plan."""
+
+        if not self.layer_allocator.require_exact_weight_metadata:
+            return True
+        selected = int(self.layer_allocator.selected_context_tokens)
+        return selected > 0 and self.max_supported_context_tokens() >= selected
 
     def max_supported_context_tokens(self) -> int:
         """Largest request context that at least one complete route can hold."""
@@ -274,6 +292,106 @@ class Scheduler:
         if model_limit is None:
             return route_limit
         return min(route_limit, int(model_limit))
+
+    def _record_memory_contract_failure(
+        self,
+        node: Node,
+        failure: Dict[str, object],
+    ) -> None:
+        """Accept one measured, epoch-fenced downward replan request."""
+
+        if not self.layer_allocator.require_exact_weight_metadata:
+            return
+        try:
+            kind = str(failure["kind"])
+            failed_epoch = int(failure["allocation_epoch"])
+            requested_tokens = int(failure["requested_tokens"])
+            supported_tokens = int(failure["supported_tokens"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Ignoring malformed memory contract report from %s", node.node_id)
+            return
+        selected_tokens = int(self.layer_allocator.selected_context_tokens)
+        if kind != "kv_materialization":
+            return
+        if failed_epoch != self.allocation_epoch:
+            logger.info(
+                "Ignoring stale memory contract report from %s for epoch %d (current=%d)",
+                node.node_id,
+                failed_epoch,
+                self.allocation_epoch,
+            )
+            return
+        if requested_tokens != selected_tokens or supported_tokens >= requested_tokens:
+            logger.warning(
+                "Ignoring inconsistent memory contract report from %s: requested=%d, "
+                "supported=%d, selected=%d",
+                node.node_id,
+                requested_tokens,
+                supported_tokens,
+                selected_tokens,
+            )
+            return
+        if self._pending_context_replan is not None:
+            return
+        downgraded_tokens = self.layer_allocator.fence_one_runtime_context_downgrade(
+            requested_tokens
+        )
+        if downgraded_tokens is None:
+            logger.error(
+                "Runtime memory contract failed on %s at %d tokens and no further bounded "
+                "downgrade is permitted",
+                node.node_id,
+                requested_tokens,
+            )
+            return
+        self._pending_context_replan = {
+            "failed_epoch": failed_epoch,
+            "node_id": node.node_id,
+            "from_tokens": requested_tokens,
+            "to_tokens": downgraded_tokens,
+            "supported_tokens": supported_tokens,
+        }
+        self._admission_paused = True
+        logger.warning(
+            "Queued one fenced runtime context downgrade after %s measured %d-token "
+            "capacity: %d -> %d tokens (epoch=%d)",
+            node.node_id,
+            supported_tokens,
+            requested_tokens,
+            downgraded_tokens,
+            failed_epoch,
+        )
+
+    def _process_pending_context_replan(self) -> bool:
+        """Commit the single downgrade only at an idle allocation boundary."""
+
+        pending = self._pending_context_replan
+        if pending is None:
+            return False
+        with self._inflight_routes_lock:
+            if self._inflight_routes or any(
+                node.routing_load > 0 or node.current_requests > 0
+                for node in self.node_manager.active_nodes
+            ):
+                return False
+            active_ids = [node.node_id for node in self.node_manager.active_nodes]
+            if active_ids:
+                self.node_manager.standby(active_ids)
+            logger.warning(
+                "Replanning allocation epoch %d once at the fenced %d-token ceiling",
+                int(pending["failed_epoch"]),
+                int(pending["to_tokens"]),
+            )
+            success = self.bootstrap(reboot=True)
+            if not success:
+                logger.error(
+                    "Fenced runtime downgrade could not form a complete %d-token route",
+                    int(pending["to_tokens"]),
+                )
+                return False
+            self._pending_context_replan = None
+            self._admission_paused = False
+            return True
 
     def report_pipeline_capacity(
         self,
@@ -339,6 +457,7 @@ class Scheduler:
         lease_started_at = time.time()
         for node in self.node_manager.active_nodes:
             node.last_heartbeat = lease_started_at
+        self.allocation_epoch += 1
         self._bootstrapped_event.set()
         self._queue_bootstrap_standby_rebalances()
         # Snapshot at INFO after bootstrap since allocations/pipelines may have materially changed.
@@ -378,6 +497,7 @@ class Scheduler:
         reachable_peer_ids: Optional[List[str]] = None,
         relayed_peer_ids: Optional[List[str]] = None,
         account_hash: Optional[str] = None,
+        memory_contract_failure: Optional[Dict[str, object]] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
@@ -410,6 +530,9 @@ class Scheduler:
             node.relayed_peer_ids = set(relayed_peer_ids)
         if account_hash is not None:
             node.account_hash = account_hash
+        node.memory_contract_failure = memory_contract_failure
+        if memory_contract_failure is not None:
+            self._record_memory_contract_failure(node, memory_contract_failure)
         node.last_heartbeat = time.time()
 
     # Async-style event enqueuers for main loop
@@ -443,6 +566,7 @@ class Scheduler:
         reachable_peer_ids: Optional[List[str]] = None,
         relayed_peer_ids: Optional[List[str]] = None,
         account_hash: Optional[str] = None,
+        memory_contract_failure: Optional[Dict[str, object]] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -463,6 +587,7 @@ class Scheduler:
                 reachable_peer_ids,
                 relayed_peer_ids,
                 account_hash,
+                memory_contract_failure,
             )
         )
         self._wake_event.set()
@@ -896,6 +1021,7 @@ class Scheduler:
         last_hb_check = 0.0
         while not self._stop_event.is_set():
             self._process_node_updates()
+            self._process_pending_context_replan()
             self._process_joins()
             self._process_leaves()
             self._process_pending_rebalance()
@@ -945,6 +1071,7 @@ class Scheduler:
                     reachable_peer_ids,
                     relayed_peer_ids,
                     account_hash,
+                    memory_contract_failure,
                 ) = self._pending_node_updates.get_nowait()
             except queue.Empty:
                 break
@@ -969,6 +1096,7 @@ class Scheduler:
                 reachable_peer_ids=reachable_peer_ids,
                 relayed_peer_ids=relayed_peer_ids,
                 account_hash=account_hash,
+                memory_contract_failure=memory_contract_failure,
             )
 
         # Manual allocations can complete before their executors finish loading.
@@ -1100,6 +1228,13 @@ class Scheduler:
             rebalance_threshold=self.layer_allocator.rebalance_threshold,
             water_filling_max_iterations=self.layer_allocator.water_filling_max_iterations,
             trim_layers_on_turning_points=self.layer_allocator.trim_layers_on_turning_points,
+            planning_context_tokens=self.layer_allocator.planning_context_tokens,
+            preferred_context_tokens=self.layer_allocator.preferred_context_tokens,
+            require_exact_weight_metadata=self.layer_allocator.require_exact_weight_metadata,
+            context_ceiling_tokens=self.layer_allocator.context_ceiling_tokens,
+            runtime_context_downgrade_used=(
+                self.layer_allocator.runtime_context_downgrade_used
+            ),
         )
         for node_id, start_layer, end_layer in self.list_node_allocations():
             planned_allocator.allocate(planned_by_id[node_id], start_layer, end_layer)
@@ -1169,6 +1304,7 @@ class Scheduler:
         lease_started_at = time.time()
         for node in self.node_manager.active_nodes:
             node.last_heartbeat = lease_started_at
+        self.allocation_epoch += 1
         self._bootstrapped_event.set()
         self.emit_alloc_log_snapshot(reason="after drained global rebalance")
         return True

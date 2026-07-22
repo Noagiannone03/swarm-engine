@@ -113,12 +113,15 @@ class SharedState:
         """Get model and layer allocation information."""
         return {
             "model_name": self._dict.get("model_name"),
+            "model_revision": self._dict.get("model_revision"),
             "block_start_index": self._dict.get("block_start_index"),
             "block_end_index": self._dict.get("block_end_index"),
             "tp_size": self._dict.get("tp_size"),
             "enable_weight_refit": self._dict.get("enable_weight_refit"),
             "weight_refit_mode": self._dict.get("weight_refit_mode"),
             "model_max_sequence_length": self._dict.get("model_max_sequence_length"),
+            "planned_context_tokens": self._dict.get("planned_context_tokens"),
+            "allocation_epoch": self._dict.get("allocation_epoch"),
             "chunked_prefill_size": self._dict.get("chunked_prefill_size"),
             "_layer_allocation_changed": self._dict.get("_layer_allocation_changed", False),
         }
@@ -149,10 +152,13 @@ class SharedState:
         shared_dict["block_start_index"] = None
         shared_dict["block_end_index"] = None
         shared_dict["model_name"] = None
+        shared_dict["model_revision"] = None
         shared_dict["tp_size"] = None
         shared_dict["enable_weight_refit"] = None
         shared_dict["weight_refit_mode"] = None
         shared_dict["model_max_sequence_length"] = None
+        shared_dict["planned_context_tokens"] = None
+        shared_dict["allocation_epoch"] = None
         shared_dict["chunked_prefill_size"] = None
         shared_dict["kv_cache_token_capacity"] = None
         shared_dict["kv_cache_block_size"] = None
@@ -163,6 +169,7 @@ class SharedState:
         shared_dict["_memory_shutdown_requested"] = False
         shared_dict["memory_pressure"] = "normal"
         shared_dict["memory_pressure_resources"] = {}
+        shared_dict["memory_contract_failure"] = None
         shared_dict["status"] = None
 
         # Create nested shared dict for metrics

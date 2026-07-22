@@ -8,11 +8,79 @@ and performance estimation decisions.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ModelWeightProfile:
+    """Exact checkpoint bytes owned by every pipeline stage.
+
+    Values come from safetensors data offsets, not architecture formulas.  The
+    same tied embedding can be needed by both ends of a split pipeline, while a
+    single-node stage only stores it once; ``shared_endpoint_bytes`` captures
+    that intersection explicitly.
+    """
+
+    layer_bytes: tuple[int, ...]
+    input_endpoint_bytes: int
+    output_endpoint_bytes: int
+    shared_endpoint_bytes: int = 0
+    source_revision: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.layer_bytes:
+            raise ValueError("An exact weight profile must contain decoder layers")
+        values: Sequence[int] = (
+            *self.layer_bytes,
+            self.input_endpoint_bytes,
+            self.output_endpoint_bytes,
+            self.shared_endpoint_bytes,
+        )
+        if any(int(value) < 0 for value in values):
+            raise ValueError("Weight profile byte counts must be non-negative")
+        if self.shared_endpoint_bytes > min(self.input_endpoint_bytes, self.output_endpoint_bytes):
+            raise ValueError("Shared endpoint bytes exceed an endpoint")
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.layer_bytes)
+
+    def stage_bytes(self, start_layer: int, end_layer: int) -> int:
+        """Return exact stored weight bytes for ``[start_layer, end_layer)``."""
+
+        return self.range_bytes(
+            start_layer,
+            end_layer,
+            owns_input=start_layer == 0,
+            owns_output=end_layer == self.num_layers,
+        )
+
+    def range_bytes(
+        self,
+        start_layer: int,
+        end_layer: int,
+        *,
+        owns_input: bool = False,
+        owns_output: bool = False,
+    ) -> int:
+        """Return exact bytes for a decoder range and explicit endpoint roles."""
+
+        if not 0 <= start_layer < end_layer <= self.num_layers:
+            raise ValueError(
+                f"Invalid stage [{start_layer}, {end_layer}) for {self.num_layers} layers"
+            )
+        total = sum(self.layer_bytes[start_layer:end_layer])
+        if owns_input:
+            total += self.input_endpoint_bytes
+        if owns_output:
+            total += self.output_endpoint_bytes
+        if owns_input and owns_output:
+            total -= self.shared_endpoint_bytes
+        return total
 
 
 @dataclass
@@ -42,6 +110,10 @@ class ModelInfo:
     cache_bytes_per_element: int = 1
     embedding_bytes_per_element: int = 1
     max_context_length: Optional[int] = None
+    weight_profile: Optional[ModelWeightProfile] = None
+    mlx_weight_profile: Optional[ModelWeightProfile] = None
+    model_revision: Optional[str] = None
+    mlx_model_revision: Optional[str] = None
 
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
@@ -192,3 +264,19 @@ class ModelInfo:
     def lm_head_flops(self, target_seq_len: int = 1) -> int:
         """Estimate FLOPs for lm_head (last layer GEMM) for a sequence length."""
         return 2 * target_seq_len * self.hidden_dim * self.vocab_size
+
+    def exact_weight_profile(self, *, using_mlx: bool = False) -> Optional[ModelWeightProfile]:
+        """Return the exact checkpoint profile for the selected runtime."""
+
+        profile = self.mlx_weight_profile if using_mlx else self.weight_profile
+        if profile is None or profile.num_layers != self.num_layers:
+            return None
+        return profile
+
+    def stage_weight_bytes(
+        self, start_layer: int, end_layer: int, *, using_mlx: bool = False
+    ) -> Optional[int]:
+        """Return exact stage weights, or ``None`` when metadata is unavailable."""
+
+        profile = self.exact_weight_profile(using_mlx=using_mlx)
+        return None if profile is None else profile.stage_bytes(start_layer, end_layer)

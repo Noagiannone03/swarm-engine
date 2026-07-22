@@ -1,0 +1,30 @@
+services:
+  parallax-scheduler-qwen3-4b:
+    image: local/parallax-scheduler:iroh-qualified
+    container_name: parallax-scheduler-qwen3-4b
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PARALLAX_HTTP_PORT: "3015"
+      PARALLAX_TCP_PORT: "18150"
+      PARALLAX_UDP_PORT: "18150"
+      PARALLAX_MODEL: "Qwen/Qwen3-4B"
+      PARALLAX_STRATEGY: "dp"
+      PARALLAX_ROUTING_STRATEGY: "dp"
+      PARALLAX_CONTEXT_AWARE_ALLOC: "1"
+      PARALLAX_HEARTBEAT_TIMEOUT: "180"
+      FABI_NETWORK_TRANSPORT: "iroh"
+      FABI_RELAY_URL: "https://server.undefinedstudio.fr:4443"
+      FABI_RELAY_TOKEN_FILE: "/run/secrets/fabi-iroh-relay-token"
+      FABI_NETWORK_IDENTITY_PATH: "/opt/parallax-runtime/network/scheduler.key"
+      FABI_FORCE_RELAY: "0"
+    network_mode: host
+    volumes:
+      - parallax-cache:/root/.cache
+      - parallax-state-qwen3-4b:/opt/parallax-runtime
+      - /etc/fabi-iroh-relay/relay.env:/run/secrets/fabi-iroh-relay-token:ro
+
+volumes:
+  parallax-cache:
+  parallax-state-qwen3-4b:

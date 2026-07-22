@@ -185,6 +185,7 @@ class RPCConnectionHandler(ConnectionHandler):
                     sorted(node.relayed_peer_ids) if node.relayed_peer_ids is not None else None
                 ),
                 account_hash=node.account_hash,
+                memory_contract_failure=node.memory_contract_failure,
             )
             # Return current layer allocation to node
             layer_allocation = self.get_layer_allocation(node.node_id)
@@ -289,6 +290,11 @@ class RPCConnectionHandler(ConnectionHandler):
                             if node.hardware.device != "mlx"
                             else node.model_info.mlx_model_name
                         ),
+                        "model_revision": (
+                            node.model_info.model_revision
+                            if node.hardware.device != "mlx"
+                            else node.model_info.mlx_model_revision
+                        ),
                         "start_layer": start_layer,
                         "end_layer": end_layer,
                         "tp_size": node.hardware.num_gpus,
@@ -296,6 +302,14 @@ class RPCConnectionHandler(ConnectionHandler):
                         "weight_refit_mode": self.scheduler.weight_refit_mode,
                         "model_max_sequence_length": getattr(
                             self.scheduler.model_info, "max_context_length", None
+                        ),
+                        "planned_context_tokens": getattr(
+                            getattr(self.scheduler, "layer_allocator", None),
+                            "selected_context_tokens",
+                            0,
+                        ),
+                        "allocation_epoch": int(
+                            getattr(self.scheduler, "allocation_epoch", 0)
                         ),
                         "chunked_prefill_size": self.scheduler.chunked_prefill_size_for_node(
                             node_id
@@ -358,6 +372,7 @@ class RPCConnectionHandler(ConnectionHandler):
                 else None
             ),
             account_hash=account_hash(node_json.get("account_token")),
+            memory_contract_failure=node_json.get("memory_contract_failure"),
         )
         if node_json.get("start_layer", None) is not None:
             node.start_layer = node_json.get("start_layer")

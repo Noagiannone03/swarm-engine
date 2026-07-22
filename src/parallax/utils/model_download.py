@@ -30,6 +30,7 @@ def download_model_snapshot(
     ignore_patterns: Optional[list[str] | str] = None,
     local_dir: Optional[str | Path] = None,
     local_files_only: bool = False,
+    revision: Optional[str] = None,
 ) -> Path:
     if _use_modelscope():
         return Path(
@@ -49,6 +50,7 @@ def download_model_snapshot(
             ignore_patterns=ignore_patterns,
             local_dir=local_dir,
             local_files_only=local_files_only,
+            revision=revision,
         )
     )
 
@@ -57,6 +59,7 @@ def download_model_file(
     repo_id: str,
     filename: str,
     local_files_only: bool = False,
+    revision: Optional[str] = None,
 ) -> Path:
     if _use_modelscope():
         return Path(
@@ -72,6 +75,7 @@ def download_model_file(
             repo_id=repo_id,
             filename=filename,
             local_files_only=local_files_only,
+            revision=revision,
         )
     )
 
@@ -81,6 +85,7 @@ def selective_model_download(
     start_layer: Optional[int] = None,
     end_layer: Optional[int] = None,
     local_files_only: bool = False,
+    revision: Optional[str] = None,
 ) -> Path:
     local_path = Path(repo_id)
     if local_path.exists():
@@ -92,6 +97,7 @@ def selective_model_download(
         repo_id=repo_id,
         ignore_patterns=_EXCLUDE_WEIGHT_PATTERNS,
         local_files_only=local_files_only,
+        revision=revision,
     )
     logger.debug(f"Downloaded model metadata to {model_path}")
 
@@ -106,7 +112,11 @@ def selective_model_download(
 
         if not needed_weight_files:
             logger.debug("Could not determine specific weight files, downloading all")
-            download_model_snapshot(repo_id=repo_id, local_files_only=local_files_only)
+            download_model_snapshot(
+                repo_id=repo_id,
+                local_files_only=local_files_only,
+                revision=revision,
+            )
         else:
             missing_weight_files = [
                 weight_file
@@ -122,6 +132,7 @@ def selective_model_download(
                         repo_id=repo_id,
                         allow_patterns=missing_weight_files,
                         local_files_only=local_files_only,
+                        revision=revision,
                     )
                 except Exception as e:
                     logger.error(
@@ -137,7 +148,11 @@ def selective_model_download(
             logger.debug(f"Downloaded weight files for layers [{start_layer}, {end_layer})")
     else:
         logger.debug("No layer range specified, downloading all model files")
-        download_model_snapshot(repo_id=repo_id, local_files_only=local_files_only)
+        download_model_snapshot(
+            repo_id=repo_id,
+            local_files_only=local_files_only,
+            revision=revision,
+        )
 
     return model_path
 

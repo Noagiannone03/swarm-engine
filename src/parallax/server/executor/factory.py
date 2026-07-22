@@ -6,6 +6,8 @@ import argparse
 import os
 from typing import Any, List, Optional
 
+from parallax.server.memory_contract import MemoryContractError
+from parallax.utils.shared_state import SharedState
 from parallax.utils.utils import get_current_device
 from parallax_utils.logging_config import get_logger, set_log_level
 
@@ -17,6 +19,7 @@ def create_executor_config(args: argparse.Namespace, shared_state=None, conn=Non
 
     config = {
         "model_repo": args.model_path,
+        "model_revision": getattr(args, "model_revision", None),
         "start_layer": args.start_layer,
         "end_layer": args.end_layer,
         "dtype": args.dtype,
@@ -52,6 +55,7 @@ def create_executor_config(args: argparse.Namespace, shared_state=None, conn=Non
         "enable_weight_refit": args.enable_weight_refit,
         "weight_refit_mode": args.weight_refit_mode,
         "chunked_prefill_size": getattr(args, "chunked_prefill_size", None),
+        "planned_context_tokens": getattr(args, "planned_context_tokens", None),
     }
 
     if args.gpu_backend == "sglang":
@@ -122,6 +126,19 @@ def run_executor_process(args, shared_state=None, conn=None):
         executor.run_loop()
     except KeyboardInterrupt:
         logger.debug("Executor received interrupt signal, shutting down...")
+    except MemoryContractError as exc:
+        if shared_state is not None:
+            state = SharedState(shared_state)
+            state.update(
+                status="initializing",
+                kv_cache_token_capacity=None,
+                kv_cache_block_size=None,
+                memory_contract_failure=exc.as_report(
+                    allocation_epoch=state.get("allocation_epoch")
+                ),
+            )
+        logger.error("Executor rejected its runtime memory contract: %s", exc)
+        raise
     except Exception:
         logger.exception("Executor subprocess failed")
         raise

@@ -240,6 +240,9 @@ class Node:
     # scheduler never stores the credential itself; this field only binds a
     # ready, allocated worker to consumption admission for the same account.
     account_hash: Optional[str] = None
+    # Structured, epoch-fenced backend materialization failure. This is not a
+    # free-form exception and is consumed only by the bounded context replan.
+    memory_contract_failure: Optional[Dict[str, object]] = None
 
     _force_max_concurrent_requests: bool = False
 
@@ -272,6 +275,7 @@ class Node:
         self.reachable_peer_ids = registration.reachable_peer_ids
         self.relayed_peer_ids = registration.relayed_peer_ids
         self.account_hash = registration.account_hash
+        self.memory_contract_failure = registration.memory_contract_failure
 
         self.last_heartbeat = time.time()
 
@@ -372,7 +376,11 @@ class Node:
         return self.current_requests
 
     def get_decoder_layer_capacity(
-        self, include_input_embed: bool = False, include_lm_head: bool = False
+        self,
+        include_input_embed: bool = False,
+        include_lm_head: bool = False,
+        *,
+        context_tokens: int = 0,
     ) -> int:
         """Return how many decoder layers this node can store for parameters.
 
@@ -387,6 +395,50 @@ class Node:
             if reported_usable is not None and int(reported_usable) >= 0
             else physical_memory_bytes
         )
+        exact_profile = self.model_info.exact_weight_profile(
+            using_mlx=self.hardware.device == "mlx"
+        )
+        if exact_profile is not None:
+            target_context = max(0, int(context_tokens))
+            per_layer_kv_bytes = self.model_info.per_token_per_layer_kv_size * target_context
+
+            def required_bytes(start_layer: int, end_layer: int) -> int:
+                decoder_count = end_layer - start_layer
+                return (
+                    exact_profile.range_bytes(
+                        start_layer,
+                        end_layer,
+                        owns_input=include_input_embed,
+                        owns_output=include_lm_head,
+                    )
+                    + decoder_count * per_layer_kv_bytes
+                )
+
+            # Endpoint stages have a fixed side of the model.  Interior stages
+            # use the largest same-length window so a scalar DP capacity never
+            # claims that an arbitrary range fits merely because a lighter one
+            # does.
+            for decoder_count in range(self.model_info.num_layers, 0, -1):
+                if include_input_embed:
+                    windows = ((0, decoder_count),)
+                elif include_lm_head:
+                    windows = (
+                        (
+                            self.model_info.num_layers - decoder_count,
+                            self.model_info.num_layers,
+                        ),
+                    )
+                else:
+                    windows = (
+                        (start, start + decoder_count)
+                        for start in range(self.model_info.num_layers - decoder_count + 1)
+                    )
+                if all(
+                    required_bytes(start, end) <= capacity_memory_bytes for start, end in windows
+                ):
+                    return decoder_count
+            return 0
+
         available_memory_bytes = floor(capacity_memory_bytes * self.param_mem_ratio)
         if include_input_embed:
             available_memory_bytes -= self.model_info.embedding_io_bytes
