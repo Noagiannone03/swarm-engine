@@ -76,6 +76,7 @@ def test_cluster_node_info_exposes_measured_kv_capacity():
         reserved_context_tokens=10048,
         remaining_context_tokens=55488,
         direct_peer_ids={"next-worker"},
+        rtt_to_nodes={"next-worker": 12.5},
         hardware=SimpleNamespace(num_gpus=1, gpu_name="RTX", memory_gb=16.0),
     )
 
@@ -88,6 +89,7 @@ def test_cluster_node_info_exposes_measured_kv_capacity():
     assert info["remaining_context_tokens"] == 55488
     assert info["direct_link_telemetry_ready"] is True
     assert info["direct_peer_ids"] == ["next-worker"]
+    assert info["rtt_to_nodes_ms"] == {"next-worker": 12.5}
 
 
 def test_context_tokenizer_is_canonical_cached_and_offline_aware():

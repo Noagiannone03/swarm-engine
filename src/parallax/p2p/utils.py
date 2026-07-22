@@ -44,6 +44,34 @@ def mdns_enabled_for_topology(
     return True
 
 
+def log_nat_traversal_preflight(lattica, logger) -> bool | None:
+    """Log Lattica's UDP NAT classification without treating it as a verdict.
+
+    Lattica currently derives this value from UDP STUN mappings.  A symmetric
+    result can make UDP hole punching harder, but it cannot prove that every
+    TCP/QUIC DCUtR attempt will fail.  Connectivity is therefore qualified by
+    the real RPC probes after peers connect, not by terminating the process at
+    this advisory preflight.
+    """
+
+    try:
+        is_symmetric_nat = lattica.is_symmetric_nat()
+    except Exception:
+        logger.exception("Could not classify the UDP NAT; continuing with live connectivity probes")
+        return None
+
+    if is_symmetric_nat is None:
+        logger.warning("UDP NAT classification unavailable; continuing with live connectivity probes")
+    elif is_symmetric_nat:
+        logger.warning(
+            "Symmetric UDP NAT detected; continuing with relay-assisted DCUtR. "
+            "Only peers that pass a real direct RPC probe will be eligible for routing."
+        )
+    else:
+        logger.info("UDP NAT classification is compatible with standard hole punching")
+    return is_symmetric_nat
+
+
 def switch_to_uvloop() -> asyncio.AbstractEventLoop:
     """Stop any running event loop, then create and set a fresh loop."""
     try:

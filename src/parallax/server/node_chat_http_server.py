@@ -14,7 +14,7 @@ from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import State
 
 from backend.server.rpc_connection_handler import RPCConnectionHandler
-from parallax.p2p.utils import mdns_enabled_for_topology
+from parallax.p2p.utils import log_nat_traversal_preflight, mdns_enabled_for_topology
 from parallax_utils.file_util import get_project_root
 from parallax_utils.logging_config import get_logger
 
@@ -123,17 +123,7 @@ class NodeChatHttpServer:
         self.lattica.build()
 
         if len(self.relay_servers) > 0:
-            try:
-                is_symmetric_nat = self.lattica.is_symmetric_nat()
-                if is_symmetric_nat is None:
-                    logger.warning("Failed to get is symmetric NAT, skip")
-                elif is_symmetric_nat:
-                    logger.error(
-                        "Your network NAT type is symmetric, relay does not work on this type of NAT, see https://en.wikipedia.org/wiki/Network_address_translation"
-                    )
-                    exit(1)
-            except Exception as e:
-                logger.exception(f"Error in is symmetric NAT: {e}, skip")
+            log_nat_traversal_preflight(self.lattica, logger)
 
         if self.scheduler_addr == "auto":
             self.scheduler_peer_id = None

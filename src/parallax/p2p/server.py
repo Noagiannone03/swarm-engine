@@ -25,7 +25,7 @@ from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stre
 from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 from parallax.p2p.proto import forward_pb2
-from parallax.p2p.utils import AsyncWorker, mdns_enabled_for_topology
+from parallax.p2p.utils import AsyncWorker, log_nat_traversal_preflight, mdns_enabled_for_topology
 from parallax.server.server_info import detect_node_hardware
 from parallax.server.vllm_rust_frontend import vllm_rust_frontend_available
 from parallax.utils.shared_state import SharedState
@@ -548,17 +548,7 @@ class GradientServer:
         self.lattica.build()
 
         if len(self.relay_servers) > 0:
-            try:
-                is_symmetric_nat = self.lattica.is_symmetric_nat()
-                if is_symmetric_nat is None:
-                    logger.warning("Failed to get is symmetric NAT, skip")
-                elif is_symmetric_nat:
-                    logger.error(
-                        "Your network NAT type is symmetric, relay does not work on this type of NAT, see https://en.wikipedia.org/wiki/Network_address_translation"
-                    )
-                    exit(1)
-            except Exception as e:
-                logger.exception(f"Error in is symmetric NAT: {e}")
+            log_nat_traversal_preflight(self.lattica, logger)
 
         if self.scheduler_addr == "auto":
             self.scheduler_peer_id = None

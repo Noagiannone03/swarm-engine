@@ -10,7 +10,7 @@ from backend.server.rpc_connection_handler import RPCConnectionHandler
 from backend.server.static_config import get_model_info, get_node_join_command
 from parallax.cli import PUBLIC_INITIAL_PEERS, PUBLIC_RELAY_SERVERS
 from parallax.p2p.server import TransformerConnectionHandler
-from parallax.p2p.utils import mdns_enabled_for_topology
+from parallax.p2p.utils import log_nat_traversal_preflight, mdns_enabled_for_topology
 from parallax_utils.logging_config import get_logger
 from scheduling.node import RequestSignal
 from scheduling.scheduler import Scheduler
@@ -204,6 +204,7 @@ class SchedulerManage:
                 if getattr(node, "direct_peer_ids", None) is not None
                 else None
             ),
+            "rtt_to_nodes_ms": dict(getattr(node, "rtt_to_nodes", {}) or {}),
         }
 
     def _start_scheduler(self, model_name, init_nodes_num):
@@ -294,17 +295,7 @@ class SchedulerManage:
         logger.debug("Lattica node built")
 
         if len(self.relay_servers) > 0:
-            try:
-                is_symmetric_nat = self.lattica.is_symmetric_nat()
-                if is_symmetric_nat is None:
-                    logger.warning("Failed to get is symmetric NAT, skip")
-                elif is_symmetric_nat:
-                    logger.error(
-                        "Your network NAT type is symmetric, relay does not work on this type of NAT, see https://en.wikipedia.org/wiki/Network_address_translation"
-                    )
-                    exit(1)
-            except Exception as e:
-                logger.exception(f"Error in is symmetric NAT: {e}")
+            log_nat_traversal_preflight(self.lattica, logger)
 
         store_success = False
         for _ in range(10):
