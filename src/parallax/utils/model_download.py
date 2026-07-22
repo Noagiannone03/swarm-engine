@@ -128,12 +128,28 @@ def selective_model_download(
                 logger.info(f"Downloading {len(missing_weight_files)} weight files")
                 logger.debug(f"Downloading weight files: {missing_weight_files}")
                 try:
-                    download_model_snapshot(
-                        repo_id=repo_id,
-                        allow_patterns=missing_weight_files,
-                        local_files_only=local_files_only,
-                        revision=revision,
-                    )
+                    # ``snapshot_download`` downloads files concurrently (eight
+                    # workers by default).  That is useful for many small
+                    # artifacts, but large checkpoint shards can leave several
+                    # long-lived HTTP transfers competing for the same home
+                    # connection.  Download the exact shard set serially with
+                    # the Hub's supported single-file API instead.  We retain
+                    # its cache locking, integrity checks and resumable
+                    # ``.incomplete`` files without implementing transport code
+                    # of our own.
+                    for index, weight_file in enumerate(missing_weight_files, start=1):
+                        logger.info(
+                            "Downloading weight shard %d/%d: %s",
+                            index,
+                            len(missing_weight_files),
+                            weight_file,
+                        )
+                        download_model_file(
+                            repo_id=repo_id,
+                            filename=weight_file,
+                            local_files_only=local_files_only,
+                            revision=revision,
+                        )
                 except Exception as e:
                     logger.error(
                         f"Failed to download weight files {missing_weight_files} "

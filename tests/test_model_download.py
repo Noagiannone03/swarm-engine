@@ -27,7 +27,7 @@ def test_snapshot_download_forwards_immutable_revision(tmp_path):
     )
 
 
-def test_selective_download_fetches_needed_weights_in_one_snapshot_call(tmp_path):
+def test_selective_download_fetches_needed_weights_serially(tmp_path):
     model_path = tmp_path / "model"
     model_path.mkdir()
     (model_path / "config.json").write_text(json.dumps({"num_hidden_layers": 4}))
@@ -59,13 +59,20 @@ def test_selective_download_fetches_needed_weights_in_one_snapshot_call(tmp_path
         )
 
     assert result == model_path
-    assert download_snapshot.call_count == 2
-    assert all(
-        call.kwargs["revision"] == "immutable-sha"
-        for call in download_snapshot.call_args_list
-    )
-    assert download_snapshot.call_args_list[1].kwargs["allow_patterns"] == [
-        "layer-1-attn.safetensors",
-        "layer-1-mlp.safetensors",
+    download_snapshot.assert_called_once()
+    assert download_snapshot.call_args.kwargs["revision"] == "immutable-sha"
+    assert download_file.call_count == 2
+    assert [call.kwargs for call in download_file.call_args_list] == [
+        {
+            "repo_id": "remote-org/remote-model",
+            "filename": "layer-1-attn.safetensors",
+            "local_files_only": False,
+            "revision": "immutable-sha",
+        },
+        {
+            "repo_id": "remote-org/remote-model",
+            "filename": "layer-1-mlp.safetensors",
+            "local_files_only": False,
+            "revision": "immutable-sha",
+        },
     ]
-    download_file.assert_not_called()
