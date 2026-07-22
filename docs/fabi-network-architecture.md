@@ -108,7 +108,7 @@ are captured in the IDE handoff.
   endpoints discovered a local direct candidate and upgraded to a selected
   direct path (`10.0.1.54`, about 0.22 ms RTT) while retaining relay fallback.
 - The real scheduler `node_update` handler passed through Iroh with reachable
-  and relayed topology telemetry. The full Python suite is green at 417 passed
+  and relayed topology telemetry. The full Python suite is green at 418 passed
   and 7 skipped (the additional skip is the opt-in live-relay regression);
   Rust unit tests and strict Clippy are green.
 
