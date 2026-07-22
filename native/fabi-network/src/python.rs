@@ -43,6 +43,24 @@ const STREAM_CANCEL_CODE: u32 = 0xFAB1;
 type RpcResponse = std::result::Result<Vec<u8>, String>;
 type ConnectionCache = Arc<tokio::sync::Mutex<HashMap<EndpointId, Connection>>>;
 
+#[derive(Clone)]
+struct InboundDispatcher {
+    sender: SyncSender<InboundRequest>,
+    max_payload: u64,
+    response_timeout: Duration,
+}
+
+impl InboundDispatcher {
+    fn spawn(&self, connection: Connection) {
+        tokio::spawn(handle_rpc_connection(
+            connection,
+            self.sender.clone(),
+            self.max_payload,
+            self.response_timeout,
+        ));
+    }
+}
+
 enum InboundResponse {
     Unary(oneshot::Sender<RpcResponse>),
     Stream(tokio_mpsc::Sender<RpcResponse>),
@@ -290,6 +308,7 @@ struct PyNetworkNode {
     endpoint: Endpoint,
     relay_url: RelayUrl,
     incoming: Arc<Mutex<Receiver<InboundRequest>>>,
+    dispatcher: InboundDispatcher,
     connections: ConnectionCache,
     request_id: AtomicU64,
     max_payload: u64,
@@ -340,14 +359,17 @@ impl PyNetworkNode {
             .detach(move || runtime_for_bind.block_on(bind(secret_key, &config)))
             .map_err(py_error)?;
         let (incoming_tx, incoming_rx) = sync_channel(INBOUND_QUEUE_CAPACITY);
+        let dispatcher = InboundDispatcher {
+            sender: incoming_tx,
+            max_payload: max_payload_bytes,
+            response_timeout: Duration::from_secs(response_timeout_seconds),
+        };
         let connections = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         runtime.spawn(accept_loop(
             endpoint.clone(),
-            incoming_tx,
+            dispatcher.clone(),
             Arc::clone(&connections),
-            max_payload_bytes,
-            Duration::from_secs(response_timeout_seconds),
             Arc::clone(&closed),
         ));
 
@@ -356,6 +378,7 @@ impl PyNetworkNode {
             endpoint,
             relay_url,
             incoming: Arc::new(Mutex::new(incoming_rx)),
+            dispatcher,
             connections,
             request_id: AtomicU64::new(1),
             max_payload: max_payload_bytes,
@@ -381,6 +404,7 @@ impl PyNetworkNode {
         let peer_id = EndpointId::from_str(peer_id).map_err(py_error)?;
         let endpoint = self.endpoint.clone();
         let relay_url = self.relay_url.clone();
+        let dispatcher = self.dispatcher.clone();
         let connections = Arc::clone(&self.connections);
         let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
         let method = method.to_owned();
@@ -392,6 +416,7 @@ impl PyNetworkNode {
                 runtime.block_on(call_rpc(
                     endpoint,
                     relay_url,
+                    dispatcher,
                     connections,
                     peer_id,
                     request_id,
@@ -418,6 +443,7 @@ impl PyNetworkNode {
         let peer_id = EndpointId::from_str(peer_id).map_err(py_error)?;
         let endpoint = self.endpoint.clone();
         let relay_url = self.relay_url.clone();
+        let dispatcher = self.dispatcher.clone();
         let connections = Arc::clone(&self.connections);
         let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
         let method = method.to_owned();
@@ -438,6 +464,7 @@ impl PyNetworkNode {
             if let Err(error) = call_stream_rpc(
                 endpoint,
                 relay_url,
+                dispatcher,
                 connections,
                 peer_id,
                 request_id,
@@ -596,10 +623,8 @@ fn py_error(error: impl std::fmt::Display) -> PyErr {
 
 async fn accept_loop(
     endpoint: Endpoint,
-    incoming_tx: SyncSender<InboundRequest>,
+    dispatcher: InboundDispatcher,
     connections: ConnectionCache,
-    max_payload: u64,
-    response_timeout: Duration,
     closed: Arc<AtomicBool>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
@@ -632,17 +657,16 @@ async fn accept_loop(
                 continue;
             }
         };
+        // A simultaneous cross-dial can produce two valid QUIC connections.
+        // Keep the already cached one as the preferred outbound connection,
+        // but serve streams on this incoming connection as well: it may
+        // already carry the RPC which caused Endpoint::accept to wake up.
         connections
             .lock()
             .await
-            .insert(connection.remote_id(), connection.clone());
-        let sender = incoming_tx.clone();
-        tokio::spawn(handle_rpc_connection(
-            connection,
-            sender,
-            max_payload,
-            response_timeout,
-        ));
+            .entry(connection.remote_id())
+            .or_insert_with(|| connection.clone());
+        dispatcher.spawn(connection);
     }
 }
 
@@ -834,6 +858,7 @@ async fn write_stream_frame_or_stopped(
 async fn call_rpc(
     endpoint: Endpoint,
     relay_url: RelayUrl,
+    dispatcher: InboundDispatcher,
     connections: ConnectionCache,
     peer_id: EndpointId,
     request_id: u64,
@@ -848,7 +873,8 @@ async fn call_rpc(
             u64::try_from(payload.len()).unwrap_or(u64::MAX) <= max_payload,
             "RPC request exceeds configured payload limit"
         );
-        let connection = get_connection(&endpoint, relay_url, &connections, peer_id).await?;
+        let connection =
+            get_connection(&endpoint, relay_url, &dispatcher, &connections, peer_id).await?;
         let (mut send, mut recv) = connection
             .open_bi()
             .await
@@ -891,6 +917,7 @@ async fn call_rpc(
 async fn call_stream_rpc(
     endpoint: Endpoint,
     relay_url: RelayUrl,
+    dispatcher: InboundDispatcher,
     connections: ConnectionCache,
     peer_id: EndpointId,
     request_id: u64,
@@ -907,7 +934,7 @@ async fn call_stream_rpc(
     );
     let connection = tokio::select! {
         _ = &mut cancel => return Ok(()),
-        result = get_connection(&endpoint, relay_url, &connections, peer_id) => result?,
+        result = get_connection(&endpoint, relay_url, &dispatcher, &connections, peer_id) => result?,
     };
     let (mut send, mut recv) = tokio::select! {
         _ = &mut cancel => return Ok(()),
@@ -1005,6 +1032,7 @@ fn cancel_quic_stream(
 async fn get_connection(
     endpoint: &Endpoint,
     relay_url: RelayUrl,
+    dispatcher: &InboundDispatcher,
     connections: &ConnectionCache,
     peer_id: EndpointId,
 ) -> Result<Connection> {
@@ -1019,8 +1047,25 @@ async fn get_connection(
         .connect(remote, ALPN)
         .await
         .context("failed to connect RPC peer")?;
-    connections.lock().await.insert(peer_id, connection.clone());
-    Ok(connection)
+    let selected = {
+        let mut cache = connections.lock().await;
+        if let Some(existing) = cache
+            .get(&peer_id)
+            .filter(|existing| existing.close_reason().is_none())
+            .cloned()
+        {
+            existing
+        } else {
+            cache.insert(peer_id, connection.clone());
+            dispatcher.spawn(connection.clone());
+            return Ok(connection);
+        }
+    };
+
+    // Another task or a simultaneous inbound connection won the race. Avoid
+    // leaking an unused parallel connection and reuse the registered one.
+    connection.close(0u8.into(), b"superseded connection");
+    Ok(selected)
 }
 
 #[pymodule(gil_used = false)]
@@ -1030,4 +1075,106 @@ fn fabi_network_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRpcStream>()?;
     module.add("PROTOCOL_VERSION", 1)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::sync_channel;
+
+    use anyhow::{Context, Result, anyhow, bail, ensure};
+    use iroh::{Endpoint, RelayMode, endpoint::presets};
+
+    use super::*;
+
+    async fn direct_endpoint() -> Result<Endpoint> {
+        Endpoint::builder(presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .context("failed to bind direct test endpoint")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dialed_connection_serves_reverse_rpc() -> Result<()> {
+        let listener = direct_endpoint().await?;
+        let dialer = direct_endpoint().await?;
+
+        let accepting_endpoint = listener.clone();
+        let accept_task = tokio::spawn(async move {
+            let incoming = accepting_endpoint
+                .accept()
+                .await
+                .context("listener closed before accepting")?;
+            incoming
+                .accept()
+                .context("failed to accept direct connection")?
+                .await
+                .context("direct connection handshake failed")
+        });
+        let outbound_connection = tokio::time::timeout(
+            Duration::from_secs(5),
+            dialer.connect(listener.addr(), ALPN),
+        )
+        .await
+        .context("direct dial timed out")?
+        .context("failed to dial direct endpoint")?;
+        let accepted = tokio::time::timeout(Duration::from_secs(5), accept_task)
+            .await
+            .context("direct accept timed out")?
+            .context("accept task panicked")??;
+
+        // The dialer initiated the QUIC connection. It must still accept a new
+        // bidirectional stream opened later by the listening peer.
+        let (dialer_tx, dialer_rx) = sync_channel(1);
+        let dialer_dispatcher = InboundDispatcher {
+            sender: dialer_tx,
+            max_payload: DEFAULT_MAX_PAYLOAD,
+            response_timeout: Duration::from_secs(5),
+        };
+        dialer_dispatcher.spawn(outbound_connection);
+        let responder = tokio::task::spawn_blocking(move || -> Result<()> {
+            let request = dialer_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("dialer never accepted the reverse RPC stream")?;
+            ensure!(request.method == "test.reverse", "unexpected RPC method");
+            ensure!(request.body == b"ping", "unexpected RPC body");
+            match request.response {
+                InboundResponse::Unary(sender) => sender
+                    .send(Ok(b"pong".to_vec()))
+                    .map_err(|_| anyhow!("reverse RPC caller stopped waiting")),
+                InboundResponse::Stream(_) => bail!("expected a unary reverse RPC"),
+            }
+        });
+
+        let connections = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            dialer.id(),
+            accepted,
+        )])));
+        let (unused_tx, _unused_rx) = sync_channel(1);
+        let listener_dispatcher = InboundDispatcher {
+            sender: unused_tx,
+            max_payload: DEFAULT_MAX_PAYLOAD,
+            response_timeout: Duration::from_secs(5),
+        };
+        let reply = call_rpc(
+            listener.clone(),
+            RelayUrl::from_str("https://unused.invalid")?,
+            listener_dispatcher,
+            connections,
+            dialer.id(),
+            1,
+            "test.reverse".to_owned(),
+            b"ping".to_vec(),
+            DEFAULT_MAX_PAYLOAD,
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        ensure!(reply == b"pong", "unexpected reverse RPC response");
+        responder.await.context("responder task panicked")??;
+        listener.close().await;
+        dialer.close().await;
+        Ok(())
+    }
 }

@@ -16,6 +16,8 @@ The optional PyO3 extension exposes the same endpoint as `NetworkNode`.
 - unary calls return standard Python futures;
 - server-streaming calls use one cancellable QUIC stream per request;
 - cancellation resets only that stream, never the shared peer connection;
+- every accepted or dialed QUIC connection serves incoming streams, so RPCs
+  remain bidirectional after either peer establishes the connection;
 - handlers are dispatched concurrently so long generations cannot block
   scheduler heartbeats;
 - application values use an explicit codec byte followed by MessagePack,
