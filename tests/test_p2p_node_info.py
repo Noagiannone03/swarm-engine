@@ -360,6 +360,27 @@ def test_worker_builds_iroh_with_explicit_scheduler_endpoint(monkeypatch):
     assert server.scheduler_peer_id == "scheduler-endpoint"
 
 
+def test_worker_qualifies_scheduler_before_reading_connection_telemetry():
+    path = {"kind": "relay", "selected": True, "rtt_ms": 42.0}
+    transport = SimpleNamespace(selected_path=lambda peer_id: path)
+    server = GradientServer.__new__(GradientServer)
+    server.iroh_transport = transport
+    server.scheduler_peer_id = "scheduler-endpoint"
+    server.scheduler_stub = ProbeStub(ProbeFuture({"peer_id": "scheduler-endpoint"}))
+
+    server._qualify_iroh_scheduler()
+
+
+def test_worker_rejects_wrong_scheduler_health_identity():
+    server = GradientServer.__new__(GradientServer)
+    server.iroh_transport = SimpleNamespace(selected_path=lambda peer_id: None)
+    server.scheduler_peer_id = "scheduler-endpoint"
+    server.scheduler_stub = ProbeStub(ProbeFuture({"peer_id": "different-endpoint"}))
+
+    with pytest.raises(RuntimeError, match="wrong endpoint identity"):
+        server._qualify_iroh_scheduler()
+
+
 @pytest.mark.parametrize("scheduler_addr", [None, "auto", "/ip4/127.0.0.1/tcp/1"])
 def test_worker_iroh_rejects_implicit_or_lattica_scheduler_address(scheduler_addr):
     server = GradientServer.__new__(GradientServer)

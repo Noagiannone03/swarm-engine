@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from backend.server.contribution_gate import account_hash
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 
@@ -56,6 +58,13 @@ class AllocationScheduler:
     def chunked_prefill_size_for_node(self, node_id):
         assert node_id in self.nodes
         return self.negotiated_chunked_prefill_size()
+
+
+def test_scheduler_health_returns_iroh_transport_identity():
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.iroh_transport = SimpleNamespace(peer_id=lambda: "scheduler-endpoint")
+
+    assert handler.rpc_health({}) == {"peer_id": "scheduler-endpoint"}
 
 
 def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():

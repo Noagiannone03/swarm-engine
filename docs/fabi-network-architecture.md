@@ -108,7 +108,7 @@ are captured in the IDE handoff.
   endpoints discovered a local direct candidate and upgraded to a selected
   direct path (`10.0.1.54`, about 0.22 ms RTT) while retaining relay fallback.
 - The real scheduler `node_update` handler passed through Iroh with reachable
-  and relayed topology telemetry. The full Python suite is green at 418 passed
+  and relayed topology telemetry. The full Python suite is green at 424 passed
   and 7 skipped (the additional skip is the opt-in live-relay regression);
   Rust unit tests and strict Clippy are green.
 
@@ -130,8 +130,16 @@ exists only for qualification. Scheduler and worker identities default to
 `~/.fabi/network/{role}.key`, or can be set with
 `FABI_NETWORK_IDENTITY_PATH`.
 
+An Iroh endpoint ID is an address to dial, not an already-established peer.
+Workers therefore authenticate the scheduler with `rpc_health` first; that
+RPC opens the QUIC connection through direct discovery or the relay. Only then
+does the worker read path/RTT telemetry and send `node_join`. Requiring the
+scheduler in `peers()` before the first dial creates an impossible bootstrap
+cycle and is explicitly covered by the worker qualification tests.
+
 Before making Iroh the default, the remaining gates are a complete two-worker
-model load and generation (prefill, decode, SSE and abort), Windows/macOS wheel
-packaging, path-aware bandwidth measurement, relay failover and production
-credential bootstrap. Weight refit remains intentionally disabled on Iroh
-until a separate content-addressed plane is qualified.
+model load and generation (prefill, decode, SSE and abort), relay failover and
+production credential bootstrap. Native ABI3 wheels have been built and smoke
+tested on macOS arm64, Windows amd64 and Linux amd64. Weight refit remains
+intentionally disabled on Iroh until a separate content-addressed plane is
+qualified.

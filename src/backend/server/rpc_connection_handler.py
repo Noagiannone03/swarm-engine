@@ -64,6 +64,19 @@ class RPCConnectionHandler(ConnectionHandler):
         self.scheduler = scheduler
         self.http_port = http_port
 
+    @rpc_method
+    def rpc_health(self, request):
+        """Return the authenticated scheduler identity for connection warm-up."""
+
+        del request
+        transport = getattr(self, "iroh_transport", None)
+        if transport is not None:
+            return {"peer_id": transport.peer_id()}
+        lattica = getattr(self, "lattica_instance", None)
+        if lattica is not None:
+            return {"peer_id": lattica.peer_id()}
+        raise RuntimeError("scheduler network transport is not initialized")
+
     @rpc_stream
     def node_join(self, message):
         # node = {

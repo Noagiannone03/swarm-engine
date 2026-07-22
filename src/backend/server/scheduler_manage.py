@@ -364,6 +364,7 @@ class SchedulerManage:
             scheduler=self.scheduler,
             http_port=self.http_port,
         )
+        handler.iroh_transport = transport
         transport.register(handler)
         self.iroh_transport = transport
         # Keep the legacy attribute during the staged migration; callers only

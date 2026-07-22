@@ -604,6 +604,17 @@ class GradientServer:
         )
         return True
 
+    def _qualify_iroh_scheduler(self) -> None:
+        """Open and authenticate the scheduler connection before reading telemetry."""
+
+        if self.iroh_transport is None:
+            return
+        response = self.scheduler_stub.rpc_health({}).result(timeout=30)
+        if not isinstance(response, dict) or response.get("peer_id") != self.scheduler_peer_id:
+            raise RuntimeError("Iroh scheduler health response has the wrong endpoint identity")
+        path = self.iroh_transport.selected_path(self.scheduler_peer_id)
+        logger.info("Qualified Iroh scheduler connection: path=%s", path)
+
     def run(self):
         if self.build_lattica():
             logger.info(
@@ -624,6 +635,7 @@ class GradientServer:
                     self.scheduler_stub = RPCConnectionHandler(self.lattica, None, None).get_stub(
                         self.scheduler_peer_id
                     )
+                self._qualify_iroh_scheduler()
                 node_info = self.get_node_info()
                 if node_info == {}:
                     logger.error("Failed to get node info, try again after 10 seconds")
