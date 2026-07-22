@@ -31,6 +31,7 @@ def download_model_snapshot(
     local_dir: Optional[str | Path] = None,
     local_files_only: bool = False,
     revision: Optional[str] = None,
+    max_workers: int = 1,
 ) -> Path:
     if _use_modelscope():
         return Path(
@@ -51,6 +52,7 @@ def download_model_snapshot(
             local_dir=local_dir,
             local_files_only=local_files_only,
             revision=revision,
+            max_workers=max_workers,
         )
     )
 
@@ -93,12 +95,40 @@ def selective_model_download(
         return local_path
 
     logger.debug(f"Downloading model metadata for {repo_id}")
-    model_path = download_model_snapshot(
-        repo_id=repo_id,
-        ignore_patterns=_EXCLUDE_WEIGHT_PATTERNS,
-        local_files_only=local_files_only,
-        revision=revision,
-    )
+    model_path: Optional[Path] = None
+
+    # A commit SHA names immutable Hub content.  Prefer a complete cached
+    # metadata snapshot before contacting the network again: workers are often
+    # restarted after an interrupted multi-gigabyte checkpoint download, and a
+    # fresh remote validation can itself stall on constrained Windows/home
+    # connections.  Mutable revisions still go online so they cannot silently
+    # reuse stale metadata.
+    if not local_files_only and _is_immutable_commit_revision(revision):
+        try:
+            cached_path = download_model_snapshot(
+                repo_id=repo_id,
+                ignore_patterns=_EXCLUDE_WEIGHT_PATTERNS,
+                local_files_only=True,
+                revision=revision,
+            )
+            if _cached_metadata_snapshot_is_usable(cached_path):
+                model_path = cached_path
+                logger.info("Using cached immutable model metadata at %s", model_path)
+            else:
+                logger.debug("Cached metadata snapshot is incomplete: %s", cached_path)
+        except Exception as cache_error:
+            # This is a best-effort cache probe.  The normal online path below
+            # remains authoritative and will surface a useful error if it also
+            # fails.
+            logger.debug("Immutable metadata cache miss for %s: %s", repo_id, cache_error)
+
+    if model_path is None:
+        model_path = download_model_snapshot(
+            repo_id=repo_id,
+            ignore_patterns=_EXCLUDE_WEIGHT_PATTERNS,
+            local_files_only=local_files_only,
+            revision=revision,
+        )
     logger.debug(f"Downloaded model metadata to {model_path}")
 
     if start_layer is not None and end_layer is not None:
@@ -182,6 +212,42 @@ _EXCLUDE_WEIGHT_PATTERNS = [
     "model*.safetensors",
     "weight*.safetensors",
 ]
+
+_TOKENIZER_METADATA_CANDIDATES = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "spiece.model",
+    "vocab.json",
+)
+
+
+def _is_immutable_commit_revision(revision: Optional[str]) -> bool:
+    return bool(
+        revision
+        and len(revision) == 40
+        and all(character in "0123456789abcdefABCDEF" for character in revision)
+    )
+
+
+def _cached_metadata_snapshot_is_usable(model_path: Path) -> bool:
+    if not (model_path / "config.json").is_file():
+        return False
+    if not any((model_path / filename).is_file() for filename in _TOKENIZER_METADATA_CANDIDATES):
+        return False
+
+    # Sharded checkpoints need their index to map layers to files.  An
+    # unsharded checkpoint is usable only when its single weight file is
+    # already complete in the cache.
+    return any(
+        (model_path / filename).is_file()
+        for filename in (
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+            "model.safetensors",
+            "pytorch_model.bin",
+            "model.bin",
+        )
+    )
 
 
 def _determine_needed_weight_files_for_download(
