@@ -21,6 +21,14 @@ from swarm_protocol.contracts import (
     WorkerOffer,
     WorkerRole,
 )
+from swarm_protocol.discovery import (
+    CatalogRecordConflict,
+    DiscoveryError,
+    DiscoverySnapshot,
+    DiscoveryStore,
+    InMemoryDiscoveryStore,
+    StaleCatalogRecord,
+)
 from swarm_protocol.reservations import (
     CapacityUnavailable,
     InvalidReservationTransition,
@@ -60,6 +68,12 @@ __all__ = [
     "SpanState",
     "WorkerOffer",
     "WorkerRole",
+    "CatalogRecordConflict",
+    "DiscoveryError",
+    "DiscoverySnapshot",
+    "DiscoveryStore",
+    "InMemoryDiscoveryStore",
+    "StaleCatalogRecord",
     "CapacityUnavailable",
     "InvalidReservationTransition",
     "LocalReservationTable",
