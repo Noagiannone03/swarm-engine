@@ -55,6 +55,7 @@ packages = [
 [project.scripts]
 parallax = "parallax.cli:main"
 fabi-swarm-registry = "swarm_protocol.registry_operator:main"
+fabi-catalog-router = "swarm_protocol.catalog_router:main"
 
 [project.optional-dependencies]
 
