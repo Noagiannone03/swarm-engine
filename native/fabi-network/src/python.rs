@@ -102,6 +102,7 @@ fn catalog_kind_name(kind: CatalogRecordKind) -> &'static str {
         CatalogRecordKind::WorkerOffer => "worker_offer",
         CatalogRecordKind::SpanLease => "span_lease",
         CatalogRecordKind::LinkMetric => "link_metric",
+        CatalogRecordKind::ModelMember => "model_member",
         CatalogRecordKind::Unspecified => "unspecified",
     }
 }
@@ -112,6 +113,7 @@ fn parse_catalog_kind(kind: &str) -> PyResult<CatalogRecordKind> {
         "worker_offer" => Ok(CatalogRecordKind::WorkerOffer),
         "span_lease" => Ok(CatalogRecordKind::SpanLease),
         "link_metric" => Ok(CatalogRecordKind::LinkMetric),
+        "model_member" => Ok(CatalogRecordKind::ModelMember),
         _ => Err(PyRuntimeError::new_err(format!(
             "unsupported catalogue record kind {kind:?}"
         ))),
@@ -543,6 +545,9 @@ impl PyNetworkNode {
                 let target = EndpointId::from_str(target).map_err(py_error)?;
                 Ok(catalog::keys::link_metric(&source, &target))
             }
+            CatalogRecordKind::ModelMember => model_swarm_id
+                .map(|model| catalog::keys::model_member(model, &source))
+                .ok_or_else(|| PyRuntimeError::new_err("model_swarm_id is required")),
             CatalogRecordKind::Unspecified => Err(PyRuntimeError::new_err(
                 "catalogue record kind is unspecified",
             )),
@@ -657,6 +662,32 @@ impl PyNetworkNode {
         let runtime = Arc::clone(&self.runtime);
         py.detach(move || runtime.block_on(handle.get(logical_key)))
             .map(PyCatalogRecord::from)
+            .map_err(py_error)
+    }
+
+    fn catalog_get_members(
+        &self,
+        py: Python<'_>,
+        logical_key: &str,
+    ) -> PyResult<Vec<PyCatalogRecord>> {
+        let handle = self.catalog_dht_handle()?;
+        let logical_key = logical_key.to_owned();
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(move || runtime.block_on(handle.get_members(logical_key)))
+            .map(|records| records.into_iter().map(PyCatalogRecord::from).collect())
+            .map_err(py_error)
+    }
+
+    fn catalog_get_model_members(
+        &self,
+        py: Python<'_>,
+        model_swarm_id: &str,
+    ) -> PyResult<Vec<PyCatalogRecord>> {
+        let handle = self.catalog_dht_handle()?;
+        let model_swarm_id = model_swarm_id.to_owned();
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(move || runtime.block_on(handle.get_model_members(&model_swarm_id)))
+            .map(|records| records.into_iter().map(PyCatalogRecord::from).collect())
             .map_err(py_error)
     }
 

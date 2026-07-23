@@ -8,6 +8,7 @@ from swarm_protocol.contracts import (
     KvGeometry,
     LayerSpan,
     LinkMetric,
+    ModelMemberAdvertisement,
     ModelManifest,
     PathKind,
     RecoveryLevel,
@@ -29,6 +30,7 @@ from swarm_protocol.discovery import (
     InMemoryDiscoveryStore,
     StaleCatalogRecord,
 )
+from swarm_protocol.dht_discovery import DhtDiscoveryStore
 from swarm_protocol.reservations import (
     CapacityUnavailable,
     InvalidReservationTransition,
@@ -56,6 +58,7 @@ __all__ = [
     "KvGeometry",
     "LayerSpan",
     "LinkMetric",
+    "ModelMemberAdvertisement",
     "ModelManifest",
     "PathKind",
     "RecoveryLevel",
@@ -74,6 +77,7 @@ __all__ = [
     "DiscoveryStore",
     "InMemoryDiscoveryStore",
     "StaleCatalogRecord",
+    "DhtDiscoveryStore",
     "CapacityUnavailable",
     "InvalidReservationTransition",
     "LocalReservationTable",

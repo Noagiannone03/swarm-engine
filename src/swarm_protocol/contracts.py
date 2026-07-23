@@ -216,6 +216,30 @@ class SpanLease(ContractModel):
         return self
 
 
+class ModelMemberAdvertisement(ContractModel):
+    """Self-contained planning view carried by one signed model-membership subkey.
+
+    This mirrors Petals' per-peer ``ServerInfo`` value: one DHT read yields the worker offer,
+    hosted span and its recent outgoing link observations without an N+1 catalogue lookup.
+    """
+
+    protocol_version: int = PROTOCOL_VERSION
+    offer: WorkerOffer
+    lease: SpanLease
+    outgoing_links: tuple[LinkMetric, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_member(self) -> Self:
+        if self.protocol_version != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version: {self.protocol_version}")
+        if self.offer.worker_id != self.lease.worker_id:
+            raise ValueError("member offer and span lease identify different workers")
+        for metric in self.outgoing_links:
+            if metric.from_worker_id != self.offer.worker_id:
+                raise ValueError("member link source must match the advertised worker")
+        return self
+
+
 class RequestContract(ContractModel):
     request_id: NonEmpty
     model_swarm_id: HashHex

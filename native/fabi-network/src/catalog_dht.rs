@@ -20,7 +20,8 @@ use libp2p::{
     Multiaddr, PeerId, SwarmBuilder, identify,
     identity::Keypair,
     kad::{
-        self, GetRecordOk, InboundRequest, Mode, QueryId, QueryResult, Quorum, Record, RecordKey,
+        self, GetRecordError, GetRecordOk, InboundRequest, Mode, QueryId, QueryResult, Quorum,
+        Record, RecordKey,
         store::{MemoryStore, MemoryStoreConfig, RecordStore},
     },
     noise,
@@ -29,7 +30,10 @@ use libp2p::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-use crate::catalog::{MAX_CATALOG_RECORD_BYTES, ValidatedCatalogRecord, verify_catalog_record};
+use crate::catalog::{
+    CatalogRecordKind, MAX_CATALOG_SET_BYTES, ValidatedCatalogRecord, keys,
+    merge_catalog_membership_values, verify_catalog_membership_value, verify_catalog_record,
+};
 
 const DHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/fabi/swarm/kad/3");
 const IDENTIFY_PROTOCOL: &str = "/fabi/swarm/identify/3";
@@ -180,6 +184,10 @@ enum Command {
         logical_key: String,
         reply: oneshot::Sender<Result<ValidatedCatalogRecord>>,
     },
+    GetMembers {
+        logical_key: String,
+        reply: oneshot::Sender<Result<Vec<ValidatedCatalogRecord>>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -192,6 +200,11 @@ enum PendingQuery {
         logical_key: String,
         best: Option<ValidatedCatalogRecord>,
         reply: oneshot::Sender<Result<ValidatedCatalogRecord>>,
+    },
+    GetMembers {
+        logical_key: String,
+        values: Vec<Vec<u8>>,
+        reply: oneshot::Sender<Result<Vec<ValidatedCatalogRecord>>>,
     },
 }
 
@@ -270,6 +283,54 @@ impl CatalogDhtHandle {
         receive.await.context("catalogue get reply dropped")?
     }
 
+    /// Fetch and merge all independently signed live members of one model shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shard has no valid live members or the event loop has stopped.
+    pub async fn get_members(
+        &self,
+        logical_key: impl Into<String>,
+    ) -> Result<Vec<ValidatedCatalogRecord>> {
+        let (reply, receive) = oneshot::channel();
+        self.commands
+            .send(Command::GetMembers {
+                logical_key: logical_key.into(),
+                reply,
+            })
+            .await
+            .context("catalogue DHT event loop stopped")?;
+        receive
+            .await
+            .context("catalogue membership lookup reply dropped")?
+    }
+
+    /// Fetch all deterministic membership shards for one model with bounded concurrency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any shard lookup fails, preventing a partial network view from being
+    /// mistaken for a complete discovery snapshot.
+    pub async fn get_model_members(
+        &self,
+        model_swarm_id: &str,
+    ) -> Result<Vec<ValidatedCatalogRecord>> {
+        let lookups = futures::stream::iter(keys::all_model_membership_shards(model_swarm_id))
+            .map(|logical_key| {
+                let handle = self.clone();
+                async move { handle.get_members(logical_key).await }
+            })
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
+        let mut members = Vec::new();
+        for lookup in lookups {
+            members.extend(lookup?);
+        }
+        members.sort_by_key(|record| record.publisher_endpoint_id.to_string());
+        Ok(members)
+    }
+
     /// Stop the DHT event loop and close its transports.
     ///
     /// # Errors
@@ -323,28 +384,105 @@ fn instant_expiry(expires_at_ms: u64) -> Result<Instant> {
     Ok(Instant::now() + Duration::from_millis(remaining))
 }
 
+fn membership_expiry(
+    expected_key: &str,
+    encoded: &[u8],
+    max_clock_skew: Duration,
+) -> Result<Instant> {
+    let skew_ms = max_clock_skew
+        .as_millis()
+        .try_into()
+        .context("clock skew exceeds u64 milliseconds")?;
+    let latest_expiry = verify_catalog_membership_value(expected_key, encoded, now_ms()?, skew_ms)?
+        .into_iter()
+        .map(|record| record.expires_at_ms)
+        .max()
+        .context("catalogue membership set is empty")?;
+    instant_expiry(latest_expiry)
+}
+
+fn merge_membership_inbound(
+    behaviour: &mut CatalogueBehaviour,
+    record: Record,
+    expected_key: &str,
+    max_clock_skew: Duration,
+) {
+    let current = behaviour
+        .kad
+        .store_mut()
+        .get(&record.key)
+        .map(|stored| stored.into_owned().value);
+    let Ok(skew_ms) = max_clock_skew.as_millis().try_into() else {
+        return;
+    };
+    let Ok(timestamp) = now_ms() else {
+        return;
+    };
+    let merged = match current.as_deref() {
+        Some(existing) => merge_catalog_membership_values(
+            expected_key,
+            [existing, record.value.as_slice()],
+            timestamp,
+            skew_ms,
+        ),
+        None => merge_catalog_membership_values(
+            expected_key,
+            [record.value.as_slice()],
+            timestamp,
+            skew_ms,
+        ),
+    };
+    let Ok(value) = merged else {
+        return;
+    };
+    let Ok(expires) = membership_expiry(expected_key, &value, max_clock_skew) else {
+        return;
+    };
+    let merged_record = Record {
+        key: record.key,
+        value,
+        publisher: None,
+        expires: Some(expires),
+    };
+    if let Err(error) = behaviour.kad.store_mut().put(merged_record) {
+        tracing::warn!(%error, "validated catalogue membership set could not be stored");
+    }
+}
+
 fn maybe_store_inbound(
     behaviour: &mut CatalogueBehaviour,
     record: Record,
     max_clock_skew: Duration,
 ) {
-    let Ok(expected_key) = std::str::from_utf8(record.key.as_ref()) else {
+    let Ok(expected_key) = std::str::from_utf8(record.key.as_ref()).map(str::to_owned) else {
         return;
     };
-    let Ok(incoming) = validate_value(expected_key, &record.value, max_clock_skew) else {
-        return;
-    };
-
-    if let Some(current_record) = behaviour.kad.store_mut().get(&record.key) {
-        let current_record = current_record.into_owned();
-        if let Ok(current) = validate_value(expected_key, &current_record.value, max_clock_skew)
-            && current.sequence >= incoming.sequence
-        {
+    if let Ok(incoming) = validate_value(&expected_key, &record.value, max_clock_skew) {
+        if incoming.kind == CatalogRecordKind::ModelMember {
+            merge_membership_inbound(behaviour, record, &expected_key, max_clock_skew);
             return;
         }
+
+        if let Some(current_record) = behaviour.kad.store_mut().get(&record.key) {
+            let current_record = current_record.into_owned();
+            if let Ok(current) =
+                validate_value(&expected_key, &current_record.value, max_clock_skew)
+                && current.sequence >= incoming.sequence
+            {
+                return;
+            }
+        }
+        if let Err(error) = behaviour.kad.store_mut().put(record) {
+            tracing::warn!(%error, "validated catalogue record could not be stored");
+        }
+        return;
     }
-    if let Err(error) = behaviour.kad.store_mut().put(record) {
-        tracing::warn!(%error, "validated catalogue record could not be stored");
+
+    let (Ok(timestamp), Ok(skew_ms)) = (now_ms(), max_clock_skew.as_millis().try_into()) else {
+        return;
+    };
+    if verify_catalog_membership_value(&expected_key, &record.value, timestamp, skew_ms).is_ok() {
+        merge_membership_inbound(behaviour, record, &expected_key, max_clock_skew);
     }
 }
 
@@ -388,12 +526,12 @@ pub async fn spawn_catalog_dht(config: CatalogDhtConfig) -> Result<CatalogDhtHan
                 .set_replication_interval(Some(DEFAULT_REPLICATION_INTERVAL))
                 .set_publication_interval(None)
                 .set_record_filtering(kad::StoreInserts::FilterBoth)
-                .set_max_packet_size(MAX_CATALOG_RECORD_BYTES + 1024);
+                .set_max_packet_size(MAX_CATALOG_SET_BYTES + 1024);
             let store = MemoryStore::with_config(
                 peer_id,
                 MemoryStoreConfig {
                     max_records,
-                    max_value_bytes: MAX_CATALOG_RECORD_BYTES + 1,
+                    max_value_bytes: MAX_CATALOG_SET_BYTES + 1,
                     ..MemoryStoreConfig::default()
                 },
             );
@@ -477,8 +615,75 @@ async fn run_event_loop(
                     "catalogue DHT stopped before query completion"
                 )));
             }
+            PendingQuery::GetMembers { reply, .. } => {
+                let _ = reply.send(Err(anyhow!(
+                    "catalogue DHT stopped before membership lookup completion"
+                )));
+            }
         }
     }
+}
+
+fn current_record_for_publisher(
+    logical_key: &str,
+    encoded: &[u8],
+    publisher: iroh::EndpointId,
+    max_clock_skew: Duration,
+) -> Option<ValidatedCatalogRecord> {
+    validate_value(logical_key, encoded, max_clock_skew)
+        .ok()
+        .filter(|record| record.publisher_endpoint_id == publisher)
+        .or_else(|| {
+            let skew_ms = max_clock_skew.as_millis().try_into().ok()?;
+            verify_catalog_membership_value(logical_key, encoded, now_ms().ok()?, skew_ms)
+                .ok()?
+                .into_iter()
+                .find(|record| record.publisher_endpoint_id == publisher)
+        })
+}
+
+fn start_put(
+    swarm: &mut libp2p::Swarm<CatalogueBehaviour>,
+    logical_key: &str,
+    encoded: Vec<u8>,
+    quorum: NonZeroUsize,
+    max_clock_skew: Duration,
+) -> Result<Option<QueryId>> {
+    let validated = validate_value(logical_key, &encoded, max_clock_skew)?;
+    let record_key = RecordKey::new(&logical_key);
+    if let Some(current_record) = swarm.behaviour_mut().kad.store_mut().get(&record_key) {
+        let current_record = current_record.into_owned();
+        if let Some(current) = current_record_for_publisher(
+            logical_key,
+            &current_record.value,
+            validated.publisher_endpoint_id,
+            max_clock_skew,
+        ) {
+            ensure!(
+                validated.sequence >= current.sequence,
+                "catalogue publication sequence would roll back local soft state"
+            );
+            if validated.sequence == current.sequence {
+                ensure!(
+                    validated == current,
+                    "catalogue publication reuses a sequence with different contents"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    let record = Record {
+        key: record_key,
+        value: encoded,
+        publisher: Some(*swarm.local_peer_id()),
+        expires: Some(instant_expiry(validated.expires_at_ms)?),
+    };
+    swarm
+        .behaviour_mut()
+        .kad
+        .put_record(record, Quorum::N(quorum))
+        .map(Some)
+        .map_err(anyhow::Error::from)
 }
 
 fn handle_command(
@@ -502,43 +707,7 @@ fn handle_command(
             quorum,
             reply,
         } => {
-            let result = validate_value(&logical_key, &encoded, max_clock_skew).and_then(|validated| {
-                    let record_key = RecordKey::new(&logical_key);
-                    if let Some(current_record) =
-                        swarm.behaviour_mut().kad.store_mut().get(&record_key)
-                    {
-                        let current_record = current_record.into_owned();
-                        if let Ok(current) = validate_value(
-                            &logical_key,
-                            &current_record.value,
-                            max_clock_skew,
-                        ) {
-                            ensure!(
-                                validated.sequence >= current.sequence,
-                                "catalogue publication sequence would roll back local soft state"
-                            );
-                            if validated.sequence == current.sequence {
-                                ensure!(
-                                    encoded == current_record.value,
-                                    "catalogue publication reuses a sequence with different contents"
-                                );
-                                return Ok(None);
-                            }
-                        }
-                    }
-                    let record = Record {
-                        key: record_key,
-                        value: encoded,
-                        publisher: Some(*swarm.local_peer_id()),
-                        expires: Some(instant_expiry(validated.expires_at_ms)?),
-                    };
-                    swarm
-                        .behaviour_mut()
-                        .kad
-                        .put_record(record, Quorum::N(quorum))
-                        .map(Some)
-                        .map_err(anyhow::Error::from)
-                });
+            let result = start_put(swarm, &logical_key, encoded, quorum, max_clock_skew);
             match result {
                 Ok(Some(query_id)) => {
                     pending.insert(query_id, PendingQuery::Put(reply));
@@ -561,6 +730,20 @@ fn handle_command(
                 PendingQuery::Get {
                     logical_key,
                     best: None,
+                    reply,
+                },
+            );
+        }
+        Command::GetMembers { logical_key, reply } => {
+            let query_id = swarm
+                .behaviour_mut()
+                .kad
+                .get_record(RecordKey::new(&logical_key));
+            pending.insert(
+                query_id,
+                PendingQuery::GetMembers {
+                    logical_key,
+                    values: Vec::new(),
                     reply,
                 },
             );
@@ -603,6 +786,35 @@ fn handle_swarm_event(
         )) => handle_query_progress(id, result, step.last, pending, max_clock_skew),
         _ => {}
     }
+}
+
+fn finish_membership_lookup(
+    logical_key: &str,
+    values: &[Vec<u8>],
+    result: QueryResult,
+    max_clock_skew: Duration,
+) -> Result<Vec<ValidatedCatalogRecord>> {
+    if values.is_empty() {
+        return match result {
+            QueryResult::GetRecord(Ok(_) | Err(GetRecordError::NotFound { .. })) => Ok(Vec::new()),
+            QueryResult::GetRecord(Err(network_error)) => {
+                Err(anyhow!(network_error).context("catalogue membership lookup failed"))
+            }
+            _ => Err(anyhow!("unexpected catalogue membership query result")),
+        };
+    }
+    let timestamp = now_ms()?;
+    let skew_ms = max_clock_skew
+        .as_millis()
+        .try_into()
+        .context("clock skew exceeds u64 milliseconds")?;
+    let merged = merge_catalog_membership_values(
+        logical_key,
+        values.iter().map(Vec::as_slice),
+        timestamp,
+        skew_ms,
+    )?;
+    verify_catalog_membership_value(logical_key, &merged, timestamp, skew_ms)
 }
 
 fn handle_query_progress(
@@ -654,6 +866,45 @@ fn handle_query_progress(
                 Err(error) => anyhow!(error).context("catalogue lookup failed"),
                 Ok(_) => anyhow!("no valid live catalogue record found for {logical_key}"),
             });
+            let _ = reply.send(answer);
+        }
+        (
+            PendingQuery::GetMembers {
+                logical_key,
+                values,
+                ..
+            },
+            QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(peer_record))),
+        ) => {
+            let skew_ms = max_clock_skew.as_millis().try_into().ok();
+            if let (Ok(timestamp), Some(skew_ms)) = (now_ms(), skew_ms)
+                && verify_catalog_membership_value(
+                    logical_key,
+                    &peer_record.record.value,
+                    timestamp,
+                    skew_ms,
+                )
+                .is_ok()
+            {
+                values.push(peer_record.record.value);
+            }
+        }
+        (PendingQuery::GetMembers { .. }, QueryResult::GetRecord(result)) if last => {
+            let PendingQuery::GetMembers {
+                logical_key,
+                values,
+                reply,
+            } = pending.remove(&query_id).expect("query exists")
+            else {
+                unreachable!()
+            };
+            let answer = finish_membership_lookup(
+                &logical_key,
+                &values,
+                QueryResult::GetRecord(result),
+                max_clock_skew,
+            )
+            .map_err(|error| error.context(format!("membership shard {logical_key}")));
             let _ = reply.send(answer);
         }
         _ => {}
@@ -762,6 +1013,100 @@ mod tests {
 
         reader.shutdown().await?;
         writer.shutdown().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn routing_server_merges_independent_model_members_for_reader() -> Result<()> {
+        let server = spawn_catalog_dht(CatalogDhtConfig::server(
+            Keypair::generate_ed25519(),
+            "/ip4/127.0.0.1/tcp/0".parse()?,
+        ))
+        .await?;
+        let mut server_address = server.listen_address().clone();
+        ensure!(
+            matches!(
+                server_address.pop(),
+                Some(libp2p::multiaddr::Protocol::P2p(_))
+            ),
+            "server address has no /p2p component"
+        );
+        let bootstrap = BootstrapPeer {
+            peer_id: server.peer_id(),
+            address: server_address,
+        };
+        let first_writer = spawn_catalog_dht(CatalogDhtConfig::client(
+            Keypair::generate_ed25519(),
+            vec![bootstrap.clone()],
+        ))
+        .await?;
+        let second_writer = spawn_catalog_dht(CatalogDhtConfig::client(
+            Keypair::generate_ed25519(),
+            vec![bootstrap.clone()],
+        ))
+        .await?;
+        first_writer.bootstrap().await?;
+        second_writer.bootstrap().await?;
+
+        let model = "c".repeat(64);
+        let first_publisher = SecretKey::generate();
+        let shard = crate::catalog::membership_shard(&first_publisher.public());
+        let second_publisher = (0..10_000)
+            .map(|_| SecretKey::generate())
+            .find(|key| crate::catalog::membership_shard(&key.public()) == shard)
+            .context("failed to find two endpoint ids in one membership shard")?;
+        let logical_key = keys::model_member(&model, &first_publisher.public());
+        let timestamp = now_ms()?;
+        let sign_member = |publisher: &SecretKey, peer_id: PeerId, sequence| {
+            sign_catalog_record(
+                publisher,
+                CatalogRecordParams {
+                    kind: CatalogRecordKind::ModelMember,
+                    logical_key: &logical_key,
+                    discovery_peer_id: &peer_id.to_string(),
+                    sequence,
+                    issued_at_ms: timestamp,
+                    expires_at_ms: timestamp + 60_000,
+                    payload: b"member",
+                },
+            )
+        };
+        first_writer
+            .put(
+                &logical_key,
+                sign_member(&first_publisher, first_writer.peer_id(), 2)?,
+                NonZeroUsize::new(1).expect("one"),
+            )
+            .await?;
+        second_writer
+            .put(
+                &logical_key,
+                sign_member(&second_publisher, second_writer.peer_id(), 7)?,
+                NonZeroUsize::new(1).expect("one"),
+            )
+            .await?;
+
+        let reader = spawn_catalog_dht(CatalogDhtConfig::client(
+            Keypair::generate_ed25519(),
+            vec![bootstrap],
+        ))
+        .await?;
+        reader.bootstrap().await?;
+        let members = reader.get_members(&logical_key).await?;
+        assert_eq!(members.len(), 2);
+        let mut sequences = members
+            .iter()
+            .map(|member| member.sequence)
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![2, 7]);
+        let all_model_members = reader.get_model_members(&model).await?;
+        assert_eq!(all_model_members.len(), 2);
+
+        reader.shutdown().await?;
+        second_writer.shutdown().await?;
+        first_writer.shutdown().await?;
         server.shutdown().await?;
         Ok(())
     }
