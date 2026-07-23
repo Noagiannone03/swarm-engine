@@ -44,6 +44,7 @@ packages = [
   { include = "parallax_extensions", from = "src" },
   { include = "parallax_utils", from = "src" },
   { include = "scheduling", from = "src" },
+  { include = "swarm_protocol", from = "src" },
 ]
 
 [project.scripts]
