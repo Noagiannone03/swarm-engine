@@ -99,6 +99,9 @@ jobs:
             "huggingface-hub>=0.28" \
             "tuf==7.0.0" \
             "cryptography>=40.0.0" \
+            "lattica==1.0.21" \
+            "msgpack>=1.0.7" \
+            "protobuf>=7.35.1,<8" \
             "pytest>=8.2"
           python -m pip install --no-deps -e ../..
           cd ../..
