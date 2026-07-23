@@ -23,6 +23,7 @@ from swarm_protocol.contracts import (
 from swarm_protocol.discovery import DiscoveryError, DiscoverySnapshot, InMemoryDiscoveryStore
 
 _CATALOG_TTL_MS = 4 * 60 * 1000
+MAX_ADVERTISED_LINKS = 8
 
 
 class NativeCatalogRecord(Protocol):
@@ -230,9 +231,15 @@ class DhtDiscoveryStore:
                     for metric in self._local_links.values()
                     if metric.from_worker_id == offer.worker_id and metric.expires_at_ms > now
                 ),
-                key=lambda metric: (metric.from_worker_id, metric.to_worker_id),
+                key=lambda metric: (
+                    metric.path_kind.value,
+                    metric.loss_rate,
+                    metric.rtt_ms,
+                    -metric.throughput_bytes_per_second,
+                    metric.to_worker_id,
+                ),
             )
-        )
+        )[:MAX_ADVERTISED_LINKS]
         advertisement = ModelMemberAdvertisement(
             offer=offer,
             lease=lease,

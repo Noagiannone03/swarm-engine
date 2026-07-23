@@ -20,7 +20,7 @@ const CATALOG_SET_MAGIC: &[u8] = b"FABISET3\0";
 
 /// Fixed protocol-level fan-out for model membership.  A worker has exactly one shard per model,
 /// derived from its authenticated endpoint id, so it cannot choose a hot or misleading shard.
-pub const MODEL_MEMBERSHIP_SHARDS: u16 = 64;
+pub const MODEL_MEMBERSHIP_SHARDS: u16 = 256;
 
 /// Hard DHT limits keep malicious records from becoming memory or bandwidth amplifiers.
 pub const MAX_CATALOG_RECORD_BYTES: usize = 32 * 1024;
@@ -734,5 +734,69 @@ mod tests {
                 .sequence,
             9
         );
+    }
+
+    #[test]
+    fn ten_thousand_deterministic_endpoints_remain_balanced_across_shards() {
+        let mut counts = vec![0usize; usize::from(MODEL_MEMBERSHIP_SHARDS)];
+        for index in 0_u64..10_000 {
+            let seed = blake3::hash(&index.to_le_bytes());
+            let endpoint = SecretKey::from_bytes(seed.as_bytes()).public();
+            counts[usize::from(membership_shard(&endpoint))] += 1;
+        }
+        assert_eq!(counts.iter().sum::<usize>(), 10_000);
+        assert!(counts.iter().all(|count| *count > 0));
+        assert!(
+            counts.iter().copied().max().expect("shards") <= 64,
+            "reference population exceeds the tested per-shard planning envelope: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn reference_ten_thousand_worker_shard_fits_the_wire_bound() {
+        let model = "d".repeat(HASH_HEX);
+        let mut encoded = Vec::new();
+        let payload = vec![b'x'; 2_800];
+        for index in 0_u64..100_000 {
+            let seed = blake3::hash(&index.to_le_bytes());
+            let publisher = SecretKey::from_bytes(seed.as_bytes());
+            if membership_shard(&publisher.public()) != 0 {
+                continue;
+            }
+            let logical_key = keys::model_member(&model, &publisher.public());
+            encoded.push(
+                sign_catalog_record(
+                    &publisher,
+                    CatalogRecordParams {
+                        kind: CatalogRecordKind::ModelMember,
+                        logical_key: &logical_key,
+                        discovery_peer_id: "12D3KooWScaleFixture",
+                        sequence: index,
+                        issued_at_ms: 1_000,
+                        expires_at_ms: 61_000,
+                        // Approximately one complete planning advertisement with eight links.
+                        payload: &payload,
+                    },
+                )
+                .expect("sign scale fixture"),
+            );
+            if encoded.len() == 64 {
+                break;
+            }
+        }
+        assert_eq!(encoded.len(), 64);
+        // Use the logical key carried by the first verified record rather than assuming which
+        // deterministic seed first landed in shard zero.
+        let logical_key = verify_catalog_record(&encoded[0], 2_000, 0)
+            .expect("verify fixture")
+            .logical_key;
+        let merged = merge_catalog_membership_values(
+            &logical_key,
+            encoded.iter().map(Vec::as_slice),
+            2_000,
+            0,
+        )
+        .expect("merge scale fixture");
+        assert!(merged.len() <= MAX_CATALOG_SET_BYTES);
     }
 }
