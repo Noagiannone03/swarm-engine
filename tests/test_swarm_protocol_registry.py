@@ -119,6 +119,9 @@ def test_tuf_registry_authenticates_bundle_and_survives_root_rotation(tmp_path):
     with _serve(repository) as base_url:
         client = _client(tmp_path / "client", base_url, root_bytes)
         assert client.fetch(bundle.model_swarm_id) == bundle
+        projected_root = tmp_path / "client" / "metadata" / "root.json"
+        assert not projected_root.is_symlink()
+        assert projected_root.read_bytes() == root_bytes
         assert client.resolve("test/model", immutable_revision=REVISION) == bundle
         assert client.catalog().models[0].model_swarm_id == bundle.model_swarm_id
 
@@ -129,6 +132,10 @@ def test_tuf_registry_authenticates_bundle_and_survives_root_rotation(tmp_path):
 
         # The original embedded root follows the dual-signed chain and accepts the new roles.
         assert client.fetch(bundle.model_swarm_id) == bundle
+        assert not projected_root.is_symlink()
+        assert projected_root.read_bytes() == (
+            repository / "metadata" / "2.root.json"
+        ).read_bytes()
 
 
 def test_tuf_registry_rejects_target_tampering(tmp_path):

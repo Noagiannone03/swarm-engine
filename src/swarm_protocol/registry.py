@@ -422,6 +422,31 @@ class TufRegistryPublisher:
         return metadata
 
 
+class _PortableTufUpdater(Updater):
+    """Project the current trusted root without requiring filesystem symlinks.
+
+    python-tuf 7 keeps every trusted root under ``root_history`` and exposes the
+    current one through a ``root.json`` symlink.  Creating that symlink requires
+    SeCreateSymbolicLinkPrivilege on a default Windows installation, which a
+    normal Fabi worker intentionally does not have.  The non-versioned file is a
+    cache projection, not a trust anchor: every Fabi updater is bootstrapped from
+    immutable application bytes.  An atomic regular-file projection therefore
+    preserves TUF's verified root history and rollback checks while remaining
+    usable by an unprivileged process on every supported platform.
+
+    This is deliberately scoped to the private hook in the exactly pinned
+    ``tuf==7.0.0`` dependency.  A TUF upgrade must revalidate this adapter.
+    """
+
+    def _update_root_symlink(self) -> None:
+        version = self._trusted_set.root.version
+        versioned_root = Path(self._dir, "root_history", f"{version}.root.json")
+        self._persist_file(
+            str(Path(self._dir, "root.json")),
+            versioned_root.read_bytes(),
+        )
+
+
 class TrustedModelRegistry:
     """Runtime TUF client rooted in immutable bootstrap bytes shipped with Fabi."""
 
@@ -488,7 +513,7 @@ class TrustedModelRegistry:
     def _fetch_target(self, target_path: str) -> bytes:
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        updater = Updater(
+        updater = _PortableTufUpdater(
             metadata_dir=str(self.metadata_dir),
             metadata_base_url=self.metadata_base_url,
             target_dir=str(self.target_dir),
