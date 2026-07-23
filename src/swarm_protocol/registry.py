@@ -187,8 +187,14 @@ def _utc_now(now: datetime | None) -> datetime:
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
+    """Atomically publish one non-secret TUF repository object."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+        # TUF metadata and targets are public by design.  NamedTemporaryFile defaults to 0600,
+        # which prevents an nginx/caddy service account from reading an operator-published tree.
+        if os.name != "nt":
+            os.fchmod(temporary.fileno(), 0o644)
         temporary.write(payload)
         temporary.flush()
         os.fsync(temporary.fileno())
