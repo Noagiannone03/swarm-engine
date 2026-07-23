@@ -163,7 +163,10 @@ def test_active_v3_routing_receives_exact_token_budget(monkeypatch):
         reserve=lambda **kwargs: calls.append(kwargs) or ("head", "tail"),
     )
     manager = SchedulerManage()
-    manager.scheduler = object()
+    manager.scheduler = SimpleNamespace(
+        serving_ready=lambda: True,
+        _admission_paused=False,
+    )
     manager.active_v3_routes = active
 
     route = manager.get_routing_table(

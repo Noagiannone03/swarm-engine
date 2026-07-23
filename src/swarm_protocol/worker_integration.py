@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Protocol
 
 from swarm_protocol.artifact_verification import (
     VerifiedSpanArtifacts,
@@ -30,6 +31,13 @@ from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
 
 _REPORT_TTL_MS = 45_000
 _VERIFICATION_RETRY_SECONDS = 30.0
+
+
+class AdvertisementPublisher(Protocol):
+    def publish_advertisement(
+        self,
+        advertisement: ModelMemberAdvertisement,
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -112,6 +120,17 @@ class WorkerProtocolV3Reporter:
         self._retry_after = 0.0
         self._offer_seq = 0
         self._lease_seq = 0
+        self._catalog: AdvertisementPublisher | None = None
+        self._catalog_pending: ModelMemberAdvertisement | None = None
+        self._catalog_active = False
+        self._catalog_status: dict[str, object] = {"state": "off"}
+
+    def attach_catalog(self, catalog: AdvertisementPublisher) -> None:
+        """Attach the production DHT publisher after transport startup."""
+
+        with self._lock:
+            self._catalog = catalog
+            self._catalog_status = {"state": "waiting_advertisement"}
 
     @classmethod
     def from_environment(cls) -> "WorkerProtocolV3Reporter | None":
@@ -186,12 +205,56 @@ class WorkerProtocolV3Reporter:
                     "state": "rejected",
                     "error": {"code": type(exc).__name__, "detail": str(exc)[:256]},
                 }
+            self._queue_catalog_publish(advertisement)
             return {
                 "mode": self.mode,
                 "state": "ready" if serving.is_ready else "warming",
                 "model_swarm_id": verified.bundle.model_swarm_id,
                 "advertisement": advertisement.model_dump(mode="json"),
+                "catalog": dict(self._catalog_status),
             }
+
+    def _queue_catalog_publish(self, advertisement: ModelMemberAdvertisement) -> None:
+        with self._lock:
+            if self._catalog is None:
+                return
+            self._catalog_pending = advertisement
+            if self._catalog_active:
+                return
+            self._catalog_active = True
+            threading.Thread(
+                target=self._catalog_publish_loop,
+                name="SwarmV3CatalogPublisher",
+                daemon=True,
+            ).start()
+
+    def _catalog_publish_loop(self) -> None:
+        while True:
+            with self._lock:
+                advertisement = self._catalog_pending
+                self._catalog_pending = None
+                catalog = self._catalog
+                if advertisement is None or catalog is None:
+                    self._catalog_active = False
+                    return
+            try:
+                catalog.publish_advertisement(advertisement)
+            except Exception as exc:  # noqa: BLE001 - asynchronous network status boundary
+                status: dict[str, object] = {
+                    "state": "error",
+                    "error": {
+                        "code": type(exc).__name__,
+                        "detail": str(exc)[:256],
+                    },
+                }
+            else:
+                status = {
+                    "state": "published",
+                    "offer_seq": advertisement.offer.offer_seq,
+                    "lease_seq": advertisement.lease.lease_seq,
+                }
+            with self._lock:
+                self._catalog_status = status
 
     def _verify_contract(self, serving: WorkerServingSnapshot) -> None:
         key = serving.verification_key

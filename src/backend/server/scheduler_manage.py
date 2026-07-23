@@ -119,6 +119,7 @@ class SchedulerManage:
 
         self._start_scheduler(model_name, init_nodes_num)
         self._start_lattica()
+        self._attach_v3_catalog()
         self._start_active_v3_routes()
         self.completion_handler = TransformerConnectionHandler(
             lattica=None if self.iroh_transport is not None else self.lattica,
@@ -457,7 +458,22 @@ class SchedulerManage:
             transport=self.iroh_transport,
             nodes_provider=lambda: list(self.scheduler.node_manager.nodes),
         )
+        self.scheduler.external_routes_active = self.active_v3_routes.has_active_routes
         logger.info("Protocol-v3 active route admission is ready")
+
+    def _attach_v3_catalog(self) -> None:
+        planner = self.scheduler.swarm_v3_shadow if self.scheduler is not None else None
+        catalog = (
+            self.iroh_transport.catalog_discovery
+            if self.iroh_transport is not None
+            else None
+        )
+        if planner is not None and catalog is not None:
+            planner.attach_catalog(catalog)
+            logger.info(
+                "Protocol-v3 catalogue attached: peer=%s",
+                self.iroh_transport.catalog_peer_id,
+            )
 
     def _get_context_tokenizer(self):
         """Lazily load the canonical tokenizer used by the scheduler's model."""
@@ -503,6 +519,8 @@ class SchedulerManage:
         """
         logger.debug(f"Routing table requested for request_id={request_id}")
         if self.active_v3_routes is not None:
+            if not self.scheduler.serving_ready() or self.scheduler._admission_paused:
+                return []
             if prompt_tokens is None or reserved_output_tokens is None:
                 raise ValueError("active v3 routing requires exact prompt and output token budgets")
             if prompt_tokens + reserved_output_tokens != required_context_tokens:

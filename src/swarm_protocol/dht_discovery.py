@@ -216,6 +216,54 @@ class DhtDiscoveryStore:
                 self._publish_membership_locked(lease)
             return changed
 
+    def publish_advertisement(self, advertisement: ModelMemberAdvertisement) -> None:
+        """Publish one coherent worker heartbeat without an N+1 catalogue read.
+
+        The worker signed the complete source-owned advertisement. Target
+        workers are deliberately not resolved here; readers retain only links
+        whose target also appears in their coherent membership snapshot.
+        """
+
+        offer = advertisement.offer
+        lease = advertisement.lease
+        if offer.endpoint_id != self._node.endpoint_id:
+            raise DiscoveryError(
+                "worker advertisement endpoint does not match the signing endpoint"
+            )
+        if offer.worker_id != lease.worker_id:
+            raise DiscoveryError("worker advertisement contains inconsistent identities")
+        if len(advertisement.outgoing_links) > MAX_ADVERTISED_LINKS:
+            raise DiscoveryError("worker advertisement exceeds the link bound")
+        with self._lock:
+            offer_key = self._node.catalog_key("worker_offer")
+            self._sign_and_put(
+                kind="worker_offer",
+                logical_key=offer_key,
+                sequence=offer.offer_seq,
+                issued_at_ms=offer.issued_at_ms,
+                expires_at_ms=offer.expires_at_ms,
+                payload=_json_payload(offer),
+            )
+            lease_key = self._node.catalog_key("span_lease", lease.model_swarm_id)
+            self._sign_and_put(
+                kind="span_lease",
+                logical_key=lease_key,
+                sequence=lease.lease_seq,
+                issued_at_ms=lease.issued_at_ms,
+                expires_at_ms=lease.expires_at_ms,
+                payload=_json_payload(lease),
+            )
+            self._local_offer = offer
+            self._local_leases[lease.model_swarm_id] = lease
+            self._local_links = {
+                (metric.from_worker_id, metric.to_worker_id): metric
+                for metric in advertisement.outgoing_links
+            }
+            self._known_offers[offer.worker_id] = offer
+            self._shadow.publish_offer(offer)
+            self._shadow.publish_span_lease(lease)
+            self._publish_membership_locked(lease)
+
     def _publish_membership_locked(self, lease: SpanLease) -> None:
         offer = self._local_offer
         if offer is None:

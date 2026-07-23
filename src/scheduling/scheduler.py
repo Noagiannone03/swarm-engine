@@ -11,7 +11,7 @@ import threading
 import time
 from collections import deque
 from math import isfinite
-from typing import Deque, Dict, List, Literal, Optional, Tuple, TypeAlias
+from typing import Callable, Deque, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 from parallax_utils.logging_config import get_logger
 from scheduling.layer_allocation import (
@@ -147,6 +147,7 @@ class Scheduler:
         # flag; memory-pressure samples deliberately do not, preventing reload
         # oscillations on desktop contributors.
         self._pending_rebalance_node_ids: set[str] = set()
+        self._rebalance_after_leave_pending = False
         self._next_rebalance_attempt_at: float = 0.0
         self._pending_context_replan: Optional[Dict[str, object]] = None
         self.allocation_epoch: int = 0
@@ -156,6 +157,7 @@ class Scheduler:
         self._wake_event: threading.Event = threading.Event()
         self._bootstrapped_event: threading.Event = threading.Event()
         self._admission_paused: bool = False
+        self.external_routes_active: Callable[[], bool] | None = None
         # Engine construction parameters are immutable in upstream Parallax,
         # vLLM and SGLang.  Keep the negotiated wire contract monotonic within
         # one allocation generation: compatibility may force it down, but a
@@ -392,9 +394,13 @@ class Scheduler:
         if pending is None:
             return False
         with self._inflight_routes_lock:
-            if self._inflight_routes or any(
-                node.routing_load > 0 or node.current_requests > 0
-                for node in self.node_manager.active_nodes
+            if (
+                self._inflight_routes
+                or any(
+                    node.routing_load > 0 or node.current_requests > 0
+                    for node in self.node_manager.active_nodes
+                )
+                or (self.external_routes_active is not None and self.external_routes_active())
             ):
                 return False
             active_ids = [node.node_id for node in self.node_manager.active_nodes]
@@ -1379,7 +1385,7 @@ class Scheduler:
             if self._inflight_routes or any(
                 node.routing_load > 0 or node.current_requests > 0
                 for node in self.node_manager.active_nodes
-            ):
+            ) or (self.external_routes_active is not None and self.external_routes_active()):
                 return False
             active_nodes = self.node_manager.active_nodes
             pending_nodes = [
@@ -1444,11 +1450,19 @@ class Scheduler:
             except Exception as exc:
                 logger.warning(f"Leave failed for {node_id}: {exc}")
 
-        # After draining all leaves, decide whether to do a single global rebalance.
-        if not removed_any:
+        if removed_any:
+            self._rebalance_after_leave_pending = True
+
+        # After draining all leaves, decide whether to do a single global
+        # rebalance. Keep the intent pending while an unrelated v3 request owns
+        # a route; consuming the leave queue must not lose this transition.
+        if not self._rebalance_after_leave_pending:
+            return
+        if self.external_routes_active is not None and self.external_routes_active():
             return
 
         if not self.layer_allocator.should_global_rebalance():
+            self._rebalance_after_leave_pending = False
             return
 
         nodes = self.node_manager.nodes
@@ -1460,14 +1474,17 @@ class Scheduler:
         logger.debug(f"Node count: {manual_count} manual, {total_count - manual_count} automatic")
         if total_count == 0:
             logger.debug("No nodes left after leave(s); skipping global rebalance")
+            self._rebalance_after_leave_pending = False
             return
         if manual_count == total_count:
             logger.debug("All nodes are manual assignment, skipping global rebalance")
+            self._rebalance_after_leave_pending = False
             return
         if manual_count > 0:
             logger.error(
                 f"Mixed assignment detected ({manual_count} manual, {total_count - manual_count} automatic); skipping rebalance"
             )
+            self._rebalance_after_leave_pending = False
             return
 
         # Move active nodes to standby and re-bootstrap (reboot) once.
@@ -1480,6 +1497,7 @@ class Scheduler:
         try:
             self.bootstrap(reboot=True)
         finally:
+            self._rebalance_after_leave_pending = False
             # Ensure snapshot reflects post-rebalance state even if bootstrap fails.
             self.emit_alloc_log_snapshot(reason="after global rebalance")
 

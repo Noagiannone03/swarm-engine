@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .rpc import IrohRpcRuntime, RpcServiceStub
+from swarm_protocol.dht_discovery import DhtDiscoveryStore
 
 IROH_TRANSPORT = "iroh"
 LATTICA_TRANSPORT = "lattica"
@@ -59,16 +60,33 @@ def _relay_token() -> str:
     return value
 
 
-class IrohTransport:
-    """Runtime facade for centrally scheduled Parallax components.
+def _catalog_bootstrap_addresses() -> list[str]:
+    raw = os.environ.get("FABI_CATALOG_DHT_BOOTSTRAPS", "").strip()
+    if not raw:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        decoded = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not isinstance(decoded, list) or any(
+        not isinstance(address, str) or not address.strip() for address in decoded
+    ):
+        raise ValueError("FABI_CATALOG_DHT_BOOTSTRAPS must be a JSON array or newline list")
+    return [address.strip() for address in decoded]
 
-    DHT and content-addressed weight distribution are deliberately absent: the
-    scheduler owns discovery/routing, while weight distribution remains a
-    separate content-plane concern.
+
+class IrohTransport:
+    """Authenticated RPC plus an optional native peer-discovery catalogue.
+
+    Model bytes remain a separate content-plane concern. The embedded DHT
+    carries only bounded signed manifests and short-lived membership records.
     """
 
     def __init__(self, runtime: IrohRpcRuntime):
         self.runtime = runtime
+        self.catalog_discovery: DhtDiscoveryStore | None = None
+        self.catalog_peer_id: str | None = None
+        self.catalog_listen_address: str | None = None
 
     @classmethod
     def from_environment(cls, role: str) -> IrohTransport:
@@ -84,7 +102,50 @@ class IrohTransport:
             relay_token,
             force_relay=_env_bool("FABI_FORCE_RELAY"),
         )
-        return cls(runtime)
+        transport = cls(runtime)
+        try:
+            transport._start_catalog_from_environment(role)
+        except BaseException:
+            runtime.close()
+            raise
+        return transport
+
+    def _start_catalog_from_environment(self, role: str) -> None:
+        mode = os.environ.get("FABI_CATALOG_DHT_MODE", "off").strip().lower()
+        if mode in {"", "off", "disabled"}:
+            return
+        if mode not in {"client", "server"}:
+            raise ValueError("FABI_CATALOG_DHT_MODE must be off, client, or server")
+        bootstraps = _catalog_bootstrap_addresses()
+        if mode == "client" and not bootstraps:
+            raise ValueError("catalogue DHT clients require at least one bootstrap address")
+        configured_identity = os.environ.get("FABI_CATALOG_DHT_IDENTITY_PATH", "").strip()
+        identity_path = Path(
+            configured_identity or f"~/.fabi/network/{role}-catalog.key"
+        ).expanduser()
+        default_listen = (
+            "/ip4/0.0.0.0/tcp/0" if mode == "server" else "/ip4/127.0.0.1/tcp/0"
+        )
+        listen_address = os.environ.get(
+            "FABI_CATALOG_DHT_LISTEN_ADDRESS",
+            default_listen,
+        ).strip()
+        peer_id, bound_address = self.runtime._node.start_catalog_dht(
+            identity_path,
+            mode == "server",
+            listen_address,
+            bootstraps,
+            15,
+            25_000,
+        )
+        if bootstraps:
+            self.runtime._node.catalog_bootstrap()
+        self.catalog_peer_id = str(peer_id)
+        self.catalog_listen_address = str(bound_address)
+        self.catalog_discovery = DhtDiscoveryStore(
+            self.runtime._node,
+            self.catalog_peer_id,
+        )
 
     def peer_id(self) -> str:
         return self.runtime.endpoint_id
@@ -129,6 +190,9 @@ class IrohTransport:
         self.runtime._node.verify_control_payload(signer_endpoint_id, payload, signature)
 
     def close(self) -> None:
+        if self.catalog_discovery is not None:
+            self.runtime._node.stop_catalog_dht()
+            self.catalog_discovery = None
         self.runtime.close()
 
     def store(self, *args: object, **kwargs: object) -> bool:

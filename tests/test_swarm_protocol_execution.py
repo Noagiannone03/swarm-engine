@@ -377,3 +377,34 @@ def test_released_route_allows_bounded_peer_abort_but_not_more_execution():
         routing_table=("worker",),
         caller_endpoint_id=WORKER_ENDPOINT,
     )
+
+
+def test_drain_atomically_rejects_new_routes_but_allows_existing_release():
+    now = [1_000]
+    admission = controller(now)
+    route = commit_route(admission, now=now[0])
+
+    assert admission.begin_drain() == 1
+    with pytest.raises(ExecutionAdmissionError, match="draining"):
+        admission.prepare(
+            signed_plan(plan(now=now[0], epoch=2)),
+            caller_endpoint_id=COORDINATOR_ENDPOINT,
+        )
+
+    admission.apply_command(
+        signed_command(
+            command(
+                now=now[0],
+                action=ReservationAction.RELEASE,
+                route_id=route.route_id,
+                epoch=route.epoch,
+            )
+        ),
+        caller_endpoint_id=COORDINATOR_ENDPOINT,
+    )
+    assert admission.draining_reservations() == 0
+    admission.cancel_drain()
+    admission.prepare(
+        signed_plan(plan(now=now[0], epoch=2)),
+        caller_endpoint_id=COORDINATOR_ENDPOINT,
+    )

@@ -676,6 +676,13 @@ class GradientServer:
         self.scheduler_peer_id = str(self.scheduler_addr)
         if (
             getattr(self, "swarm_v3_reporter", None) is not None
+            and getattr(self.iroh_transport, "catalog_discovery", None) is not None
+        ):
+            self.swarm_v3_reporter.attach_catalog(
+                self.iroh_transport.catalog_discovery
+            )
+        if (
+            getattr(self, "swarm_v3_reporter", None) is not None
             and self.swarm_v3_reporter.mode == "active"
         ):
             self.swarm_v3_execution_admission = WorkerExecutionAdmission(

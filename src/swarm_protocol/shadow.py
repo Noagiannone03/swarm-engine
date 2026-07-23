@@ -7,17 +7,30 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from swarm_protocol.contracts import (
+    ModelManifest,
     ModelMemberAdvertisement,
     RecoveryLevel,
     RequestContract,
 )
+from swarm_protocol.discovery import DiscoverySnapshot
 from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
 from swarm_protocol.routing import ExactRoutePlanner, NoFeasibleRoute
 
 logger = logging.getLogger(__name__)
+
+
+class CatalogStore(Protocol):
+    def publish_manifest(self, manifest: ModelManifest) -> bool: ...
+
+    def snapshot(
+        self,
+        *,
+        model_swarm_id: str | None = None,
+        now_ms: int | None = None,
+    ) -> DiscoverySnapshot: ...
 
 
 class SchedulerProtocolV3Shadow:
@@ -36,6 +49,21 @@ class SchedulerProtocolV3Shadow:
         self._bundle_retry_after: dict[str, float] = {}
         self._latest: dict[str, object] = {"mode": mode, "state": "waiting_workers"}
         self._last_log_key = ""
+        self._catalog: CatalogStore | None = None
+        self._catalog_status: dict[str, object] = {"state": "off"}
+        self._catalog_snapshots: dict[str, DiscoverySnapshot] = {}
+        self._catalog_reads_pending: set[str] = set()
+        self._catalog_read_retry_after: dict[str, float] = {}
+        self._catalog_manifest_pending: set[str] = set()
+        self._catalog_manifest_publish_after: dict[str, float] = {}
+
+    def attach_catalog(self, catalog: CatalogStore) -> None:
+        with self._lock:
+            self._catalog = catalog
+            bundles = tuple(self._bundles.values())
+            self._catalog_status = {"state": "waiting_manifest"}
+        for bundle in bundles:
+            self._publish_manifest_async(bundle)
 
     @classmethod
     def from_environment(cls) -> "SchedulerProtocolV3Shadow | None":
@@ -131,6 +159,9 @@ class SchedulerProtocolV3Shadow:
                 }
             )
 
+        self._publish_manifest_async(bundle)
+        self._refresh_catalog_async(model_swarm_id)
+
         prompt_tokens = max(1, planning_context_tokens - min(4096, planning_context_tokens - 1))
         output_tokens = planning_context_tokens - prompt_tokens
         request = RequestContract(
@@ -204,6 +235,9 @@ class SchedulerProtocolV3Shadow:
         rejected_workers: dict[str, str] = {}
         for node in nodes:
             report = getattr(node, "swarm_v3", None)
+            if not getattr(node, "is_active", False):
+                rejected_workers[str(node.node_id)] = "scheduler_transition"
+                continue
             if not isinstance(report, dict) or report.get("state") not in {"ready", "warming"}:
                 if isinstance(report, dict):
                     rejected_workers[str(node.node_id)] = str(report.get("state", "invalid"))
@@ -237,21 +271,36 @@ class SchedulerProtocolV3Shadow:
             for advertisement in advertisements
             if advertisement.lease.model_swarm_id == request.model_swarm_id
         ]
-        if not matching:
-            raise NoFeasibleRoute(
-                f"no verified workers for model swarm {request.model_swarm_id}; "
-                f"rejected={rejected_workers}"
-            )
         with self._lock:
             bundle = self._bundles.get(request.model_swarm_id)
+            catalog = self._catalog
+            catalog_snapshot = self._catalog_snapshots.get(request.model_swarm_id)
         if bundle is None:
             raise NoFeasibleRoute("trusted model bundle is not ready")
+        if catalog is not None:
+            self._refresh_catalog_async(request.model_swarm_id)
+            if catalog_snapshot is None:
+                raise NoFeasibleRoute("coherent DHT membership snapshot is not ready")
+            if catalog_snapshot.manifest(request.model_swarm_id) != bundle.manifest:
+                raise NoFeasibleRoute("DHT manifest does not match the trusted registry bundle")
+            offers = catalog_snapshot.offers
+            leases = catalog_snapshot.leases
+            links = catalog_snapshot.links
+        else:
+            if not matching:
+                raise NoFeasibleRoute(
+                    f"no verified workers for model swarm {request.model_swarm_id}; "
+                    f"rejected={rejected_workers}"
+                )
+            offers = tuple(item.offer for item in matching)
+            leases = tuple(item.lease for item in matching)
+            links = tuple(link for item in matching for link in item.outgoing_links)
         return self.planner.plan(
             manifest=bundle.manifest,
             request=request,
-            offers=tuple(item.offer for item in matching),
-            leases=tuple(item.lease for item in matching),
-            links=tuple(link for item in matching for link in item.outgoing_links),
+            offers=offers,
+            leases=leases,
+            links=links,
             snapshot_time_ms=time.time_ns() // 1_000_000,
             coordinator_id=coordinator_id,
             reservation_deadline_ms=reservation_deadline_ms,
@@ -259,8 +308,69 @@ class SchedulerProtocolV3Shadow:
             epoch=epoch,
         )
 
+    def _refresh_catalog_async(self, model_swarm_id: str) -> None:
+        with self._lock:
+            if self._catalog is None:
+                return
+            if model_swarm_id in self._catalog_reads_pending:
+                return
+            if time.monotonic() < self._catalog_read_retry_after.get(model_swarm_id, 0):
+                return
+            self._catalog_reads_pending.add(model_swarm_id)
+        threading.Thread(
+            target=self._refresh_catalog,
+            args=(model_swarm_id,),
+            name="SwarmV3CatalogSnapshot",
+            daemon=True,
+        ).start()
+
+    def _refresh_catalog(self, model_swarm_id: str) -> None:
+        with self._lock:
+            catalog = self._catalog
+        if catalog is None:
+            return
+        try:
+            snapshot = catalog.snapshot(model_swarm_id=model_swarm_id)
+        except Exception as exc:  # noqa: BLE001 - asynchronous network status boundary
+            with self._lock:
+                self._catalog_status = {
+                    "state": "read_error",
+                    "error": {
+                        "code": type(exc).__name__,
+                        "detail": str(exc)[:256],
+                    },
+                }
+                self._catalog_read_retry_after[model_swarm_id] = time.monotonic() + 2
+                self._catalog_reads_pending.discard(model_swarm_id)
+            return
+        with self._lock:
+            self._catalog_snapshots[model_swarm_id] = snapshot
+            self._catalog_status = {
+                "state": "snapshot_ready",
+                "model_swarm_id": model_swarm_id,
+                "captured_at_ms": snapshot.captured_at_ms,
+                "workers": len(snapshot.offers),
+            }
+            self._catalog_read_retry_after[model_swarm_id] = time.monotonic() + 2
+            self._catalog_reads_pending.discard(model_swarm_id)
+
     def ready_model_swarm_id(self, nodes: list[Any]) -> str:
         """Return the dominant verified swarm whose trusted bundle is ready."""
+
+        with self._lock:
+            if self._catalog is not None:
+                ready = {
+                    swarm_id: len(snapshot.leases)
+                    for swarm_id, snapshot in self._catalog_snapshots.items()
+                    if swarm_id in self._bundles
+                    and snapshot.manifest(swarm_id) == self._bundles[swarm_id].manifest
+                    and snapshot.leases
+                }
+                if not ready:
+                    raise NoFeasibleRoute(
+                        "no DHT model swarm has both trusted metadata and live members"
+                    )
+                return min(ready, key=lambda swarm_id: (-ready[swarm_id], swarm_id))
 
         advertisements, _ = self._advertisements(nodes)
         counts: dict[str, int] = {}
@@ -274,6 +384,22 @@ class SchedulerProtocolV3Shadow:
         if not ready:
             raise NoFeasibleRoute("no verified model swarm has a trusted registry bundle")
         return min(ready, key=lambda swarm_id: (-ready[swarm_id], swarm_id))
+
+    def live_worker_ids(self) -> frozenset[str] | None:
+        """Return DHT liveness when the catalogue is authoritative.
+
+        ``None`` means that discovery is still using the qualified scheduler
+        membership and callers must retain their legacy liveness source.
+        """
+
+        with self._lock:
+            if self._catalog is None:
+                return None
+            return frozenset(
+                offer.worker_id
+                for snapshot in self._catalog_snapshots.values()
+                for offer in snapshot.offers
+            )
 
     def _fetch_bundle(self, model_swarm_id: str) -> None:
         try:
@@ -292,6 +418,51 @@ class SchedulerProtocolV3Shadow:
             self._bundle_errors.pop(model_swarm_id, None)
             self._bundle_retry_after.pop(model_swarm_id, None)
             self._pending.discard(model_swarm_id)
+        self._publish_manifest_async(bundle)
+
+    def _publish_manifest_async(self, bundle: ModelRegistryBundle) -> None:
+        with self._lock:
+            if self._catalog is None:
+                return
+            swarm_id = bundle.model_swarm_id
+            if swarm_id in self._catalog_manifest_pending:
+                return
+            if time.monotonic() < self._catalog_manifest_publish_after.get(swarm_id, 0):
+                return
+            self._catalog_manifest_pending.add(swarm_id)
+        threading.Thread(
+            target=self._publish_manifest,
+            args=(bundle,),
+            name="SwarmV3ManifestPublisher",
+            daemon=True,
+        ).start()
+
+    def _publish_manifest(self, bundle: ModelRegistryBundle) -> None:
+        with self._lock:
+            catalog = self._catalog
+        if catalog is None:
+            return
+        try:
+            catalog.publish_manifest(bundle.manifest)
+        except Exception as exc:  # noqa: BLE001 - asynchronous network status boundary
+            status: dict[str, object] = {
+                "state": "error",
+                "error": {
+                    "code": type(exc).__name__,
+                    "detail": str(exc)[:256],
+                },
+            }
+        else:
+            status = {
+                "state": "published",
+                "model_swarm_id": bundle.model_swarm_id,
+            }
+        with self._lock:
+            self._catalog_status = status
+            self._catalog_manifest_pending.discard(bundle.model_swarm_id)
+            self._catalog_manifest_publish_after[bundle.model_swarm_id] = (
+                time.monotonic() + (120 if status["state"] == "published" else 5)
+            )
 
     @staticmethod
     def _legacy_complete_routes(nodes: list[Any], num_layers: int) -> tuple[tuple[str, ...], ...]:
@@ -318,8 +489,9 @@ class SchedulerProtocolV3Shadow:
         return tuple(sorted(routes))
 
     def _store(self, value: dict[str, object]) -> dict[str, object]:
-        log_key = repr(value)
         with self._lock:
+            value = {**value, "catalog": dict(self._catalog_status)}
+            log_key = repr(value)
             self._latest = value
             if log_key != self._last_log_key:
                 logger.info("Protocol-v3 %s planner status: %s", self.mode, value)

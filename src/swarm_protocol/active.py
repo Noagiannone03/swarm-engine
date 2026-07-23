@@ -143,6 +143,10 @@ class ActiveRouteRuntime:
             route = self._routes.get(str(request_id))
             return route is not None and route.active
 
+    def has_active_routes(self) -> bool:
+        with self._lock:
+            return any(route.active for route in self._routes.values())
+
     def authority(self, request_id: str) -> dict[str, object] | None:
         """Return the immutable data-plane fence for one active request."""
 
@@ -226,9 +230,14 @@ class ActiveRouteRuntime:
     def maintain_once(self) -> None:
         """Check membership and renew due leases once (also deterministic in tests)."""
 
-        active_workers = {
-            str(node.node_id) for node in self.nodes_provider() if getattr(node, "is_active", False)
-        }
+        live_worker_ids = getattr(self.planner, "live_worker_ids", None)
+        active_workers = live_worker_ids() if live_worker_ids is not None else None
+        if active_workers is None:
+            active_workers = {
+                str(node.node_id)
+                for node in self.nodes_provider()
+                if getattr(node, "is_active", False)
+            }
         with self._lock:
             routes = list(self._routes.items())
         now_ms = self._now_ms()

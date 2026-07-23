@@ -217,6 +217,7 @@ def build_hub_bundle_file(
         quantization=quantization,
         dtype=dtype,
         token=token,
+        include_weight_profile=True,
     )
     bundle = ModelRegistryBundle(
         manifest=resolved.manifest,

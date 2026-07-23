@@ -15,12 +15,15 @@ from swarm_protocol import (
     ModelMemberAdvertisement,
     ModelRegistryBundle,
     PathKind,
+    RecoveryLevel,
+    RequestContract,
     SpanLease,
     SpanState,
     WorkerOffer,
     WorkerRole,
     artifact_collection_hash,
 )
+from swarm_protocol.discovery import DiscoverySnapshot
 from swarm_protocol.shadow import SchedulerProtocolV3Shadow
 
 
@@ -182,3 +185,61 @@ def test_shadow_routes_cold_workers_without_inventing_performance_estimates():
     assert result["performance_telemetry_complete"] is False
     assert result["projected_ttft_ms"] is None
     assert result["projected_inter_token_ms"] is None
+
+
+class _Catalog:
+    def __init__(self, snapshot):
+        self.value = snapshot
+
+    def publish_manifest(self, manifest):
+        assert manifest == self.value.manifests[0]
+        return True
+
+    def snapshot(self, *, model_swarm_id=None, now_ms=None):
+        del now_ms
+        assert model_swarm_id == self.value.manifests[0].model_swarm_id
+        return self.value
+
+
+def test_active_planning_uses_dht_membership_not_legacy_scheduler_nodes():
+    bundle = _bundle()
+    nodes = _nodes(bundle)
+    advertisements = [
+        ModelMemberAdvertisement.model_validate(node.swarm_v3["advertisement"])
+        for node in nodes
+    ]
+    catalog_snapshot = DiscoverySnapshot(
+        captured_at_ms=time.time_ns() // 1_000_000,
+        manifests=(bundle.manifest,),
+        offers=tuple(item.offer for item in advertisements),
+        leases=tuple(item.lease for item in advertisements),
+        links=tuple(link for item in advertisements for link in item.outgoing_links),
+    )
+    planner = SchedulerProtocolV3Shadow(_Registry(bundle), mode="active")
+    planner.attach_catalog(_Catalog(catalog_snapshot))
+    _observe_until_resolved(planner, nodes)
+    deadline = time.monotonic() + 2
+    while not planner.live_worker_ids() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    for node in nodes:
+        node.is_active = False
+    now_ms = time.time_ns() // 1_000_000
+    planned = planner.plan_request(
+        nodes,
+        request=RequestContract(
+            request_id="dht-only",
+            model_swarm_id=bundle.model_swarm_id,
+            prompt_tokens=400,
+            reserved_output_tokens=112,
+            recovery_level=RecoveryLevel.RESTARTABLE,
+        ),
+        coordinator_id="coordinator",
+        epoch=1,
+        reservation_deadline_ms=now_ms + 5_000,
+        plan_expires_at_ms=now_ms + 10_000,
+    )
+
+    assert tuple(stage.worker_id for stage in planned.plan.stages) == ("mac", "rtx")
+    assert planner.ready_model_swarm_id(nodes) == bundle.model_swarm_id
+    assert planner.live_worker_ids() == frozenset({"mac", "rtx"})

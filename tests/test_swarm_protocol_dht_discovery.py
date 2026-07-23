@@ -255,3 +255,40 @@ def test_snapshot_drops_member_whose_signed_endpoint_and_offer_disagree() -> Non
     snapshot = store.snapshot(model_swarm_id=model.model_swarm_id, now_ms=2_000)
     assert snapshot.offers == ()
     assert snapshot.leases == ()
+
+
+def test_coherent_advertisement_publishes_links_without_n_plus_one_lookups() -> None:
+    model = manifest()
+    native = FakeNativeCatalog("endpoint-mac")
+    store = DhtDiscoveryStore(native, "dht-mac", clock_ms=lambda: 2_000)
+    store.publish_manifest(model)
+    rtx_offer = offer("rtx", "endpoint-rtx")
+    native.inject_member(
+        rtx_offer.endpoint_id,
+        model.model_swarm_id,
+        ModelMemberAdvertisement(
+            offer=rtx_offer,
+            lease=lease(model.model_swarm_id, "rtx", 4, 28),
+        ),
+        sequence=1,
+    )
+    metric = LinkMetric(
+        from_worker_id="mac",
+        to_worker_id="rtx",
+        path_kind=PathKind.RELAY,
+        rtt_ms=25,
+        throughput_bytes_per_second=10_000_000,
+        measured_at_ms=1_900,
+        expires_at_ms=10_000,
+    )
+    store.publish_advertisement(
+        ModelMemberAdvertisement(
+            offer=offer("mac", native.endpoint_id),
+            lease=lease(model.model_swarm_id, "mac", 0, 4),
+            outgoing_links=(metric,),
+        )
+    )
+
+    snapshot = store.snapshot(model_swarm_id=model.model_swarm_id, now_ms=2_000)
+    assert {item.worker_id for item in snapshot.offers} == {"mac", "rtx"}
+    assert snapshot.links == (metric,)

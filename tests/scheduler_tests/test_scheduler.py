@@ -691,6 +691,61 @@ def test_fast_decoder_join_waits_for_inflight_request_to_finish():
     assert sched.list_node_allocations() == [("mac", 0, 1), ("rtx", 1, 28)]
 
 
+def test_fast_decoder_join_waits_for_external_v3_route_to_finish():
+    model = build_model_info(28)
+    mac = build_node("mac", model, tflops=10.0, mem_gb=200.0, mem_bandwidth_gbps=100.0)
+    rtx = build_node(
+        "rtx",
+        model,
+        tflops=200.0,
+        mem_gb=400.0,
+        mem_bandwidth_gbps=1000.0,
+        supports_frontend=False,
+    )
+    set_rtt_from_coords([mac, rtx])
+    sched = Scheduler(model, [mac], strategy="dp", routing_strategy="dp")
+    assert sched.bootstrap()
+    route_active = [True]
+    sched.external_routes_active = lambda: route_active[0]
+    sched.enqueue_join(rtx)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    assert not sched._process_pending_rebalance(force=True)  # type: ignore[attr-defined]
+    assert sched.list_node_allocations() == [("mac", 0, 28)]
+
+    route_active[0] = False
+    assert sched._process_pending_rebalance(force=True)  # type: ignore[attr-defined]
+    assert sched.list_node_allocations() == [("mac", 0, 1), ("rtx", 1, 28)]
+
+
+def test_leave_rebalance_intent_survives_external_v3_route_drain(monkeypatch):
+    model = build_model_info(12)
+    first = build_node("first", model, tflops=100.0, mem_gb=40.0, x=0, y=0)
+    second = build_node("second", model, tflops=100.0, mem_gb=40.0, x=1, y=0)
+    set_rtt_from_coords([first, second])
+    sched = Scheduler(model, [first, second], strategy="dp", routing_strategy="dp")
+    assert sched.bootstrap()
+    monkeypatch.setattr(sched.layer_allocator, "should_global_rebalance", lambda: True)
+    bootstrap_calls = []
+    monkeypatch.setattr(
+        sched,
+        "bootstrap",
+        lambda *, reboot=False: bootstrap_calls.append(reboot) or True,
+    )
+    route_active = [True]
+    sched.external_routes_active = lambda: route_active[0]
+
+    sched.enqueue_leave(first.node_id)
+    sched._process_leaves()  # type: ignore[attr-defined]
+    assert sched._rebalance_after_leave_pending  # type: ignore[attr-defined]
+    assert bootstrap_calls == []
+
+    route_active[0] = False
+    sched._process_leaves()  # type: ignore[attr-defined]
+    assert bootstrap_calls == [True]
+    assert not sched._rebalance_after_leave_pending  # type: ignore[attr-defined]
+
+
 def test_fast_decoder_join_waits_for_rtt_before_planning():
     """Join registration preceding network probes must remain retryable."""
 

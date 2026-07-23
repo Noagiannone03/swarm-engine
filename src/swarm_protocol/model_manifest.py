@@ -251,6 +251,7 @@ def build_hub_model_bundle(
     token: bool | str | None = None,
     api: HfApi | None = None,
     artifact_reader: ArtifactReader | None = None,
+    include_weight_profile: bool = False,
 ) -> ResolvedModelBundle:
     """Resolve a mutable Hub reference into one reproducible Fabi model bundle.
 
@@ -421,6 +422,18 @@ def build_hub_model_bundle(
         "tensor_encoding": "safetensors/v1",
         "wire_protocol_version": wire_protocol_version,
     }
+    weight_profile = None
+    if include_weight_profile:
+        from backend.server.model_weight_metadata import load_hub_weight_profile
+
+        weight_profile = load_hub_weight_profile(
+            canonical_model_id,
+            num_layers=num_layers,
+            tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
+            revision=immutable_revision,
+            token=token,
+            api=client,
+        )
 
     manifest = ModelManifest(
         model_id=canonical_model_id,
@@ -438,6 +451,16 @@ def build_hub_model_bundle(
             num_layers=num_layers,
             hidden_size=hidden_size,
             dtype_bytes=_DTYPE_BYTES[dtype_key],
+        ),
+        weight_bytes_by_layer=(() if weight_profile is None else weight_profile.layer_bytes),
+        input_endpoint_weight_bytes=(
+            0 if weight_profile is None else weight_profile.input_endpoint_bytes
+        ),
+        output_endpoint_weight_bytes=(
+            0 if weight_profile is None else weight_profile.output_endpoint_bytes
+        ),
+        shared_endpoint_weight_bytes=(
+            0 if weight_profile is None else weight_profile.shared_endpoint_bytes
         ),
         rope_context_contract_hash=_canonical_hash(
             "fabi/model-contract/rope-context/v1", rope_contract

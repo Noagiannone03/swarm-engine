@@ -70,6 +70,7 @@ class WorkerExecutionAdmission:
         self._contract_key: tuple[object, ...] | None = None
         self._plans_by_route_id: dict[str, RoutePlan] = {}
         self._highest_epoch_by_request: dict[str, int] = {}
+        self._draining = False
         self._lock = threading.RLock()
 
     def _now_ms(self) -> int:
@@ -134,15 +135,66 @@ class WorkerExecutionAdmission:
     def _ready_contract(
         self, now_ms: int
     ) -> tuple[ModelMemberAdvertisement, LocalReservationTable]:
-        member = self._advertisement
-        table = self._reservations
-        if member is None or table is None:
-            raise ExecutionAdmissionError("worker has no verified serving contract")
-        if member.lease.state != SpanState.READY:
-            raise ExecutionAdmissionError("worker hosted span is not ready")
-        if member.offer.expires_at_ms <= now_ms or member.lease.expires_at_ms <= now_ms:
-            raise ExecutionAdmissionError("worker serving contract has expired")
-        return member, table
+        with self._lock:
+            member = self._advertisement
+            table = self._reservations
+            draining = self._draining
+            if member is None or table is None:
+                raise ExecutionAdmissionError("worker has no verified serving contract")
+            if draining:
+                raise ExecutionAdmissionError("worker hosted span is draining")
+            if member.lease.state != SpanState.READY:
+                raise ExecutionAdmissionError("worker hosted span is not ready")
+            if member.offer.expires_at_ms <= now_ms or member.lease.expires_at_ms <= now_ms:
+                raise ExecutionAdmissionError("worker serving contract has expired")
+            return member, table
+
+    def _configured_table(self) -> LocalReservationTable:
+        with self._lock:
+            if self._reservations is None:
+                raise ExecutionAdmissionError("worker has no verified serving contract")
+            return self._reservations
+
+    def begin_drain(self) -> int:
+        """Atomically close admission and return capacity-owning reservations."""
+
+        with self._lock:
+            self._draining = True
+            if self._reservations is None:
+                return 0
+            return sum(
+                lease.state in {ReservationState.PREPARED, ReservationState.COMMITTED}
+                for lease in self._reservations.snapshot()
+            )
+
+    def draining_reservations(self) -> int:
+        with self._lock:
+            if not self._draining or self._reservations is None:
+                return 0
+            return sum(
+                lease.state in {ReservationState.PREPARED, ReservationState.COMMITTED}
+                for lease in self._reservations.snapshot()
+            )
+
+    def cancel_drain(self) -> None:
+        """Reopen the unchanged READY generation after an aborted movement."""
+
+        with self._lock:
+            member = self._advertisement
+            if member is None or member.lease.state != SpanState.READY:
+                raise ExecutionAdmissionError("cannot cancel drain without an unchanged ready span")
+            self._draining = False
+
+    def finish_drain(self) -> None:
+        """Open admission after the replacement generation is verified READY."""
+
+        with self._lock:
+            member = self._advertisement
+            if member is None or member.lease.state != SpanState.READY:
+                raise ExecutionAdmissionError("replacement serving contract is not ready")
+            if self._reservations is not None and self._reservations.used_kv_bytes:
+                raise ServingContractBusy("replacement generation still owns old KV reservations")
+            self._draining = False
 
     def _local_stage(
         self,
@@ -179,28 +231,28 @@ class WorkerExecutionAdmission:
         caller_endpoint_id: str,
     ) -> SignedControlMessage:
         self._require_caller(caller_endpoint_id)
-        now_ms = self._now_ms()
-        member, table = self._ready_contract(now_ms)
-        plan = verify_control_contract(
-            signed_plan,
-            expected_kind=ControlMessageKind.ROUTE_PLAN,
-            expected_signer_endpoint_id=self.coordinator_endpoint_id,
-            contract_type=RoutePlan,
-            crypto=self.crypto,
-        )
-        if plan.reservation_deadline_ms <= now_ms or plan.plan_expires_at_ms <= now_ms:
-            raise ExecutionAdmissionError("route plan reservation window has expired")
-        stage = self._local_stage(plan, member)
-        reservation = table.prepare(
-            reservation_id=f"{plan.route_id}:{self.worker_id}",
-            request_id=plan.request_id,
-            route_id=plan.route_id,
-            epoch=plan.epoch,
-            effective_span=stage.effective_span,
-            exact_kv_bytes=stage.exact_kv_bytes,
-            ttl_ms=plan.reservation_deadline_ms - now_ms,
-        )
         with self._lock:
+            now_ms = self._now_ms()
+            member, table = self._ready_contract(now_ms)
+            plan = verify_control_contract(
+                signed_plan,
+                expected_kind=ControlMessageKind.ROUTE_PLAN,
+                expected_signer_endpoint_id=self.coordinator_endpoint_id,
+                contract_type=RoutePlan,
+                crypto=self.crypto,
+            )
+            if plan.reservation_deadline_ms <= now_ms or plan.plan_expires_at_ms <= now_ms:
+                raise ExecutionAdmissionError("route plan reservation window has expired")
+            stage = self._local_stage(plan, member)
+            reservation = table.prepare(
+                reservation_id=f"{plan.route_id}:{self.worker_id}",
+                request_id=plan.request_id,
+                route_id=plan.route_id,
+                epoch=plan.epoch,
+                effective_span=stage.effective_span,
+                exact_kv_bytes=stage.exact_kv_bytes,
+                ttl_ms=plan.reservation_deadline_ms - now_ms,
+            )
             highest = self._highest_epoch_by_request.get(plan.request_id, -1)
             if plan.epoch > highest:
                 self._plans_by_route_id = {
@@ -224,7 +276,7 @@ class WorkerExecutionAdmission:
     ) -> SignedControlMessage | None:
         self._require_caller(caller_endpoint_id)
         now_ms = self._now_ms()
-        _, table = self._ready_contract(now_ms)
+        table = self._configured_table()
         command = verify_control_contract(
             signed_command,
             expected_kind=ControlMessageKind.RESERVATION_COMMAND,

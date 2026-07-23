@@ -211,6 +211,10 @@ class ModelManifest(ContractModel):
     num_layers: PositiveInt
     activation_bytes_per_token: PositiveInt
     kv_bytes_per_token_by_layer: tuple[PositiveInt, ...]
+    weight_bytes_by_layer: tuple[PositiveInt, ...] = ()
+    input_endpoint_weight_bytes: NonNegativeInt = 0
+    output_endpoint_weight_bytes: NonNegativeInt = 0
+    shared_endpoint_weight_bytes: NonNegativeInt = 0
     rope_context_contract_hash: HashHex
     attention_kv_contract_hash: HashHex
     prefill_contract_hash: HashHex
@@ -222,7 +226,32 @@ class ModelManifest(ContractModel):
             raise ValueError(f"unsupported protocol version: {self.protocol_version}")
         if len(self.kv_bytes_per_token_by_layer) != self.num_layers:
             raise ValueError("KV byte geometry must contain exactly one value per model layer")
+        if self.weight_bytes_by_layer and len(self.weight_bytes_by_layer) != self.num_layers:
+            raise ValueError("weight byte geometry must contain exactly one value per model layer")
+        if self.shared_endpoint_weight_bytes > min(
+            self.input_endpoint_weight_bytes,
+            self.output_endpoint_weight_bytes,
+        ):
+            raise ValueError("shared endpoint weights exceed an endpoint")
         return self
+
+    def weight_bytes(self, span: LayerSpan) -> int:
+        """Return exact resident checkpoint bytes for one stage."""
+
+        if not self.weight_bytes_by_layer:
+            raise ValueError("manifest has no exact per-layer weight geometry")
+        if span.end > self.num_layers:
+            raise ValueError("weight span exceeds the model")
+        total = sum(self.weight_bytes_by_layer[span.start : span.end])
+        owns_input = span.start == 0
+        owns_output = span.end == self.num_layers
+        if owns_input:
+            total += self.input_endpoint_weight_bytes
+        if owns_output:
+            total += self.output_endpoint_weight_bytes
+        if owns_input and owns_output:
+            total -= self.shared_endpoint_weight_bytes
+        return total
 
     @property
     def model_swarm_id(self) -> str:

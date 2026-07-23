@@ -66,6 +66,21 @@ def test_model_swarm_id_is_deterministic_and_contract_sensitive() -> None:
     assert changed.model_swarm_id != manifest.model_swarm_id
 
 
+def test_manifest_accounts_exact_stage_weights_and_tied_endpoints() -> None:
+    manifest = make_manifest().model_copy(
+        update={
+            "weight_bytes_by_layer": (100,) * 28,
+            "input_endpoint_weight_bytes": 1_000,
+            "output_endpoint_weight_bytes": 1_500,
+            "shared_endpoint_weight_bytes": 750,
+        }
+    )
+
+    assert manifest.weight_bytes(LayerSpan(start=0, end=4)) == 1_400
+    assert manifest.weight_bytes(LayerSpan(start=4, end=28)) == 3_900
+    assert manifest.weight_bytes(LayerSpan(start=0, end=28)) == 4_550
+
+
 def test_worker_offer_accepts_non_executor_contribution() -> None:
     offer = WorkerOffer(
         worker_id="worker-small",
