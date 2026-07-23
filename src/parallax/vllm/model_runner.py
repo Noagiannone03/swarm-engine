@@ -89,8 +89,18 @@ def _use_eager_execution() -> bool:
 def _build_scheduler_config(
     *, max_num_batched_tokens: int, max_num_seqs: int, max_model_len: int
 ) -> SchedulerConfig:
+    # With chunked prefill disabled, vLLM requires enough batched-token budget
+    # for one full sequence, but warns when that budget exceeds the aggregate
+    # capacity of the configured batch.  Reconcile the CLI preference with the
+    # allocation-scoped model length instead of carrying a stale larger worker
+    # ceiling into a smaller scheduler context tier.
+    batch_capacity = int(max_num_seqs) * int(max_model_len)
+    effective_batched_tokens = min(
+        max(int(max_num_batched_tokens), int(max_model_len)),
+        batch_capacity,
+    )
     return SchedulerConfig(
-        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_batched_tokens=effective_batched_tokens,
         max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
         is_encoder_decoder=False,
@@ -595,11 +605,10 @@ def initialize_vllm_model_runner(
     device_config = DeviceConfig(device=device)
     load_config_for_config = LoadConfig(load_format="auto")
 
-    max_batched_tokens = max(max_num_tokens_per_batch, model_config.max_model_len)
     max_num_seqs = max_batch_size
 
     scheduler_config = _build_scheduler_config(
-        max_num_batched_tokens=max_batched_tokens,
+        max_num_batched_tokens=max_num_tokens_per_batch,
         max_num_seqs=max_num_seqs,
         max_model_len=model_config.max_model_len,
     )

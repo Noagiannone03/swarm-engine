@@ -91,26 +91,45 @@ def _update_args_from_shared_state(args, shared_state: SharedState, force_update
 
     # A worker advertises its hardware/runtime ceiling before it knows which
     # model the scheduler will assign.  Keep that original ceiling stable and
-    # derive an effective value for each model generation.  This prevents a
-    # low-context model from being started with an unsafe larger window while
-    # still allowing a later model switch to restore the worker's capability.
+    # derive an effective value for each allocation generation.  The runtime
+    # limit must satisfy all three independent ceilings:
+    #
+    # * what this worker was configured to support;
+    # * what the model architecture supports;
+    # * what the scheduler's exact weight + KV plan reserved for this epoch.
+    #
+    # In particular, ``planned_context_tokens`` is not merely telemetry.  vLLM
+    # materializes KV storage against ``max_model_len`` and deliberately refuses
+    # to start when that value exceeds the available KV budget.  Starting it at
+    # the model's larger native context would therefore violate the scheduler's
+    # allocation contract even when the planned context fits exactly.
     if not hasattr(args, "_worker_max_sequence_length"):
         args._worker_max_sequence_length = getattr(args, "max_sequence_length", None)
-    worker_limit = args._worker_max_sequence_length
-    model_limit = model_info.get("model_max_sequence_length")
-    if worker_limit is None:
-        args.max_sequence_length = model_limit
-    elif model_limit is None:
-        args.max_sequence_length = worker_limit
-    else:
-        args.max_sequence_length = min(int(worker_limit), int(model_limit))
-        if args.max_sequence_length < int(worker_limit):
-            logger.info(
-                "Clamped worker context from %s to model limit %s for %s",
-                worker_limit,
-                model_limit,
-                model_info["model_name"],
-            )
+    context_limits = {
+        "worker": args._worker_max_sequence_length,
+        "model": model_info.get("model_max_sequence_length"),
+        "allocation": model_info.get("planned_context_tokens"),
+    }
+    positive_limits = {
+        name: int(value)
+        for name, value in context_limits.items()
+        if value is not None and int(value) > 0
+    }
+    args.max_sequence_length = min(positive_limits.values()) if positive_limits else None
+
+    binding_limits = [
+        name for name, value in positive_limits.items() if value == args.max_sequence_length
+    ]
+    logger.info(
+        "Effective runtime context for allocation epoch %s: %s tokens "
+        "(worker=%s, model=%s, allocation=%s; binding=%s)",
+        model_info.get("allocation_epoch"),
+        args.max_sequence_length,
+        context_limits["worker"],
+        context_limits["model"],
+        context_limits["allocation"],
+        ",".join(binding_limits) or "none",
+    )
     # Update tp_size if provided, otherwise keep current value
     args.tp_size = model_info["tp_size"] or args.tp_size
     # Update weight refit switch

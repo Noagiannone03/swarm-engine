@@ -15,6 +15,26 @@ def test_vllm_runner_disables_async_scheduling():
     assert config.async_scheduling is False
 
 
+def test_vllm_runner_bounds_stale_worker_batch_budget_to_allocation_context():
+    config = model_runner._build_scheduler_config(
+        max_num_batched_tokens=65536,
+        max_num_seqs=1,
+        max_model_len=32768,
+    )
+
+    assert config.max_num_batched_tokens == 32768
+
+
+def test_vllm_runner_keeps_useful_multi_request_batch_budget():
+    config = model_runner._build_scheduler_config(
+        max_num_batched_tokens=65536,
+        max_num_seqs=4,
+        max_model_len=32768,
+    )
+
+    assert config.max_num_batched_tokens == 65536
+
+
 def test_extracts_synchronous_sampled_token_ids():
     token_ids = [[17]]
 

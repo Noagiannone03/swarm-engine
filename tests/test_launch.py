@@ -128,6 +128,67 @@ def test_model_context_limit_clamps_each_generation_without_losing_worker_capabi
     assert args._worker_max_sequence_length == 65536
 
 
+def test_scheduler_allocation_context_caps_runtime_model_length():
+    args = Namespace(
+        model_path=None,
+        max_sequence_length=65536,
+        tp_size=1,
+        enable_weight_refit=False,
+        weight_refit_mode=None,
+    )
+    shared_state = SharedState(
+        {
+            "model_name": "Qwen/Qwen3-4B",
+            "model_max_sequence_length": 40960,
+            "planned_context_tokens": 32768,
+            "allocation_epoch": 2,
+            "block_start_index": 5,
+            "block_end_index": 36,
+            "tp_size": 1,
+            "enable_weight_refit": False,
+            "weight_refit_mode": None,
+        }
+    )
+
+    _update_args_from_shared_state(args, shared_state, force_update=False)
+
+    assert args.max_sequence_length == 32768
+    assert args.planned_context_tokens == 32768
+    assert args._worker_max_sequence_length == 65536
+
+
+def test_later_allocation_epoch_recomputes_context_from_stable_worker_ceiling():
+    args = Namespace(
+        model_path=None,
+        max_sequence_length=65536,
+        tp_size=1,
+        enable_weight_refit=False,
+        weight_refit_mode=None,
+    )
+    shared_state = SharedState(
+        {
+            "model_name": "Qwen/Qwen3-4B",
+            "model_max_sequence_length": 40960,
+            "planned_context_tokens": 16384,
+            "allocation_epoch": 2,
+            "block_start_index": 5,
+            "block_end_index": 36,
+            "tp_size": 1,
+            "enable_weight_refit": False,
+            "weight_refit_mode": None,
+        }
+    )
+
+    _update_args_from_shared_state(args, shared_state, force_update=False)
+    assert args.max_sequence_length == 16384
+
+    shared_state.update(planned_context_tokens=32768, allocation_epoch=3)
+    _update_args_from_shared_state(args, shared_state, force_update=True)
+
+    assert args.max_sequence_length == 32768
+    assert args._worker_max_sequence_length == 65536
+
+
 def test_explicit_model_alias_wins_before_manual_scheduler_assignment_arrives():
     args = Namespace(
         model_path="/models/Qwen3-0.6B-bf16",
