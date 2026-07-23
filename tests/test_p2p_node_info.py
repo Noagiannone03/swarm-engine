@@ -77,6 +77,44 @@ def test_dynamic_span_handler_enqueues_after_standby_assignment():
     assert socket.messages == [[b"forward", request.SerializeToString()]]
 
 
+def test_autonomous_span_reload_fences_ingress_and_updates_shared_generation():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+        block_start_index=0,
+        block_end_index=2,
+    )
+    values = {}
+
+    class State:
+        def get(self, key, default=None):
+            return values.get(key, default)
+
+        def update(self, **changes):
+            values.update(changes)
+
+    spans = []
+    server._shared_state = State()
+    server.swarm_v3_execution_admission = object()
+    server.connection_handler = SimpleNamespace(
+        update_serving_span=lambda start, end: spans.append((start, end))
+    )
+
+    server._apply_v3_span_reload(
+        span=SimpleNamespace(start=2, end=4),
+        generation=7,
+    )
+
+    assert spans == [(2, 4)]
+    assert server.block_start_index == 2
+    assert server.block_end_index == 4
+    assert server.status is ServerState.INITIALIZING
+    assert values["_layer_allocation_changed"] is True
+    assert values["swarm_v3_placement_generation"] == 7
+    assert values["swarm_v3_placement_phase"] == "building"
+
+
 def test_forward_enqueue_failure_is_not_reported_as_success():
     handler = build_forward_handler(RecordingSocket(error=RuntimeError("enqueue failed")))
     request = forward_pb2.ForwardRequest()

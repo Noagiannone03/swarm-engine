@@ -223,6 +223,20 @@ def _wait_executors_check_layer_change(
         if shared_state.get_layer_allocation_changed():
             return True
 
+        failed = [
+            (getattr(proc, "pid", None), getattr(proc, "exitcode", None))
+            for proc in executor_subprocs
+            if not proc.is_alive() and getattr(proc, "exitcode", None) not in {None, 0}
+        ]
+        if failed:
+            shared_state.update(
+                frontend_alive=False,
+                status=ServerState.INITIALIZING.value,
+            )
+            if shared_state.get("memory_contract_failure") is not None:
+                return True
+            raise RuntimeError(f"Executor subprocess exited unexpectedly: {failed}")
+
         now = time.monotonic()
         if memory_pressure_guards and now - last_pressure_poll >= DEFAULT_PRESSURE_POLL_SECONDS:
             last_pressure_poll = now
@@ -311,11 +325,10 @@ def _wait_executors_check_layer_change(
                         "after drain (current_requests=%d)",
                         current_requests,
                     )
-                    return False
     failed = [
         (getattr(proc, "pid", None), getattr(proc, "exitcode", None))
         for proc in executor_subprocs
-        if getattr(proc, "exitcode", None) not in (None, 0)
+        if getattr(proc, "exitcode", None) not in {None, 0}
     ]
     if failed:
         shared_state.update(
@@ -323,13 +336,43 @@ def _wait_executors_check_layer_change(
             status=ServerState.INITIALIZING.value,
         )
         if shared_state.get("memory_contract_failure") is not None:
-            # This is a qualified backend measurement, not an arbitrary crash.
-            # Keep the P2P heartbeat alive so the scheduler can lower one tier
-            # and publish a new fenced allocation generation.
             return True
         raise RuntimeError(f"Executor subprocess exited unexpectedly: {failed}")
-    # Check race condition: layer allocation changed after all processes exited
     return shared_state.get_layer_allocation_changed()
+
+
+def _wait_for_v3_placement_rollback(
+    shared_state: SharedState,
+    *,
+    failed_generation: int,
+    detail: str,
+    timeout: float = 45.0,
+) -> bool:
+    """Publish one load failure and wait for the P2P controller's fenced rollback."""
+
+    previous_start = shared_state.get("swarm_v3_previous_start_layer")
+    previous_end = shared_state.get("swarm_v3_previous_end_layer")
+    if (
+        failed_generation <= 0
+        or previous_start is None
+        or previous_end is None
+        or shared_state.get("swarm_v3_placement_phase") != "building"
+    ):
+        return False
+    shared_state.update(
+        status=ServerState.INITIALIZING.value,
+        frontend_alive=False,
+        swarm_v3_placement_error={
+            "generation": failed_generation,
+            "detail": detail[:256],
+        },
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if int(shared_state.get("swarm_v3_placement_generation", 0)) > failed_generation:
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def _wait_for_contract_replan(
@@ -664,10 +707,30 @@ if __name__ == "__main__":
                     break
                 except Exception as e:
                     logger.exception(f"Executor error: {e}")
-                    # Shutdown all executor processes on error
-                    for proc in executor_subprocs:
-                        if proc.is_alive():
-                            stop_executor_process(proc)
+                    _stop_executor_processes(executor_subprocs)
+                    if frontend_process is not None:
+                        stop_vllm_rust_frontend(frontend_process)
+                        frontend_process = None
+                    _cleanup_engine_core_generation(args)
+                    failed_generation = int(
+                        shared_state.get("swarm_v3_placement_generation", 0) or 0
+                    )
+                    if _wait_for_v3_placement_rollback(
+                        shared_state,
+                        failed_generation=failed_generation,
+                        detail=f"{type(e).__name__}: {e}",
+                    ):
+                        shared_state.update(
+                            _layer_allocation_changed=False,
+                            swarm_v3_placement_error=None,
+                            status=ServerState.INITIALIZING.value,
+                        )
+                        _update_args_from_shared_state(args, shared_state, force_update=True)
+                        logger.warning(
+                            "Retrying the previous verified span after failed v3 generation %d",
+                            failed_generation,
+                        )
+                        continue
                     raise
     except KeyboardInterrupt:
         logger.debug("Received interrupt signal, shutting down...")

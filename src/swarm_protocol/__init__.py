@@ -83,12 +83,14 @@ from swarm_protocol.routing import (
     RouteEstimate,
     RoutePlanningError,
 )
+from swarm_protocol.worker_placement import AutonomousWorkerPlacement
 
 __all__ = [
     "PROTOCOL_VERSION",
     "ArtifactDescriptor",
     "ArtifactRole",
     "AutonomousPlacementPolicy",
+    "AutonomousWorkerPlacement",
     "BackendKind",
     "ContributionReceipt",
     "CapacityDemandMap",

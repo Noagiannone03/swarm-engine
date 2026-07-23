@@ -519,7 +519,11 @@ class SchedulerManage:
         """
         logger.debug(f"Routing table requested for request_id={request_id}")
         if self.active_v3_routes is not None:
-            if not self.scheduler.serving_ready() or self.scheduler._admission_paused:
+            planner = getattr(self.scheduler, "swarm_v3_shadow", None)
+            dht_workers = planner.live_worker_ids() if planner is not None else None
+            if self.scheduler._admission_paused or (
+                dht_workers is None and not self.scheduler.serving_ready()
+            ):
                 return []
             if prompt_tokens is None or reserved_output_tokens is None:
                 raise ValueError("active v3 routing requires exact prompt and output token budgets")

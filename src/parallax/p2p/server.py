@@ -49,13 +49,20 @@ from parallax.utils.weight_refit_utils import (
     release_disk_storage,
 )
 from parallax_utils.logging_config import get_logger, set_log_level
-from swarm_protocol.contracts import BackendKind, LayerSpan, LinkMetric, PathKind
+from swarm_protocol.contracts import (
+    BackendKind,
+    LayerSpan,
+    LinkMetric,
+    ModelMemberAdvertisement,
+    PathKind,
+)
 from swarm_protocol.execution import WorkerExecutionAdmission
 from swarm_protocol.execution_rpc import WorkerExecutionControlService
 from swarm_protocol.worker_integration import (
     WorkerProtocolV3Reporter,
     WorkerServingSnapshot,
 )
+from swarm_protocol.worker_placement import AutonomousWorkerPlacement
 
 logger = get_logger(__name__)
 
@@ -535,6 +542,13 @@ class GradientServer:
         self.account_token = os.environ.get("FABI_ACCOUNT_TOKEN") or None
         self.swarm_v3_reporter = None
         self.swarm_v3_execution_admission = None
+        self.swarm_v3_placement_controller = None
+        self.swarm_v3_placement_mode = os.environ.get(
+            "FABI_SWARM_V3_PLACEMENT",
+            "legacy",
+        ).strip().lower()
+        if self.swarm_v3_placement_mode not in {"legacy", "autonomous"}:
+            raise ValueError("FABI_SWARM_V3_PLACEMENT supports only legacy or autonomous")
         self.swarm_v3_init_error = None
         try:
             self.swarm_v3_reporter = WorkerProtocolV3Reporter.from_environment()
@@ -585,6 +599,46 @@ class GradientServer:
                 status=self.status.value,
                 _layer_allocation_changed=self._layer_allocation_changed,
             )
+
+    def _apply_v3_span_reload(self, span: LayerSpan, generation: int) -> None:
+        """Fence ingress and hand one autonomous span generation to launch.py."""
+
+        if self._shared_state is None:
+            raise RuntimeError("autonomous placement requires shared executor state")
+        if self.swarm_v3_execution_admission is None:
+            raise RuntimeError("autonomous placement requires worker-local v3 admission")
+        previous_start = self.block_start_index
+        previous_end = self.block_end_index
+        placement_phase = self._shared_state.get("swarm_v3_placement_phase", "legacy")
+        self.block_start_index = span.start
+        self.block_end_index = span.end
+        if self.connection_handler is not None:
+            self.connection_handler.update_serving_span(span.start, span.end)
+        self._layer_allocation_changed = True
+        self.status = ServerState.INITIALIZING
+        self._sync_to_shared_state()
+        self._shared_state.update(
+            swarm_v3_placement_generation=generation,
+            swarm_v3_placement_phase="building",
+            swarm_v3_placement_error=None,
+            swarm_v3_previous_start_layer=(
+                previous_start
+                if placement_phase != "building"
+                else self._shared_state.get("swarm_v3_previous_start_layer")
+            ),
+            swarm_v3_previous_end_layer=(
+                previous_end
+                if placement_phase != "building"
+                else self._shared_state.get("swarm_v3_previous_end_layer")
+            ),
+            frontend_alive=False,
+        )
+        logger.warning(
+            "Protocol-v3 placement generation %d is reloading layers [%d, %d)",
+            generation,
+            span.start,
+            span.end,
+        )
 
     def check_and_release_disk_weight(self):
         """Only save 3 history versions of weight"""
@@ -690,6 +744,13 @@ class GradientServer:
                 endpoint_id=self.iroh_transport.peer_id(),
                 coordinator_endpoint_id=self.scheduler_peer_id,
                 crypto=self.iroh_transport,
+            )
+        if getattr(self, "swarm_v3_placement_mode", "legacy") == "autonomous" and (
+            getattr(self, "swarm_v3_execution_admission", None) is None
+            or getattr(self.iroh_transport, "catalog_discovery", None) is None
+        ):
+            raise RuntimeError(
+                "autonomous v3 placement requires active mode and the native catalogue DHT"
             )
         logger.info(
             "Iroh worker endpoint ready: %s (scheduler %s)",
@@ -1193,6 +1254,12 @@ class GradientServer:
                                 allocation_epoch = response.get("allocation_epoch")
                                 has_model_context = "model_max_sequence_length" in response
                                 negotiated_chunk_size = response.get("chunked_prefill_size")
+                                if self.swarm_v3_placement_controller is not None:
+                                    # The qualified scheduler still supplies model and wire
+                                    # contracts during migration, but layer ownership belongs to
+                                    # the worker-side v3 transaction once it has started.
+                                    start_layer = self.block_start_index
+                                    end_layer = self.block_end_index
                                 if start_layer is not None and end_layer is not None:
                                     logger.debug(
                                         f"Heartbeat: Node {self.lattica.peer_id()}... "
@@ -1379,6 +1446,21 @@ class GradientServer:
             runtime_kv_capacity = self._shared_state.get("kv_cache_token_capacity")
             runtime_kv_block_size = self._shared_state.get("kv_cache_block_size")
             memory_contract_failure = self._shared_state.get("memory_contract_failure")
+            placement_error = self._shared_state.get("swarm_v3_placement_error")
+            if (
+                placement_error is not None
+                and self.swarm_v3_placement_controller is not None
+            ):
+                try:
+                    self.swarm_v3_placement_controller.mark_failed(
+                        generation=int(placement_error["generation"]),
+                        error=RuntimeError(str(placement_error["detail"])),
+                    )
+                except RuntimeError:
+                    logger.debug(
+                        "Ignoring an already fenced placement failure: %s",
+                        placement_error,
+                    )
 
         info = {
             "node_id": self.lattica.peer_id(),
@@ -1456,6 +1538,11 @@ class GradientServer:
                     runtime_kv_block_size,
                     runtime_max_requests,
                     hardware.get("usable_memory_bytes"),
+                    (
+                        self.planned_context_tokens
+                        if self.swarm_v3_placement_mode == "autonomous"
+                        else 1
+                    ),
                 )
                 if all(value is not None for value in required_contract):
                     backend = (
@@ -1495,7 +1582,48 @@ class GradientServer:
                         "warming",
                     }:
                         try:
-                            self.swarm_v3_execution_admission.configure(report["advertisement"])
+                            advertisement = ModelMemberAdvertisement.model_validate(
+                                report["advertisement"]
+                            )
+                            if self.swarm_v3_placement_mode == "autonomous":
+                                manifest = self.swarm_v3_reporter.trusted_manifest(
+                                    advertisement.lease.model_swarm_id
+                                )
+                                catalog = self.iroh_transport.catalog_discovery
+                                if manifest is None or catalog is None:
+                                    raise RuntimeError(
+                                        "autonomous placement trust or catalogue is not ready"
+                                    )
+                                if self.swarm_v3_placement_controller is None:
+                                    self.swarm_v3_placement_controller = (
+                                        AutonomousWorkerPlacement(
+                                            catalog=catalog,
+                                            admission=self.swarm_v3_execution_admission,
+                                            state_publisher=self.swarm_v3_reporter,
+                                            reload_target=self._apply_v3_span_reload,
+                                            current_span=advertisement.lease.hosted_span,
+                                        )
+                                    )
+                                placement = self.swarm_v3_placement_controller.observe(
+                                    advertisement=advertisement,
+                                    manifest=manifest,
+                                    context_tokens=int(self.planned_context_tokens),
+                                )
+                                report["placement"] = placement
+                                if self._shared_state is not None:
+                                    placement_state = {
+                                        "swarm_v3_placement_generation": placement["generation"],
+                                        "swarm_v3_placement_phase": placement["phase"],
+                                    }
+                                    if placement["phase"] == "ready":
+                                        placement_state.update(
+                                            swarm_v3_placement_error=None,
+                                            swarm_v3_previous_start_layer=None,
+                                            swarm_v3_previous_end_layer=None,
+                                        )
+                                    self._shared_state.update(**placement_state)
+                            else:
+                                self.swarm_v3_execution_admission.configure(advertisement)
                         except Exception as exc:
                             report = {
                                 "mode": "active",

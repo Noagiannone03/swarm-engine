@@ -132,6 +132,43 @@ class WorkerProtocolV3Reporter:
             self._catalog = catalog
             self._catalog_status = {"state": "waiting_advertisement"}
 
+    def trusted_manifest(self, model_swarm_id: str):
+        """Return only metadata already verified through the pinned registry."""
+
+        with self._lock:
+            verified = self._verified
+            if verified is None or verified.bundle.model_swarm_id != model_swarm_id:
+                return None
+            return verified.bundle.manifest
+
+    def publish_span_state(
+        self,
+        advertisement: ModelMemberAdvertisement,
+        state: SpanState,
+    ) -> ModelMemberAdvertisement:
+        """Publish a sequenced non-READY transition for the current generation."""
+
+        if state is SpanState.READY:
+            raise ValueError("READY must come from a freshly verified serving snapshot")
+        now_ms = time.time_ns() // 1_000_000
+        with self._lock:
+            self._lease_seq = max(self._lease_seq, advertisement.lease.lease_seq) + 1
+            transitioned = advertisement.model_copy(
+                update={
+                    "lease": advertisement.lease.model_copy(
+                        update={
+                            "state": state,
+                            "available_kv_bytes_snapshot": 0,
+                            "lease_seq": self._lease_seq,
+                            "issued_at_ms": now_ms,
+                            "expires_at_ms": now_ms + _REPORT_TTL_MS,
+                        }
+                    )
+                }
+            )
+        self._queue_catalog_publish(transitioned)
+        return transitioned
+
     @classmethod
     def from_environment(cls) -> "WorkerProtocolV3Reporter | None":
         """Build the opt-in shadow reporter without trust-on-first-use."""

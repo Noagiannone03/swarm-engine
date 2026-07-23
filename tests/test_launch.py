@@ -1,4 +1,6 @@
 from argparse import Namespace
+import threading
+import time
 
 import pytest
 
@@ -8,6 +10,7 @@ from parallax.launch import (
     _prepare_engine_core_generation,
     _update_args_from_shared_state,
     _wait_executors_check_layer_change,
+    _wait_for_v3_placement_rollback,
 )
 from parallax.p2p.server import ServerState
 from parallax.server.memory_budget import GIB, MemoryPressureController
@@ -330,6 +333,57 @@ def test_memory_contract_failure_keeps_heartbeat_generation_alive_for_replan():
 
     assert _wait_executors_check_layer_change(shared_state, [FailedExecutor()]) is True
     assert shared_state.get_status() == ServerState.INITIALIZING.value
+
+
+def test_v3_load_failure_waits_for_a_new_fenced_rollback_generation():
+    shared_state = SharedState.create()
+    shared_state.update(
+        swarm_v3_placement_generation=3,
+        swarm_v3_placement_phase="building",
+        swarm_v3_previous_start_layer=0,
+        swarm_v3_previous_end_layer=2,
+    )
+
+    def acknowledge_failure():
+        while shared_state.get("swarm_v3_placement_error") is None:
+            time.sleep(0.001)
+        shared_state.update(
+            swarm_v3_placement_generation=4,
+            block_start_index=0,
+            block_end_index=2,
+        )
+
+    thread = threading.Thread(target=acknowledge_failure)
+    thread.start()
+    assert _wait_for_v3_placement_rollback(
+        shared_state,
+        failed_generation=3,
+        detail="synthetic load error",
+        timeout=1,
+    )
+    thread.join()
+
+    assert shared_state.get("swarm_v3_placement_error") == {
+        "generation": 3,
+        "detail": "synthetic load error",
+    }
+    assert shared_state.get("swarm_v3_placement_generation") == 4
+
+
+def test_v3_load_failure_without_previous_verified_span_fails_closed():
+    shared_state = SharedState.create()
+    shared_state.update(
+        swarm_v3_placement_generation=1,
+        swarm_v3_placement_phase="building",
+    )
+
+    assert not _wait_for_v3_placement_rollback(
+        shared_state,
+        failed_generation=1,
+        detail="cold join failed",
+        timeout=0,
+    )
+    assert shared_state.get("swarm_v3_placement_error") is None
 
 
 def test_memory_warning_pauses_then_resumes_without_layer_reallocation(monkeypatch):

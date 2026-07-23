@@ -175,6 +175,11 @@ class SharedState:
         shared_dict["model_max_sequence_length"] = None
         shared_dict["planned_context_tokens"] = None
         shared_dict["allocation_epoch"] = None
+        shared_dict["swarm_v3_placement_generation"] = 0
+        shared_dict["swarm_v3_placement_phase"] = "legacy"
+        shared_dict["swarm_v3_placement_error"] = None
+        shared_dict["swarm_v3_previous_start_layer"] = None
+        shared_dict["swarm_v3_previous_end_layer"] = None
         shared_dict["chunked_prefill_size"] = None
         shared_dict["kv_cache_token_capacity"] = None
         shared_dict["kv_cache_block_size"] = None
