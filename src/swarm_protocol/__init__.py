@@ -1,5 +1,11 @@
 """Versioned contracts for the decentralized Fabi swarm control plane."""
 
+from swarm_protocol.artifact_verification import (
+    VerifiedSpanArtifacts,
+    required_weight_descriptors,
+    verify_artifact,
+    verify_worker_span,
+)
 from swarm_protocol.contracts import (
     PROTOCOL_VERSION,
     ArtifactDescriptor,
@@ -10,9 +16,9 @@ from swarm_protocol.contracts import (
     KvGeometry,
     LayerSpan,
     LinkMetric,
-    ModelMemberAdvertisement,
     ModelArtifactIndex,
     ModelManifest,
+    ModelMemberAdvertisement,
     PathKind,
     RecoveryLevel,
     RequestContract,
@@ -25,6 +31,7 @@ from swarm_protocol.contracts import (
     WorkerOffer,
     WorkerRole,
 )
+from swarm_protocol.dht_discovery import DhtDiscoveryStore
 from swarm_protocol.discovery import (
     CatalogRecordConflict,
     DiscoveryError,
@@ -33,11 +40,20 @@ from swarm_protocol.discovery import (
     InMemoryDiscoveryStore,
     StaleCatalogRecord,
 )
-from swarm_protocol.dht_discovery import DhtDiscoveryStore
 from swarm_protocol.model_manifest import (
     ResolvedModelBundle,
     artifact_collection_hash,
     build_hub_model_bundle,
+)
+from swarm_protocol.registry import (
+    ModelCatalogEntry,
+    ModelRegistryBundle,
+    ModelRegistryCatalog,
+    RegistryExpiryPolicy,
+    RegistryRoleSigners,
+    TrustedModelRegistry,
+    TufRegistryPublisher,
+    model_target_path,
 )
 from swarm_protocol.reservations import (
     CapacityUnavailable,
@@ -89,6 +105,10 @@ __all__ = [
     "InMemoryDiscoveryStore",
     "StaleCatalogRecord",
     "DhtDiscoveryStore",
+    "VerifiedSpanArtifacts",
+    "required_weight_descriptors",
+    "verify_artifact",
+    "verify_worker_span",
     "ResolvedModelBundle",
     "artifact_collection_hash",
     "build_hub_model_bundle",
@@ -100,6 +120,14 @@ __all__ = [
     "ReservationExpired",
     "ReservationNotFound",
     "StaleEpoch",
+    "ModelRegistryBundle",
+    "ModelCatalogEntry",
+    "ModelRegistryCatalog",
+    "RegistryExpiryPolicy",
+    "RegistryRoleSigners",
+    "TrustedModelRegistry",
+    "TufRegistryPublisher",
+    "model_target_path",
     "ExactRoutePlanner",
     "NoFeasibleRoute",
     "PlannedRoute",

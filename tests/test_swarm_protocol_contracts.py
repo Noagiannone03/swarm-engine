@@ -50,6 +50,7 @@ def make_manifest() -> ModelManifest:
         dtype="bfloat16",
         num_layers=28,
         activation_bytes_per_token=4096,
+        kv_bytes_per_token_by_layer=(512,) * 28,
         rope_context_contract_hash=HASH_D,
         attention_kv_contract_hash=HASH_E,
         prefill_contract_hash=HASH_F,

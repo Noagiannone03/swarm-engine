@@ -622,6 +622,41 @@ class BaseExecutor:
             "decode_batch": decode_batch,
         }
 
+    @staticmethod
+    def _sum_token_counts(value: Any) -> int:
+        """Convert backend tensor/list token counts without importing another tensor runtime."""
+
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            return sum(BaseExecutor._sum_token_counts(item) for item in value)
+        return int(value)
+
+    @staticmethod
+    def _processed_token_count(batch_type: str, prepared_inputs: Dict[str, Any]) -> Optional[int]:
+        """Return backend-scheduled tokens, or ``None`` when no exact counter is exposed."""
+
+        requests = prepared_inputs.get("requests") or []
+        if batch_type == "decode_batch":
+            # Every maintained backend schedules exactly one decode token per request here.
+            return len(requests) or None
+
+        actual_lengths = prepared_inputs.get("actual_processed_lengths")
+        if actual_lengths is not None:
+            return BaseExecutor._sum_token_counts(actual_lengths)
+        scheduler_output = prepared_inputs.get("scheduler_output")
+        scheduled = getattr(scheduler_output, "total_num_scheduled_tokens", None)
+        if scheduled is not None:
+            return int(scheduled)
+        if (
+            "forward_batch" in prepared_inputs
+            and prepared_inputs.get("context_lengths") is not None
+        ):
+            # SGLang's prefill adapter stores the scheduled extend lengths here (not total
+            # sequence lengths as the vLLM adapter does).
+            return BaseExecutor._sum_token_counts(prepared_inputs["context_lengths"])
+        return None
+
     def prepare_next_batch_requests(
         self, requests: List[Request], batch_output: Any, context_lengths: Any
     ) -> List[Request]:
@@ -635,9 +670,9 @@ class BaseExecutor:
             context_lengths: Context lengths for each request
         """
         # Extract hidden_states and probs from output (always a dict now)
-        assert isinstance(batch_output, dict), (
-            f"Expected dict from process_batch, got {type(batch_output)}"
-        )
+        assert isinstance(
+            batch_output, dict
+        ), f"Expected dict from process_batch, got {type(batch_output)}"
         hidden_states = batch_output["hidden_states"]
         token_probs = batch_output["probs"]
 
@@ -792,10 +827,24 @@ class BaseExecutor:
                     if prepared_inputs_dict and prepared_inputs_dict.get(batch_type):
                         prepared_inputs = prepared_inputs_dict[batch_type]
 
-                        start_time = time.time()
+                        start_time = time.perf_counter()
                         output = self.process_batch(
                             prepared_inputs, return_decoded_tokens=self.is_last_peer
                         )
+                        elapsed_seconds = max(time.perf_counter() - start_time, 1e-9)
+                        processed_tokens = self._processed_token_count(batch_type, prepared_inputs)
+                        if (
+                            batch_type == "prefill_batch"
+                            and processed_tokens is not None
+                            and processed_tokens > 0
+                            and self.tp_rank == 0
+                            and self.shared_state is not None
+                        ):
+                            self.shared_state.update_metrics(
+                                prefill_tokens_per_second_sample=(
+                                    processed_tokens / elapsed_seconds
+                                )
+                            )
                         # Update metrics with per-layer latency sample (throttled by decode steps)
                         if batch_type == "decode_batch":
                             try:
@@ -804,12 +853,18 @@ class BaseExecutor:
                                     self._decode_steps_since_metric
                                     >= self.layer_latency_update_every
                                 ):
-                                    elapsed_ms = (time.time() - start_time) * 1000.0
+                                    elapsed_ms = elapsed_seconds * 1000.0
                                     assert self.num_shard_layers > 0
                                     per_layer_ms = elapsed_ms / float(self.num_shard_layers)
-                                    if self.shared_state is not None:
+                                    if self.shared_state is not None and self.tp_rank == 0:
                                         self.shared_state.update_metrics(
-                                            layer_latency_ms_sample=per_layer_ms
+                                            layer_latency_ms_sample=per_layer_ms,
+                                            decode_tokens_per_second_sample=(
+                                                processed_tokens / elapsed_seconds
+                                                if processed_tokens is not None
+                                                and processed_tokens > 0
+                                                else None
+                                            ),
                                         )
                                     self._decode_steps_since_metric = 0
                             except Exception:
@@ -903,9 +958,9 @@ class BaseExecutor:
         """
         # This peer is the last peer or a single node.
         if self.is_last_peer and self.is_first_peer:
-            assert isinstance(request, (InitialRequest, IntermediateRequest)), (
-                "Invalid request type for decoding."
-            )
+            assert isinstance(
+                request, (InitialRequest, IntermediateRequest)
+            ), "Invalid request type for decoding."
 
             next_token_id, hidden_states = self._gen_token_id_from_hidden(hidden_states)
             return IntermediateRequest(
@@ -922,9 +977,9 @@ class BaseExecutor:
         if self.is_last_peer:
             # Last peer decodes a token and sends it back to the first peer.
             # The token is wrapped in an IntermediateRequest.
-            assert isinstance(request, IntermediateRequest), (
-                "Last peer must receive an IntermediateRequest."
-            )
+            assert isinstance(
+                request, IntermediateRequest
+            ), "Last peer must receive an IntermediateRequest."
 
             next_token_id, hidden_states = self._gen_token_id_from_hidden(hidden_states)
             return IntermediateRequest(
@@ -946,9 +1001,9 @@ class BaseExecutor:
             return IntermediateRequest.from_initial_request(
                 request, hidden_states=hidden_states, lora_path=request.lora_path
             )
-        assert isinstance(request, IntermediateRequest), (
-            "Intermediate peer must process an IntermediateRequest."
-        )
+        assert isinstance(
+            request, IntermediateRequest
+        ), "Intermediate peer must process an IntermediateRequest."
         return IntermediateRequest.from_intermediate_request(
             request, hidden_states, lora_path=request.lora_path
         )

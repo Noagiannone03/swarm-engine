@@ -26,7 +26,11 @@ from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 from fabi_network.transport import IrohTransport, using_iroh
 from parallax.p2p.proto import forward_pb2
-from parallax.p2p.utils import AsyncWorker, log_nat_traversal_preflight, mdns_enabled_for_topology
+from parallax.p2p.utils import (
+    AsyncWorker,
+    log_nat_traversal_preflight,
+    mdns_enabled_for_topology,
+)
 from parallax.server.server_info import detect_node_hardware
 from parallax.server.vllm_rust_frontend import vllm_rust_frontend_available
 from parallax.utils.shared_state import SharedState
@@ -39,6 +43,11 @@ from parallax.utils.weight_refit_utils import (
     release_disk_storage,
 )
 from parallax_utils.logging_config import get_logger, set_log_level
+from swarm_protocol.contracts import BackendKind, LayerSpan, LinkMetric, PathKind
+from swarm_protocol.worker_integration import (
+    WorkerProtocolV3Reporter,
+    WorkerServingSnapshot,
+)
 
 logger = get_logger(__name__)
 
@@ -474,12 +483,25 @@ class GradientServer:
         self.rtts = {}
         self.rtt_last_update = 0
         self.rtt_update_interval = 60
+        self.link_throughputs = {}
+        self.link_throughputs_lock = threading.Lock()
         self.status = ServerState.JOINING
         self.manual_layer_assignment = block_end_index is not None and block_start_index is not None
         self.conn = conn
         # Account credential is transported only over the encrypted scheduler
         # RPC.  The scheduler immediately hashes it and never logs/stores it.
         self.account_token = os.environ.get("FABI_ACCOUNT_TOKEN") or None
+        self.swarm_v3_reporter = None
+        self.swarm_v3_init_error = None
+        try:
+            self.swarm_v3_reporter = WorkerProtocolV3Reporter.from_environment()
+        except Exception as exc:
+            # Shadow telemetry must never take the qualified v2 heartbeat or serving path down.
+            self.swarm_v3_init_error = {
+                "code": type(exc).__name__,
+                "detail": str(exc)[:256],
+            }
+            logger.error("Protocol-v3 shadow reporter is disabled: %s", exc)
 
         self.scheduler_stub = None
         self.scheduler_peer_id = None
@@ -853,6 +875,39 @@ class GradientServer:
         self.rtt_last_update = time.time()
         return True
 
+    def _v3_outgoing_link_metrics(self) -> tuple[LinkMetric, ...]:
+        """Return recent effective goodput samples from real activation transfers."""
+
+        now_ms = time.time_ns() // 1_000_000
+        with self.link_throughputs_lock:
+            samples = dict(self.link_throughputs)
+        metrics = []
+        for peer_id, sample in sorted(samples.items()):
+            measured_at_ms = int(sample["measured_at_ms"])
+            if now_ms - measured_at_ms >= 120_000:
+                continue
+            if peer_id in self.direct_peer_ids:
+                path_kind = PathKind.DIRECT
+            elif peer_id in self.relayed_peer_ids:
+                path_kind = PathKind.RELAY
+            else:
+                continue
+            rtt_ms = self.rtts.get(peer_id)
+            if rtt_ms is None:
+                continue
+            metrics.append(
+                LinkMetric(
+                    from_worker_id=self.lattica.peer_id(),
+                    to_worker_id=peer_id,
+                    path_kind=path_kind,
+                    rtt_ms=max(0.0, float(rtt_ms)),
+                    throughput_bytes_per_second=float(sample["bytes_per_second"]),
+                    measured_at_ms=measured_at_ms,
+                    expires_at_ms=measured_at_ms + 120_000,
+                )
+            )
+        return tuple(metrics)
+
     def start_routing_table_updater(self):
         def _updater_thread():
             while True and not self.stop_event.is_set():
@@ -968,8 +1023,21 @@ class GradientServer:
                         )
 
                         size_mb, elapsed_ms, speed_mb_s = _transfer_metrics(
-                            len(message_body), time.perf_counter_ns() - start_ns
+                            new_forward_request.ByteSize(), time.perf_counter_ns() - start_ns
                         )
+                        measured_at_ms = time.time_ns() // 1_000_000
+                        measured_bytes_per_second = speed_mb_s * 1024 * 1024
+                        with self.link_throughputs_lock:
+                            previous = self.link_throughputs.get(next_peer_id)
+                            if previous is not None:
+                                measured_bytes_per_second = (
+                                    0.8 * float(previous["bytes_per_second"])
+                                    + 0.2 * measured_bytes_per_second
+                                )
+                            self.link_throughputs[next_peer_id] = {
+                                "bytes_per_second": measured_bytes_per_second,
+                                "measured_at_ms": measured_at_ms,
+                            }
                         logger.info(
                             f"Forwarding data to {next_peer_id}, "
                             f"total size: {size_mb:.3f} MB, "
@@ -1300,6 +1368,62 @@ class GradientServer:
             if not self.manual_layer_assignment:
                 info["start_layer"] = self.block_start_index
                 info["end_layer"] = self.block_end_index
+
+            if self.swarm_v3_init_error is not None:
+                info["swarm_v3"] = {
+                    "mode": "shadow",
+                    "state": "rejected",
+                    "error": self.swarm_v3_init_error,
+                }
+            elif self.swarm_v3_reporter is not None:
+                required_contract = (
+                    self.model_name,
+                    self.model_revision,
+                    self.block_start_index,
+                    self.block_end_index,
+                    runtime_kv_capacity,
+                    runtime_kv_block_size,
+                    runtime_max_requests,
+                    hardware.get("usable_memory_bytes"),
+                )
+                if all(value is not None for value in required_contract):
+                    backend = (
+                        BackendKind.MLX
+                        if runtime_backend == "mlx"
+                        else (BackendKind.VLLM if runtime_backend == "vllm" else BackendKind.SGLANG)
+                    )
+                    info["swarm_v3"] = self.swarm_v3_reporter.snapshot(
+                        WorkerServingSnapshot(
+                            worker_id=self.lattica.peer_id(),
+                            endpoint_id=self.lattica.peer_id(),
+                            model_id=str(self.model_name),
+                            immutable_revision=str(self.model_revision),
+                            span=LayerSpan(
+                                start=int(self.block_start_index),
+                                end=int(self.block_end_index),
+                            ),
+                            backend=backend,
+                            stable_memory_envelope_bytes=int(hardware["usable_memory_bytes"]),
+                            kv_cache_token_capacity=int(runtime_kv_capacity),
+                            kv_cache_block_size=int(runtime_kv_block_size),
+                            max_sessions=int(runtime_max_requests),
+                            is_ready=self._get_status() == ServerState.READY.value,
+                            current_requests=int(metrics.get("current_requests", 0)),
+                            supports_frontend=self.supports_frontend,
+                            outgoing_links=self._v3_outgoing_link_metrics(),
+                            measured_prefill_tokens_per_second=metrics.get(
+                                "prefill_tokens_per_second"
+                            ),
+                            measured_decode_tokens_per_second=metrics.get(
+                                "decode_tokens_per_second"
+                            ),
+                        )
+                    )
+                else:
+                    info["swarm_v3"] = {
+                        "mode": "shadow",
+                        "state": "waiting_contract",
+                    }
 
         return info
 

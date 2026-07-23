@@ -37,6 +37,7 @@ def manifest(model_id: str = "Qwen/Qwen3-8B") -> ModelManifest:
         dtype="bfloat16",
         num_layers=28,
         activation_bytes_per_token=4096,
+        kv_bytes_per_token_by_layer=(512,) * 28,
         rope_context_contract_hash=HASHES[3],
         attention_kv_contract_hash=HASHES[4],
         prefill_contract_hash=HASHES[5],

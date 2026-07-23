@@ -162,8 +162,17 @@ class LayerSpan(ContractModel):
 
 class KvGeometry(ContractModel):
     block_size_tokens: PositiveInt
-    bytes_per_token_per_layer: PositiveInt
+    bytes_per_token_per_layer: PositiveInt | None = None
+    bytes_per_token_by_layer: tuple[PositiveInt, ...] = ()
     allocatable_bytes: NonNegativeInt
+
+    @model_validator(mode="after")
+    def validate_geometry(self) -> Self:
+        if (self.bytes_per_token_per_layer is None) == (not self.bytes_per_token_by_layer):
+            raise ValueError(
+                "KV geometry requires exactly one uniform or per-layer byte representation"
+            )
+        return self
 
     def rounded_tokens(self, requested_tokens: int) -> int:
         if requested_tokens <= 0:
@@ -172,7 +181,14 @@ class KvGeometry(ContractModel):
         return blocks * self.block_size_tokens
 
     def required_bytes(self, span: LayerSpan, requested_tokens: int) -> int:
-        return self.rounded_tokens(requested_tokens) * self.bytes_per_token_per_layer * span.length
+        if self.bytes_per_token_by_layer:
+            if span.end > len(self.bytes_per_token_by_layer):
+                raise ValueError("layer span exceeds per-layer KV geometry")
+            bytes_per_token = sum(self.bytes_per_token_by_layer[span.start : span.end])
+        else:
+            assert self.bytes_per_token_per_layer is not None
+            bytes_per_token = self.bytes_per_token_per_layer * span.length
+        return self.rounded_tokens(requested_tokens) * bytes_per_token
 
 
 class ModelManifest(ContractModel):
@@ -187,6 +203,7 @@ class ModelManifest(ContractModel):
     dtype: NonEmpty
     num_layers: PositiveInt
     activation_bytes_per_token: PositiveInt
+    kv_bytes_per_token_by_layer: tuple[PositiveInt, ...]
     rope_context_contract_hash: HashHex
     attention_kv_contract_hash: HashHex
     prefill_contract_hash: HashHex
@@ -196,6 +213,8 @@ class ModelManifest(ContractModel):
     def require_protocol_version(self) -> Self:
         if self.protocol_version != PROTOCOL_VERSION:
             raise ValueError(f"unsupported protocol version: {self.protocol_version}")
+        if len(self.kv_bytes_per_token_by_layer) != self.num_layers:
+            raise ValueError("KV byte geometry must contain exactly one value per model layer")
         return self
 
     @property
@@ -260,6 +279,10 @@ class SpanLease(ContractModel):
             raise ValueError("span lease must bind at least one weight hash")
         if self.available_kv_bytes_snapshot > self.kv_geometry.allocatable_bytes:
             raise ValueError("available KV snapshot exceeds the worker's allocatable KV envelope")
+        if self.kv_geometry.bytes_per_token_by_layer and self.hosted_span.end > len(
+            self.kv_geometry.bytes_per_token_by_layer
+        ):
+            raise ValueError("hosted span exceeds the advertised per-layer KV geometry")
         if self.expires_at_ms <= self.issued_at_ms:
             raise ValueError("span lease must expire after it is issued")
         return self

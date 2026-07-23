@@ -24,6 +24,7 @@ from scheduling.request_routing import (
     DynamicProgrammingRouting,
     RoundRobinOverFixedPipelinesRouting,
 )
+from swarm_protocol.shadow import SchedulerProtocolV3Shadow
 
 logger = get_logger(__name__)
 
@@ -44,6 +45,7 @@ NodeUpdate: TypeAlias = Tuple[
     Optional[List[str]],
     Optional[List[str]],
     Optional[str],
+    Optional[Dict[str, object]],
     Optional[Dict[str, object]],
 ]
 
@@ -169,6 +171,25 @@ class Scheduler:
         self.alloc_log_snapshot: str = ""
         # Avoid spamming: only emit the "all nodes active" INFO log on transitions.
         self._all_nodes_active_logged: bool = False
+        self.swarm_v3_shadow = None
+        self.swarm_v3_shadow_snapshot: Dict[str, object] = {
+            "mode": "off",
+            "state": "disabled",
+        }
+        try:
+            self.swarm_v3_shadow = SchedulerProtocolV3Shadow.from_environment()
+            if self.swarm_v3_shadow is not None:
+                self.swarm_v3_shadow_snapshot = {
+                    "mode": "shadow",
+                    "state": "waiting_workers",
+                }
+        except Exception as exc:
+            self.swarm_v3_shadow_snapshot = {
+                "mode": "shadow",
+                "state": "rejected",
+                "error": {"code": type(exc).__name__, "detail": str(exc)[:256]},
+            }
+            logger.error("Protocol-v3 scheduler shadow is disabled: %s", exc)
         logger.info(
             f"Scheduler initialized, min_nodes_bootstrapping {self.min_nodes_bootstrapping}, "
             f"Layer allocations trategy {strategy}, Request routing strategy {routing_strategy}."
@@ -498,6 +519,7 @@ class Scheduler:
         relayed_peer_ids: Optional[List[str]] = None,
         account_hash: Optional[str] = None,
         memory_contract_failure: Optional[Dict[str, object]] = None,
+        swarm_v3: Optional[Dict[str, object]] = None,
     ) -> None:
         """Update the info of a node."""
         if current_requests is not None:
@@ -531,6 +553,8 @@ class Scheduler:
         if account_hash is not None:
             node.account_hash = account_hash
         node.memory_contract_failure = memory_contract_failure
+        if swarm_v3 is not None:
+            node.swarm_v3 = swarm_v3
         if memory_contract_failure is not None:
             self._record_memory_contract_failure(node, memory_contract_failure)
         node.last_heartbeat = time.time()
@@ -567,6 +591,7 @@ class Scheduler:
         relayed_peer_ids: Optional[List[str]] = None,
         account_hash: Optional[str] = None,
         memory_contract_failure: Optional[Dict[str, object]] = None,
+        swarm_v3: Optional[Dict[str, object]] = None,
     ) -> None:
         """Enqueue a node update event."""
         self._pending_node_updates.put(
@@ -588,6 +613,7 @@ class Scheduler:
                 relayed_peer_ids,
                 account_hash,
                 memory_contract_failure,
+                swarm_v3,
             )
         )
         self._wake_event.set()
@@ -1019,6 +1045,7 @@ class Scheduler:
     def _event_loop(self, poll_interval: float) -> None:
         """Process joins/leaves/updates and perform heartbeat checks."""
         last_hb_check = 0.0
+        last_v3_shadow_check = 0.0
         while not self._stop_event.is_set():
             self._process_node_updates()
             self._process_pending_context_replan()
@@ -1026,6 +1053,30 @@ class Scheduler:
             self._process_leaves()
             self._process_pending_rebalance()
             now = time.time()
+            if self.swarm_v3_shadow is not None and now - last_v3_shadow_check >= 2.0:
+                selected_context = int(
+                    getattr(self.layer_allocator, "selected_context_tokens", 0) or 0
+                )
+                try:
+                    self.swarm_v3_shadow_snapshot = self.swarm_v3_shadow.observe(
+                        list(self.node_manager.nodes),
+                        model_num_layers=self.num_layers,
+                        planning_context_tokens=max(
+                            1,
+                            selected_context
+                            or int(
+                                getattr(
+                                    self.layer_allocator,
+                                    "planning_context_tokens",
+                                    16_384,
+                                )
+                            ),
+                        ),
+                        epoch=self.allocation_epoch,
+                    )
+                except Exception:
+                    logger.warning("Protocol-v3 shadow comparison failed", exc_info=True)
+                last_v3_shadow_check = now
             if now - last_hb_check >= max(0.5, poll_interval):
                 self.checking_node_heartbeat()
                 last_hb_check = now
@@ -1072,6 +1123,7 @@ class Scheduler:
                     relayed_peer_ids,
                     account_hash,
                     memory_contract_failure,
+                    swarm_v3,
                 ) = self._pending_node_updates.get_nowait()
             except queue.Empty:
                 break
@@ -1097,6 +1149,7 @@ class Scheduler:
                 relayed_peer_ids=relayed_peer_ids,
                 account_hash=account_hash,
                 memory_contract_failure=memory_contract_failure,
+                swarm_v3=swarm_v3,
             )
 
         # Manual allocations can complete before their executors finish loading.
@@ -1232,9 +1285,7 @@ class Scheduler:
             preferred_context_tokens=self.layer_allocator.preferred_context_tokens,
             require_exact_weight_metadata=self.layer_allocator.require_exact_weight_metadata,
             context_ceiling_tokens=self.layer_allocator.context_ceiling_tokens,
-            runtime_context_downgrade_used=(
-                self.layer_allocator.runtime_context_downgrade_used
-            ),
+            runtime_context_downgrade_used=(self.layer_allocator.runtime_context_downgrade_used),
         )
         for node_id, start_layer, end_layer in self.list_node_allocations():
             planned_allocator.allocate(planned_by_id[node_id], start_layer, end_layer)

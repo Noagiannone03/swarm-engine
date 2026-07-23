@@ -197,20 +197,22 @@ class ExactRoutePlanner:
         if not (hosted.start <= start_layer < hosted.end):
             return ()
 
-        rounded_tokens = lease.kv_geometry.rounded_tokens(request.required_context_tokens)
-        bytes_per_layer = rounded_tokens * lease.kv_geometry.bytes_per_token_per_layer
-        max_layers = lease.available_kv_bytes_snapshot // bytes_per_layer
-        if max_layers <= 0:
-            return ()
-
         if lease.effective_span_mode == EffectiveSpanMode.FIXED:
-            if start_layer != hosted.start or hosted.length > max_layers:
+            if start_layer != hosted.start or hosted.end > model_num_layers:
                 return ()
-            return (hosted,) if hosted.end <= model_num_layers else ()
+            required_bytes = lease.kv_geometry.required_bytes(
+                hosted, request.required_context_tokens
+            )
+            return (hosted,) if required_bytes <= lease.available_kv_bytes_snapshot else ()
 
-        max_end = min(hosted.end, model_num_layers, start_layer + max_layers)
         return tuple(
-            LayerSpan(start=start_layer, end=end) for end in range(start_layer + 1, max_end + 1)
+            span
+            for end in range(start_layer + 1, min(hosted.end, model_num_layers) + 1)
+            if lease.kv_geometry.required_bytes(
+                (span := LayerSpan(start=start_layer, end=end)),
+                request.required_context_tokens,
+            )
+            <= lease.available_kv_bytes_snapshot
         )
 
     def plan(

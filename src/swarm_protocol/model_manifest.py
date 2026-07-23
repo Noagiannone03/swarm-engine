@@ -180,6 +180,53 @@ def _runtime_contract(config: Mapping[str, Any], keys: tuple[str, ...]) -> dict[
     return {key: config[key] for key in keys if key in config and config[key] is not None}
 
 
+def _kv_bytes_per_token_by_layer(
+    config: Mapping[str, Any],
+    *,
+    num_layers: int,
+    hidden_size: int,
+    dtype_bytes: int,
+) -> tuple[int, ...]:
+    """Derive exact uniform attention-cache geometry from the model contract.
+
+    Current Parallax executors expose a decoder-layer KV cache. Architectures with recurrent or
+    state-space layers need a different cache contract and are rejected until the runtime can
+    measure and advertise their per-layer state explicitly.
+    """
+
+    attention_heads = int(config.get("num_attention_heads") or 0)
+    kv_heads = int(config.get("num_key_value_heads") or attention_heads)
+    if attention_heads <= 0 or kv_heads <= 0 or hidden_size % attention_heads != 0:
+        raise ValueError("model config does not expose a valid attention/KV head geometry")
+    default_head_dim = hidden_size // attention_heads
+    key_head_dim = int(
+        (config.get("qk_nope_head_dim") or 0) + (config.get("qk_rope_head_dim") or 0)
+        or config.get("head_dim")
+        or default_head_dim
+    )
+    value_head_dim = int(config.get("v_head_dim") or config.get("head_dim") or default_head_dim)
+    if key_head_dim <= 0 or value_head_dim <= 0:
+        raise ValueError("model config declares invalid KV head dimensions")
+
+    layer_types = config.get("layer_types")
+    if layer_types is not None:
+        if not isinstance(layer_types, list) or len(layer_types) != num_layers:
+            raise ValueError("model layer_types must contain exactly one entry per layer")
+        unsupported = [
+            layer_type
+            for layer_type in layer_types
+            if not isinstance(layer_type, str)
+            or not any(token in layer_type.lower() for token in ("attention", "sliding"))
+        ]
+        if unsupported:
+            raise ValueError(
+                "state-space or recurrent layer cache geometry is not yet supported by protocol v3"
+            )
+
+    per_layer = dtype_bytes * kv_heads * (key_head_dim + value_head_dim)
+    return (per_layer,) * num_layers
+
+
 def _quantization_identity(label: str, config: Mapping[str, Any]) -> str:
     normalized_label = _QUANTIZATION_ALIASES.get(label.strip().lower(), label.strip().lower())
     quantization_config = config.get("quantization_config") or config.get("quantization")
@@ -386,6 +433,12 @@ def build_hub_model_bundle(
         dtype=dtype_key,
         num_layers=num_layers,
         activation_bytes_per_token=hidden_size * _DTYPE_BYTES[dtype_key],
+        kv_bytes_per_token_by_layer=_kv_bytes_per_token_by_layer(
+            config,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            dtype_bytes=_DTYPE_BYTES[dtype_key],
+        ),
         rope_context_contract_hash=_canonical_hash(
             "fabi/model-contract/rope-context/v1", rope_contract
         ),

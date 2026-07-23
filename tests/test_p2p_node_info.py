@@ -1,5 +1,5 @@
-import time
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -235,6 +235,54 @@ def test_mlx_worker_keeps_chunked_prefill_enabled(monkeypatch):
     assert node_info["supports_chunked_prefill"] is True
     assert node_info["preferred_chunked_prefill_size"] == 1024
     assert node_info["chunked_prefill_size"] == 1024
+
+
+def test_worker_heartbeat_carries_non_blocking_v3_shadow_report(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+        block_start_index=0,
+        block_end_index=4,
+        gpu_backend="sglang",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.rtt_last_update = time.time()
+    server.model_name = "test/model"
+    server.model_revision = "0123456789abcdef0123456789abcdef01234567"
+    captured = {}
+    server.swarm_v3_reporter = SimpleNamespace(
+        snapshot=lambda serving: captured.setdefault(
+            "report", {"mode": "shadow", "state": "verifying", "span": serving.span}
+        )
+    )
+    values = {
+        "max_concurrent_requests": 2,
+        "kv_cache_token_capacity": 4096,
+        "kv_cache_block_size": 16,
+        "memory_contract_failure": None,
+        "memory_pressure": "normal",
+        "memory_pressure_resources": {},
+    }
+    server._shared_state = SimpleNamespace(
+        get=lambda key, default=None: values.get(key, default),
+        get_status=lambda: ServerState.READY.value,
+        get_metrics=lambda: {"current_requests": 0},
+    )
+    monkeypatch.setattr(
+        "parallax.p2p.server.detect_node_hardware",
+        lambda node_id: {
+            "node_id": node_id,
+            "device": "cuda",
+            "usable_memory_bytes": 8 * 1024**3,
+        },
+    )
+
+    heartbeat = server.get_node_info(is_update=True)
+
+    assert heartbeat["swarm_v3"]["state"] == "verifying"
+    assert captured["report"]["span"].start == 0
+    assert captured["report"]["span"].end == 4
 
 
 def test_worker_advertises_executor_measured_kv_geometry(monkeypatch):

@@ -33,6 +33,7 @@ def manifest(num_layers: int = 8) -> ModelManifest:
         dtype="bfloat16",
         num_layers=num_layers,
         activation_bytes_per_token=4096,
+        kv_bytes_per_token_by_layer=(512,) * num_layers,
         rope_context_contract_hash=HASHES[3],
         attention_kv_contract_hash=HASHES[4],
         prefill_contract_hash=HASHES[5],

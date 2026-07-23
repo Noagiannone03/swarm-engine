@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 from backend.server.contribution_gate import account_hash
 from backend.server.rpc_connection_handler import RPCConnectionHandler
-
 from tests.scheduler_tests.test_utils import build_model_info, build_node
 
 
@@ -99,6 +98,7 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
             "reachable_peer_ids": ["downstream-worker", "relay-worker"],
             "relayed_peer_ids": ["relay-worker"],
             "account_token": "ab" * 32,
+            "swarm_v3": {"mode": "shadow", "state": "verifying"},
         }
     )
 
@@ -115,6 +115,7 @@ def test_node_update_forwards_raw_latency_while_worker_is_at_capacity():
     assert update["reachable_peer_ids"] == ["downstream-worker", "relay-worker"]
     assert update["relayed_peer_ids"] == ["relay-worker"]
     assert update["account_hash"] == account_hash("ab" * 32)
+    assert update["swarm_v3"] == {"mode": "shadow", "state": "verifying"}
 
 
 def test_node_update_refreshes_registration_when_bootstrap_is_incomplete():

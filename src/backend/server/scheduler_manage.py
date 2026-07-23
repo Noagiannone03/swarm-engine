@@ -198,6 +198,9 @@ class SchedulerManage:
                 ),
                 "node_list": self.get_node_list(),
                 "need_more_nodes": self.need_more_nodes(),
+                "swarm_v3_shadow": (
+                    self.scheduler.swarm_v3_shadow_snapshot if self.scheduler else None
+                ),
                 "max_running_request": (
                     self.scheduler.report_pipeline_capacity()[1] if self.scheduler else 0
                 ),
@@ -222,6 +225,11 @@ class SchedulerManage:
             "max_concurrent_requests": getattr(node, "max_requests", None),
             "kv_cache_telemetry_ready": (
                 getattr(node, "kv_cache_token_capacity", None) is not None
+            ),
+            "swarm_v3_state": (
+                getattr(node, "swarm_v3", {}).get("state")
+                if isinstance(getattr(node, "swarm_v3", None), dict)
+                else None
             ),
             "kv_cache_token_capacity": getattr(node, "kv_cache_token_capacity", None),
             "kv_cache_block_size": getattr(node, "kv_cache_block_size", None),

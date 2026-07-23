@@ -27,6 +27,11 @@ dependencies = [
   "uvloop; sys_platform != 'win32'",
   "fastapi",
   "pydantic",
+  # TUF is the model-registry trust root: threshold signatures, key rotation,
+  # expiry and rollback/freeze protection. Keep the audited wire behaviour
+  # reproducible across worker platforms instead of implementing crypto here.
+  "tuf==7.0.0",
+  "cryptography>=40.0.0",
   # vLLM 0.16 excludes the protobuf 6.31 family and current grpcio-reflection
   # requires the 7.35 runtime.  Generated Parallax messages remain compatible
   # with the supported protobuf 7 major line.

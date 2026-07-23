@@ -41,6 +41,11 @@ def node_log_summary(message: object) -> dict:
             "end_layer": message.get("end_layer"),
             "current_requests": message.get("current_requests"),
             "memory_pressure": message.get("memory_pressure"),
+            "swarm_v3_state": (
+                message.get("swarm_v3", {}).get("state")
+                if isinstance(message.get("swarm_v3"), dict)
+                else None
+            ),
             "hardware": safe_hardware,
         }.items()
         if value is not None and value != {}
@@ -186,6 +191,7 @@ class RPCConnectionHandler(ConnectionHandler):
                 ),
                 account_hash=node.account_hash,
                 memory_contract_failure=node.memory_contract_failure,
+                swarm_v3=node.swarm_v3,
             )
             # Return current layer allocation to node
             layer_allocation = self.get_layer_allocation(node.node_id)
@@ -308,9 +314,7 @@ class RPCConnectionHandler(ConnectionHandler):
                             "selected_context_tokens",
                             0,
                         ),
-                        "allocation_epoch": int(
-                            getattr(self.scheduler, "allocation_epoch", 0)
-                        ),
+                        "allocation_epoch": int(getattr(self.scheduler, "allocation_epoch", 0)),
                         "chunked_prefill_size": self.scheduler.chunked_prefill_size_for_node(
                             node_id
                         ),
@@ -373,6 +377,9 @@ class RPCConnectionHandler(ConnectionHandler):
             ),
             account_hash=account_hash(node_json.get("account_token")),
             memory_contract_failure=node_json.get("memory_contract_failure"),
+            swarm_v3=(
+                dict(node_json["swarm_v3"]) if isinstance(node_json.get("swarm_v3"), dict) else None
+            ),
         )
         if node_json.get("start_layer", None) is not None:
             node.start_layer = node_json.get("start_layer")

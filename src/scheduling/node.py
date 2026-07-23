@@ -243,6 +243,10 @@ class Node:
     # Structured, epoch-fenced backend materialization failure. This is not a
     # free-form exception and is consumed only by the bounded context replan.
     memory_contract_failure: Optional[Dict[str, object]] = None
+    # Authenticated protocol-v3 data is still advisory while shadow mode is
+    # compared with the qualified scheduler. Unknown/malformed reports remain
+    # isolated from the v2 serving fields above.
+    swarm_v3: Optional[Dict[str, object]] = None
 
     _force_max_concurrent_requests: bool = False
 
@@ -276,6 +280,7 @@ class Node:
         self.relayed_peer_ids = registration.relayed_peer_ids
         self.account_hash = registration.account_hash
         self.memory_contract_failure = registration.memory_contract_failure
+        self.swarm_v3 = registration.swarm_v3
 
         self.last_heartbeat = time.time()
 
