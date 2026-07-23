@@ -36,6 +36,7 @@ def make_manifest() -> ModelManifest:
         quantization="bf16",
         dtype="bfloat16",
         num_layers=28,
+        activation_bytes_per_token=4096,
         rope_context_contract_hash=HASH_D,
         attention_kv_contract_hash=HASH_E,
         prefill_contract_hash=HASH_F,

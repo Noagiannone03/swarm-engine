@@ -61,6 +61,25 @@ class PathKind(str, Enum):
     RELAY = "relay"
 
 
+class LinkMetric(ContractModel):
+    from_worker_id: NonEmpty
+    to_worker_id: NonEmpty
+    path_kind: PathKind
+    rtt_ms: Annotated[float, Field(ge=0)]
+    throughput_bytes_per_second: Annotated[float, Field(gt=0)]
+    loss_rate: Annotated[float, Field(ge=0, lt=1)] = 0
+    measured_at_ms: NonNegativeInt
+    expires_at_ms: PositiveInt
+
+    @model_validator(mode="after")
+    def validate_link(self) -> Self:
+        if self.from_worker_id == self.to_worker_id:
+            raise ValueError("network link must connect two different workers")
+        if self.expires_at_ms <= self.measured_at_ms:
+            raise ValueError("link metric must expire after it was measured")
+        return self
+
+
 class RecoveryLevel(str, Enum):
     NONE = "none"
     RESTARTABLE = "restartable"
@@ -118,6 +137,7 @@ class ModelManifest(ContractModel):
     quantization: NonEmpty
     dtype: NonEmpty
     num_layers: PositiveInt
+    activation_bytes_per_token: PositiveInt
     rope_context_contract_hash: HashHex
     attention_kv_contract_hash: HashHex
     prefill_contract_hash: HashHex

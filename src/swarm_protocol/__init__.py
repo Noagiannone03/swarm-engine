@@ -7,6 +7,7 @@ from swarm_protocol.contracts import (
     EffectiveSpanMode,
     KvGeometry,
     LayerSpan,
+    LinkMetric,
     ModelManifest,
     PathKind,
     RecoveryLevel,
@@ -30,6 +31,14 @@ from swarm_protocol.reservations import (
     ReservationNotFound,
     StaleEpoch,
 )
+from swarm_protocol.routing import (
+    ExactRoutePlanner,
+    NoFeasibleRoute,
+    PlannedRoute,
+    RouteCandidate,
+    RouteEstimate,
+    RoutePlanningError,
+)
 
 __all__ = [
     "PROTOCOL_VERSION",
@@ -38,6 +47,7 @@ __all__ = [
     "EffectiveSpanMode",
     "KvGeometry",
     "LayerSpan",
+    "LinkMetric",
     "ModelManifest",
     "PathKind",
     "RecoveryLevel",
@@ -58,4 +68,10 @@ __all__ = [
     "ReservationExpired",
     "ReservationNotFound",
     "StaleEpoch",
+    "ExactRoutePlanner",
+    "NoFeasibleRoute",
+    "PlannedRoute",
+    "RouteCandidate",
+    "RouteEstimate",
+    "RoutePlanningError",
 ]
