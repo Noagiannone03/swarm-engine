@@ -16,7 +16,7 @@ import random
 import shutil
 import threading
 import time
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import dijkstar
 import httpx
@@ -68,6 +68,29 @@ logger = get_logger(__name__)
 
 # Global HTTP client for reuse
 _http_client = None
+
+_DEFAULT_LINK_PROBE_BYTES = 4 * 1024 * 1024
+_MIN_LINK_PROBE_BYTES = 64 * 1024
+_MAX_LINK_PROBE_BYTES = 8 * 1024 * 1024
+_LINK_PROBE_INTERVAL_SECONDS = 60.0
+_LINK_PROBE_MIN_RECEIVE_INTERVAL_SECONDS = 30.0
+_LINK_METRIC_TTL_MS = 120_000
+
+
+def _configured_link_probe_bytes() -> int:
+    """Return the bounded application payload used for cold-link calibration."""
+
+    raw = os.environ.get("FABI_LINK_PROBE_BYTES", str(_DEFAULT_LINK_PROBE_BYTES)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("FABI_LINK_PROBE_BYTES must be an integer") from exc
+    if not _MIN_LINK_PROBE_BYTES <= value <= _MAX_LINK_PROBE_BYTES:
+        raise ValueError(
+            "FABI_LINK_PROBE_BYTES must be between "
+            f"{_MIN_LINK_PROBE_BYTES} and {_MAX_LINK_PROBE_BYTES}"
+        )
+    return value
 
 
 def _resolve_worker_key_path() -> str:
@@ -178,6 +201,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         notify_url: Optional[str] = None,
         iroh_transport: Optional[IrohTransport] = None,
         execution_admission: Optional[WorkerExecutionAdmission] = None,
+        link_probe_authorizer: Optional[Callable[[str], bool]] = None,
     ):
         if lattica is not None:
             super().__init__(lattica)
@@ -191,6 +215,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         self.http_port = http_port
         self.notify_url = notify_url
         self.execution_admission = execution_admission
+        self.link_probe_authorizer = link_probe_authorizer
+        self._link_probe_lock = threading.Lock()
+        self._link_probe_last_received: dict[str, float] = {}
         self._recv_from_peer = None
         self._recv_from_peer_lock = threading.Lock()
 
@@ -251,6 +278,37 @@ class TransformerConnectionHandler(ConnectionHandler):
         if getattr(self, "iroh_transport", None) is not None:
             return {"peer_id": self.iroh_transport.peer_id()}
         return {"peer_id": self.lattica_instance.peer_id()}
+
+    @rpc_method
+    def rpc_link_probe(self, request):
+        """Accept one bounded upload from an assigned, authenticated peer.
+
+        The caller measures end-to-end application goodput. The body is never
+        echoed, hashed or retained, so calibration cannot amplify traffic or
+        compete with model memory after this method returns.
+        """
+
+        if getattr(self, "iroh_transport", None) is None:
+            raise RuntimeError("link calibration requires the authenticated Iroh transport")
+        caller = authenticated_rpc_peer_id()
+        authorizer = getattr(self, "link_probe_authorizer", None)
+        if authorizer is None or not authorizer(caller):
+            raise PermissionError("link calibration caller is not an assigned peer")
+        if not isinstance(request, bytes):
+            raise TypeError("link calibration payload must be bytes")
+        if not _MIN_LINK_PROBE_BYTES <= len(request) <= _MAX_LINK_PROBE_BYTES:
+            raise ValueError("link calibration payload size is outside the permitted bounds")
+
+        now = time.monotonic()
+        with self._link_probe_lock:
+            previous = self._link_probe_last_received.get(caller)
+            if previous is not None and now - previous < _LINK_PROBE_MIN_RECEIVE_INTERVAL_SECONDS:
+                raise RuntimeError("link calibration is rate limited")
+            self._link_probe_last_received[caller] = now
+        return {
+            "peer_id": self.iroh_transport.peer_id(),
+            "received_bytes": len(request),
+        }
 
     @rpc_method
     def rpc_abort(
@@ -534,6 +592,9 @@ class GradientServer:
         self.rtt_update_interval = 60
         self.link_throughputs = {}
         self.link_throughputs_lock = threading.Lock()
+        self.link_probe_bytes = _configured_link_probe_bytes()
+        self.link_probe_payload = bytes(self.link_probe_bytes)
+        self.link_probe_last_attempt: dict[str, float] = {}
         self.status = ServerState.JOINING
         self.manual_layer_assignment = block_end_index is not None and block_start_index is not None
         self.conn = conn
@@ -543,10 +604,14 @@ class GradientServer:
         self.swarm_v3_reporter = None
         self.swarm_v3_execution_admission = None
         self.swarm_v3_placement_controller = None
-        self.swarm_v3_placement_mode = os.environ.get(
-            "FABI_SWARM_V3_PLACEMENT",
-            "legacy",
-        ).strip().lower()
+        self.swarm_v3_placement_mode = (
+            os.environ.get(
+                "FABI_SWARM_V3_PLACEMENT",
+                "legacy",
+            )
+            .strip()
+            .lower()
+        )
         if self.swarm_v3_placement_mode not in {"legacy", "autonomous"}:
             raise ValueError("FABI_SWARM_V3_PLACEMENT supports only legacy or autonomous")
         self.swarm_v3_init_error = None
@@ -732,9 +797,7 @@ class GradientServer:
             getattr(self, "swarm_v3_reporter", None) is not None
             and getattr(self.iroh_transport, "catalog_discovery", None) is not None
         ):
-            self.swarm_v3_reporter.attach_catalog(
-                self.iroh_transport.catalog_discovery
-            )
+            self.swarm_v3_reporter.attach_catalog(self.iroh_transport.catalog_discovery)
         if (
             getattr(self, "swarm_v3_reporter", None) is not None
             and self.swarm_v3_reporter.mode == "active"
@@ -847,6 +910,7 @@ class GradientServer:
             notify_url=self.notify_url,
             iroh_transport=self.iroh_transport,
             execution_admission=self.swarm_v3_execution_admission,
+            link_probe_authorizer=lambda peer_id: peer_id in self.outbound_peer_ids,
         )  # thread
         if self.iroh_transport is not None:
             self.iroh_transport.register(self.connection_handler)
@@ -942,7 +1006,70 @@ class GradientServer:
         self.direct_peer_ids = direct
         self.reachable_peer_ids = reachable
         self.relayed_peer_ids = relayed
+        if self.iroh_transport is not None:
+            for peer_id in reachable:
+                self._probe_peer_goodput(peer_id)
         return reachable
+
+    def _record_link_goodput(
+        self,
+        peer_id: str,
+        bytes_per_second: float,
+        *,
+        measured_at_ms: int | None = None,
+    ) -> None:
+        """Store an EWMA shared by calibration and real activation transfers."""
+
+        if bytes_per_second <= 0:
+            return
+        measured_at_ms = measured_at_ms or time.time_ns() // 1_000_000
+        with self.link_throughputs_lock:
+            previous = self.link_throughputs.get(peer_id)
+            smoothed = float(bytes_per_second)
+            if previous is not None:
+                smoothed = 0.8 * float(previous["bytes_per_second"]) + 0.2 * smoothed
+            self.link_throughputs[peer_id] = {
+                "bytes_per_second": smoothed,
+                "measured_at_ms": measured_at_ms,
+            }
+
+    def _probe_peer_goodput(self, peer_id: str) -> bool:
+        """Measure cold-link upload goodput without touching the heartbeat path."""
+
+        now = time.monotonic()
+        previous_attempt = self.link_probe_last_attempt.get(peer_id)
+        if previous_attempt is not None and now - previous_attempt < _LINK_PROBE_INTERVAL_SECONDS:
+            return False
+        self.link_probe_last_attempt[peer_id] = now
+
+        started_ns = time.perf_counter_ns()
+        try:
+            response_future = self.get_stub(peer_id).rpc_link_probe(self.link_probe_payload)
+            response = (
+                response_future.result(timeout=15)
+                if hasattr(response_future, "result")
+                else response_future
+            )
+            if not isinstance(response, dict) or response.get("peer_id") != peer_id:
+                raise RuntimeError("link calibration returned the wrong peer identity")
+            if response.get("received_bytes") != self.link_probe_bytes:
+                raise RuntimeError("link calibration returned the wrong payload length")
+        except Exception:
+            logger.debug("Goodput calibration to %s failed", peer_id, exc_info=True)
+            return False
+
+        elapsed_ns = max(time.perf_counter_ns() - started_ns, 1)
+        bytes_per_second = self.link_probe_bytes / (elapsed_ns / 1_000_000_000)
+        self._record_link_goodput(peer_id, bytes_per_second)
+        size_mb, elapsed_ms, speed_mb_s = _transfer_metrics(self.link_probe_bytes, elapsed_ns)
+        logger.info(
+            "Calibrated application goodput to %s: %.3f MB in %.3f ms (%.3f MB/s)",
+            peer_id,
+            size_mb,
+            elapsed_ms,
+            speed_mb_s,
+        )
+        return True
 
     def start_direct_peer_prober(self):
         """Refresh route topology without ever delaying liveness heartbeats.
@@ -1016,7 +1143,7 @@ class GradientServer:
         metrics = []
         for peer_id, sample in sorted(samples.items()):
             measured_at_ms = int(sample["measured_at_ms"])
-            if now_ms - measured_at_ms >= 120_000:
+            if now_ms - measured_at_ms >= _LINK_METRIC_TTL_MS:
                 continue
             if peer_id in self.direct_peer_ids:
                 path_kind = PathKind.DIRECT
@@ -1035,7 +1162,7 @@ class GradientServer:
                     rtt_ms=max(0.0, float(rtt_ms)),
                     throughput_bytes_per_second=float(sample["bytes_per_second"]),
                     measured_at_ms=measured_at_ms,
-                    expires_at_ms=measured_at_ms + 120_000,
+                    expires_at_ms=measured_at_ms + _LINK_METRIC_TTL_MS,
                 )
             )
         return tuple(metrics)
@@ -1121,9 +1248,9 @@ class GradientServer:
                     for req in forward_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert (
-                                self.block_start_index == 0
-                            ), "Request routing table is not set for non-head rank"
+                            assert self.block_start_index == 0, (
+                                "Request routing table is not set for non-head rank"
+                            )
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -1157,19 +1284,10 @@ class GradientServer:
                         size_mb, elapsed_ms, speed_mb_s = _transfer_metrics(
                             new_forward_request.ByteSize(), time.perf_counter_ns() - start_ns
                         )
-                        measured_at_ms = time.time_ns() // 1_000_000
-                        measured_bytes_per_second = speed_mb_s * 1024 * 1024
-                        with self.link_throughputs_lock:
-                            previous = self.link_throughputs.get(next_peer_id)
-                            if previous is not None:
-                                measured_bytes_per_second = (
-                                    0.8 * float(previous["bytes_per_second"])
-                                    + 0.2 * measured_bytes_per_second
-                                )
-                            self.link_throughputs[next_peer_id] = {
-                                "bytes_per_second": measured_bytes_per_second,
-                                "measured_at_ms": measured_at_ms,
-                            }
+                        self._record_link_goodput(
+                            next_peer_id,
+                            speed_mb_s * 1024 * 1024,
+                        )
                         logger.info(
                             f"Forwarding data to {next_peer_id}, "
                             f"total size: {size_mb:.3f} MB, "
@@ -1187,9 +1305,9 @@ class GradientServer:
                     for req in abort_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert (
-                                self.block_start_index == 0
-                            ), "Request routing table is not set for non-head rank"
+                            assert self.block_start_index == 0, (
+                                "Request routing table is not set for non-head rank"
+                            )
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -1447,10 +1565,7 @@ class GradientServer:
             runtime_kv_block_size = self._shared_state.get("kv_cache_block_size")
             memory_contract_failure = self._shared_state.get("memory_contract_failure")
             placement_error = self._shared_state.get("swarm_v3_placement_error")
-            if (
-                placement_error is not None
-                and self.swarm_v3_placement_controller is not None
-            ):
+            if placement_error is not None and self.swarm_v3_placement_controller is not None:
                 try:
                     self.swarm_v3_placement_controller.mark_failed(
                         generation=int(placement_error["generation"]),
@@ -1595,14 +1710,12 @@ class GradientServer:
                                         "autonomous placement trust or catalogue is not ready"
                                     )
                                 if self.swarm_v3_placement_controller is None:
-                                    self.swarm_v3_placement_controller = (
-                                        AutonomousWorkerPlacement(
-                                            catalog=catalog,
-                                            admission=self.swarm_v3_execution_admission,
-                                            state_publisher=self.swarm_v3_reporter,
-                                            reload_target=self._apply_v3_span_reload,
-                                            current_span=advertisement.lease.hosted_span,
-                                        )
+                                    self.swarm_v3_placement_controller = AutonomousWorkerPlacement(
+                                        catalog=catalog,
+                                        admission=self.swarm_v3_execution_admission,
+                                        state_publisher=self.swarm_v3_reporter,
+                                        reload_target=self._apply_v3_span_reload,
+                                        current_span=advertisement.lease.hosted_span,
                                     )
                                 placement = self.swarm_v3_placement_controller.observe(
                                     advertisement=advertisement,

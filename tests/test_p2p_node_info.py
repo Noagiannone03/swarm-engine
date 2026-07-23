@@ -27,12 +27,19 @@ class ProbeFuture:
 
 
 class ProbeStub:
-    def __init__(self, future):
+    def __init__(self, future, link_future=None):
         self.future = future
+        self.link_future = link_future
 
     def rpc_health(self, request):
         assert request == {}
         return self.future
+
+    def rpc_link_probe(self, request):
+        assert isinstance(request, bytes)
+        if self.link_future is None:
+            raise RuntimeError("link probe is not configured")
+        return self.link_future
 
 
 class RecordingSocket:
@@ -471,6 +478,71 @@ def test_transformer_health_rpc_returns_registered_peer_identity():
     handler.lattica_instance = SimpleNamespace(peer_id=lambda: "worker-peer")
 
     assert handler.rpc_health({}) == {"peer_id": "worker-peer"}
+
+
+def test_link_probe_accepts_only_bounded_payload_from_assigned_iroh_peer(monkeypatch):
+    handler = TransformerConnectionHandler.__new__(TransformerConnectionHandler)
+    handler.iroh_transport = SimpleNamespace(peer_id=lambda: "receiving-worker")
+    handler.link_probe_authorizer = lambda peer_id: peer_id == "sending-worker"
+    handler._link_probe_lock = threading.Lock()
+    handler._link_probe_last_received = {}
+    monkeypatch.setattr(
+        "parallax.p2p.server.authenticated_rpc_peer_id",
+        lambda: "sending-worker",
+    )
+    payload = bytes(64 * 1024)
+
+    assert handler.rpc_link_probe(payload) == {
+        "peer_id": "receiving-worker",
+        "received_bytes": len(payload),
+    }
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        handler.rpc_link_probe(payload)
+
+
+def test_link_probe_rejects_unassigned_peer_before_reading_payload(monkeypatch):
+    handler = TransformerConnectionHandler.__new__(TransformerConnectionHandler)
+    handler.iroh_transport = SimpleNamespace(peer_id=lambda: "receiving-worker")
+    handler.link_probe_authorizer = lambda peer_id: False
+    handler._link_probe_lock = threading.Lock()
+    handler._link_probe_last_received = {}
+    monkeypatch.setattr(
+        "parallax.p2p.server.authenticated_rpc_peer_id",
+        lambda: "unassigned-worker",
+    )
+
+    with pytest.raises(PermissionError, match="not an assigned peer"):
+        handler.rpc_link_probe(bytes(64 * 1024))
+
+
+def test_worker_calibrates_cold_link_with_application_goodput(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.iroh_transport = object()
+    server.link_probe_bytes = 64 * 1024
+    server.link_probe_payload = bytes(server.link_probe_bytes)
+    server.get_stub = lambda peer_id: ProbeStub(
+        ProbeFuture({"peer_id": peer_id}),
+        ProbeFuture(
+            {
+                "peer_id": peer_id,
+                "received_bytes": server.link_probe_bytes,
+            }
+        ),
+    )
+    timestamps = iter((1_000_000_000, 1_100_000_000))
+    monkeypatch.setattr(
+        "parallax.p2p.server.time.perf_counter_ns",
+        lambda: next(timestamps),
+    )
+
+    assert server._probe_peer_goodput("next-worker") is True
+    assert server.link_throughputs["next-worker"]["bytes_per_second"] == pytest.approx(655_360.0)
+    assert server._probe_peer_goodput("next-worker") is False
 
 
 def test_worker_builds_iroh_with_explicit_scheduler_endpoint(monkeypatch):
