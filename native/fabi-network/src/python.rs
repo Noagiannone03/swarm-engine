@@ -11,7 +11,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, endpoint::Connection};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, endpoint::Connection,
+};
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError},
     prelude::*,
@@ -25,6 +27,10 @@ use tracing::{debug, warn};
 
 use crate::{
     ALPN,
+    catalog::{
+        self, CatalogRecordKind, CatalogRecordParams, ValidatedCatalogRecord, sign_catalog_record,
+        verify_catalog_record,
+    },
     endpoint::{EndpointConfig, bind},
     identity,
     protocol::{
@@ -42,6 +48,70 @@ const STREAM_CANCEL_CODE: u32 = 0xFAB1;
 
 type RpcResponse = std::result::Result<Vec<u8>, String>;
 type ConnectionCache = Arc<tokio::sync::Mutex<HashMap<EndpointId, Connection>>>;
+
+#[pyclass(name = "CatalogRecord", frozen)]
+struct PyCatalogRecord {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    logical_key: String,
+    #[pyo3(get)]
+    publisher_endpoint_id: String,
+    #[pyo3(get)]
+    discovery_peer_id: String,
+    #[pyo3(get)]
+    sequence: u64,
+    #[pyo3(get)]
+    issued_at_ms: u64,
+    #[pyo3(get)]
+    expires_at_ms: u64,
+    payload: Vec<u8>,
+}
+
+#[pymethods]
+impl PyCatalogRecord {
+    #[getter]
+    fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.payload)
+    }
+}
+
+impl From<ValidatedCatalogRecord> for PyCatalogRecord {
+    fn from(record: ValidatedCatalogRecord) -> Self {
+        Self {
+            kind: catalog_kind_name(record.kind).to_owned(),
+            logical_key: record.logical_key,
+            publisher_endpoint_id: record.publisher_endpoint_id.to_string(),
+            discovery_peer_id: record.discovery_peer_id,
+            sequence: record.sequence,
+            issued_at_ms: record.issued_at_ms,
+            expires_at_ms: record.expires_at_ms,
+            payload: record.payload,
+        }
+    }
+}
+
+fn catalog_kind_name(kind: CatalogRecordKind) -> &'static str {
+    match kind {
+        CatalogRecordKind::ModelManifest => "model_manifest",
+        CatalogRecordKind::WorkerOffer => "worker_offer",
+        CatalogRecordKind::SpanLease => "span_lease",
+        CatalogRecordKind::LinkMetric => "link_metric",
+        CatalogRecordKind::Unspecified => "unspecified",
+    }
+}
+
+fn parse_catalog_kind(kind: &str) -> PyResult<CatalogRecordKind> {
+    match kind {
+        "model_manifest" => Ok(CatalogRecordKind::ModelManifest),
+        "worker_offer" => Ok(CatalogRecordKind::WorkerOffer),
+        "span_lease" => Ok(CatalogRecordKind::SpanLease),
+        "link_metric" => Ok(CatalogRecordKind::LinkMetric),
+        _ => Err(PyRuntimeError::new_err(format!(
+            "unsupported catalogue record kind {kind:?}"
+        ))),
+    }
+}
 
 #[derive(Clone)]
 struct InboundDispatcher {
@@ -306,6 +376,7 @@ impl Drop for PyRpcStream {
 struct PyNetworkNode {
     runtime: Arc<Runtime>,
     endpoint: Endpoint,
+    secret_key: SecretKey,
     relay_url: RelayUrl,
     incoming: Arc<Mutex<Receiver<InboundRequest>>>,
     dispatcher: InboundDispatcher,
@@ -355,8 +426,9 @@ impl PyNetworkNode {
             force_relay,
         };
         let runtime_for_bind = Arc::clone(&runtime);
+        let endpoint_secret_key = secret_key.clone();
         let endpoint = py
-            .detach(move || runtime_for_bind.block_on(bind(secret_key, &config)))
+            .detach(move || runtime_for_bind.block_on(bind(endpoint_secret_key, &config)))
             .map_err(py_error)?;
         let (incoming_tx, incoming_rx) = sync_channel(INBOUND_QUEUE_CAPACITY);
         let dispatcher = InboundDispatcher {
@@ -376,6 +448,7 @@ impl PyNetworkNode {
         Ok(Self {
             runtime,
             endpoint,
+            secret_key,
             relay_url,
             incoming: Arc::new(Mutex::new(incoming_rx)),
             dispatcher,
@@ -389,6 +462,84 @@ impl PyNetworkNode {
     #[getter]
     fn endpoint_id(&self) -> String {
         self.endpoint.id().to_string()
+    }
+
+    #[pyo3(signature = (
+        kind,
+        logical_key,
+        discovery_peer_id,
+        sequence,
+        issued_at_ms,
+        expires_at_ms,
+        payload,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn sign_catalog_record<'py>(
+        &self,
+        py: Python<'py>,
+        kind: &str,
+        logical_key: &str,
+        discovery_peer_id: &str,
+        sequence: u64,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        payload: &[u8],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        self.ensure_open()?;
+        let encoded = sign_catalog_record(
+            &self.secret_key,
+            CatalogRecordParams {
+                kind: parse_catalog_kind(kind)?,
+                logical_key,
+                discovery_peer_id,
+                sequence,
+                issued_at_ms,
+                expires_at_ms,
+                payload,
+            },
+        )
+        .map_err(py_error)?;
+        Ok(PyBytes::new(py, &encoded))
+    }
+
+    #[staticmethod]
+    fn verify_catalog_record(
+        encoded: &[u8],
+        now_ms: u64,
+        max_clock_skew_ms: u64,
+    ) -> PyResult<PyCatalogRecord> {
+        verify_catalog_record(encoded, now_ms, max_clock_skew_ms)
+            .map(PyCatalogRecord::from)
+            .map_err(py_error)
+    }
+
+    #[pyo3(signature = (kind, model_swarm_id=None, target_endpoint_id=None))]
+    fn catalog_key(
+        &self,
+        kind: &str,
+        model_swarm_id: Option<&str>,
+        target_endpoint_id: Option<&str>,
+    ) -> PyResult<String> {
+        let kind = parse_catalog_kind(kind)?;
+        let source = self.endpoint.id();
+        match kind {
+            CatalogRecordKind::ModelManifest => model_swarm_id
+                .map(catalog::keys::manifest)
+                .ok_or_else(|| PyRuntimeError::new_err("model_swarm_id is required")),
+            CatalogRecordKind::WorkerOffer => Ok(catalog::keys::worker_offer(&source)),
+            CatalogRecordKind::SpanLease => model_swarm_id
+                .map(|model| catalog::keys::span_lease(model, &source))
+                .ok_or_else(|| PyRuntimeError::new_err("model_swarm_id is required")),
+            CatalogRecordKind::LinkMetric => {
+                let target = target_endpoint_id
+                    .ok_or_else(|| PyRuntimeError::new_err("target_endpoint_id is required"))?;
+                let target = EndpointId::from_str(target).map_err(py_error)?;
+                Ok(catalog::keys::link_metric(&source, &target))
+            }
+            CatalogRecordKind::Unspecified => Err(PyRuntimeError::new_err(
+                "catalogue record kind is unspecified",
+            )),
+        }
     }
 
     fn call(
@@ -1071,6 +1222,7 @@ async fn get_connection(
 #[pymodule(gil_used = false)]
 fn fabi_network_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyNetworkNode>()?;
+    module.add_class::<PyCatalogRecord>()?;
     module.add_class::<PyRpcRequest>()?;
     module.add_class::<PyRpcStream>()?;
     module.add("PROTOCOL_VERSION", 1)?;
