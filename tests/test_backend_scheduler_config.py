@@ -116,6 +116,32 @@ def test_cluster_node_info_exposes_measured_kv_capacity():
     assert info["rtt_to_nodes_ms"] == {"next-worker": 12.5}
 
 
+def test_cluster_node_info_exposes_bounded_v3_worker_error():
+    manager = SchedulerManage()
+    node = SimpleNamespace(
+        node_id="rejected-worker",
+        is_active=True,
+        supports_frontend=False,
+        swarm_v3={
+            "state": "rejected",
+            "error": {
+                "code": "ArtifactVerificationError",
+                "detail": "x" * 400,
+                "internal": "must not cross the status boundary",
+            },
+        },
+        hardware=SimpleNamespace(num_gpus=1, gpu_name="RTX", memory_gb=16.0),
+    )
+
+    info = manager.build_node_info(node)
+
+    assert info["swarm_v3_state"] == "rejected"
+    assert info["swarm_v3_error"] == {
+        "code": "ArtifactVerificationError",
+        "detail": "x" * 256,
+    }
+
+
 def test_scheduler_starts_and_reuses_iroh_rpc_handler(monkeypatch):
     registered = []
     transport = SimpleNamespace(

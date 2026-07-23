@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import threading
@@ -31,6 +32,7 @@ from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
 
 _REPORT_TTL_MS = 45_000
 _VERIFICATION_RETRY_SECONDS = 30.0
+logger = logging.getLogger(__name__)
 
 
 class AdvertisementPublisher(Protocol):
@@ -237,6 +239,12 @@ class WorkerProtocolV3Reporter:
             try:
                 advertisement = self._advertisement(serving, verified)
             except ValueError as exc:
+                logger.warning(
+                    "Swarm v3 advertisement rejected for %s: %s: %s",
+                    key,
+                    type(exc).__name__,
+                    str(exc)[:256],
+                )
                 return {
                     "mode": self.mode,
                     "state": "rejected",
@@ -314,6 +322,12 @@ class WorkerProtocolV3Reporter:
             )
             result = _VerifiedServingContract(key=key, bundle=bundle, artifacts=artifacts)
         except Exception as exc:  # noqa: BLE001 - converted to a fail-closed status boundary
+            logger.warning(
+                "Swarm v3 serving contract verification failed for %s: %s: %s",
+                key,
+                type(exc).__name__,
+                str(exc)[:256],
+            )
             with self._lock:
                 if self._pending_key == key:
                     self._error = {

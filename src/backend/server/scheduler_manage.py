@@ -241,6 +241,16 @@ class SchedulerManage:
         return [self.build_node_info(node) for node in self.scheduler.node_manager.nodes]
 
     def build_node_info(self, node):
+        swarm_v3 = getattr(node, "swarm_v3", None)
+        swarm_v3_error = swarm_v3.get("error") if isinstance(swarm_v3, dict) else None
+        if isinstance(swarm_v3_error, dict):
+            swarm_v3_error = {
+                key: str(swarm_v3_error[key])[:256]
+                for key in ("code", "detail")
+                if swarm_v3_error.get(key) is not None
+            }
+        else:
+            swarm_v3_error = None
         return {
             "node_id": node.node_id,
             "status": NODE_STATUS_AVAILABLE if node.is_active else NODE_STATUS_WAITING,
@@ -253,11 +263,8 @@ class SchedulerManage:
             "kv_cache_telemetry_ready": (
                 getattr(node, "kv_cache_token_capacity", None) is not None
             ),
-            "swarm_v3_state": (
-                getattr(node, "swarm_v3", {}).get("state")
-                if isinstance(getattr(node, "swarm_v3", None), dict)
-                else None
-            ),
+            "swarm_v3_state": (swarm_v3.get("state") if isinstance(swarm_v3, dict) else None),
+            "swarm_v3_error": swarm_v3_error,
             "kv_cache_token_capacity": getattr(node, "kv_cache_token_capacity", None),
             "kv_cache_block_size": getattr(node, "kv_cache_block_size", None),
             "reserved_context_tokens": getattr(node, "reserved_context_tokens", 0),
@@ -463,11 +470,7 @@ class SchedulerManage:
 
     def _attach_v3_catalog(self) -> None:
         planner = self.scheduler.swarm_v3_shadow if self.scheduler is not None else None
-        catalog = (
-            self.iroh_transport.catalog_discovery
-            if self.iroh_transport is not None
-            else None
-        )
+        catalog = self.iroh_transport.catalog_discovery if self.iroh_transport is not None else None
         if planner is not None and catalog is not None:
             planner.attach_catalog(catalog)
             logger.info(
