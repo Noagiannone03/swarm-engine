@@ -2,6 +2,8 @@ import pytest
 from pydantic import ValidationError
 
 from swarm_protocol import (
+    ArtifactDescriptor,
+    ArtifactRole,
     BackendKind,
     EffectiveSpanMode,
     KvGeometry,
@@ -23,6 +25,17 @@ HASH_C = "c" * 64
 HASH_D = "d" * 64
 HASH_E = "e" * 64
 HASH_F = "f" * 64
+
+
+def test_artifact_descriptor_rejects_ambiguous_paths() -> None:
+    with pytest.raises(ValidationError, match="normalized"):
+        ArtifactDescriptor(
+            path="weights/../model.safetensors",
+            size=1,
+            sha256=HASH_A,
+            media_type="application/vnd.safetensors",
+            role=ArtifactRole.WEIGHT,
+        )
 
 
 def make_manifest() -> ModelManifest:

@@ -61,6 +61,55 @@ class PathKind(str, Enum):
     RELAY = "relay"
 
 
+class ArtifactRole(str, Enum):
+    ARCHITECTURE = "architecture"
+    TOKENIZER = "tokenizer"
+    WEIGHT = "weight"
+
+
+class ArtifactDescriptor(ContractModel):
+    """Content-addressed model file descriptor, following the OCI descriptor shape."""
+
+    path: Annotated[str, Field(min_length=1, max_length=1024)]
+    size: NonNegativeInt
+    sha256: HashHex
+    media_type: Annotated[str, Field(min_length=1, max_length=255)]
+    role: ArtifactRole
+
+    @model_validator(mode="after")
+    def validate_path(self) -> Self:
+        parts = self.path.split("/")
+        if (
+            self.path.startswith("/")
+            or "\\" in self.path
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("artifact path must be a normalized relative POSIX path")
+        return self
+
+
+class ModelArtifactIndex(ContractModel):
+    """Persistent artifact index referenced by the compact DHT model manifest."""
+
+    protocol_version: int = PROTOCOL_VERSION
+    model_id: NonEmpty
+    immutable_revision: NonEmpty
+    artifacts: Annotated[tuple[ArtifactDescriptor, ...], Field(min_length=1, max_length=100_000)]
+
+    @model_validator(mode="after")
+    def validate_index(self) -> Self:
+        if self.protocol_version != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version: {self.protocol_version}")
+        if not self.artifacts:
+            raise ValueError("model artifact index cannot be empty")
+        paths = [artifact.path for artifact in self.artifacts]
+        if paths != sorted(paths):
+            raise ValueError("model artifacts must be sorted by path")
+        if len(paths) != len(set(paths)):
+            raise ValueError("model artifact paths must be unique")
+        return self
+
+
 class LinkMetric(ContractModel):
     from_worker_id: NonEmpty
     to_worker_id: NonEmpty

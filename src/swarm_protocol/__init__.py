@@ -2,6 +2,8 @@
 
 from swarm_protocol.contracts import (
     PROTOCOL_VERSION,
+    ArtifactDescriptor,
+    ArtifactRole,
     BackendKind,
     ContributionReceipt,
     EffectiveSpanMode,
@@ -9,6 +11,7 @@ from swarm_protocol.contracts import (
     LayerSpan,
     LinkMetric,
     ModelMemberAdvertisement,
+    ModelArtifactIndex,
     ModelManifest,
     PathKind,
     RecoveryLevel,
@@ -31,6 +34,11 @@ from swarm_protocol.discovery import (
     StaleCatalogRecord,
 )
 from swarm_protocol.dht_discovery import DhtDiscoveryStore
+from swarm_protocol.model_manifest import (
+    ResolvedModelBundle,
+    artifact_collection_hash,
+    build_hub_model_bundle,
+)
 from swarm_protocol.reservations import (
     CapacityUnavailable,
     InvalidReservationTransition,
@@ -52,6 +60,8 @@ from swarm_protocol.routing import (
 
 __all__ = [
     "PROTOCOL_VERSION",
+    "ArtifactDescriptor",
+    "ArtifactRole",
     "BackendKind",
     "ContributionReceipt",
     "EffectiveSpanMode",
@@ -59,6 +69,7 @@ __all__ = [
     "LayerSpan",
     "LinkMetric",
     "ModelMemberAdvertisement",
+    "ModelArtifactIndex",
     "ModelManifest",
     "PathKind",
     "RecoveryLevel",
@@ -78,6 +89,9 @@ __all__ = [
     "InMemoryDiscoveryStore",
     "StaleCatalogRecord",
     "DhtDiscoveryStore",
+    "ResolvedModelBundle",
+    "artifact_collection_hash",
+    "build_hub_model_bundle",
     "CapacityUnavailable",
     "InvalidReservationTransition",
     "LocalReservationTable",
