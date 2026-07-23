@@ -8,10 +8,12 @@ import pytest
 from lattica import rpc_method, rpc_stream, rpc_stream_iter
 
 from fabi_network.rpc import (
+    IrohRpcRuntime,
     RpcServiceStub,
     _decode_value,
     _encode_value,
     _service_methods,
+    authenticated_rpc_peer_id,
 )
 from fabi_network.transport import _relay_token, configured_transport
 from parallax.p2p.proto import forward_pb2
@@ -30,6 +32,10 @@ class ExampleService:
     @rpc_stream_iter
     def tokens(self, values):
         yield from values
+
+    @rpc_method
+    def caller(self, _value):
+        return authenticated_rpc_peer_id()
 
 
 def test_safe_codec_round_trips_supported_values():
@@ -109,6 +115,23 @@ def test_service_stub_returns_futures_and_cancellable_iterators():
         ("unary", "peer", "ExampleService.echo", 12.5),
         ("stream", "peer", "ExampleService.tokens", 12.5),
     ]
+
+
+def test_inbound_handler_receives_authenticated_native_peer_identity():
+    responses = []
+    request = SimpleNamespace(
+        peer_id="authenticated-iroh-endpoint",
+        body=_encode_value({}),
+        respond=responses.append,
+        fail=lambda message: pytest.fail(message),
+    )
+    method = _service_methods(ExampleService())["ExampleService.caller"]
+
+    IrohRpcRuntime._dispatch_request(request, method)
+
+    assert _decode_value(responses[0]) == "authenticated-iroh-endpoint"
+    with pytest.raises(RuntimeError, match="no authenticated Iroh peer"):
+        authenticated_rpc_peer_id()
 
 
 def test_transport_selection_and_protected_token_file(monkeypatch, tmp_path):

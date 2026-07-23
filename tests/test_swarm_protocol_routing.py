@@ -67,8 +67,8 @@ def lease(
     *,
     kv_bytes: int = 10**12,
     mode: EffectiveSpanMode = EffectiveSpanMode.SUBSPAN,
-    prefill_tps: float = 10_000,
-    decode_tps: float = 100,
+    prefill_tps: float | None = 10_000,
+    decode_tps: float | None = 100,
     expires_at_ms: int = 10_000,
 ) -> SpanLease:
     return SpanLease(
@@ -253,3 +253,17 @@ def test_route_is_independent_from_discovery_order() -> None:
         list(reversed(links)),
     )
     assert forward.plan.stages == reverse.plan.stages
+
+
+def test_cold_worker_without_throughput_is_admissible_but_estimate_is_unknown() -> None:
+    model = manifest()
+    result = plan(
+        model,
+        request(model),
+        [offer("cold")],
+        [lease(model, "cold", 0, 8, prefill_tps=None, decode_tps=None)],
+        [],
+    )
+
+    assert [stage.worker_id for stage in result.plan.stages] == ["cold"]
+    assert result.estimate.complete is False

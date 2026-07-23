@@ -104,6 +104,8 @@ class TestMessageUtil:
             next_token_id=50,
             sampling_params=self.sampling_params,
             routing_table=["nodeA"],
+            route_id="route-7",
+            route_epoch=7,
             lora_path=None,
         )
 
@@ -137,6 +139,8 @@ class TestMessageUtil:
         )
 
         assert converted_request.routing_table == original_request.routing_table
+        assert converted_request.route_id == "route-7"
+        assert converted_request.route_epoch == 7
 
         np.testing.assert_array_equal(
             np.array(converted_request.hidden_states.tolist()),

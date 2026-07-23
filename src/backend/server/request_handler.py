@@ -22,6 +22,8 @@ logger = get_logger(__name__)
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 PARALLAX_ROUTING_TABLE_XARG = "parallax_routing_table"
 PARALLAX_SCHEDULER_REQUEST_ID_XARG = "parallax_scheduler_request_id"
+FABI_ROUTE_ID_XARG = "fabi_route_id"
+FABI_ROUTE_EPOCH_XARG = "fabi_route_epoch"
 
 
 class ClientDisconnectedError(Exception):
@@ -173,6 +175,11 @@ class RequestHandler:
 
         vllm_xargs[PARALLAX_ROUTING_TABLE_XARG] = list(routing_table)
         vllm_xargs[PARALLAX_SCHEDULER_REQUEST_ID_XARG] = str(request_id)
+        route_authority = getattr(self.scheduler_manage, "get_route_authority", None)
+        authority = route_authority(str(request_id)) if route_authority is not None else None
+        if authority is not None:
+            vllm_xargs[FABI_ROUTE_ID_XARG] = str(authority["route_id"])
+            vllm_xargs[FABI_ROUTE_EPOCH_XARG] = int(authority["epoch"])
         backend_request["vllm_xargs"] = vllm_xargs
         return backend_request
 
@@ -254,6 +261,8 @@ class RequestHandler:
                         request_id,
                         received_ts,
                         required_context_tokens,
+                        prompt_tokens=budget.prompt_tokens,
+                        reserved_output_tokens=budget.max_output_tokens,
                     )
                     logger.debug(
                         f"get_routing_table for request {request_id} return: {routing_table} (attempt {attempts + 1})"

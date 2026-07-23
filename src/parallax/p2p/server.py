@@ -7,6 +7,7 @@ It is used to handle the communication between the peers, and communicate with t
 
 """
 
+import copy
 import dataclasses
 import enum
 import multiprocessing
@@ -24,7 +25,12 @@ from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stre
 
 from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.rpc_connection_handler import RPCConnectionHandler
+from fabi_network.rpc import authenticated_rpc_peer_id
 from fabi_network.transport import IrohTransport, using_iroh
+from parallax.p2p.liveness import (
+    WORKER_HEARTBEAT_INTERVAL_SECONDS,
+    WORKER_HEARTBEAT_RPC_TIMEOUT_SECONDS,
+)
 from parallax.p2p.proto import forward_pb2
 from parallax.p2p.utils import (
     AsyncWorker,
@@ -44,6 +50,8 @@ from parallax.utils.weight_refit_utils import (
 )
 from parallax_utils.logging_config import get_logger, set_log_level
 from swarm_protocol.contracts import BackendKind, LayerSpan, LinkMetric, PathKind
+from swarm_protocol.execution import WorkerExecutionAdmission
+from swarm_protocol.execution_rpc import WorkerExecutionControlService
 from swarm_protocol.worker_integration import (
     WorkerProtocolV3Reporter,
     WorkerServingSnapshot,
@@ -162,6 +170,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         http_port: Optional[int] = None,
         notify_url: Optional[str] = None,
         iroh_transport: Optional[IrohTransport] = None,
+        execution_admission: Optional[WorkerExecutionAdmission] = None,
     ):
         if lattica is not None:
             super().__init__(lattica)
@@ -174,6 +183,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self.block_end_index = block_end_index
         self.http_port = http_port
         self.notify_url = notify_url
+        self.execution_admission = execution_admission
         self._recv_from_peer = None
         self._recv_from_peer_lock = threading.Lock()
 
@@ -202,6 +212,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         request: forward_pb2.ForwardRequest,
     ) -> forward_pb2.ForwardResponse:
         """Handle forward pass request with explicit proxy tensors support"""
+        if getattr(self, "execution_admission", None) is not None:
+            caller = authenticated_rpc_peer_id()
+            for req in request.reqs:
+                self.execution_admission.authorize_forward(
+                    request_id=req.rid,
+                    route_id=req.route_id,
+                    epoch=req.route_epoch,
+                    routing_table=tuple(req.routing_table),
+                    caller_endpoint_id=caller,
+                )
+
         # The local enqueue is the data-plane operation. Do it before optional
         # telemetry and let failures propagate to the remote RPC caller instead
         # of returning a false successful response.
@@ -229,6 +250,16 @@ class TransformerConnectionHandler(ConnectionHandler):
         self,
         request: forward_pb2.AbortRequest,
     ) -> forward_pb2.AbortResponse:
+        if getattr(self, "execution_admission", None) is not None:
+            caller = authenticated_rpc_peer_id()
+            for req in request.reqs:
+                self.execution_admission.authorize_route_peer(
+                    request_id=req.rid,
+                    route_id=req.route_id,
+                    epoch=req.route_epoch,
+                    routing_table=tuple(req.routing_table),
+                    caller_endpoint_id=caller,
+                )
         with self._recv_from_peer_lock:
             self.recv_from_peer.send_multipart([b"abort", request.SerializeToString()])
         return forward_pb2.AbortResponse()
@@ -256,6 +287,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         """Handle chat completion request"""
         logger.debug(f"Chat completion request: {request}, type: {type(request)}")
         try:
+            if getattr(self, "execution_admission", None) is not None:
+                xargs = request.get("vllm_xargs")
+                if not isinstance(xargs, dict):
+                    raise PermissionError("active v3 request is missing route authority")
+                self.execution_admission.authorize_frontend(
+                    request_id=str(request.get("request_id", "")),
+                    route_id=str(xargs.get("fabi_route_id", "")),
+                    epoch=int(xargs.get("fabi_route_epoch", 0)),
+                    routing_table=tuple(xargs.get("parallax_routing_table", ())),
+                    caller_endpoint_id=authenticated_rpc_peer_id(),
+                )
             with httpx.Client(timeout=10 * 60, proxy=None, trust_env=False) as client:
                 if request.get("stream", False):
                     with client.stream(
@@ -492,6 +534,7 @@ class GradientServer:
         # RPC.  The scheduler immediately hashes it and never logs/stores it.
         self.account_token = os.environ.get("FABI_ACCOUNT_TOKEN") or None
         self.swarm_v3_reporter = None
+        self.swarm_v3_execution_admission = None
         self.swarm_v3_init_error = None
         try:
             self.swarm_v3_reporter = WorkerProtocolV3Reporter.from_environment()
@@ -517,6 +560,12 @@ class GradientServer:
         logger.debug(f"manual_layer_assignment: {self.manual_layer_assignment}")
         self._layer_allocation_changed = False
         self._shared_state = None  # Will be set if running in subprocess mode
+        # Capacity is a contract for this worker process generation. Re-reading
+        # free RAM/VRAM after model materialization would count the loaded
+        # weights twice during scheduler recovery. Live pressure is reported
+        # independently through SharedState and may pause admission or drain.
+        self._capacity_hardware_snapshot = None
+        self._capacity_hardware_lock = threading.Lock()
 
     def _sync_to_shared_state(self):
         """Sync current layer allocation and status to shared state if available"""
@@ -625,6 +674,16 @@ class GradientServer:
         self.iroh_transport = IrohTransport.from_environment("worker")
         self.lattica = self.iroh_transport
         self.scheduler_peer_id = str(self.scheduler_addr)
+        if (
+            getattr(self, "swarm_v3_reporter", None) is not None
+            and self.swarm_v3_reporter.mode == "active"
+        ):
+            self.swarm_v3_execution_admission = WorkerExecutionAdmission(
+                worker_id=self.iroh_transport.peer_id(),
+                endpoint_id=self.iroh_transport.peer_id(),
+                coordinator_endpoint_id=self.scheduler_peer_id,
+                crypto=self.iroh_transport,
+            )
         logger.info(
             "Iroh worker endpoint ready: %s (scheduler %s)",
             self.iroh_transport.peer_id(),
@@ -719,9 +778,14 @@ class GradientServer:
             http_port=self.http_port,
             notify_url=self.notify_url,
             iroh_transport=self.iroh_transport,
+            execution_admission=self.swarm_v3_execution_admission,
         )  # thread
         if self.iroh_transport is not None:
             self.iroh_transport.register(self.connection_handler)
+            if self.swarm_v3_execution_admission is not None:
+                self.iroh_transport.register(
+                    WorkerExecutionControlService(self.swarm_v3_execution_admission)
+                )
 
         if self.scheduler_addr is not None:
             self.start_direct_peer_prober()
@@ -1103,7 +1167,7 @@ class GradientServer:
                             )
                             # Get the response result
                             response, refit_message = (
-                                response_future.result(timeout=30)
+                                response_future.result(timeout=WORKER_HEARTBEAT_RPC_TIMEOUT_SECONDS)
                                 if hasattr(response_future, "result")
                                 else response_future
                             )
@@ -1253,7 +1317,7 @@ class GradientServer:
                             exc_info=True,
                         )
 
-                    self.stop_event.wait(10)
+                    self.stop_event.wait(WORKER_HEARTBEAT_INTERVAL_SECONDS)
             except Exception as e:
                 logger.exception(f"Module announcer thread error: {e}")
 
@@ -1288,7 +1352,7 @@ class GradientServer:
         direct_peer_ids = list(self.direct_peer_ids)
         reachable_peer_ids = list(self.reachable_peer_ids)
         relayed_peer_ids = list(self.relayed_peer_ids)
-        hardware = detect_node_hardware(self.lattica.peer_id())
+        hardware = self._stable_capacity_hardware()
         runtime_backend = "mlx" if hardware.get("device") == "mlx" else self.gpu_backend
         self.supports_chunked_prefill = runtime_backend in {"mlx", "sglang"}
         if not self.supports_chunked_prefill:
@@ -1371,7 +1435,7 @@ class GradientServer:
 
             if self.swarm_v3_init_error is not None:
                 info["swarm_v3"] = {
-                    "mode": "shadow",
+                    "mode": "active" if self.swarm_v3_execution_admission is not None else "shadow",
                     "state": "rejected",
                     "error": self.swarm_v3_init_error,
                 }
@@ -1392,7 +1456,7 @@ class GradientServer:
                         if runtime_backend == "mlx"
                         else (BackendKind.VLLM if runtime_backend == "vllm" else BackendKind.SGLANG)
                     )
-                    info["swarm_v3"] = self.swarm_v3_reporter.snapshot(
+                    report = self.swarm_v3_reporter.snapshot(
                         WorkerServingSnapshot(
                             worker_id=self.lattica.peer_id(),
                             endpoint_id=self.lattica.peer_id(),
@@ -1419,13 +1483,38 @@ class GradientServer:
                             ),
                         )
                     )
+                    if self.swarm_v3_execution_admission is not None and report.get("state") in {
+                        "ready",
+                        "warming",
+                    }:
+                        try:
+                            self.swarm_v3_execution_admission.configure(report["advertisement"])
+                        except Exception as exc:
+                            report = {
+                                "mode": "active",
+                                "state": "rejected",
+                                "error": {
+                                    "code": type(exc).__name__,
+                                    "detail": str(exc)[:256],
+                                },
+                            }
+                    info["swarm_v3"] = report
                 else:
                     info["swarm_v3"] = {
-                        "mode": "shadow",
+                        "mode": self.swarm_v3_reporter.mode,
                         "state": "waiting_contract",
                     }
 
         return info
+
+    def _stable_capacity_hardware(self) -> dict[str, Any]:
+        """Return the immutable capacity envelope for this worker generation."""
+
+        with self._capacity_hardware_lock:
+            if self._capacity_hardware_snapshot is None:
+                detected = detect_node_hardware(self.lattica.peer_id())
+                self._capacity_hardware_snapshot = copy.deepcopy(detected)
+            return copy.deepcopy(self._capacity_hardware_snapshot)
 
     def shutdown(self):
         self.stop_event.set()

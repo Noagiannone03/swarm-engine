@@ -39,6 +39,8 @@ message Req {
   optional float token_prob = 9;  // Probability value for the sampled token
   bool return_probs = 10;  // Whether to return probabilities
   bool terminal_error = 11;  // Pipeline execution failed; abort peers and return ERROR upstream
+  string route_id = 12;  // Signed protocol-v3 route identity
+  uint64 route_epoch = 13;  // Fencing epoch for retries/failover
 }
 
 message SamplingParams {

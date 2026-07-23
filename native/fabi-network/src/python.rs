@@ -36,6 +36,7 @@ use crate::{
         BootstrapPeer, CatalogDhtConfig, CatalogDhtHandle, load_or_create_dht_keypair,
         spawn_catalog_dht,
     },
+    control,
     endpoint::{EndpointConfig, bind},
     identity,
     protocol::{
@@ -509,6 +510,27 @@ impl PyNetworkNode {
         )
         .map_err(py_error)?;
         Ok(PyBytes::new(py, &encoded))
+    }
+
+    fn sign_control_payload<'py>(
+        &self,
+        py: Python<'py>,
+        payload: &[u8],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        self.ensure_open()?;
+        let signature =
+            control::sign_control_payload(&self.secret_key, payload).map_err(py_error)?;
+        Ok(PyBytes::new(py, &signature))
+    }
+
+    #[staticmethod]
+    fn verify_control_payload(
+        signer_endpoint_id: &str,
+        payload: &[u8],
+        signature: &[u8],
+    ) -> PyResult<()> {
+        let endpoint = EndpointId::from_str(signer_endpoint_id).map_err(py_error)?;
+        control::verify_control_payload(&endpoint, payload, signature).map_err(py_error)
     }
 
     #[staticmethod]

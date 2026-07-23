@@ -6,6 +6,7 @@
 
 pub mod catalog;
 pub mod catalog_dht;
+pub mod control;
 pub mod endpoint;
 pub mod identity;
 pub mod protocol;

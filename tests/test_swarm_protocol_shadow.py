@@ -171,12 +171,14 @@ def test_shadow_compares_v3_route_with_legacy_without_serving_it():
     assert result["legacy_routes"] == (("mac", "rtx"),)
 
 
-def test_shadow_explains_missing_executor_measurements():
+def test_shadow_routes_cold_workers_without_inventing_performance_estimates():
     bundle = _bundle()
     result = _observe_until_resolved(
         SchedulerProtocolV3Shadow(_Registry(bundle)),
         _nodes(bundle, measured=False),
     )
 
-    assert result["state"] == "no_feasible_route"
-    assert result["blockers"] == ["missing_executor_throughput"]
+    assert result["state"] == "agreement"
+    assert result["performance_telemetry_complete"] is False
+    assert result["projected_ttft_ms"] is None
+    assert result["projected_inter_token_ms"] is None

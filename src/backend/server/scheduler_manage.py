@@ -11,11 +11,18 @@ from backend.server.rpc_connection_handler import RPCConnectionHandler
 from backend.server.static_config import get_model_info, get_node_join_command
 from fabi_network.transport import IrohTransport, using_iroh
 from parallax.cli import PUBLIC_INITIAL_PEERS, PUBLIC_RELAY_SERVERS
+from parallax.p2p.liveness import (
+    DEFAULT_SCHEDULER_HEARTBEAT_TIMEOUT_SECONDS,
+    validate_scheduler_heartbeat_timeout,
+)
 from parallax.p2p.server import TransformerConnectionHandler
 from parallax.p2p.utils import log_nat_traversal_preflight, mdns_enabled_for_topology
 from parallax_utils.logging_config import get_logger
 from scheduling.node import RequestSignal
 from scheduling.scheduler import Scheduler
+from swarm_protocol.active import ActiveRouteRuntime
+from swarm_protocol.coordinator import RouteReservationError
+from swarm_protocol.routing import RoutePlanningError
 
 logger = get_logger(__name__)
 
@@ -41,6 +48,7 @@ class SchedulerManage:
         weight_refit_mode: str = "disk",
         allocation_strategy: Literal["greedy", "dp"] = "dp",
         routing_strategy: Literal["rr", "dp"] = "dp",
+        heartbeat_timeout: float = DEFAULT_SCHEDULER_HEARTBEAT_TIMEOUT_SECONDS,
     ):
         """Initialize the manager with networking bootstrap parameters."""
         self.initial_peers = initial_peers
@@ -54,12 +62,19 @@ class SchedulerManage:
         self.weight_refit_mode = weight_refit_mode
         self.allocation_strategy = allocation_strategy
         self.routing_strategy = routing_strategy
+        self.heartbeat_timeout = validate_scheduler_heartbeat_timeout(heartbeat_timeout)
+        self.swarm_v3_mode = os.environ.get("FABI_SWARM_V3_MODE", "off").strip().lower()
+        if self.swarm_v3_mode in {"", "disabled"}:
+            self.swarm_v3_mode = "off"
+        if self.swarm_v3_mode not in {"off", "shadow", "active"}:
+            raise ValueError("FABI_SWARM_V3_MODE supports only off, shadow, or active")
         self.model_name = None
         self.init_nodes_num = None
         self.scheduler = None
         self.node_id = f"{dht_prefix}_announce"
         self.lattica = None
         self.iroh_transport = None
+        self.active_v3_routes = None
         self.stubs = {}
         self.is_local_network = False
         self._context_tokenizer = None
@@ -104,6 +119,7 @@ class SchedulerManage:
 
         self._start_scheduler(model_name, init_nodes_num)
         self._start_lattica()
+        self._start_active_v3_routes()
         self.completion_handler = TransformerConnectionHandler(
             lattica=None if self.iroh_transport is not None else self.lattica,
             recv_from_peer_addr="",
@@ -124,6 +140,10 @@ class SchedulerManage:
         Stop the scheduler only. Lattica will remain running.
         """
         logger.info("Stopping scheduler...")
+
+        if self.active_v3_routes is not None:
+            self.active_v3_routes.close()
+            self.active_v3_routes = None
 
         # Stop scheduler if running
         if self.scheduler is not None:
@@ -177,6 +197,7 @@ class SchedulerManage:
                 "init_nodes_num": self.init_nodes_num,
                 "allocation_strategy": self.allocation_strategy,
                 "routing_strategy": self.routing_strategy,
+                "heartbeat_timeout_seconds": self.heartbeat_timeout,
                 "chunked_prefill_size": (
                     self.scheduler.negotiated_chunked_prefill_size() if self.scheduler else 0
                 ),
@@ -200,6 +221,11 @@ class SchedulerManage:
                 "need_more_nodes": self.need_more_nodes(),
                 "swarm_v3_shadow": (
                     self.scheduler.swarm_v3_shadow_snapshot if self.scheduler else None
+                ),
+                "swarm_v3_execution": (
+                    self.active_v3_routes.snapshot()
+                    if self.active_v3_routes is not None
+                    else {"mode": "off", "active_routes": []}
                 ),
                 "max_running_request": (
                     self.scheduler.report_pipeline_capacity()[1] if self.scheduler else 0
@@ -287,6 +313,7 @@ class SchedulerManage:
             weight_refit_mode=self.weight_refit_mode,
             strategy=self.allocation_strategy,
             routing_strategy=self.routing_strategy,
+            heartbeat_timeout=self.heartbeat_timeout,
             planning_context_tokens=self._positive_context_env(
                 "PARALLAX_PLANNING_CONTEXT_TOKENS", 16_384
             ),
@@ -413,6 +440,25 @@ class SchedulerManage:
         self.connection_handler = handler
         logger.info("Iroh scheduler endpoint ready: %s", transport.peer_id())
 
+    def _start_active_v3_routes(self) -> None:
+        """Activate v3 traffic only when the verified planner and Iroh are ready."""
+
+        planner = self.scheduler.swarm_v3_shadow if self.scheduler is not None else None
+        if self.swarm_v3_mode != "active":
+            return
+        if planner is None or planner.mode != "active":
+            raise RuntimeError("protocol-v3 active planner failed to initialize")
+        if self.iroh_transport is None:
+            raise RuntimeError("protocol-v3 active mode requires the authenticated Iroh transport")
+        if self.active_v3_routes is not None:
+            self.active_v3_routes.close()
+        self.active_v3_routes = ActiveRouteRuntime(
+            planner=planner,
+            transport=self.iroh_transport,
+            nodes_provider=lambda: list(self.scheduler.node_manager.nodes),
+        )
+        logger.info("Protocol-v3 active route admission is ready")
+
     def _get_context_tokenizer(self):
         """Lazily load the canonical tokenizer used by the scheduler's model."""
         model_name = self.model_name
@@ -439,7 +485,15 @@ class SchedulerManage:
             return 0
         return self.scheduler.max_supported_context_tokens()
 
-    def get_routing_table(self, request_id, received_ts, required_context_tokens: int = 0):
+    def get_routing_table(
+        self,
+        request_id,
+        received_ts,
+        required_context_tokens: int = 0,
+        *,
+        prompt_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
+    ):
         """Block briefly until the scheduler assigns a routing path for the request.
 
         Distinguish three states via `RequestSignal.routing_table`:
@@ -448,6 +502,23 @@ class SchedulerManage:
         - [..]: valid routing path, return immediately
         """
         logger.debug(f"Routing table requested for request_id={request_id}")
+        if self.active_v3_routes is not None:
+            if prompt_tokens is None or reserved_output_tokens is None:
+                raise ValueError("active v3 routing requires exact prompt and output token budgets")
+            if prompt_tokens + reserved_output_tokens != required_context_tokens:
+                raise ValueError("active v3 routing token budget is internally inconsistent")
+            try:
+                return list(
+                    self.active_v3_routes.reserve(
+                        request_id=str(request_id),
+                        prompt_tokens=prompt_tokens,
+                        reserved_output_tokens=reserved_output_tokens,
+                    )
+                )
+            except (RoutePlanningError, RouteReservationError) as exc:
+                logger.info("Protocol-v3 route not currently admissible: %s", exc)
+                return []
+
         request = RequestSignal(
             request_id,
             received_ts,
@@ -479,18 +550,31 @@ class SchedulerManage:
         """Release scheduler capacity as soon as the forwarded HTTP request ends."""
         if self.scheduler is None:
             return False
+        if self.active_v3_routes is not None:
+            return self.active_v3_routes.release(str(request_id))
         return self.scheduler.release_request(str(request_id))
 
     def is_routing_table_active(self, request_id: str) -> bool:
         """Return whether a dispatched request still owns a live worker route."""
         if self.scheduler is None:
             return False
+        if self.active_v3_routes is not None:
+            return self.active_v3_routes.is_active(str(request_id))
         return self.scheduler.is_request_route_active(str(request_id))
+
+    def get_route_authority(self, request_id: str) -> dict[str, object] | None:
+        """Return v3 data-plane fencing metadata for the active route."""
+
+        if self.active_v3_routes is None:
+            return None
+        return self.active_v3_routes.authority(str(request_id))
 
     def wait_for_routing_capacity(self, timeout: float) -> bool:
         """Block until a route can be admitted or the bounded wait expires."""
         if self.scheduler is None:
             return False
+        if self.active_v3_routes is not None:
+            return self.active_v3_routes.wait_for_capacity(timeout)
         return self.scheduler.wait_for_routing_capacity(timeout)
 
     def get_schedule_status(self):

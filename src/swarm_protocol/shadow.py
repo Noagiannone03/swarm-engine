@@ -21,17 +21,20 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerProtocolV3Shadow:
-    """Validate worker reports independently and compare v3 routing without serving traffic."""
+    """Validate worker reports and expose the shared v3 route planner."""
 
-    def __init__(self, registry: TrustedModelRegistry) -> None:
+    def __init__(self, registry: TrustedModelRegistry, *, mode: str = "shadow") -> None:
+        if mode not in {"shadow", "active"}:
+            raise ValueError("scheduler protocol-v3 mode must be 'shadow' or 'active'")
         self.registry = registry
+        self.mode = mode
         self.planner = ExactRoutePlanner()
         self._lock = threading.RLock()
         self._bundles: dict[str, ModelRegistryBundle] = {}
         self._pending: set[str] = set()
         self._bundle_errors: dict[str, dict[str, str]] = {}
         self._bundle_retry_after: dict[str, float] = {}
-        self._latest: dict[str, object] = {"mode": "shadow", "state": "waiting_workers"}
+        self._latest: dict[str, object] = {"mode": mode, "state": "waiting_workers"}
         self._last_log_key = ""
 
     @classmethod
@@ -39,8 +42,8 @@ class SchedulerProtocolV3Shadow:
         mode = os.environ.get("FABI_SWARM_V3_MODE", "off").strip().lower()
         if mode in {"", "off", "disabled"}:
             return None
-        if mode != "shadow":
-            raise ValueError("FABI_SWARM_V3_MODE currently supports only 'off' or 'shadow'")
+        if mode not in {"shadow", "active"}:
+            raise ValueError("FABI_SWARM_V3_MODE supports only 'off', 'shadow', or 'active'")
         metadata_url = os.environ.get("FABI_MODEL_REGISTRY_METADATA_URL")
         targets_url = os.environ.get("FABI_MODEL_REGISTRY_TARGETS_URL")
         root_path = os.environ.get("FABI_MODEL_REGISTRY_ROOT")
@@ -58,7 +61,8 @@ class SchedulerProtocolV3Shadow:
                 metadata_base_url=metadata_url,
                 target_base_url=targets_url,
                 bootstrap_root=Path(root_path).read_bytes(),
-            )
+            ),
+            mode=mode,
         )
 
     @property
@@ -77,29 +81,12 @@ class SchedulerProtocolV3Shadow:
         """Perform a CPU-only comparison and schedule registry I/O off-thread."""
 
         now_ms = time.time_ns() // 1_000_000
-        advertisements = []
-        rejected_workers: dict[str, str] = {}
-        for node in nodes:
-            report = getattr(node, "swarm_v3", None)
-            if not isinstance(report, dict) or report.get("state") not in {"ready", "warming"}:
-                if isinstance(report, dict):
-                    rejected_workers[str(node.node_id)] = str(report.get("state", "invalid"))
-                continue
-            raw_advertisement = report.get("advertisement")
-            try:
-                advertisement = ModelMemberAdvertisement.model_validate(raw_advertisement)
-            except Exception as exc:  # noqa: BLE001 - untrusted RPC boundary
-                rejected_workers[str(node.node_id)] = f"invalid:{type(exc).__name__}"
-                continue
-            if advertisement.offer.worker_id != str(node.node_id):
-                rejected_workers[str(node.node_id)] = "worker_identity_mismatch"
-                continue
-            advertisements.append(advertisement)
+        advertisements, rejected_workers = self._advertisements(nodes)
 
         if not advertisements:
             return self._store(
                 {
-                    "mode": "shadow",
+                    "mode": self.mode,
                     "state": "waiting_workers",
                     "accepted_workers": 0,
                     "rejected_workers": rejected_workers,
@@ -135,7 +122,7 @@ class SchedulerProtocolV3Shadow:
         if bundle is None:
             return self._store(
                 {
-                    "mode": "shadow",
+                    "mode": self.mode,
                     "state": "registry_rejected" if bundle_error else "verifying_registry",
                     "model_swarm_id": model_swarm_id,
                     "accepted_workers": len(advertisements),
@@ -159,12 +146,6 @@ class SchedulerProtocolV3Shadow:
             link for advertisement in advertisements for link in advertisement.outgoing_links
         )
         blockers = []
-        if any(
-            lease.measured_prefill_tokens_per_second is None
-            or lease.measured_decode_tokens_per_second is None
-            for lease in leases
-        ):
-            blockers.append("missing_executor_throughput")
         if len(leases) > 1 and not links:
             blockers.append("missing_link_goodput")
         try:
@@ -183,7 +164,7 @@ class SchedulerProtocolV3Shadow:
         except NoFeasibleRoute as exc:
             return self._store(
                 {
-                    "mode": "shadow",
+                    "mode": self.mode,
                     "state": "no_feasible_route",
                     "model_swarm_id": model_swarm_id,
                     "required_context_tokens": planning_context_tokens,
@@ -198,17 +179,101 @@ class SchedulerProtocolV3Shadow:
         agrees = v3_route in legacy_routes
         return self._store(
             {
-                "mode": "shadow",
+                "mode": self.mode,
                 "state": "agreement" if agrees else "divergence",
                 "model_swarm_id": model_swarm_id,
                 "required_context_tokens": planning_context_tokens,
                 "v3_route": v3_route,
                 "legacy_routes": legacy_routes,
-                "projected_ttft_ms": planned.estimate.ttft_ms,
-                "projected_inter_token_ms": planned.estimate.inter_token_ms,
+                "projected_ttft_ms": (
+                    planned.estimate.ttft_ms if planned.estimate.complete else None
+                ),
+                "projected_inter_token_ms": (
+                    planned.estimate.inter_token_ms if planned.estimate.complete else None
+                ),
+                "performance_telemetry_complete": planned.estimate.complete,
                 "rejected_workers": rejected_workers,
             }
         )
+
+    @staticmethod
+    def _advertisements(
+        nodes: list[Any],
+    ) -> tuple[list[ModelMemberAdvertisement], dict[str, str]]:
+        advertisements = []
+        rejected_workers: dict[str, str] = {}
+        for node in nodes:
+            report = getattr(node, "swarm_v3", None)
+            if not isinstance(report, dict) or report.get("state") not in {"ready", "warming"}:
+                if isinstance(report, dict):
+                    rejected_workers[str(node.node_id)] = str(report.get("state", "invalid"))
+                continue
+            try:
+                advertisement = ModelMemberAdvertisement.model_validate(report.get("advertisement"))
+            except Exception as exc:  # noqa: BLE001 - untrusted RPC boundary
+                rejected_workers[str(node.node_id)] = f"invalid:{type(exc).__name__}"
+                continue
+            if advertisement.offer.worker_id != str(node.node_id):
+                rejected_workers[str(node.node_id)] = "worker_identity_mismatch"
+                continue
+            advertisements.append(advertisement)
+        return advertisements, rejected_workers
+
+    def plan_request(
+        self,
+        nodes: list[Any],
+        *,
+        request: RequestContract,
+        coordinator_id: str,
+        epoch: int,
+        reservation_deadline_ms: int,
+        plan_expires_at_ms: int,
+    ):
+        """Plan from the same verified snapshot used by comparison mode."""
+
+        advertisements, rejected_workers = self._advertisements(nodes)
+        matching = [
+            advertisement
+            for advertisement in advertisements
+            if advertisement.lease.model_swarm_id == request.model_swarm_id
+        ]
+        if not matching:
+            raise NoFeasibleRoute(
+                f"no verified workers for model swarm {request.model_swarm_id}; "
+                f"rejected={rejected_workers}"
+            )
+        with self._lock:
+            bundle = self._bundles.get(request.model_swarm_id)
+        if bundle is None:
+            raise NoFeasibleRoute("trusted model bundle is not ready")
+        return self.planner.plan(
+            manifest=bundle.manifest,
+            request=request,
+            offers=tuple(item.offer for item in matching),
+            leases=tuple(item.lease for item in matching),
+            links=tuple(link for item in matching for link in item.outgoing_links),
+            snapshot_time_ms=time.time_ns() // 1_000_000,
+            coordinator_id=coordinator_id,
+            reservation_deadline_ms=reservation_deadline_ms,
+            plan_expires_at_ms=plan_expires_at_ms,
+            epoch=epoch,
+        )
+
+    def ready_model_swarm_id(self, nodes: list[Any]) -> str:
+        """Return the dominant verified swarm whose trusted bundle is ready."""
+
+        advertisements, _ = self._advertisements(nodes)
+        counts: dict[str, int] = {}
+        for advertisement in advertisements:
+            swarm_id = advertisement.lease.model_swarm_id
+            counts[swarm_id] = counts.get(swarm_id, 0) + 1
+        with self._lock:
+            ready = {
+                swarm_id: count for swarm_id, count in counts.items() if swarm_id in self._bundles
+            }
+        if not ready:
+            raise NoFeasibleRoute("no verified model swarm has a trusted registry bundle")
+        return min(ready, key=lambda swarm_id: (-ready[swarm_id], swarm_id))
 
     def _fetch_bundle(self, model_swarm_id: str) -> None:
         try:
@@ -257,6 +322,6 @@ class SchedulerProtocolV3Shadow:
         with self._lock:
             self._latest = value
             if log_key != self._last_log_key:
-                logger.info("Protocol-v3 shadow comparison: %s", value)
+                logger.info("Protocol-v3 %s planner status: %s", self.mode, value)
                 self._last_log_key = log_key
             return dict(value)

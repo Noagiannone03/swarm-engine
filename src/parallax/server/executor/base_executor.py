@@ -971,6 +971,8 @@ class BaseExecutor:
                 hidden_states=hidden_states,
                 next_token_id=next_token_id,
                 routing_table=request.routing_table,
+                route_id=request.route_id,
+                route_epoch=request.route_epoch,
                 lora_path=request.lora_path,
                 token_prob=token_prob,
             )
@@ -990,6 +992,8 @@ class BaseExecutor:
                 hidden_states=hidden_states,
                 next_token_id=next_token_id,
                 routing_table=request.routing_table,
+                route_id=request.route_id,
+                route_epoch=request.route_epoch,
                 lora_path=request.lora_path,
                 token_prob=token_prob,
             )

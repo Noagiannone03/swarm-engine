@@ -328,6 +328,7 @@ if __name__ == "__main__":
         weight_refit_mode=args.weight_refit_mode,
         allocation_strategy=args.allocation_strategy,
         routing_strategy=args.routing_strategy,
+        heartbeat_timeout=args.heartbeat_timeout,
     )
 
     request_handler.set_scheduler_manage(scheduler_manage)

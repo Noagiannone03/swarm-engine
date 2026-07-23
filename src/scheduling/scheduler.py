@@ -5,6 +5,7 @@ Scheduler for Layer Allocation and Request Routing.
 from __future__ import annotations
 
 import copy
+import os
 import queue
 import threading
 import time
@@ -180,16 +181,17 @@ class Scheduler:
             self.swarm_v3_shadow = SchedulerProtocolV3Shadow.from_environment()
             if self.swarm_v3_shadow is not None:
                 self.swarm_v3_shadow_snapshot = {
-                    "mode": "shadow",
+                    "mode": self.swarm_v3_shadow.mode,
                     "state": "waiting_workers",
                 }
         except Exception as exc:
+            configured_v3_mode = os.environ.get("FABI_SWARM_V3_MODE", "shadow").strip().lower()
             self.swarm_v3_shadow_snapshot = {
-                "mode": "shadow",
+                "mode": configured_v3_mode,
                 "state": "rejected",
                 "error": {"code": type(exc).__name__, "detail": str(exc)[:256]},
             }
-            logger.error("Protocol-v3 scheduler shadow is disabled: %s", exc)
+            logger.error("Protocol-v3 scheduler planner is disabled: %s", exc)
         logger.info(
             f"Scheduler initialized, min_nodes_bootstrapping {self.min_nodes_bootstrapping}, "
             f"Layer allocations trategy {strategy}, Request routing strategy {routing_strategy}."

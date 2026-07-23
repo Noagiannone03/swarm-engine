@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from math import inf
-
 from swarm_protocol.contracts import (
     EffectiveSpanMode,
     LayerSpan,
@@ -50,6 +48,7 @@ class RouteCandidate:
 class RouteEstimate:
     ttft_ms: float
     inter_token_ms: float
+    complete: bool = True
 
     def projected_total_ms(self, reserved_output_tokens: int) -> float:
         return self.ttft_ms + self.inter_token_ms * reserved_output_tokens
@@ -72,9 +71,11 @@ class _PartialPath:
     segments: tuple[_Segment, ...]
     ttft_ms: float
     inter_token_ms: float
+    unknown_compute_stages: int
 
-    def score(self, reserved_output_tokens: int) -> tuple[float, int, tuple[str, ...]]:
+    def score(self, reserved_output_tokens: int) -> tuple[int, float, int, tuple[str, ...]]:
         return (
+            self.unknown_compute_stages,
             self.ttft_ms + self.inter_token_ms * reserved_output_tokens,
             len(self.segments),
             tuple(segment.candidate.offer.worker_id for segment in self.segments),
@@ -98,7 +99,10 @@ class ExactRoutePlanner:
             lease.measured_prefill_tokens_per_second is None
             or lease.measured_decode_tokens_per_second is None
         ):
-            return RouteEstimate(inf, inf)
+            # Missing cold-start telemetry must not masquerade as a capacity
+            # failure. Keep the estimate explicitly incomplete; exact memory
+            # admission remains worker-local during PREPARE.
+            return RouteEstimate(0, 0, complete=False)
         fraction = span.length / lease.hosted_span.length
         return RouteEstimate(
             ttft_ms=(
@@ -177,8 +181,6 @@ class ExactRoutePlanner:
                 or lease.model_swarm_id != request.model_swarm_id
                 or lease.state != SpanState.READY
                 or lease.expires_at_ms <= snapshot_time_ms
-                or lease.measured_prefill_tokens_per_second is None
-                or lease.measured_decode_tokens_per_second is None
             ):
                 continue
             candidates.append(RouteCandidate(offer=offer, lease=lease))
@@ -259,7 +261,10 @@ class ExactRoutePlanner:
             ):
                 head_cost = self._stage_compute_cost(head, head_span, request)
                 initial = _PartialPath(
-                    (_Segment(head, head_span),), head_cost.ttft_ms, head_cost.inter_token_ms
+                    (_Segment(head, head_span),),
+                    head_cost.ttft_ms,
+                    head_cost.inter_token_ms,
+                    int(not head_cost.complete),
                 )
                 states: dict[tuple[int, str], _PartialPath] = {
                     (head_span.end, head.offer.worker_id): initial
@@ -285,6 +290,7 @@ class ExactRoutePlanner:
                                 partial.segments,
                                 partial.ttft_ms,
                                 partial.inter_token_ms + closure_cost.inter_token_ms,
+                                partial.unknown_compute_stages,
                             )
                             if best_complete is None or complete.score(
                                 request.reserved_output_tokens
@@ -312,6 +318,7 @@ class ExactRoutePlanner:
                                     partial.inter_token_ms
                                     + network.inter_token_ms
                                     + compute.inter_token_ms,
+                                    partial.unknown_compute_stages + int(not compute.complete),
                                 )
                                 key = (span.end, candidate.offer.worker_id)
                                 previous = states.get(key)
@@ -367,5 +374,9 @@ class ExactRoutePlanner:
         )
         return PlannedRoute(
             plan=plan,
-            estimate=RouteEstimate(best_complete.ttft_ms, best_complete.inter_token_ms),
+            estimate=RouteEstimate(
+                best_complete.ttft_ms,
+                best_complete.inter_token_ms,
+                complete=best_complete.unknown_compute_stages == 0,
+            ),
         )

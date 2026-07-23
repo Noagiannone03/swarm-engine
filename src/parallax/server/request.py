@@ -96,6 +96,8 @@ class Request:
         routing_table: Optional[List[str]] = [],
         sampling_params: Optional[SamplingParams] = None,
         lora_path: Optional[str] = None,
+        route_id: str = "",
+        route_epoch: int = 0,
     ):
         self.request_id = request_id or str(uuid.uuid4())
         self.status = status
@@ -110,6 +112,8 @@ class Request:
         self.last_updated_time: Optional[float] = None
         self.lora_id: Optional[str] = None
         self.lora_path = lora_path
+        self.route_id = route_id
+        self.route_epoch = route_epoch
         self.rid = self.request_id
         self.is_chunked = False
         # Full prompt tokens as received from the client. Chunked prefill may
@@ -173,6 +177,8 @@ class InitialRequest(Request):
         lora_path: Optional[str] = None,
         return_probs: bool = False,
         routing_table: Optional[List[str]] = None,
+        route_id: str = "",
+        route_epoch: int = 0,
     ):
         if not prompt and not input_ids:
             raise ValueError("prompt or input_ids cannot be empty.")
@@ -184,6 +190,8 @@ class InitialRequest(Request):
             routing_table=routing_table or [],
             sampling_params=sampling_params,
             lora_path=lora_path,
+            route_id=route_id,
+            route_epoch=route_epoch,
         )
         self.prompt = prompt
         self.return_probs = return_probs
@@ -287,6 +295,8 @@ class IntermediateRequest(Request):
         lora_path: Optional[str] = None,
         token_prob: Optional[float] = None,
         return_probs: bool = False,
+        route_id: str = "",
+        route_epoch: int = 0,
     ):
         super().__init__(
             request_id=request_id,
@@ -295,6 +305,8 @@ class IntermediateRequest(Request):
             input_ids=input_ids,
             sampling_params=sampling_params,
             lora_path=lora_path,
+            route_id=route_id,
+            route_epoch=route_epoch,
         )
         # Hidden states from the previous peer's computation.
         # Shape:
@@ -365,6 +377,8 @@ class IntermediateRequest(Request):
             lora_path=lora_path,
             token_prob=token_prob,
             return_probs=initial_request.return_probs,
+            route_id=initial_request.route_id,
+            route_epoch=initial_request.route_epoch,
         )
 
     @classmethod
@@ -391,6 +405,8 @@ class IntermediateRequest(Request):
             lora_path=lora_path,
             token_prob=token_prob,
             return_probs=old_request.return_probs,
+            route_id=old_request.route_id,
+            route_epoch=old_request.route_epoch,
         )
 
     def __repr__(self):

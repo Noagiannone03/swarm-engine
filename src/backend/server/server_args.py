@@ -1,8 +1,29 @@
 import argparse
+import os
 
 from parallax_utils.logging_config import get_logger
+from parallax.p2p.liveness import (
+    DEFAULT_SCHEDULER_HEARTBEAT_TIMEOUT_SECONDS,
+    validate_scheduler_heartbeat_timeout,
+)
 
 logger = get_logger(__name__)
+
+
+def _heartbeat_timeout_default() -> str:
+    # Keep this as a string so argparse applies ``type`` to an environment
+    # default and reports a normal CLI usage error instead of a traceback.
+    return os.environ.get(
+        "PARALLAX_HEARTBEAT_TIMEOUT",
+        str(DEFAULT_SCHEDULER_HEARTBEAT_TIMEOUT_SECONDS),
+    )
+
+
+def _heartbeat_timeout_arg(raw: str) -> float:
+    try:
+        return validate_scheduler_heartbeat_timeout(float(raw))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +64,15 @@ def parse_args() -> argparse.Namespace:
         choices=["dp", "rr"],
         default="dp",
         help="Request routing strategy; dp dynamically allocates newly joined workers",
+    )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=_heartbeat_timeout_arg,
+        default=_heartbeat_timeout_default(),
+        help=(
+            "Worker lease TTL in seconds. It must exceed one heartbeat RPC deadline "
+            "and its retry interval."
+        ),
     )
     parser.add_argument(
         "--is-local-network", type=bool, default=True, help="Whether to use local network"

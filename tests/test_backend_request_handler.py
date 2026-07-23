@@ -18,6 +18,12 @@ class DummySchedulerManage:
         return "Qwen/Qwen3-0.6B"
 
 
+class AuthoritySchedulerManage(DummySchedulerManage):
+    def get_route_authority(self, request_id):
+        assert request_id == "scheduler-req"
+        return {"route_id": "route-7", "epoch": 7}
+
+
 class ForwardingSchedulerManage(DummySchedulerManage):
     def __init__(
         self,
@@ -44,8 +50,23 @@ class ForwardingSchedulerManage(DummySchedulerManage):
     def max_supported_context_tokens(self):
         return self.max_context
 
-    def get_routing_table(self, request_id, received_ts, required_context_tokens=0):
-        self.routing_requests.append((request_id, required_context_tokens))
+    def get_routing_table(
+        self,
+        request_id,
+        received_ts,
+        required_context_tokens=0,
+        *,
+        prompt_tokens=None,
+        reserved_output_tokens=None,
+    ):
+        self.routing_requests.append(
+            (
+                request_id,
+                required_context_tokens,
+                prompt_tokens,
+                reserved_output_tokens,
+            )
+        )
         if self.routing_table:
             self.active_routes.add(str(request_id))
         return self.routing_table
@@ -175,6 +196,24 @@ def test_prepare_backend_request_uses_vllm_xargs_for_parallax_metadata():
     assert request_data["vllm_xargs"]["parallax_routing_table"] == ["user-node"]
 
 
+def test_prepare_backend_request_propagates_active_v3_route_fence():
+    handler = RequestHandler()
+    handler.set_scheduler_manage(AuthoritySchedulerManage())
+
+    backend_request = handler._prepare_backend_request(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        "scheduler-req",
+        ["node-a"],
+    )
+
+    assert backend_request["vllm_xargs"] == {
+        "parallax_routing_table": ["node-a"],
+        "parallax_scheduler_request_id": "scheduler-req",
+        "fabi_route_id": "route-7",
+        "fabi_route_epoch": 7,
+    }
+
+
 def test_forward_request_returns_openai_error_when_scheduler_not_ready():
     handler = RequestHandler()
     handler.set_scheduler_manage(ForwardingSchedulerManage(status=NODE_STATUS_WAITING))
@@ -255,7 +294,7 @@ def test_forward_request_routes_with_exact_required_context():
     )
 
     assert response.status_code == 200
-    assert scheduler_manage.routing_requests == [("accepted-req", 32768)]
+    assert scheduler_manage.routing_requests == [("accepted-req", 32768, 28672, 4096)]
 
 
 def test_forward_request_wakes_when_capacity_becomes_available():

@@ -113,6 +113,21 @@ class IrohTransport:
             raise RuntimeError(f"peer {peer_id} has no active Iroh path")
         return float(path["rtt_ms"]) / 1000.0
 
+    def sign_control_payload(self, payload: bytes) -> bytes:
+        """Sign exact v3 control bytes with this endpoint's stable identity."""
+
+        return bytes(self.runtime._node.sign_control_payload(payload))
+
+    def verify_control_payload(
+        self,
+        signer_endpoint_id: str,
+        payload: bytes,
+        signature: bytes,
+    ) -> None:
+        """Verify exact v3 control bytes against the claimed endpoint identity."""
+
+        self.runtime._node.verify_control_payload(signer_endpoint_id, payload, signature)
+
     def close(self) -> None:
         self.runtime.close()
 

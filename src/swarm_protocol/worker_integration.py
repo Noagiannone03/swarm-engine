@@ -98,8 +98,11 @@ def _local_model_root(
 class WorkerProtocolV3Reporter:
     """Verify large checkpoints off the heartbeat path and expose fresh live reports."""
 
-    def __init__(self, registry: TrustedModelRegistry) -> None:
+    def __init__(self, registry: TrustedModelRegistry, *, mode: str = "shadow") -> None:
+        if mode not in {"shadow", "active"}:
+            raise ValueError("worker protocol-v3 mode must be 'shadow' or 'active'")
         self.registry = registry
+        self.mode = mode
         self._lock = threading.RLock()
         self._pending_key: tuple[str, str, int, int] | None = None
         self._verification_active = False
@@ -117,8 +120,8 @@ class WorkerProtocolV3Reporter:
         mode = os.environ.get("FABI_SWARM_V3_MODE", "off").strip().lower()
         if mode in {"", "off", "disabled"}:
             return None
-        if mode != "shadow":
-            raise ValueError("FABI_SWARM_V3_MODE currently supports only 'off' or 'shadow'")
+        if mode not in {"shadow", "active"}:
+            raise ValueError("FABI_SWARM_V3_MODE supports only 'off', 'shadow', or 'active'")
 
         required = {
             "metadata URL": os.environ.get("FABI_MODEL_REGISTRY_METADATA_URL"),
@@ -142,7 +145,8 @@ class WorkerProtocolV3Reporter:
                 metadata_base_url=str(required["metadata URL"]),
                 target_base_url=str(required["targets URL"]),
                 bootstrap_root=bootstrap_root,
-            )
+            ),
+            mode=mode,
         )
 
     def snapshot(self, serving: WorkerServingSnapshot) -> dict[str, object]:
@@ -170,7 +174,7 @@ class WorkerProtocolV3Reporter:
                 thread.start()
             if verified is None:
                 return {
-                    "mode": "shadow",
+                    "mode": self.mode,
                     "state": "rejected" if retry_blocked else "verifying",
                     "error": self._error,
                 }
@@ -178,12 +182,12 @@ class WorkerProtocolV3Reporter:
                 advertisement = self._advertisement(serving, verified)
             except ValueError as exc:
                 return {
-                    "mode": "shadow",
+                    "mode": self.mode,
                     "state": "rejected",
                     "error": {"code": type(exc).__name__, "detail": str(exc)[:256]},
                 }
             return {
-                "mode": "shadow",
+                "mode": self.mode,
                 "state": "ready" if serving.is_ready else "warming",
                 "model_swarm_id": verified.bundle.model_swarm_id,
                 "advertisement": advertisement.model_dump(mode="json"),

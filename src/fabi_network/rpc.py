@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -27,6 +28,24 @@ _DEFAULT_DISPATCH_WORKERS = 64
 _DEFAULT_PENDING_REQUESTS = 1024
 
 _T = TypeVar("_T")
+_AUTHENTICATED_RPC_PEER_ID: ContextVar[str | None] = ContextVar(
+    "fabi_authenticated_rpc_peer_id",
+    default=None,
+)
+
+
+def authenticated_rpc_peer_id() -> str:
+    """Return the Iroh endpoint authenticated for the current inbound RPC.
+
+    The value comes from ``Connection.remote_id()`` in the native QUIC
+    receiver, never from the application payload. Calls made through a
+    transport that cannot provide this identity fail closed.
+    """
+
+    peer_id = _AUTHENTICATED_RPC_PEER_ID.get()
+    if not peer_id:
+        raise RuntimeError("the current RPC has no authenticated Iroh peer identity")
+    return peer_id
 
 
 def _native_module():
@@ -388,6 +407,9 @@ class IrohRpcRuntime:
     @staticmethod
     def _dispatch_request(request: object, method: _Method) -> None:
         iterator = None
+        peer_token = _AUTHENTICATED_RPC_PEER_ID.set(
+            str(peer_id) if (peer_id := getattr(request, "peer_id", None)) else None
+        )
         try:
             value = _decode_value(request.body, method.request_protobuf)
             result = _invoke(method.function, value)
@@ -404,6 +426,7 @@ class IrohRpcRuntime:
             except RuntimeError:
                 pass
         finally:
+            _AUTHENTICATED_RPC_PEER_ID.reset(peer_token)
             close = getattr(iterator, "close", None)
             if close is not None:
                 close()

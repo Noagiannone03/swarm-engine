@@ -142,6 +142,13 @@ class ReservationState(str, Enum):
     EXPIRED = "expired"
 
 
+class ReservationAction(str, Enum):
+    COMMIT = "commit"
+    RENEW = "renew"
+    RELEASE = "release"
+    FENCE = "fence"
+
+
 class LayerSpan(ContractModel):
     start: NonNegativeInt
     end: PositiveInt
@@ -349,7 +356,7 @@ class RoutePlan(ContractModel):
     model_num_layers: PositiveInt
     prompt_tokens: PositiveInt
     reserved_output_tokens: PositiveInt
-    stages: tuple[RouteStage, ...]
+    stages: Annotated[tuple[RouteStage, ...], Field(min_length=1, max_length=256)]
     recovery_level: RecoveryLevel
     coordinator_id: NonEmpty
     reservation_deadline_ms: PositiveInt
@@ -372,6 +379,12 @@ class RoutePlan(ContractModel):
         for previous, current in zip(self.stages, self.stages[1:]):
             if previous.effective_span.end != current.effective_span.start:
                 raise ValueError("route stages must form a contiguous, non-overlapping cover")
+        worker_ids = [stage.worker_id for stage in self.stages]
+        endpoint_ids = [stage.endpoint_id for stage in self.stages]
+        if len(worker_ids) != len(set(worker_ids)):
+            raise ValueError("route may use each worker at most once")
+        if len(endpoint_ids) != len(set(endpoint_ids)):
+            raise ValueError("route may use each endpoint at most once")
         for stage in self.stages:
             if stage.rounded_context_tokens < self.required_context_tokens:
                 raise ValueError("stage KV reservation is smaller than the request context")
@@ -399,6 +412,38 @@ class ReservationLease(ContractModel):
             raise ValueError(f"unsupported protocol version: {self.protocol_version}")
         if self.expires_at_ms <= self.issued_at_ms:
             raise ValueError("reservation must expire after it is issued")
+        return self
+
+
+class ReservationCommand(ContractModel):
+    """Short-lived coordinator command for an existing local reservation."""
+
+    protocol_version: int = PROTOCOL_VERSION
+    action: ReservationAction
+    reservation_id: NonEmpty | None = None
+    request_id: NonEmpty
+    route_id: NonEmpty
+    epoch: NonNegativeInt
+    ttl_ms: PositiveInt | None = None
+    issued_at_ms: NonNegativeInt
+    expires_at_ms: PositiveInt
+
+    @model_validator(mode="after")
+    def validate_command(self) -> Self:
+        if self.protocol_version != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version: {self.protocol_version}")
+        if self.expires_at_ms <= self.issued_at_ms:
+            raise ValueError("reservation command must expire after it was issued")
+        if self.action == ReservationAction.FENCE:
+            if self.reservation_id is not None or self.ttl_ms is not None:
+                raise ValueError("fence command must not carry a reservation id or TTL")
+        else:
+            if self.reservation_id is None:
+                raise ValueError(f"{self.action.value} command requires a reservation id")
+            if self.action == ReservationAction.RENEW and self.ttl_ms is None:
+                raise ValueError("renew command requires a TTL")
+            if self.action != ReservationAction.RENEW and self.ttl_ms is not None:
+                raise ValueError(f"{self.action.value} command must not carry a TTL")
         return self
 
 

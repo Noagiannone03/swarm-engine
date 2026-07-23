@@ -386,6 +386,48 @@ def test_heartbeat_uses_cached_topology_without_running_network_probes(monkeypat
     assert heartbeat["direct_peer_ids"] == ["qualified-peer"]
 
 
+def test_worker_capacity_envelope_is_immutable_for_process_generation(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.rtt_last_update = time.time()
+    detections = [
+        {
+            "node_id": "worker-peer",
+            "device": "mlx",
+            "usable_memory_bytes": 9_000,
+            "system_available_memory_bytes": 11_000,
+        },
+        {
+            "node_id": "worker-peer",
+            "device": "mlx",
+            "usable_memory_bytes": 1_000,
+            "system_available_memory_bytes": 2_000,
+        },
+    ]
+    calls = 0
+
+    def detect(_node_id):
+        nonlocal calls
+        result = detections[calls]
+        calls += 1
+        return result
+
+    monkeypatch.setattr("parallax.p2p.server.detect_node_hardware", detect)
+
+    initial = server.get_node_info()
+    heartbeat = server.get_node_info(is_update=True)
+
+    assert calls == 1
+    assert initial["hardware"]["usable_memory_bytes"] == 9_000
+    assert heartbeat["hardware"]["usable_memory_bytes"] == 9_000
+    initial["hardware"]["usable_memory_bytes"] = 0
+    assert server.get_node_info(is_update=True)["hardware"]["usable_memory_bytes"] == 9_000
+
+
 def test_transformer_health_rpc_returns_registered_peer_identity():
     handler = TransformerConnectionHandler.__new__(TransformerConnectionHandler)
     handler.lattica_instance = SimpleNamespace(peer_id=lambda: "worker-peer")
