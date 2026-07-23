@@ -1,0 +1,91 @@
+name: Native network
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/native-network.yml'
+      - 'native/fabi-network/**'
+  push:
+    branches:
+      - codex/swarm-protocol-v3
+    paths:
+      - '.github/workflows/native-network.yml'
+      - 'native/fabi-network/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-network-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheel:
+    name: Wheel and DHT tests / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
+
+    defaults:
+      run:
+        working-directory: native/fabi-network
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Rust 1.91
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.91'
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/fabi-network
+
+      - name: Install Maturin
+        run: python -m pip install "maturin>=1.9,<2"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint all targets and features
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test Python bindings and three-node DHT
+        env:
+          PYO3_PYTHON: python
+        run: cargo test --features python
+
+      - name: Build ABI3 wheel
+        env:
+          PYO3_PYTHON: python
+        run: python -m maturin build --release --interpreter python
+
+      - name: Install built wheel
+        run: python -m pip install --no-index --find-links target/wheels fabi-network-native
+
+      - name: Import wheel surface
+        run: >-
+          python -c "import fabi_network_native as n;
+          assert hasattr(n, 'CatalogRecord');
+          assert hasattr(n.NetworkNode, 'start_catalog_dht');
+          assert hasattr(n.NetworkNode, 'catalog_put');
+          assert hasattr(n.NetworkNode, 'catalog_get')"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: fabi-network-${{ runner.os }}-${{ runner.arch }}
+          path: native/fabi-network/target/wheels/*.whl
+          if-no-files-found: error

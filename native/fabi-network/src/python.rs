@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, endpoint::Connection,
 };
+use libp2p::{Multiaddr, multiaddr::Protocol};
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError},
     prelude::*,
@@ -30,6 +31,10 @@ use crate::{
     catalog::{
         self, CatalogRecordKind, CatalogRecordParams, ValidatedCatalogRecord, sign_catalog_record,
         verify_catalog_record,
+    },
+    catalog_dht::{
+        BootstrapPeer, CatalogDhtConfig, CatalogDhtHandle, load_or_create_dht_keypair,
+        spawn_catalog_dht,
     },
     endpoint::{EndpointConfig, bind},
     identity,
@@ -377,6 +382,7 @@ struct PyNetworkNode {
     runtime: Arc<Runtime>,
     endpoint: Endpoint,
     secret_key: SecretKey,
+    catalog_dht: Mutex<Option<CatalogDhtHandle>>,
     relay_url: RelayUrl,
     incoming: Arc<Mutex<Receiver<InboundRequest>>>,
     dispatcher: InboundDispatcher,
@@ -449,6 +455,7 @@ impl PyNetworkNode {
             runtime,
             endpoint,
             secret_key,
+            catalog_dht: Mutex::new(None),
             relay_url,
             incoming: Arc::new(Mutex::new(incoming_rx)),
             dispatcher,
@@ -473,7 +480,7 @@ impl PyNetworkNode {
         expires_at_ms,
         payload,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn sign_catalog_record<'py>(
         &self,
         py: Python<'py>,
@@ -540,6 +547,131 @@ impl PyNetworkNode {
                 "catalogue record kind is unspecified",
             )),
         }
+    }
+
+    #[pyo3(signature = (
+        identity_path,
+        server_mode=false,
+        listen_address="/ip4/127.0.0.1/tcp/0",
+        bootstrap_addresses=Vec::new(),
+        query_timeout_seconds=15,
+        max_records=25_000,
+    ))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    fn start_catalog_dht(
+        &self,
+        py: Python<'_>,
+        identity_path: PathBuf,
+        server_mode: bool,
+        listen_address: &str,
+        bootstrap_addresses: Vec<String>,
+        query_timeout_seconds: u64,
+        max_records: usize,
+    ) -> PyResult<(String, String)> {
+        self.ensure_open()?;
+        if query_timeout_seconds == 0 || max_records == 0 {
+            return Err(PyRuntimeError::new_err(
+                "query_timeout_seconds and max_records must be positive",
+            ));
+        }
+        if self
+            .catalog_dht
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("catalogue DHT lock is poisoned"))?
+            .is_some()
+        {
+            return Err(PyRuntimeError::new_err("catalogue DHT is already running"));
+        }
+
+        let keypair = load_or_create_dht_keypair(&identity_path).map_err(py_error)?;
+        let listen_address: Multiaddr = listen_address.parse().map_err(py_error)?;
+        let bootstrap_peers = bootstrap_addresses
+            .iter()
+            .map(|address| parse_bootstrap_peer(address))
+            .collect::<PyResult<Vec<_>>>()?;
+        let mut config = if server_mode {
+            CatalogDhtConfig::server(keypair, listen_address)
+        } else {
+            let mut config = CatalogDhtConfig::client(keypair, bootstrap_peers.clone());
+            config.listen_address = listen_address;
+            config
+        };
+        if server_mode {
+            config.bootstrap_peers = bootstrap_peers;
+        }
+        config.query_timeout = Duration::from_secs(query_timeout_seconds);
+        config.max_records = max_records;
+
+        let runtime = Arc::clone(&self.runtime);
+        let handle = py
+            .detach(move || runtime.block_on(spawn_catalog_dht(config)))
+            .map_err(py_error)?;
+        let identity = (
+            handle.peer_id().to_string(),
+            handle.listen_address().to_string(),
+        );
+        let mut slot = self
+            .catalog_dht
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("catalogue DHT lock is poisoned"))?;
+        if slot.is_some() {
+            let runtime = Arc::clone(&self.runtime);
+            py.detach(move || runtime.block_on(handle.shutdown()))
+                .map_err(py_error)?;
+            return Err(PyRuntimeError::new_err(
+                "catalogue DHT was started concurrently",
+            ));
+        }
+        *slot = Some(handle);
+        Ok(identity)
+    }
+
+    fn catalog_bootstrap(&self, py: Python<'_>) -> PyResult<()> {
+        let handle = self.catalog_dht_handle()?;
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(move || runtime.block_on(handle.bootstrap()))
+            .map_err(py_error)
+    }
+
+    #[pyo3(signature = (logical_key, encoded, quorum=1))]
+    fn catalog_put(
+        &self,
+        py: Python<'_>,
+        logical_key: &str,
+        encoded: &[u8],
+        quorum: usize,
+    ) -> PyResult<()> {
+        let quorum = std::num::NonZeroUsize::new(quorum)
+            .ok_or_else(|| PyRuntimeError::new_err("quorum must be positive"))?;
+        let handle = self.catalog_dht_handle()?;
+        let logical_key = logical_key.to_owned();
+        let encoded = encoded.to_vec();
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(move || runtime.block_on(handle.put(logical_key, encoded, quorum)))
+            .map_err(py_error)
+    }
+
+    fn catalog_get(&self, py: Python<'_>, logical_key: &str) -> PyResult<PyCatalogRecord> {
+        let handle = self.catalog_dht_handle()?;
+        let logical_key = logical_key.to_owned();
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(move || runtime.block_on(handle.get(logical_key)))
+            .map(PyCatalogRecord::from)
+            .map_err(py_error)
+    }
+
+    fn stop_catalog_dht(&self, py: Python<'_>) -> PyResult<()> {
+        let handle = self
+            .catalog_dht
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("catalogue DHT lock is poisoned"))?
+            .take();
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(move || runtime.block_on(handle.shutdown()))
+            .map_err(py_error)
     }
 
     fn call(
@@ -706,8 +838,20 @@ impl PyNetworkNode {
             return;
         }
         let endpoint = self.endpoint.clone();
+        let catalog_dht = self
+            .catalog_dht
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
         let runtime = Arc::clone(&self.runtime);
-        py.detach(move || runtime.block_on(endpoint.close()));
+        py.detach(move || {
+            runtime.block_on(async move {
+                if let Some(handle) = catalog_dht {
+                    let _ = handle.shutdown().await;
+                }
+                endpoint.close().await;
+            });
+        });
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -732,15 +876,44 @@ impl PyNetworkNode {
         }
         Ok(())
     }
+
+    fn catalog_dht_handle(&self) -> PyResult<CatalogDhtHandle> {
+        self.ensure_open()?;
+        self.catalog_dht
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("catalogue DHT lock is poisoned"))?
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("catalogue DHT is not running"))
+    }
 }
 
 impl Drop for PyNetworkNode {
     fn drop(&mut self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
             let endpoint = self.endpoint.clone();
-            self.runtime.spawn(async move { endpoint.close().await });
+            let catalog_dht = self
+                .catalog_dht
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            self.runtime.spawn(async move {
+                if let Some(handle) = catalog_dht {
+                    let _ = handle.shutdown().await;
+                }
+                endpoint.close().await;
+            });
         }
     }
+}
+
+fn parse_bootstrap_peer(value: &str) -> PyResult<BootstrapPeer> {
+    let mut address: Multiaddr = value.parse().map_err(py_error)?;
+    let Some(Protocol::P2p(peer_id)) = address.pop() else {
+        return Err(PyRuntimeError::new_err(
+            "bootstrap address must end with /p2p/<peer-id>",
+        ));
+    };
+    Ok(BootstrapPeer { peer_id, address })
 }
 
 #[derive(Debug)]

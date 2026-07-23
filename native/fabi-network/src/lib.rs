@@ -5,6 +5,7 @@
 //! Python control plane.
 
 pub mod catalog;
+pub mod catalog_dht;
 pub mod endpoint;
 pub mod identity;
 pub mod protocol;
