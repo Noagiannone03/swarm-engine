@@ -71,11 +71,11 @@ class _PartialPath:
     segments: tuple[_Segment, ...]
     ttft_ms: float
     inter_token_ms: float
-    unknown_compute_stages: int
+    unknown_cost_components: int
 
     def score(self, reserved_output_tokens: int) -> tuple[int, float, int, tuple[str, ...]]:
         return (
-            self.unknown_compute_stages,
+            self.unknown_cost_components,
             self.ttft_ms + self.inter_token_ms * reserved_output_tokens,
             len(self.segments),
             tuple(segment.candidate.offer.worker_id for segment in self.segments),
@@ -118,6 +118,16 @@ class ExactRoutePlanner:
         # Measured goodput already captures ordinary loss.  The explicit loss factor is a
         # conservative tail-risk penalty, not a second bandwidth correction.
         reliability_penalty = 1.0 + metric.loss_rate
+        if metric.throughput_bytes_per_second is None:
+            # The authenticated health probe proves the edge exists.  Until a
+            # real transfer or bounded calibration supplies goodput, preserve
+            # the route without inventing bandwidth and mark its estimate
+            # incomplete so measured alternatives always rank first.
+            return RouteEstimate(
+                ttft_ms=metric.rtt_ms * multiplier * reliability_penalty,
+                inter_token_ms=metric.rtt_ms * multiplier * reliability_penalty,
+                complete=False,
+            )
         prefill_transfer_ms = (
             manifest.activation_bytes_per_token
             * request.prompt_tokens
@@ -146,13 +156,13 @@ class ExactRoutePlanner:
             key = (metric.from_worker_id, metric.to_worker_id)
             previous = result.get(key)
             metric_cost = self._link_cost(metric, manifest, request)
-            previous_cost = (
-                self._link_cost(previous, manifest, request) if previous is not None else None
-            )
+            previous_cost = self._link_cost(previous, manifest, request) if previous else None
             if previous_cost is None or (
+                int(not metric_cost.complete),
                 metric_cost.projected_total_ms(request.reserved_output_tokens),
                 metric.path_kind.value,
             ) < (
+                int(not previous_cost.complete),
                 previous_cost.projected_total_ms(request.reserved_output_tokens),
                 previous.path_kind.value,
             ):
@@ -288,7 +298,7 @@ class ExactRoutePlanner:
                                 partial.segments,
                                 partial.ttft_ms,
                                 partial.inter_token_ms + closure_cost.inter_token_ms,
-                                partial.unknown_compute_stages,
+                                partial.unknown_cost_components + int(not closure_cost.complete),
                             )
                             if best_complete is None or complete.score(
                                 request.reserved_output_tokens
@@ -316,7 +326,9 @@ class ExactRoutePlanner:
                                     partial.inter_token_ms
                                     + network.inter_token_ms
                                     + compute.inter_token_ms,
-                                    partial.unknown_compute_stages + int(not compute.complete),
+                                    partial.unknown_cost_components
+                                    + int(not compute.complete)
+                                    + int(not network.complete),
                                 )
                                 key = (span.end, candidate.offer.worker_id)
                                 previous = states.get(key)
@@ -375,6 +387,6 @@ class ExactRoutePlanner:
             estimate=RouteEstimate(
                 best_complete.ttft_ms,
                 best_complete.inter_token_ms,
-                complete=best_complete.unknown_compute_stages == 0,
+                complete=best_complete.unknown_cost_components == 0,
             ),
         )

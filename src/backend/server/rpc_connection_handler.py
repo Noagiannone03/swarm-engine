@@ -281,6 +281,7 @@ class RPCConnectionHandler(ConnectionHandler):
             "end_layer": None,
             "chunked_prefill_size": 0,
             "outbound_peer_ids": [],
+            "authorized_link_peer_ids": [],
         }
 
     def get_layer_allocation(self, current_node_id):
@@ -323,6 +324,12 @@ class RPCConnectionHandler(ConnectionHandler):
                             end_layer,
                             list_node_allocations,
                         ),
+                        "authorized_link_peer_ids": self._authorized_link_peer_ids(
+                            current_node_id,
+                            start_layer,
+                            end_layer,
+                            list_node_allocations,
+                        ),
                     }
         return {}
 
@@ -341,6 +348,32 @@ class RPCConnectionHandler(ConnectionHandler):
             and candidate_start == next_start
             and candidate_end > candidate_start
         )
+
+    def _authorized_link_peer_ids(
+        self,
+        current_node_id: str,
+        start_layer: int,
+        end_layer: int,
+        allocations,
+    ):
+        """Return adjacent callers allowed to run bounded link calibration.
+
+        Upload goodput is measured by the sender, so a worker must authorize
+        both its possible predecessors and successors.  Restricting this to
+        outgoing peers works accidentally for a two-node ring but rejects
+        legitimate probes as soon as a pipeline contains three stages.
+        """
+
+        outbound = set(self._outbound_peer_ids(current_node_id, end_layer, allocations))
+        previous_end = self.scheduler.num_layers if start_layer == 0 else start_layer
+        inbound = {
+            node_id
+            for node_id, candidate_start, candidate_end in allocations
+            if node_id != current_node_id
+            and candidate_end == previous_end
+            and candidate_end > candidate_start
+        }
+        return sorted(outbound | inbound)
 
     def build_node(self, node_json: dict):
         node = Node(

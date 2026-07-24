@@ -111,11 +111,20 @@ class ModelArtifactIndex(ContractModel):
 
 
 class LinkMetric(ContractModel):
+    """Authenticated reachability plus optional measured transfer goodput.
+
+    Reachability is a structural routing fact; goodput is an optimization
+    sample.  A healthy path must not disappear merely because its last
+    bandwidth sample expired.  This follows Petals' routing model, where
+    unknown latency affects the score but does not remove an online edge.
+    """
+
     from_worker_id: NonEmpty
     to_worker_id: NonEmpty
     path_kind: PathKind
     rtt_ms: Annotated[float, Field(ge=0)]
-    throughput_bytes_per_second: Annotated[float, Field(gt=0)]
+    throughput_bytes_per_second: Annotated[float, Field(gt=0)] | None = None
+    throughput_measured_at_ms: NonNegativeInt | None = None
     loss_rate: Annotated[float, Field(ge=0, lt=1)] = 0
     measured_at_ms: NonNegativeInt
     expires_at_ms: PositiveInt
@@ -126,6 +135,16 @@ class LinkMetric(ContractModel):
             raise ValueError("network link must connect two different workers")
         if self.expires_at_ms <= self.measured_at_ms:
             raise ValueError("link metric must expire after it was measured")
+        if (
+            self.throughput_measured_at_ms is not None
+            and self.throughput_bytes_per_second is None
+        ):
+            raise ValueError("throughput timestamp requires a throughput measurement")
+        if (
+            self.throughput_measured_at_ms is not None
+            and self.throughput_measured_at_ms > self.measured_at_ms
+        ):
+            raise ValueError("throughput cannot be newer than the link observation")
         return self
 
 

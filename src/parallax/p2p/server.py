@@ -76,6 +76,7 @@ _MAX_LINK_PROBE_BYTES = 8 * 1024 * 1024
 _LINK_PROBE_INTERVAL_SECONDS = 60.0
 _LINK_PROBE_MIN_RECEIVE_INTERVAL_SECONDS = 30.0
 _LINK_METRIC_TTL_MS = 120_000
+_LINK_REACHABILITY_TTL_MS = 15_000
 
 
 def _configured_link_probe_bytes() -> int:
@@ -633,9 +634,11 @@ class GradientServer:
         self.direct_peer_prober = None
         self.connection_handler = None
         self.outbound_peer_ids = []
+        self.authorized_link_peer_ids = []
         self.direct_peer_ids = []
         self.reachable_peer_ids = []
         self.relayed_peer_ids = []
+        self.link_path_observed_at_ms = {}
         self.stop_event = threading.Event()
         logger.debug(f"manual_layer_assignment: {self.manual_layer_assignment}")
         self._layer_allocation_changed = False
@@ -923,7 +926,7 @@ class GradientServer:
             notify_url=self.notify_url,
             iroh_transport=self.iroh_transport,
             execution_admission=self.swarm_v3_execution_admission,
-            link_probe_authorizer=lambda peer_id: peer_id in self.outbound_peer_ids,
+            link_probe_authorizer=lambda peer_id: peer_id in self.authorized_link_peer_ids,
         )  # thread
         if self.iroh_transport is not None:
             self.iroh_transport.register(self.connection_handler)
@@ -966,6 +969,13 @@ class GradientServer:
         if peers is not None:
             self.outbound_peer_ids = sorted(
                 {str(peer_id) for peer_id in peers if str(peer_id) != self.lattica.peer_id()}
+            )
+        authorized = (
+            allocation.get("authorized_link_peer_ids") if isinstance(allocation, dict) else None
+        )
+        if authorized is not None:
+            self.authorized_link_peer_ids = sorted(
+                {str(peer_id) for peer_id in authorized if str(peer_id) != self.lattica.peer_id()}
             )
 
     def _probe_outbound_peers(self):
@@ -1019,6 +1029,10 @@ class GradientServer:
         self.direct_peer_ids = direct
         self.reachable_peer_ids = reachable
         self.relayed_peer_ids = relayed
+        observed_at_ms = time.time_ns() // 1_000_000
+        self.link_path_observed_at_ms = {
+            peer_id: observed_at_ms for peer_id in reachable
+        }
         if self.iroh_transport is not None:
             for peer_id in reachable:
                 self._probe_peer_goodput(peer_id)
@@ -1148,15 +1162,20 @@ class GradientServer:
         return True
 
     def _v3_outgoing_link_metrics(self) -> tuple[LinkMetric, ...]:
-        """Return recent effective goodput samples from real activation transfers."""
+        """Return qualified paths, enriched by exact goodput when available.
+
+        The registered RPC health check is the reachability authority.  A
+        bandwidth sample only improves route ranking and may expire
+        independently, as in Petals' separation of online spans from pings.
+        """
 
         now_ms = time.time_ns() // 1_000_000
         with self.link_throughputs_lock:
             samples = dict(self.link_throughputs)
         metrics = []
-        for peer_id, sample in sorted(samples.items()):
-            measured_at_ms = int(sample["measured_at_ms"])
-            if now_ms - measured_at_ms >= _LINK_METRIC_TTL_MS:
+        for peer_id in sorted(self.reachable_peer_ids):
+            measured_at_ms = int(self.link_path_observed_at_ms.get(peer_id, now_ms))
+            if now_ms - measured_at_ms >= _LINK_REACHABILITY_TTL_MS:
                 continue
             if peer_id in self.direct_peer_ids:
                 path_kind = PathKind.DIRECT
@@ -1167,15 +1186,24 @@ class GradientServer:
             rtt_ms = self.rtts.get(peer_id)
             if rtt_ms is None:
                 continue
+            sample = samples.get(peer_id)
+            throughput = None
+            throughput_measured_at_ms = None
+            if sample is not None:
+                sample_time = int(sample["measured_at_ms"])
+                if now_ms - sample_time < _LINK_METRIC_TTL_MS:
+                    throughput = float(sample["bytes_per_second"])
+                    throughput_measured_at_ms = sample_time
             metrics.append(
                 LinkMetric(
                     from_worker_id=self.lattica.peer_id(),
                     to_worker_id=peer_id,
                     path_kind=path_kind,
                     rtt_ms=max(0.0, float(rtt_ms)),
-                    throughput_bytes_per_second=float(sample["bytes_per_second"]),
+                    throughput_bytes_per_second=throughput,
+                    throughput_measured_at_ms=throughput_measured_at_ms,
                     measured_at_ms=measured_at_ms,
-                    expires_at_ms=measured_at_ms + _LINK_METRIC_TTL_MS,
+                    expires_at_ms=measured_at_ms + _LINK_REACHABILITY_TTL_MS,
                 )
             )
         return tuple(metrics)

@@ -154,6 +154,7 @@ def test_node_update_refreshes_registration_when_bootstrap_is_incomplete():
             "end_layer": None,
             "chunked_prefill_size": 0,
             "outbound_peer_ids": [],
+            "authorized_link_peer_ids": [],
         },
         {},
     )
@@ -212,8 +213,25 @@ def test_layer_allocation_returns_all_possible_cyclic_outbound_peers():
 
     assert head["outbound_peer_ids"] == ["tail-a", "tail-b"]
     assert tail["outbound_peer_ids"] == ["head-a", "head-b"]
+    assert head["authorized_link_peer_ids"] == ["tail-a", "tail-b"]
+    assert tail["authorized_link_peer_ids"] == ["head-a", "head-b"]
     assert head["model_max_sequence_length"] == 40960
     assert tail["model_max_sequence_length"] == 40960
+
+
+def test_link_probe_authority_includes_distinct_predecessor_and_successor():
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = SimpleNamespace(num_layers=12)
+    allocations = [
+        ("head", 0, 4),
+        ("middle", 4, 8),
+        ("tail", 8, 12),
+    ]
+
+    assert handler._authorized_link_peer_ids("middle", 4, 8, allocations) == [
+        "head",
+        "tail",
+    ]
 
 
 def test_build_node_preserves_frontend_capability():

@@ -154,6 +154,35 @@ def test_builds_exact_route_and_rounds_context_per_stage() -> None:
     assert {stage.rounded_context_tokens for stage in result.plan.stages} == {128}
 
 
+def test_authenticated_links_remain_routable_without_fresh_goodput() -> None:
+    model = manifest()
+    unknown_goodput = [
+        link("mac", "rtx").model_copy(
+            update={
+                "throughput_bytes_per_second": None,
+                "throughput_measured_at_ms": None,
+            }
+        ),
+        link("rtx", "mac").model_copy(
+            update={
+                "throughput_bytes_per_second": None,
+                "throughput_measured_at_ms": None,
+            }
+        ),
+    ]
+
+    result = plan(
+        model,
+        request(model),
+        [offer("mac"), offer("rtx", frontend=False)],
+        [lease(model, "mac", 0, 4), lease(model, "rtx", 4, 8)],
+        unknown_goodput,
+    )
+
+    assert [stage.worker_id for stage in result.plan.stages] == ["mac", "rtx"]
+    assert result.estimate.complete is False
+
+
 def test_long_context_excludes_worker_with_insufficient_kv() -> None:
     model = manifest()
     req = request(model, prompt=100, output=28)
