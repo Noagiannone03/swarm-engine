@@ -283,7 +283,8 @@ class DhtDiscoveryStore:
                     metric.path_kind.value,
                     metric.loss_rate,
                     metric.rtt_ms,
-                    -metric.throughput_bytes_per_second,
+                    int(metric.throughput_bytes_per_second is None),
+                    -(metric.throughput_bytes_per_second or 0.0),
                     metric.to_worker_id,
                 ),
             )

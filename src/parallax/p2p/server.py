@@ -10,6 +10,7 @@ It is used to handle the communication between the peers, and communicate with t
 import copy
 import dataclasses
 import enum
+import math
 import multiprocessing
 import os
 import random
@@ -219,6 +220,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         iroh_transport: Optional[IrohTransport] = None,
         execution_admission: Optional[WorkerExecutionAdmission] = None,
         link_probe_authorizer: Optional[Callable[[str], bool]] = None,
+        link_probe_idle: Optional[Callable[[], bool]] = None,
     ):
         if lattica is not None:
             super().__init__(lattica)
@@ -233,6 +235,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self.notify_url = notify_url
         self.execution_admission = execution_admission
         self.link_probe_authorizer = link_probe_authorizer
+        self.link_probe_idle = link_probe_idle
         self._link_probe_lock = threading.Lock()
         self._link_probe_last_received: dict[str, float] = {}
         self._recv_from_peer = None
@@ -311,6 +314,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         authorizer = getattr(self, "link_probe_authorizer", None)
         if authorizer is None or not authorizer(caller):
             raise PermissionError("link calibration caller is not an assigned peer")
+        idle = getattr(self, "link_probe_idle", None)
+        if idle is not None and not idle():
+            raise RuntimeError("link calibration receiver is busy with active inference")
         if not isinstance(request, bytes):
             raise TypeError("link calibration payload must be bytes")
         if not _MIN_LINK_PROBE_BYTES <= len(request) <= _MAX_LINK_PROBE_BYTES:
@@ -700,6 +706,7 @@ class GradientServer:
         self.reachable_peer_ids = []
         self.relayed_peer_ids = []
         self.link_path_observed_at_ms = {}
+        self.link_path_rtts_ms = {}
         self.link_health_failures = {}
         self.link_topology_lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -989,9 +996,8 @@ class GradientServer:
             notify_url=self.notify_url,
             iroh_transport=self.iroh_transport,
             execution_admission=self.swarm_v3_execution_admission,
-            link_probe_authorizer=lambda peer_id: (
-                peer_id in self.authorized_link_peer_ids and self._link_probe_idle()
-            ),
+            link_probe_authorizer=lambda peer_id: peer_id in self.authorized_link_peer_ids,
+            link_probe_idle=self._link_probe_idle,
         )  # thread
         if self.iroh_transport is not None:
             self.iroh_transport.register(self.connection_handler)
@@ -1046,6 +1052,11 @@ class GradientServer:
                     for peer_id, measured_at_ms in self.link_path_observed_at_ms.items()
                     if peer_id in retained
                 }
+                self.link_path_rtts_ms = {
+                    peer_id: rtt_ms
+                    for peer_id, rtt_ms in self.link_path_rtts_ms.items()
+                    if peer_id in retained
+                }
                 self.link_health_failures = {
                     peer_id: failures
                     for peer_id, failures in self.link_health_failures.items()
@@ -1096,6 +1107,7 @@ class GradientServer:
                 logger.debug("Application health probe to %s failed", peer_id, exc_info=True)
 
         transport_paths = {}
+        transport_rtts_ms = {}
         if self.iroh_transport is not None:
             for peer_id in candidates:
                 try:
@@ -1104,6 +1116,10 @@ class GradientServer:
                         transport_paths[peer_id] = "direct"
                     elif path is not None and path.get("kind") == "relay":
                         transport_paths[peer_id] = "relay"
+                    if path is not None and path.get("rtt_ms") is not None:
+                        rtt_ms = float(path["rtt_ms"])
+                        if math.isfinite(rtt_ms) and rtt_ms >= 0:
+                            transport_rtts_ms[peer_id] = rtt_ms
                 except Exception:
                     logger.debug("Could not inspect Iroh path to %s", peer_id, exc_info=True)
 
@@ -1182,6 +1198,14 @@ class GradientServer:
             self.link_path_observed_at_ms = {
                 peer_id: measured_at_ms
                 for peer_id, measured_at_ms in self.link_path_observed_at_ms.items()
+                if peer_id in retained
+            }
+            self.link_path_rtts_ms = {
+                peer_id: rtt_ms
+                for peer_id, rtt_ms in {
+                    **self.link_path_rtts_ms,
+                    **transport_rtts_ms,
+                }.items()
                 if peer_id in retained
             }
             self.link_health_failures = {
@@ -1395,6 +1419,7 @@ class GradientServer:
             direct_peer_ids = frozenset(self.direct_peer_ids)
             relayed_peer_ids = frozenset(self.relayed_peer_ids)
             path_observations = dict(self.link_path_observed_at_ms)
+            path_rtts_ms = dict(self.link_path_rtts_ms)
         metrics = []
         for peer_id in sorted(reachable_peer_ids):
             measured_at_ms = int(path_observations.get(peer_id, now_ms))
@@ -1406,7 +1431,10 @@ class GradientServer:
                 path_kind = PathKind.RELAY
             else:
                 continue
-            rtt_ms = self.rtts.get(peer_id)
+            # Iroh reports the selected path kind and its RTT atomically. Use
+            # that observation first: global peer enumeration may lag behind a
+            # newly established direct/relay path, especially on Windows.
+            rtt_ms = path_rtts_ms.get(peer_id, self.rtts.get(peer_id))
             if rtt_ms is None:
                 continue
             sample = samples.get(peer_id)
@@ -1810,6 +1838,10 @@ class GradientServer:
             direct_peer_ids = list(self.direct_peer_ids)
             reachable_peer_ids = list(self.reachable_peer_ids)
             relayed_peer_ids = list(self.relayed_peer_ids)
+            # Keep legacy allocation telemetry coherent with the exact path
+            # observations used by v3 routing. Iroh-path RTTs win because they
+            # describe the currently selected direct/relay connection.
+            rtt_to_nodes = {**self.rtts, **self.link_path_rtts_ms}
         hardware = self._stable_capacity_hardware()
         runtime_backend = "mlx" if hardware.get("device") == "mlx" else self.gpu_backend
         self.supports_chunked_prefill = runtime_backend in {"mlx", "sglang"}
@@ -1856,7 +1888,7 @@ class GradientServer:
             "supports_chunked_prefill": self.supports_chunked_prefill,
             "preferred_chunked_prefill_size": self.preferred_chunked_prefill_size,
             "chunked_prefill_size": self.chunked_prefill_size,
-            "rtt_to_nodes": self.rtts,
+            "rtt_to_nodes": rtt_to_nodes,
             "status": self._get_status(),
             "is_active": self._get_status() == ServerState.READY.value,
             "manual_layer_assignment": self.manual_layer_assignment,

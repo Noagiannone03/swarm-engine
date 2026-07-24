@@ -501,7 +501,41 @@ def test_worker_retains_qualified_path_while_iroh_transport_is_live():
 
     assert server.relayed_peer_ids == ["next-worker"]
     assert server.link_path_observed_at_ms == {"next-worker": 200_000}
+    assert server.link_path_rtts_ms == {"next-worker": 250.0}
     assert server.link_health_failures == {"next-worker": 5}
+
+
+def test_worker_advertises_selected_iroh_rtt_before_global_peer_discovery_catches_up(
+    monkeypatch,
+):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "windows-worker")
+    server.iroh_transport = SimpleNamespace(
+        selected_path=lambda _peer_id: {"kind": "relay", "rtt_ms": 250.0}
+    )
+    server.connection_handler = object()
+    server.outbound_peer_ids = ["mac-worker"]
+    server.get_stub = lambda peer_id: ProbeStub(ProbeFuture({"peer_id": peer_id}))
+    server._probe_peer_goodput = lambda _peer_id: False
+    monkeypatch.setattr(
+        "parallax.p2p.server.time.time_ns",
+        lambda: 200_000 * 1_000_000,
+    )
+
+    assert server._probe_outbound_peers() == ["mac-worker"]
+    assert server.rtts == {}
+
+    [metric] = server._v3_outgoing_link_metrics()
+
+    assert metric.from_worker_id == "windows-worker"
+    assert metric.to_worker_id == "mac-worker"
+    assert metric.path_kind.value == "relay"
+    assert metric.rtt_ms == 250.0
+    assert metric.throughput_bytes_per_second is None
 
 
 def test_worker_does_not_qualify_unresponsive_peer_from_transport_path_alone():
@@ -617,6 +651,8 @@ def test_heartbeat_uses_cached_topology_without_running_network_probes(monkeypat
     server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
     server.rtt_last_update = time.time()
     server.direct_peer_ids = ["qualified-peer"]
+    server.rtts = {"scheduler-peer": 12.0}
+    server.link_path_rtts_ms = {"qualified-peer": 25.0}
     server._probe_outbound_peers = lambda: (_ for _ in ()).throw(
         AssertionError("network probes must not run in the heartbeat path")
     )
@@ -628,6 +664,10 @@ def test_heartbeat_uses_cached_topology_without_running_network_probes(monkeypat
     heartbeat = server.get_node_info(is_update=True)
 
     assert heartbeat["direct_peer_ids"] == ["qualified-peer"]
+    assert heartbeat["rtt_to_nodes"] == {
+        "scheduler-peer": 12.0,
+        "qualified-peer": 25.0,
+    }
 
 
 def test_worker_capacity_envelope_is_immutable_for_process_generation(monkeypatch):
@@ -712,6 +752,22 @@ def test_link_probe_rejects_unassigned_peer_before_reading_payload(monkeypatch):
     )
 
     with pytest.raises(PermissionError, match="not an assigned peer"):
+        handler.rpc_link_probe(bytes(64 * 1024))
+
+
+def test_link_probe_reports_busy_receiver_separately_from_peer_authorization(monkeypatch):
+    handler = TransformerConnectionHandler.__new__(TransformerConnectionHandler)
+    handler.iroh_transport = SimpleNamespace(peer_id=lambda: "receiving-worker")
+    handler.link_probe_authorizer = lambda peer_id: peer_id == "sending-worker"
+    handler.link_probe_idle = lambda: False
+    handler._link_probe_lock = threading.Lock()
+    handler._link_probe_last_received = {}
+    monkeypatch.setattr(
+        "parallax.p2p.server.authenticated_rpc_peer_id",
+        lambda: "sending-worker",
+    )
+
+    with pytest.raises(RuntimeError, match="busy with active inference"):
         handler.rpc_link_probe(bytes(64 * 1024))
 
 
