@@ -140,11 +140,11 @@ class LinkMetric(ContractModel):
             and self.throughput_bytes_per_second is None
         ):
             raise ValueError("throughput timestamp requires a throughput measurement")
-        if (
-            self.throughput_measured_at_ms is not None
-            and self.throughput_measured_at_ms > self.measured_at_ms
-        ):
-            raise ValueError("throughput cannot be newer than the link observation")
+        # Reachability and goodput are independent observations.  A successful
+        # RPC health check establishes the edge, then the bounded payload probe
+        # normally completes a little later.  Conversely, later health checks
+        # may refresh reachability while retaining an older goodput sample.
+        # Neither ordering invalidates the other measurement.
         return self
 
 

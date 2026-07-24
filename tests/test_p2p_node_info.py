@@ -609,6 +609,36 @@ def test_worker_advertises_qualified_link_when_goodput_sample_expires(monkeypatc
     assert metric.expires_at_ms == 215_000
 
 
+def test_worker_advertises_goodput_measured_after_reachability(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "mac")
+    server.reachable_peer_ids = ["rtx"]
+    server.direct_peer_ids = ["rtx"]
+    server.relayed_peer_ids = []
+    server.rtts = {"rtx": 12.5}
+    server.link_path_observed_at_ms = {"rtx": 200_000}
+    server.link_throughputs = {
+        "rtx": {
+            "bytes_per_second": 100_000_000.0,
+            "measured_at_ms": 200_400,
+        }
+    }
+    monkeypatch.setattr(
+        "parallax.p2p.server.time.time_ns",
+        lambda: 205_000 * 1_000_000,
+    )
+
+    [metric] = server._v3_outgoing_link_metrics()
+
+    assert metric.throughput_bytes_per_second == 100_000_000.0
+    assert metric.throughput_measured_at_ms == 200_400
+    assert metric.measured_at_ms == 200_000
+
+
 def test_worker_builds_iroh_with_explicit_scheduler_endpoint(monkeypatch):
     transport = SimpleNamespace(peer_id=lambda: "worker-endpoint")
     monkeypatch.setattr(

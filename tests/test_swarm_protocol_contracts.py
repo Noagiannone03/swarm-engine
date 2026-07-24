@@ -8,6 +8,7 @@ from swarm_protocol import (
     EffectiveSpanMode,
     KvGeometry,
     LayerSpan,
+    LinkMetric,
     ModelManifest,
     PathKind,
     RecoveryLevel,
@@ -36,6 +37,22 @@ def test_artifact_descriptor_rejects_ambiguous_paths() -> None:
             media_type="application/vnd.safetensors",
             role=ArtifactRole.WEIGHT,
         )
+
+
+def test_link_accepts_independent_reachability_and_goodput_timestamps() -> None:
+    metric = LinkMetric(
+        from_worker_id="mac",
+        to_worker_id="rtx",
+        path_kind=PathKind.DIRECT,
+        rtt_ms=12.5,
+        throughput_bytes_per_second=100_000_000,
+        throughput_measured_at_ms=1_100,
+        measured_at_ms=1_000,
+        expires_at_ms=16_000,
+    )
+
+    assert metric.measured_at_ms == 1_000
+    assert metric.throughput_measured_at_ms == 1_100
 
 
 def make_manifest() -> ModelManifest:
