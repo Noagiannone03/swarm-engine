@@ -439,6 +439,117 @@ def test_worker_reports_only_outbound_peers_reachable_by_registered_rpc():
     assert server.direct_peer_ids == ["direct-peer"]
 
 
+def test_worker_retains_last_qualified_path_through_two_transient_probe_failures():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.connection_handler = object()
+    server.outbound_peer_ids = ["next-worker"]
+    server.direct_peer_ids = ["next-worker"]
+    server.reachable_peer_ids = ["next-worker"]
+    server.link_path_observed_at_ms = {"next-worker": 100_000}
+    server.get_stub = lambda _peer_id: ProbeStub(
+        ProbeFuture(error=TimeoutError("relay is temporarily congested"))
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "parallax.p2p.server.time.time_ns",
+            lambda: 110_000 * 1_000_000,
+        )
+        assert server._probe_outbound_peers() == ["next-worker"]
+        assert server._probe_outbound_peers() == ["next-worker"]
+
+    assert server.direct_peer_ids == ["next-worker"]
+    assert server.link_path_observed_at_ms == {"next-worker": 100_000}
+    assert server.link_health_failures == {"next-worker": 2}
+
+
+def test_worker_removes_path_after_three_consecutive_probe_failures():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.connection_handler = object()
+    server.outbound_peer_ids = ["next-worker"]
+    server.relayed_peer_ids = ["next-worker"]
+    server.reachable_peer_ids = ["next-worker"]
+    server.link_path_observed_at_ms = {"next-worker": 100_000}
+    server.get_stub = lambda _peer_id: ProbeStub(
+        ProbeFuture(error=TimeoutError("peer remains unavailable"))
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "parallax.p2p.server.time.time_ns",
+            lambda: 110_000 * 1_000_000,
+        )
+        assert server._probe_outbound_peers() == ["next-worker"]
+        assert server._probe_outbound_peers() == ["next-worker"]
+        assert server._probe_outbound_peers() == []
+
+    assert server.relayed_peer_ids == []
+    assert server.link_health_failures == {"next-worker": 3}
+
+
+def test_successful_probe_resets_failures_and_preserves_unknown_iroh_path():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.iroh_transport = SimpleNamespace(selected_path=lambda _peer_id: None)
+    server.connection_handler = object()
+    server.outbound_peer_ids = ["next-worker"]
+    server.relayed_peer_ids = ["next-worker"]
+    server.reachable_peer_ids = ["next-worker"]
+    server.link_path_observed_at_ms = {"next-worker": 100_000}
+    server.link_health_failures = {"next-worker": 2}
+    server.get_stub = lambda peer_id: ProbeStub(ProbeFuture({"peer_id": peer_id}))
+    server._probe_peer_goodput = lambda _peer_id: False
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "parallax.p2p.server.time.time_ns",
+            lambda: 120_000 * 1_000_000,
+        )
+        assert server._probe_outbound_peers() == ["next-worker"]
+
+    assert server.relayed_peer_ids == ["next-worker"]
+    assert server.link_path_observed_at_ms == {"next-worker": 120_000}
+    assert server.link_health_failures == {"next-worker": 0}
+
+
+def test_worker_does_not_retain_a_failed_path_past_the_observation_ttl():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.connection_handler = object()
+    server.outbound_peer_ids = ["next-worker"]
+    server.direct_peer_ids = ["next-worker"]
+    server.reachable_peer_ids = ["next-worker"]
+    server.link_path_observed_at_ms = {"next-worker": 100_000}
+    server.get_stub = lambda _peer_id: ProbeStub(ProbeFuture(error=TimeoutError("stale peer")))
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "parallax.p2p.server.time.time_ns",
+            lambda: 145_000 * 1_000_000,
+        )
+        assert server._probe_outbound_peers() == []
+
+    assert server.direct_peer_ids == []
+
+
 def test_heartbeat_uses_cached_topology_without_running_network_probes(monkeypatch):
     server = GradientServer(
         recv_from_peer_addr="",
@@ -606,7 +717,7 @@ def test_worker_advertises_qualified_link_when_goodput_sample_expires(monkeypatc
     assert metric.throughput_bytes_per_second is None
     assert metric.throughput_measured_at_ms is None
     assert metric.measured_at_ms == 200_000
-    assert metric.expires_at_ms == 215_000
+    assert metric.expires_at_ms == 245_000
 
 
 def test_worker_advertises_goodput_measured_after_reachability(monkeypatch):

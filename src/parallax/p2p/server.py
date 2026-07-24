@@ -76,7 +76,21 @@ _MAX_LINK_PROBE_BYTES = 8 * 1024 * 1024
 _LINK_PROBE_INTERVAL_SECONDS = 60.0
 _LINK_PROBE_MIN_RECEIVE_INTERVAL_SECONDS = 30.0
 _LINK_METRIC_TTL_MS = 120_000
-_LINK_REACHABILITY_TTL_MS = 15_000
+_LINK_HEALTH_RPC_TIMEOUT_SECONDS = 5.0
+_LINK_HEALTH_PROBE_INTERVAL_SECONDS = 5.0
+_LINK_HEALTH_FAILURE_THRESHOLD = 3
+# A structural observation must outlive the worst-case failure-detector cycle
+# plus one worker heartbeat and one probe interval for publication.  This is a
+# soft discovery lease only: request RPC failures still fail immediately.
+_LINK_REACHABILITY_TTL_MS = int(
+    (
+        _LINK_HEALTH_FAILURE_THRESHOLD
+        * (_LINK_HEALTH_RPC_TIMEOUT_SECONDS + _LINK_HEALTH_PROBE_INTERVAL_SECONDS)
+        + WORKER_HEARTBEAT_INTERVAL_SECONDS
+        + _LINK_HEALTH_PROBE_INTERVAL_SECONDS
+    )
+    * 1_000
+)
 
 
 def _configured_link_probe_bytes() -> int:
@@ -639,6 +653,8 @@ class GradientServer:
         self.reachable_peer_ids = []
         self.relayed_peer_ids = []
         self.link_path_observed_at_ms = {}
+        self.link_health_failures = {}
+        self.link_topology_lock = threading.RLock()
         self.stop_event = threading.Event()
         logger.debug(f"manual_layer_assignment: {self.manual_layer_assignment}")
         self._layer_allocation_changed = False
@@ -967,9 +983,25 @@ class GradientServer:
         """Store scheduler-selected candidates for this shard's next stage."""
         peers = allocation.get("outbound_peer_ids") if isinstance(allocation, dict) else None
         if peers is not None:
-            self.outbound_peer_ids = sorted(
+            outbound_peer_ids = sorted(
                 {str(peer_id) for peer_id in peers if str(peer_id) != self.lattica.peer_id()}
             )
+            with self.link_topology_lock:
+                self.outbound_peer_ids = outbound_peer_ids
+                retained = set(outbound_peer_ids)
+                self.direct_peer_ids = sorted(retained.intersection(self.direct_peer_ids))
+                self.reachable_peer_ids = sorted(retained.intersection(self.reachable_peer_ids))
+                self.relayed_peer_ids = sorted(retained.intersection(self.relayed_peer_ids))
+                self.link_path_observed_at_ms = {
+                    peer_id: measured_at_ms
+                    for peer_id, measured_at_ms in self.link_path_observed_at_ms.items()
+                    if peer_id in retained
+                }
+                self.link_health_failures = {
+                    peer_id: failures
+                    for peer_id, failures in self.link_health_failures.items()
+                    if peer_id in retained
+                }
         authorized = (
             allocation.get("authorized_link_peer_ids") if isinstance(allocation, dict) else None
         )
@@ -979,64 +1011,138 @@ class GradientServer:
             )
 
     def _probe_outbound_peers(self):
-        """Use the registered Parallax RPC service to qualify direct paths."""
+        """Refresh authenticated reachability through a temporal failure detector.
+
+        A single congested relay probe must not erase a previously qualified
+        edge.  Successful RPCs refresh the structural lease and reset the
+        consecutive-failure counter.  Failed probes retain the last known path
+        until either the failure threshold or the observation TTL is reached.
+        """
         if self.connection_handler is None:
             return None
         if self.stop_event.is_set():
-            return self.reachable_peer_ids
+            with self.link_topology_lock:
+                return list(self.reachable_peer_ids)
 
         pending = {}
-        for peer_id in list(self.outbound_peer_ids):
+        with self.link_topology_lock:
+            candidates = list(self.outbound_peer_ids)
+        for peer_id in candidates:
             try:
                 pending[peer_id] = self.get_stub(peer_id).rpc_health({})
             except Exception:
                 logger.debug("Could not start direct-path probe to %s", peer_id, exc_info=True)
 
-        direct = []
-        reachable = []
-        relayed = []
+        successful_paths = {}
         for peer_id, future in pending.items():
             try:
-                response = future.result(timeout=5) if hasattr(future, "result") else future
+                response = (
+                    future.result(timeout=_LINK_HEALTH_RPC_TIMEOUT_SECONDS)
+                    if hasattr(future, "result")
+                    else future
+                )
                 if isinstance(response, dict) and response.get("peer_id") == peer_id:
-                    reachable.append(peer_id)
                     if self.iroh_transport is None:
-                        direct.append(peer_id)
+                        successful_paths[peer_id] = "direct"
                     else:
                         path = self.iroh_transport.selected_path(peer_id)
                         if path is not None and path.get("kind") == "direct":
-                            direct.append(peer_id)
+                            successful_paths[peer_id] = "direct"
                         elif path is not None and path.get("kind") == "relay":
-                            relayed.append(peer_id)
+                            successful_paths[peer_id] = "relay"
+                        else:
+                            successful_paths[peer_id] = None
             except Exception:
                 logger.debug("Transport probe to %s failed", peer_id, exc_info=True)
 
-        direct.sort()
-        reachable.sort()
-        relayed.sort()
-        if (
-            direct != self.direct_peer_ids
-            or reachable != self.reachable_peer_ids
-            or relayed != self.relayed_peer_ids
-        ):
+        observed_at_ms = time.time_ns() // 1_000_000
+        retained_after_failure = {}
+        with self.link_topology_lock:
+            # A heartbeat may replace the allocation while network futures are
+            # in flight. Never resurrect a peer removed by that newer contract.
+            candidates = [peer_id for peer_id in candidates if peer_id in self.outbound_peer_ids]
+            previous_direct = set(self.direct_peer_ids)
+            previous_reachable = set(self.reachable_peer_ids)
+            previous_relayed = set(self.relayed_peer_ids)
+            direct = set()
+            reachable = set()
+            relayed = set()
+
+            for peer_id in candidates:
+                if peer_id in successful_paths:
+                    reachable.add(peer_id)
+                    self.link_health_failures[peer_id] = 0
+                    self.link_path_observed_at_ms[peer_id] = observed_at_ms
+                    path_kind = successful_paths[peer_id]
+                    if path_kind == "direct":
+                        direct.add(peer_id)
+                    elif path_kind == "relay":
+                        relayed.add(peer_id)
+                    elif peer_id in previous_direct:
+                        direct.add(peer_id)
+                    elif peer_id in previous_relayed:
+                        relayed.add(peer_id)
+                    continue
+
+                failures = self.link_health_failures.get(peer_id, 0) + 1
+                self.link_health_failures[peer_id] = failures
+                last_success_ms = self.link_path_observed_at_ms.get(peer_id)
+                observation_is_fresh = (
+                    last_success_ms is not None
+                    and observed_at_ms - last_success_ms < _LINK_REACHABILITY_TTL_MS
+                )
+                if (
+                    peer_id in previous_reachable
+                    and failures < _LINK_HEALTH_FAILURE_THRESHOLD
+                    and observation_is_fresh
+                ):
+                    reachable.add(peer_id)
+                    retained_after_failure[peer_id] = failures
+                    if peer_id in previous_direct:
+                        direct.add(peer_id)
+                    elif peer_id in previous_relayed:
+                        relayed.add(peer_id)
+
+            retained = set(candidates)
+            self.link_path_observed_at_ms = {
+                peer_id: measured_at_ms
+                for peer_id, measured_at_ms in self.link_path_observed_at_ms.items()
+                if peer_id in retained
+            }
+            self.link_health_failures = {
+                peer_id: failures
+                for peer_id, failures in self.link_health_failures.items()
+                if peer_id in retained
+            }
+            direct_snapshot = sorted(direct)
+            reachable_snapshot = sorted(reachable)
+            relayed_snapshot = sorted(relayed)
+            changed = (
+                direct_snapshot != self.direct_peer_ids
+                or reachable_snapshot != self.reachable_peer_ids
+                or relayed_snapshot != self.relayed_peer_ids
+            )
+            self.direct_peer_ids = direct_snapshot
+            self.reachable_peer_ids = reachable_snapshot
+            self.relayed_peer_ids = relayed_snapshot
+
+        if retained_after_failure:
+            logger.debug(
+                "Retaining qualified outbound peers after transient probe failures: %s",
+                retained_after_failure,
+            )
+        if changed:
             logger.info(
                 "Qualified outbound peers: reachable=%s direct=%s relay=%s expected=%s",
-                reachable,
-                direct,
-                relayed,
-                self.outbound_peer_ids,
+                reachable_snapshot,
+                direct_snapshot,
+                relayed_snapshot,
+                candidates,
             )
-        self.direct_peer_ids = direct
-        self.reachable_peer_ids = reachable
-        self.relayed_peer_ids = relayed
-        observed_at_ms = time.time_ns() // 1_000_000
-        self.link_path_observed_at_ms = {
-            peer_id: observed_at_ms for peer_id in reachable
-        }
         if self.iroh_transport is not None:
-            for peer_id in reachable:
+            for peer_id in successful_paths:
                 self._probe_peer_goodput(peer_id)
-        return reachable
+        return reachable_snapshot
 
     def _record_link_goodput(
         self,
@@ -1114,7 +1220,7 @@ class GradientServer:
                     self._refresh_peer_rtts()
                 except Exception:
                     logger.warning("Network telemetry probe loop failed", exc_info=True)
-                self.stop_event.wait(5)
+                self.stop_event.wait(_LINK_HEALTH_PROBE_INTERVAL_SECONDS)
 
         self.direct_peer_prober = threading.Thread(
             target=_prober_thread,
@@ -1172,14 +1278,19 @@ class GradientServer:
         now_ms = time.time_ns() // 1_000_000
         with self.link_throughputs_lock:
             samples = dict(self.link_throughputs)
+        with self.link_topology_lock:
+            reachable_peer_ids = tuple(self.reachable_peer_ids)
+            direct_peer_ids = frozenset(self.direct_peer_ids)
+            relayed_peer_ids = frozenset(self.relayed_peer_ids)
+            path_observations = dict(self.link_path_observed_at_ms)
         metrics = []
-        for peer_id in sorted(self.reachable_peer_ids):
-            measured_at_ms = int(self.link_path_observed_at_ms.get(peer_id, now_ms))
+        for peer_id in sorted(reachable_peer_ids):
+            measured_at_ms = int(path_observations.get(peer_id, now_ms))
             if now_ms - measured_at_ms >= _LINK_REACHABILITY_TTL_MS:
                 continue
-            if peer_id in self.direct_peer_ids:
+            if peer_id in direct_peer_ids:
                 path_kind = PathKind.DIRECT
-            elif peer_id in self.relayed_peer_ids:
+            elif peer_id in relayed_peer_ids:
                 path_kind = PathKind.RELAY
             else:
                 continue
@@ -1582,9 +1693,10 @@ class GradientServer:
         # its last fail-closed result and therefore cannot be starved by probes.
         if not is_update and not self._refresh_peer_rtts(peer_attempts=10, rtt_attempts=30):
             return {}
-        direct_peer_ids = list(self.direct_peer_ids)
-        reachable_peer_ids = list(self.reachable_peer_ids)
-        relayed_peer_ids = list(self.relayed_peer_ids)
+        with self.link_topology_lock:
+            direct_peer_ids = list(self.direct_peer_ids)
+            reachable_peer_ids = list(self.reachable_peer_ids)
+            relayed_peer_ids = list(self.relayed_peer_ids)
         hardware = self._stable_capacity_hardware()
         runtime_backend = "mlx" if hardware.get("device") == "mlx" else self.gpu_backend
         self.supports_chunked_prefill = runtime_backend in {"mlx", "sglang"}
