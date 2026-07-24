@@ -16,6 +16,7 @@ from swarm_protocol.coordinator import (
     ControlTransport,
     RouteReservationCoordinator,
 )
+from swarm_protocol.epochs import EpochAllocator, InMemoryEpochAllocator
 from swarm_protocol.shadow import SchedulerProtocolV3Shadow
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ class ActiveRouteRuntime:
         session_ttl_ms: int = 60_000,
         renew_interval_ms: int = 20_000,
         coordinator: RouteReservationCoordinator | None = None,
+        epoch_allocator: EpochAllocator | None = None,
     ) -> None:
         if planner.mode != "active":
             raise ValueError("active route runtime requires an active v3 planner")
@@ -71,8 +73,8 @@ class ActiveRouteRuntime:
         self.coordinator = coordinator or RouteReservationCoordinator(
             transport, clock_ms=clock_ms, session_ttl_ms=session_ttl_ms
         )
+        self.epoch_allocator = epoch_allocator or InMemoryEpochAllocator()
         self._routes: dict[str, _ActiveRoute] = {}
-        self._epochs: dict[str, int] = {}
         self._request_locks: dict[str, threading.Lock] = {}
         self._failures: deque[dict[str, object]] = deque(maxlen=64)
         self._lock = threading.RLock()
@@ -109,8 +111,10 @@ class ActiveRouteRuntime:
                 current = self._routes.get(request_key)
                 if current is not None and current.active:
                     return tuple(stage.worker_id for stage in current.committed.plan.stages)
-                epoch = self._epochs.get(request_key, 0) + 1
-                self._epochs[request_key] = epoch
+            # The durable write happens before the token is put into a signed
+            # plan. A failed planning attempt intentionally burns an epoch:
+            # fencing tokens may have gaps but can never move backwards.
+            epoch = self.epoch_allocator.next_epoch()
 
             nodes = self.nodes_provider()
             model_swarm_id = self.planner.ready_model_swarm_id(nodes)

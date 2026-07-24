@@ -318,9 +318,11 @@ class AutonomousPlacementPolicy:
                 attempts += 1
                 if attempts > self.maximum_candidates:
                     raise ValueError("placement candidate count exceeds the configured bound")
-                if (start == 0 or end == manifest.num_layers) and (
-                    WorkerRole.FRONTEND not in offer.supported_roles
-                ):
+                # ``FRONTEND`` means that the worker can own request ingress
+                # and tokenization at layer zero.  A final pipeline stage does
+                # not need that HTTP capability: vLLM/MLX materialize the
+                # output norm and lm_head from ``end == num_layers`` itself.
+                if start == 0 and WorkerRole.FRONTEND not in offer.supported_roles:
                     continue
                 span = LayerSpan(start=start, end=end)
                 required = self._required_memory_bytes(

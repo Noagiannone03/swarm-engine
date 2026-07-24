@@ -16,6 +16,7 @@ import random
 import shutil
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 import dijkstar
@@ -802,11 +803,23 @@ class GradientServer:
             getattr(self, "swarm_v3_reporter", None) is not None
             and self.swarm_v3_reporter.mode == "active"
         ):
+            from swarm_protocol.epochs import SqliteRequestEpochFence
+
+            fence_path = os.environ.get("FABI_SWARM_V3_FENCE_DB")
+            if not fence_path:
+                state_dir = Path(
+                    os.environ.get(
+                        "FABI_SWARM_V3_STATE_DIR",
+                        str(Path.home() / ".fabi" / "swarm-v3" / "registry"),
+                    )
+                )
+                fence_path = str(state_dir / "request-fences.sqlite3")
             self.swarm_v3_execution_admission = WorkerExecutionAdmission(
                 worker_id=self.iroh_transport.peer_id(),
                 endpoint_id=self.iroh_transport.peer_id(),
                 coordinator_endpoint_id=self.scheduler_peer_id,
                 crypto=self.iroh_transport,
+                request_epoch_fence=SqliteRequestEpochFence(fence_path),
             )
         if getattr(self, "swarm_v3_placement_mode", "legacy") == "autonomous" and (
             getattr(self, "swarm_v3_execution_admission", None) is None

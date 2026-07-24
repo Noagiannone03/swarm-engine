@@ -25,6 +25,7 @@ from scheduling.request_routing import (
     DynamicProgrammingRouting,
     RoundRobinOverFixedPipelinesRouting,
 )
+from swarm_protocol.epochs import EpochAllocator, InMemoryEpochAllocator
 from swarm_protocol.shadow import SchedulerProtocolV3Shadow
 
 logger = get_logger(__name__)
@@ -72,6 +73,7 @@ class Scheduler:
         planning_context_tokens: int = 16_384,
         preferred_context_tokens: int = 32_768,
         require_exact_weight_metadata: bool = False,
+        epoch_allocator: EpochAllocator | None = None,
     ) -> None:
         """Initialize the scheduler.
 
@@ -150,7 +152,8 @@ class Scheduler:
         self._rebalance_after_leave_pending = False
         self._next_rebalance_attempt_at: float = 0.0
         self._pending_context_replan: Optional[Dict[str, object]] = None
-        self.allocation_epoch: int = 0
+        self.epoch_allocator = epoch_allocator or InMemoryEpochAllocator()
+        self.allocation_epoch = self.epoch_allocator.current()
 
         # Concurrency controls
         self._stop_event: threading.Event = threading.Event()
@@ -486,7 +489,7 @@ class Scheduler:
         lease_started_at = time.time()
         for node in self.node_manager.active_nodes:
             node.last_heartbeat = lease_started_at
-        self.allocation_epoch += 1
+        self.allocation_epoch = self.epoch_allocator.next_epoch()
         self._bootstrapped_event.set()
         self._queue_bootstrap_standby_rebalances()
         # Snapshot at INFO after bootstrap since allocations/pipelines may have materially changed.
@@ -1363,7 +1366,7 @@ class Scheduler:
         lease_started_at = time.time()
         for node in self.node_manager.active_nodes:
             node.last_heartbeat = lease_started_at
-        self.allocation_epoch += 1
+        self.allocation_epoch = self.epoch_allocator.next_epoch()
         self._bootstrapped_event.set()
         self.emit_alloc_log_snapshot(reason="after drained global rebalance")
         return True

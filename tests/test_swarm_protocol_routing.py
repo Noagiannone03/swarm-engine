@@ -142,7 +142,7 @@ def test_builds_exact_route_and_rounds_context_per_stage() -> None:
     result = plan(
         model,
         request(model, prompt=100, output=21),
-        [offer("mac"), offer("rtx")],
+        [offer("mac"), offer("rtx", frontend=False)],
         [lease(model, "mac", 0, 4), lease(model, "rtx", 4, 8)],
         [link("mac", "rtx"), link("rtx", "mac")],
     )

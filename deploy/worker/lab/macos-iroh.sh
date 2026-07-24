@@ -25,6 +25,8 @@ export FABI_NETWORK_TRANSPORT="iroh"
 export FABI_RELAY_URL="${FABI_RELAY_URL:-https://server.undefinedstudio.fr:4443}"
 export FABI_RELAY_TOKEN_FILE="$relay_token_file"
 export FABI_NETWORK_IDENTITY_PATH="${FABI_NETWORK_IDENTITY_PATH:-$state/network/worker.key}"
+export FABI_SWARM_V3_STATE_DIR="${FABI_SWARM_V3_STATE_DIR:-$state/swarm-v3/registry}"
+export FABI_SWARM_V3_FENCE_DB="${FABI_SWARM_V3_FENCE_DB:-$state/swarm-v3/control.sqlite3}"
 export FABI_FORCE_RELAY="${FABI_FORCE_RELAY:-0}"
 export FABI_WORKER_SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 export PARALLAX_KEY_PATH="$HOME/.config/fabi/identity"
@@ -34,7 +36,11 @@ export PYTHONUNBUFFERED=1
 export RUST_LOG="${RUST_LOG:-info}"
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
 
-mkdir -p "$PARALLAX_PROCESS_LOG_DIR" "${FABI_NETWORK_IDENTITY_PATH:h}"
+mkdir -p \
+  "$PARALLAX_PROCESS_LOG_DIR" \
+  "${FABI_NETWORK_IDENTITY_PATH:h}" \
+  "$FABI_SWARM_V3_STATE_DIR" \
+  "${FABI_SWARM_V3_FENCE_DB:h}"
 cd "$source_dir"
 exec "$python" -m parallax.cli join \
   -s "$scheduler_endpoint" \

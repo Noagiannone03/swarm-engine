@@ -48,7 +48,15 @@ def manifest() -> ModelManifest:
     )
 
 
-def offer(worker_id: str = "joining", *, memory_bytes: int = 500) -> WorkerOffer:
+def offer(
+    worker_id: str = "joining",
+    *,
+    memory_bytes: int = 500,
+    frontend: bool = True,
+) -> WorkerOffer:
+    roles = {WorkerRole.EXECUTOR}
+    if frontend:
+        roles.add(WorkerRole.FRONTEND)
     return WorkerOffer(
         worker_id=worker_id,
         endpoint_id=f"{worker_id}-endpoint",
@@ -56,7 +64,7 @@ def offer(worker_id: str = "joining", *, memory_bytes: int = 500) -> WorkerOffer
         platform="test",
         backend=BackendKind.MLX,
         stable_memory_envelope_bytes=memory_bytes,
-        supported_roles={WorkerRole.EXECUTOR, WorkerRole.FRONTEND},
+        supported_roles=roles,
         offer_seq=1,
         issued_at_ms=SWARM_NOW,
         expires_at_ms=SWARM_NOW + 60_000,
@@ -108,6 +116,23 @@ def test_joining_worker_fills_the_only_missing_contiguous_range():
     assert decision.action is PlacementAction.JOIN
     assert decision.span == LayerSpan(start=2, end=4)
     assert decision.required_memory_bytes == 500
+
+
+def test_executor_without_http_frontend_can_fill_the_model_tail():
+    model = manifest()
+    policy = AutonomousPlacementPolicy()
+    decision = policy.choose(
+        offer=offer(frontend=False),
+        manifest=model,
+        leases=(lease(model, "head", 0, 2),),
+        demand=CapacityDemandMap.uniform(4, desired_replicas=1),
+        context_tokens=10,
+        kv_block_size=1,
+        now_ms=SWARM_NOW,
+    )
+
+    assert decision.action is PlacementAction.JOIN
+    assert decision.span == LayerSpan(start=2, end=4)
 
 
 def test_small_worker_is_evaluated_for_the_layer_it_can_really_host():

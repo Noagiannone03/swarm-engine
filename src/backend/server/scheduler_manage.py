@@ -22,6 +22,7 @@ from scheduling.node import RequestSignal
 from scheduling.scheduler import Scheduler
 from swarm_protocol.active import ActiveRouteRuntime
 from swarm_protocol.coordinator import RouteReservationError
+from swarm_protocol.epochs import InMemoryEpochAllocator, SqliteEpochAllocator
 from swarm_protocol.routing import RoutePlanningError
 
 logger = get_logger(__name__)
@@ -80,6 +81,12 @@ class SchedulerManage:
         self._context_tokenizer = None
         self._context_tokenizer_model = None
         self._context_tokenizer_lock = threading.Lock()
+        epoch_db = os.environ.get("FABI_SWARM_V3_EPOCH_DB")
+        self.epoch_allocator = (
+            SqliteEpochAllocator(epoch_db, namespace="scheduler-control-plane")
+            if epoch_db
+            else InMemoryEpochAllocator()
+        )
 
     @staticmethod
     def _positive_context_env(name: str, default: int) -> int:
@@ -301,6 +308,12 @@ class SchedulerManage:
         if self.scheduler is not None:
             logger.info("Scheduler already running, stopping it first for re-initialization")
             self.stop()
+        if self.swarm_v3_mode == "active" and not os.environ.get(
+            "FABI_SWARM_V3_EPOCH_DB"
+        ):
+            raise RuntimeError(
+                "active protocol-v3 requires FABI_SWARM_V3_EPOCH_DB on persistent storage"
+            )
 
         self.model_name = model_name
         self.init_nodes_num = init_nodes_num
@@ -329,6 +342,7 @@ class SchedulerManage:
                 "PARALLAX_PREFERRED_CONTEXT_TOKENS", 32_768
             ),
             require_exact_weight_metadata=True,
+            epoch_allocator=self.epoch_allocator,
         )
 
         # Run the scheduler's event/dispatch loops in background so the process
@@ -464,6 +478,7 @@ class SchedulerManage:
             planner=planner,
             transport=self.iroh_transport,
             nodes_provider=lambda: list(self.scheduler.node_manager.nodes),
+            epoch_allocator=self.epoch_allocator,
         )
         self.scheduler.external_routes_active = self.active_v3_routes.has_active_routes
         logger.info("Protocol-v3 active route admission is ready")

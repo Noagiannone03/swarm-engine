@@ -277,8 +277,6 @@ class ExactRoutePlanner:
                     for (_, previous_worker), partial in current_states:
                         if position == manifest.num_layers:
                             tail = partial.segments[-1].candidate
-                            if WorkerRole.FRONTEND not in tail.offer.supported_roles:
-                                continue
                             if tail.offer.worker_id == head.offer.worker_id:
                                 closure_cost = RouteEstimate(0, 0)
                             else:

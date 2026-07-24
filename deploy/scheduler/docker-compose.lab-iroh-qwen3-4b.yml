@@ -18,6 +18,7 @@ services:
       FABI_RELAY_URL: "https://server.undefinedstudio.fr:4443"
       FABI_RELAY_TOKEN_FILE: "/run/secrets/fabi-iroh-relay-token"
       FABI_NETWORK_IDENTITY_PATH: "/opt/parallax-runtime/network/scheduler.key"
+      FABI_SWARM_V3_EPOCH_DB: "/opt/parallax-runtime/swarm-v3/control.sqlite3"
       FABI_FORCE_RELAY: "0"
     network_mode: host
     volumes:

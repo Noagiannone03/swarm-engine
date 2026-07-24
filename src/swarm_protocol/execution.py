@@ -29,6 +29,7 @@ from swarm_protocol.control import (
     sign_control_contract,
     verify_control_contract,
 )
+from swarm_protocol.epochs import InMemoryRequestEpochFence, RequestEpochFence
 from swarm_protocol.reservations import LocalReservationTable
 
 
@@ -38,6 +39,10 @@ class ExecutionAdmissionError(RuntimeError):
 
 class ServingContractBusy(ExecutionAdmissionError):
     """A different hosted-span generation was offered while reservations exist."""
+
+
+_MAX_PLAN_FUTURE_MS = 60_000
+_FENCE_CLOCK_SKEW_MS = 30_000
 
 
 def _system_clock_ms() -> int:
@@ -55,6 +60,7 @@ class WorkerExecutionAdmission:
         coordinator_endpoint_id: str,
         crypto: ControlCrypto,
         clock_ms: Callable[[], int] = _system_clock_ms,
+        request_epoch_fence: RequestEpochFence | None = None,
     ) -> None:
         if not worker_id or not endpoint_id or not coordinator_endpoint_id:
             raise ValueError("worker, endpoint, and coordinator identities are required")
@@ -65,6 +71,7 @@ class WorkerExecutionAdmission:
         self.coordinator_endpoint_id = coordinator_endpoint_id
         self.crypto = crypto
         self._clock_ms = clock_ms
+        self._request_epoch_fence = request_epoch_fence or InMemoryRequestEpochFence()
         self._advertisement: ModelMemberAdvertisement | None = None
         self._reservations: LocalReservationTable | None = None
         self._contract_key: tuple[object, ...] | None = None
@@ -126,7 +133,6 @@ class WorkerExecutionAdmission:
             self._advertisement = member
             self._contract_key = contract_key
             self._plans_by_route_id.clear()
-            self._highest_epoch_by_request.clear()
 
     def _require_caller(self, caller_endpoint_id: str) -> None:
         if caller_endpoint_id != self.coordinator_endpoint_id:
@@ -243,7 +249,16 @@ class WorkerExecutionAdmission:
             )
             if plan.reservation_deadline_ms <= now_ms or plan.plan_expires_at_ms <= now_ms:
                 raise ExecutionAdmissionError("route plan reservation window has expired")
+            if plan.plan_expires_at_ms > now_ms + _MAX_PLAN_FUTURE_MS:
+                raise ExecutionAdmissionError("route plan expiry exceeds the worker replay bound")
             stage = self._local_stage(plan, member)
+            self._request_epoch_fence.advance(
+                coordinator_id=self.coordinator_endpoint_id,
+                request_id=plan.request_id,
+                epoch=plan.epoch,
+                retain_until_ms=plan.plan_expires_at_ms + _FENCE_CLOCK_SKEW_MS,
+                now_ms=now_ms,
+            )
             reservation = table.prepare(
                 reservation_id=f"{plan.route_id}:{self.worker_id}",
                 request_id=plan.request_id,
@@ -286,10 +301,26 @@ class WorkerExecutionAdmission:
         )
         if command.expires_at_ms <= now_ms or command.issued_at_ms > now_ms + 30_000:
             raise ExecutionAdmissionError("reservation command is expired or issued in the future")
+        self._request_epoch_fence.advance(
+            coordinator_id=self.coordinator_endpoint_id,
+            request_id=command.request_id,
+            epoch=command.epoch,
+            retain_until_ms=command.expires_at_ms + _FENCE_CLOCK_SKEW_MS,
+            now_ms=now_ms,
+        )
 
         lease: ReservationLease | None
         if command.action == ReservationAction.FENCE:
             table.fence_request(command.request_id, epoch=command.epoch)
+            with self._lock:
+                highest = self._highest_epoch_by_request.get(command.request_id, -1)
+                if command.epoch > highest:
+                    self._highest_epoch_by_request[command.request_id] = command.epoch
+                    self._plans_by_route_id = {
+                        route_id: plan
+                        for route_id, plan in self._plans_by_route_id.items()
+                        if plan.request_id != command.request_id
+                    }
             return None
         assert command.reservation_id is not None
         if command.action == ReservationAction.COMMIT:

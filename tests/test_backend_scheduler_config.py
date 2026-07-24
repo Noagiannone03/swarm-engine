@@ -67,6 +67,7 @@ def test_scheduler_manager_forwards_dynamic_dp_configuration():
         planning_context_tokens=16_384,
         preferred_context_tokens=32_768,
         require_exact_weight_metadata=True,
+        epoch_allocator=manager.epoch_allocator,
     )
     thread_class.return_value.start.assert_called_once_with()
 
@@ -180,6 +181,15 @@ def test_active_v3_mode_fails_closed_without_verified_planner(monkeypatch):
 
     with pytest.raises(RuntimeError, match="planner failed"):
         manager._start_active_v3_routes()
+
+
+def test_active_v3_scheduler_requires_persistent_epoch_storage(monkeypatch):
+    monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
+    monkeypatch.delenv("FABI_SWARM_V3_EPOCH_DB", raising=False)
+    manager = SchedulerManage()
+
+    with pytest.raises(RuntimeError, match="persistent storage"):
+        manager._start_scheduler("Qwen/Qwen3-1.7B", 1)
 
 
 def test_active_v3_routing_receives_exact_token_budget(monkeypatch):

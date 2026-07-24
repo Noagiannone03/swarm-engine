@@ -44,6 +44,8 @@ $env:FABI_NETWORK_TRANSPORT = "iroh"
 $env:FABI_RELAY_URL = if ($env:FABI_RELAY_URL) { $env:FABI_RELAY_URL } else { "https://server.undefinedstudio.fr:4443" }
 $env:FABI_RELAY_TOKEN_FILE = $relayTokenFile
 $env:FABI_NETWORK_IDENTITY_PATH = if ($env:FABI_NETWORK_IDENTITY_PATH) { $env:FABI_NETWORK_IDENTITY_PATH } else { Join-Path $networkState "worker.key" }
+$env:FABI_SWARM_V3_STATE_DIR = if ($env:FABI_SWARM_V3_STATE_DIR) { $env:FABI_SWARM_V3_STATE_DIR } else { Join-Path $state "swarm-v3\registry" }
+$env:FABI_SWARM_V3_FENCE_DB = if ($env:FABI_SWARM_V3_FENCE_DB) { $env:FABI_SWARM_V3_FENCE_DB } else { Join-Path $state "swarm-v3\control.sqlite3" }
 $env:FABI_FORCE_RELAY = if ($env:FABI_FORCE_RELAY) { $env:FABI_FORCE_RELAY } else { "0" }
 $env:FABI_WORKER_SESSION_ID = [guid]::NewGuid().ToString()
 $env:PARALLAX_KEY_PATH = Join-Path $HOME ".config\fabi\identity"
@@ -53,6 +55,7 @@ $env:PYTHONPATH = (Join-Path $source "src")
 $env:PYTHONUNBUFFERED = "1"
 $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { "info" }
 $env:VLLM_ENGINE_READY_TIMEOUT_S = if ($env:VLLM_ENGINE_READY_TIMEOUT_S) { $env:VLLM_ENGINE_READY_TIMEOUT_S } else { "3600" }
+New-Item -ItemType Directory -Force -Path $env:FABI_SWARM_V3_STATE_DIR, (Split-Path -Parent $env:FABI_SWARM_V3_FENCE_DB) | Out-Null
 
 Set-Location $source
 & $python -m parallax.cli join `

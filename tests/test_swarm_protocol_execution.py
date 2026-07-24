@@ -33,6 +33,7 @@ from swarm_protocol.execution import (
     ServingContractBusy,
     WorkerExecutionAdmission,
 )
+from swarm_protocol.epochs import SqliteRequestEpochFence
 from swarm_protocol.reservations import CapacityUnavailable, StaleEpoch
 
 WORKER_ENDPOINT = "11" * 32
@@ -152,13 +153,14 @@ def command(
     )
 
 
-def controller(now: list[int]) -> WorkerExecutionAdmission:
+def controller(now: list[int], *, request_epoch_fence=None) -> WorkerExecutionAdmission:
     result = WorkerExecutionAdmission(
         worker_id="worker",
         endpoint_id=WORKER_ENDPOINT,
         coordinator_endpoint_id=COORDINATOR_ENDPOINT,
         crypto=FakeCrypto(WORKER_ENDPOINT),
         clock_ms=lambda: now[0],
+        request_epoch_fence=request_epoch_fence,
     )
     result.configure(member(now=now[0]))
     return result
@@ -312,6 +314,33 @@ def test_hosted_span_generation_cannot_change_while_kv_is_owned_and_epochs_fence
         )
     assert admission.snapshot()[0].state == ReservationState.RELEASED
     admission.configure(changed)
+
+
+def test_worker_restart_durably_rejects_replayed_older_plan(tmp_path):
+    now = [1_000]
+    fence_path = tmp_path / "worker-control.sqlite3"
+    first = controller(
+        now,
+        request_epoch_fence=SqliteRequestEpochFence(fence_path),
+    )
+    first.prepare(
+        signed_plan(plan(now=now[0], epoch=4)),
+        caller_endpoint_id=COORDINATOR_ENDPOINT,
+    )
+
+    restarted = controller(
+        now,
+        request_epoch_fence=SqliteRequestEpochFence(fence_path),
+    )
+    with pytest.raises(StaleEpoch, match="worker fence 4"):
+        restarted.prepare(
+            signed_plan(plan(now=now[0], epoch=3)),
+            caller_endpoint_id=COORDINATOR_ENDPOINT,
+        )
+    restarted.prepare(
+        signed_plan(plan(now=now[0], epoch=5)),
+        caller_endpoint_id=COORDINATOR_ENDPOINT,
+    )
 
 
 def test_data_plane_requires_committed_route_exact_fence_and_authenticated_hop():
