@@ -56,6 +56,7 @@ from swarm_protocol.contracts import (
     LinkMetric,
     ModelMemberAdvertisement,
     PathKind,
+    ReservationState,
 )
 from swarm_protocol.execution import WorkerExecutionAdmission
 from swarm_protocol.execution_rpc import WorkerExecutionControlService
@@ -988,7 +989,9 @@ class GradientServer:
             notify_url=self.notify_url,
             iroh_transport=self.iroh_transport,
             execution_admission=self.swarm_v3_execution_admission,
-            link_probe_authorizer=lambda peer_id: peer_id in self.authorized_link_peer_ids,
+            link_probe_authorizer=lambda peer_id: (
+                peer_id in self.authorized_link_peer_ids and self._link_probe_idle()
+            ),
         )  # thread
         if self.iroh_transport is not None:
             self.iroh_transport.register(self.connection_handler)
@@ -1196,14 +1199,27 @@ class GradientServer:
         bytes_per_second: float,
         *,
         measured_at_ms: int | None = None,
-    ) -> None:
-        """Store an EWMA shared by calibration and real activation transfers."""
+        application_limited: bool = False,
+    ) -> bool:
+        """Store a qualified delivery-rate sample.
+
+        A request/response transfer can be application-limited: its measured
+        bytes/second then reflects serialization and one RPC round trip rather
+        than the path's bulk delivery capacity. As in BBR's delivery-rate
+        estimator, such a sample may raise an existing lower bound but must
+        never lower it. Periodic bulk probes remain able to move the EWMA in
+        either direction.
+        """
 
         if bytes_per_second <= 0:
-            return
+            return False
         measured_at_ms = measured_at_ms or time.time_ns() // 1_000_000
         with self.link_throughputs_lock:
             previous = self.link_throughputs.get(peer_id)
+            if application_limited and (
+                previous is None or bytes_per_second <= float(previous["bytes_per_second"])
+            ):
+                return False
             smoothed = float(bytes_per_second)
             if previous is not None:
                 smoothed = 0.8 * float(previous["bytes_per_second"]) + 0.2 * smoothed
@@ -1211,10 +1227,29 @@ class GradientServer:
                 "bytes_per_second": smoothed,
                 "measured_at_ms": measured_at_ms,
             }
+        return True
+
+    def _link_probe_idle(self) -> bool:
+        """Return whether bulk calibration cannot contend with inference."""
+
+        admission = getattr(self, "swarm_v3_execution_admission", None)
+        if admission is None:
+            return True
+        try:
+            return not any(
+                lease.state in {ReservationState.PREPARED, ReservationState.COMMITTED}
+                for lease in admission.snapshot()
+            )
+        except Exception:
+            logger.warning("Unable to inspect execution reservations before link probe", exc_info=True)
+            return False
 
     def _probe_peer_goodput(self, peer_id: str) -> bool:
         """Measure cold-link upload goodput without touching the heartbeat path."""
 
+        if not self._link_probe_idle():
+            logger.debug("Skipping bulk link calibration to %s during active inference", peer_id)
+            return False
         now = time.monotonic()
         previous_attempt = self.link_probe_last_attempt.get(peer_id)
         if previous_attempt is not None and now - previous_attempt < _LINK_PROBE_INTERVAL_SECONDS:
@@ -1485,6 +1520,7 @@ class GradientServer:
                         self._record_link_goodput(
                             next_peer_id,
                             speed_mb_s * 1024 * 1024,
+                            application_limited=True,
                         )
                         logger.info(
                             f"Forwarding data to {next_peer_id}, "

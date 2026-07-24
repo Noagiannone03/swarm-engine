@@ -115,6 +115,10 @@ class ExactRoutePlanner:
         self, metric: LinkMetric, manifest: ModelManifest, request: RequestContract
     ) -> RouteEstimate:
         multiplier = self.relay_penalty if metric.path_kind == PathKind.RELAY else 1.0
+        # LinkMetric.rtt_ms is a round-trip observation. Each directed route
+        # edge carries activations one way; the tail-to-head closure accounts
+        # for the return path separately.
+        one_way_latency_ms = metric.rtt_ms / 2
         # Measured goodput already captures ordinary loss.  The explicit loss factor is a
         # conservative tail-risk penalty, not a second bandwidth correction.
         reliability_penalty = 1.0 + metric.loss_rate
@@ -124,8 +128,8 @@ class ExactRoutePlanner:
             # the route without inventing bandwidth and mark its estimate
             # incomplete so measured alternatives always rank first.
             return RouteEstimate(
-                ttft_ms=metric.rtt_ms * multiplier * reliability_penalty,
-                inter_token_ms=metric.rtt_ms * multiplier * reliability_penalty,
+                ttft_ms=one_way_latency_ms * multiplier * reliability_penalty,
+                inter_token_ms=one_way_latency_ms * multiplier * reliability_penalty,
                 complete=False,
             )
         prefill_transfer_ms = (
@@ -138,8 +142,12 @@ class ExactRoutePlanner:
             manifest.activation_bytes_per_token / metric.throughput_bytes_per_second * 1000
         )
         return RouteEstimate(
-            ttft_ms=(metric.rtt_ms + prefill_transfer_ms) * multiplier * reliability_penalty,
-            inter_token_ms=(metric.rtt_ms + decode_transfer_ms) * multiplier * reliability_penalty,
+            ttft_ms=(one_way_latency_ms + prefill_transfer_ms)
+            * multiplier
+            * reliability_penalty,
+            inter_token_ms=(one_way_latency_ms + decode_transfer_ms)
+            * multiplier
+            * reliability_penalty,
         )
 
     def _link_map(

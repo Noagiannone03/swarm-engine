@@ -255,6 +255,26 @@ def test_prefers_direct_route_over_slower_relay_route() -> None:
     assert [stage.worker_id for stage in result.plan.stages] == ["head", "direct"]
 
 
+def test_route_estimate_counts_half_rtt_per_directed_edge() -> None:
+    model = manifest()
+    result = plan(
+        model,
+        request(model, prompt=100, output=20),
+        [offer("head"), offer("tail", frontend=False)],
+        [lease(model, "head", 0, 4), lease(model, "tail", 4, 8)],
+        [
+            link("head", "tail", rtt_ms=20),
+            link("tail", "head", rtt_ms=20),
+        ],
+    )
+
+    # Compute: 10 ms per hosted stage for prefill/decode. Network: one-way
+    # latency is 10 ms per directed edge; activation transfer adds 3.90625
+    # ms for prefill and 0.0390625 ms for each decode edge.
+    assert result.estimate.ttft_ms == pytest.approx(33.90625)
+    assert result.estimate.inter_token_ms == pytest.approx(40.078125)
+
+
 def test_expired_lease_is_not_routable() -> None:
     model = manifest()
     with pytest.raises(NoFeasibleRoute):

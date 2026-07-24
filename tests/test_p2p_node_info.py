@@ -12,6 +12,7 @@ from parallax.p2p.server import (
     _resolve_worker_key_path,
     send_notify,
 )
+from swarm_protocol.contracts import ReservationState
 
 
 class ProbeFuture:
@@ -685,6 +686,61 @@ def test_worker_calibrates_cold_link_with_application_goodput(monkeypatch):
     assert server._probe_peer_goodput("next-worker") is True
     assert server.link_throughputs["next-worker"]["bytes_per_second"] == pytest.approx(655_360.0)
     assert server._probe_peer_goodput("next-worker") is False
+
+
+def test_application_limited_transfer_never_lowers_bulk_goodput():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.link_throughputs["next-worker"] = {
+        "bytes_per_second": 1_000_000.0,
+        "measured_at_ms": 100,
+    }
+
+    assert (
+        server._record_link_goodput(
+            "next-worker",
+            10_000.0,
+            measured_at_ms=200,
+            application_limited=True,
+        )
+        is False
+    )
+    assert server.link_throughputs["next-worker"] == {
+        "bytes_per_second": 1_000_000.0,
+        "measured_at_ms": 100,
+    }
+
+    assert (
+        server._record_link_goodput(
+            "next-worker",
+            500_000.0,
+            measured_at_ms=300,
+        )
+        is True
+    )
+    assert server.link_throughputs["next-worker"] == {
+        "bytes_per_second": pytest.approx(900_000.0),
+        "measured_at_ms": 300,
+    }
+
+
+def test_worker_skips_bulk_link_probe_while_execution_owns_capacity():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.iroh_transport = object()
+    server.swarm_v3_execution_admission = SimpleNamespace(
+        snapshot=lambda: (SimpleNamespace(state=ReservationState.COMMITTED),)
+    )
+    server.get_stub = lambda _peer_id: pytest.fail("busy worker must not start a bulk probe")
+
+    assert server._probe_peer_goodput("next-worker") is False
+    assert server.link_probe_last_attempt == {}
 
 
 def test_worker_advertises_qualified_link_when_goodput_sample_expires(monkeypatch):
