@@ -30,6 +30,9 @@ from swarm_protocol.shadow import SchedulerProtocolV3Shadow
 
 logger = get_logger(__name__)
 
+_CONTEXT_REPLAN_INITIAL_BACKOFF_SECONDS = 1.0
+_CONTEXT_REPLAN_MAX_BACKOFF_SECONDS = 30.0
+
 NodeUpdate: TypeAlias = Tuple[
     str,
     Optional[int],
@@ -378,6 +381,8 @@ class Scheduler:
             "from_tokens": requested_tokens,
             "to_tokens": downgraded_tokens,
             "supported_tokens": supported_tokens,
+            "attempts": 0,
+            "next_attempt_at": 0.0,
         }
         self._admission_paused = True
         logger.warning(
@@ -391,10 +396,19 @@ class Scheduler:
         )
 
     def _process_pending_context_replan(self) -> bool:
-        """Commit the single downgrade only at an idle allocation boundary."""
+        """Reconcile one fenced downgrade without hot-looping on infeasibility.
+
+        The event loop owns a single pending item. Failed reconciliation uses a
+        bounded exponential delay, while a new worker registration explicitly
+        makes it eligible immediately. The context fence itself is never
+        applied twice.
+        """
 
         pending = self._pending_context_replan
         if pending is None:
+            return False
+        now = time.monotonic()
+        if now < float(pending.get("next_attempt_at", 0.0)):
             return False
         with self._inflight_routes_lock:
             if (
@@ -409,21 +423,40 @@ class Scheduler:
             active_ids = [node.node_id for node in self.node_manager.active_nodes]
             if active_ids:
                 self.node_manager.standby(active_ids)
+            attempts = int(pending.get("attempts", 0)) + 1
+            pending["attempts"] = attempts
             logger.warning(
-                "Replanning allocation epoch %d once at the fenced %d-token ceiling",
+                "Reconciling allocation epoch %d at the fenced %d-token ceiling (attempt=%d)",
                 int(pending["failed_epoch"]),
                 int(pending["to_tokens"]),
+                attempts,
             )
             success = self.bootstrap(reboot=True)
             if not success:
+                delay_seconds = min(
+                    _CONTEXT_REPLAN_INITIAL_BACKOFF_SECONDS * (2 ** min(attempts - 1, 5)),
+                    _CONTEXT_REPLAN_MAX_BACKOFF_SECONDS,
+                )
+                pending["next_attempt_at"] = time.monotonic() + delay_seconds
                 logger.error(
-                    "Fenced runtime downgrade could not form a complete %d-token route",
+                    "Fenced runtime downgrade could not form a complete %d-token route; "
+                    "retrying after %.1fs or immediately on a worker registration",
                     int(pending["to_tokens"]),
+                    delay_seconds,
                 )
                 return False
             self._pending_context_replan = None
             self._admission_paused = False
             return True
+
+    def _wake_pending_context_replan(self) -> None:
+        """Make a failed reconciliation immediately eligible after new capacity."""
+
+        pending = self._pending_context_replan
+        if pending is None:
+            return
+        pending["attempts"] = 0
+        pending["next_attempt_at"] = 0.0
 
     def report_pipeline_capacity(
         self,
@@ -1199,13 +1232,20 @@ class Scheduler:
             joined_any = True
             if node.manual_layer_assignment:
                 had_manual_assignment = True
+        if joined_any:
+            self._wake_pending_context_replan()
 
         # If we are not bootstrapped (e.g., after a leave-triggered rebalance) and
         # new nodes just joined, attempt a greedy bootstrap immediately when we have
         # enough nodes. If it doesn't produce a full pipeline, we'll try again on
         # subsequent joins.
         # Skip bootstrap if manual assignments were used (they handle bootstrapping internally).
-        if joined_any and not self._bootstrapped_event.is_set() and not had_manual_assignment:
+        if (
+            joined_any
+            and self._pending_context_replan is None
+            and not self._bootstrapped_event.is_set()
+            and not had_manual_assignment
+        ):
             if self.node_manager.num_standby_nodes >= self.min_nodes_bootstrapping:
                 try:
                     ok = self.bootstrap()
@@ -1385,10 +1425,14 @@ class Scheduler:
             return False
 
         with self._inflight_routes_lock:
-            if self._inflight_routes or any(
-                node.routing_load > 0 or node.current_requests > 0
-                for node in self.node_manager.active_nodes
-            ) or (self.external_routes_active is not None and self.external_routes_active()):
+            if (
+                self._inflight_routes
+                or any(
+                    node.routing_load > 0 or node.current_requests > 0
+                    for node in self.node_manager.active_nodes
+                )
+                or (self.external_routes_active is not None and self.external_routes_active())
+            ):
                 return False
             active_nodes = self.node_manager.active_nodes
             pending_nodes = [
@@ -1492,9 +1536,9 @@ class Scheduler:
 
         # Move active nodes to standby and re-bootstrap (reboot) once.
         self.node_manager.standby([n.node_id for n in self.node_manager.active_nodes])
-        assert (
-            self.node_manager.num_standby_nodes == self.node_manager.num_nodes
-        ), "All active nodes should be moved to standby"
+        assert self.node_manager.num_standby_nodes == self.node_manager.num_nodes, (
+            "All active nodes should be moved to standby"
+        )
         assert self.node_manager.num_active_nodes == 0, "No active nodes before re-bootstrap"
         logger.warning("Re-bootstrapping for global rebalance")
         try:

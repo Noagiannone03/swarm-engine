@@ -71,17 +71,13 @@ def test_runtime_memory_feedback_downgrades_once_and_advances_allocation_epoch()
     )
     head = Node(
         "head",
-        NodeHardwareInfo(
-            "head", 1, 1.0, "head", 1.0, 1.0, "cuda", usable_memory_bytes=140_000
-        ),
+        NodeHardwareInfo("head", 1, 1.0, "head", 1.0, 1.0, "cuda", usable_memory_bytes=140_000),
         model,
         supports_frontend=True,
     )
     tail = Node(
         "tail",
-        NodeHardwareInfo(
-            "tail", 1, 1.0, "tail", 1.0, 1.0, "cuda", usable_memory_bytes=140_000
-        ),
+        NodeHardwareInfo("tail", 1, 1.0, "tail", 1.0, 1.0, "cuda", usable_memory_bytes=140_000),
         model,
         supports_frontend=False,
     )
@@ -130,6 +126,80 @@ def test_runtime_memory_feedback_downgrades_once_and_advances_allocation_epoch()
         },
     )
     assert sched._pending_context_replan is None
+
+
+def test_failed_context_replan_is_rate_limited_until_backoff_expires(monkeypatch):
+    model = build_model_info(4)
+    node = build_node("worker", model, mem_gb=80.0)
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+    sched._pending_context_replan = {
+        "failed_epoch": 7,
+        "node_id": node.node_id,
+        "from_tokens": 32_768,
+        "to_tokens": 16_384,
+        "supported_tokens": 12_000,
+        "attempts": 0,
+        "next_attempt_at": 0.0,
+    }
+    calls = []
+    monotonic = iter((100.0, 100.0, 100.1))
+    monkeypatch.setattr("scheduling.scheduler.time.monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(
+        sched,
+        "bootstrap",
+        lambda *, reboot=False: calls.append(reboot) or False,
+    )
+
+    assert not sched._process_pending_context_replan()
+    assert not sched._process_pending_context_replan()
+
+    assert calls == [True]
+    assert sched._pending_context_replan["attempts"] == 1
+    assert sched._pending_context_replan["next_attempt_at"] == 101.0
+
+
+def test_worker_registration_wakes_failed_context_replan_without_normal_bootstrap(monkeypatch):
+    model = build_model_info(4)
+    existing = build_node("worker", model, mem_gb=80.0)
+    sched = Scheduler(
+        model,
+        [existing],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+    sched._pending_context_replan = {
+        "failed_epoch": 7,
+        "node_id": existing.node_id,
+        "from_tokens": 32_768,
+        "to_tokens": 16_384,
+        "supported_tokens": 12_000,
+        "attempts": 5,
+        "next_attempt_at": 10_000.0,
+    }
+    bootstrap_calls = []
+    monkeypatch.setattr(
+        sched,
+        "bootstrap",
+        lambda *, reboot=False: bootstrap_calls.append(reboot) or False,
+    )
+    refreshed = build_node("worker", model, mem_gb=160.0)
+    sched.enqueue_join(refreshed)
+
+    sched._process_joins()
+
+    assert bootstrap_calls == []
+    assert sched._pending_context_replan["attempts"] == 0
+    assert sched._pending_context_replan["next_attempt_at"] == 0.0
+    assert sched.node_manager.get("worker").hardware.usable_memory_bytes == (
+        refreshed.hardware.usable_memory_bytes
+    )
 
 
 def test_scheduler_initialize_and_dispatch():
