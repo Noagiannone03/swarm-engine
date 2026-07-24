@@ -469,6 +469,62 @@ def test_worker_retains_last_qualified_path_through_two_transient_probe_failures
     assert server.link_health_failures == {"next-worker": 2}
 
 
+def test_worker_retains_qualified_path_while_iroh_transport_is_live():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.iroh_transport = SimpleNamespace(
+        selected_path=lambda _peer_id: {"kind": "relay", "rtt_ms": 250.0}
+    )
+    server.connection_handler = object()
+    server.outbound_peer_ids = ["next-worker"]
+    server.relayed_peer_ids = ["next-worker"]
+    server.reachable_peer_ids = ["next-worker"]
+    server.link_path_observed_at_ms = {"next-worker": 100_000}
+    server.get_stub = lambda _peer_id: ProbeStub(
+        ProbeFuture(error=TimeoutError("application RPC is congested"))
+    )
+    server._probe_peer_goodput = lambda _peer_id: pytest.fail(
+        "failed health RPC must not start bulk calibration"
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "parallax.p2p.server.time.time_ns",
+            lambda: 200_000 * 1_000_000,
+        )
+        for _ in range(5):
+            assert server._probe_outbound_peers() == ["next-worker"]
+
+    assert server.relayed_peer_ids == ["next-worker"]
+    assert server.link_path_observed_at_ms == {"next-worker": 200_000}
+    assert server.link_health_failures == {"next-worker": 5}
+
+
+def test_worker_does_not_qualify_unresponsive_peer_from_transport_path_alone():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server.iroh_transport = SimpleNamespace(
+        selected_path=lambda _peer_id: {"kind": "relay", "rtt_ms": 250.0}
+    )
+    server.connection_handler = object()
+    server.outbound_peer_ids = ["next-worker"]
+    server.get_stub = lambda _peer_id: ProbeStub(
+        ProbeFuture(error=TimeoutError("peer never answered authenticated health"))
+    )
+
+    assert server._probe_outbound_peers() == []
+    assert server.relayed_peer_ids == []
+    assert server.link_path_observed_at_ms == {}
+
+
 def test_worker_removes_path_after_three_consecutive_probe_failures():
     server = GradientServer(
         recv_from_peer_addr="",

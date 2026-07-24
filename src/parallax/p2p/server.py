@@ -71,7 +71,7 @@ logger = get_logger(__name__)
 # Global HTTP client for reuse
 _http_client = None
 
-_DEFAULT_LINK_PROBE_BYTES = 4 * 1024 * 1024
+_DEFAULT_LINK_PROBE_BYTES = 1 * 1024 * 1024
 _MIN_LINK_PROBE_BYTES = 64 * 1024
 _MAX_LINK_PROBE_BYTES = 8 * 1024 * 1024
 _LINK_PROBE_INTERVAL_SECONDS = 60.0
@@ -1082,7 +1082,7 @@ class GradientServer:
             except Exception:
                 logger.debug("Could not start direct-path probe to %s", peer_id, exc_info=True)
 
-        successful_paths = {}
+        authenticated_peers = set()
         for peer_id, future in pending.items():
             try:
                 response = (
@@ -1091,21 +1091,31 @@ class GradientServer:
                     else future
                 )
                 if isinstance(response, dict) and response.get("peer_id") == peer_id:
-                    if self.iroh_transport is None:
-                        successful_paths[peer_id] = "direct"
-                    else:
-                        path = self.iroh_transport.selected_path(peer_id)
-                        if path is not None and path.get("kind") == "direct":
-                            successful_paths[peer_id] = "direct"
-                        elif path is not None and path.get("kind") == "relay":
-                            successful_paths[peer_id] = "relay"
-                        else:
-                            successful_paths[peer_id] = None
+                    authenticated_peers.add(peer_id)
             except Exception:
-                logger.debug("Transport probe to %s failed", peer_id, exc_info=True)
+                logger.debug("Application health probe to %s failed", peer_id, exc_info=True)
+
+        transport_paths = {}
+        if self.iroh_transport is not None:
+            for peer_id in candidates:
+                try:
+                    path = self.iroh_transport.selected_path(peer_id)
+                    if path is not None and path.get("kind") == "direct":
+                        transport_paths[peer_id] = "direct"
+                    elif path is not None and path.get("kind") == "relay":
+                        transport_paths[peer_id] = "relay"
+                except Exception:
+                    logger.debug("Could not inspect Iroh path to %s", peer_id, exc_info=True)
+
+        successful_paths = {}
+        for peer_id in authenticated_peers:
+            successful_paths[peer_id] = (
+                "direct" if self.iroh_transport is None else transport_paths.get(peer_id)
+            )
 
         observed_at_ms = time.time_ns() // 1_000_000
         retained_after_failure = {}
+        retained_by_transport = {}
         with self.link_topology_lock:
             # A heartbeat may replace the allocation while network futures are
             # in flight. Never resurrect a peer removed by that newer contract.
@@ -1135,6 +1145,22 @@ class GradientServer:
 
                 failures = self.link_health_failures.get(peer_id, 0) + 1
                 self.link_health_failures[peer_id] = failures
+                transport_path = transport_paths.get(peer_id)
+                if peer_id in previous_reachable and transport_path is not None:
+                    # Initial qualification always requires the authenticated
+                    # application RPC above. Once qualified, worker liveness is
+                    # supplied independently by scheduler heartbeats and Iroh's
+                    # selected QUIC path is authoritative for transport
+                    # continuity. Do not let a congested bulk calibration make
+                    # its own health RPC evict an otherwise live route.
+                    reachable.add(peer_id)
+                    self.link_path_observed_at_ms[peer_id] = observed_at_ms
+                    retained_by_transport[peer_id] = failures
+                    if transport_path == "direct":
+                        direct.add(peer_id)
+                    else:
+                        relayed.add(peer_id)
+                    continue
                 last_success_ms = self.link_path_observed_at_ms.get(peer_id)
                 observation_is_fresh = (
                     last_success_ms is not None
@@ -1179,6 +1205,11 @@ class GradientServer:
             logger.debug(
                 "Retaining qualified outbound peers after transient probe failures: %s",
                 retained_after_failure,
+            )
+        if retained_by_transport:
+            logger.debug(
+                "Retaining qualified outbound peers through live Iroh paths: %s",
+                retained_by_transport,
             )
         if changed:
             logger.info(
