@@ -1,4 +1,4 @@
-FROM rust:1.91.0-slim-bookworm AS native-builder
+FROM rust:1.91.0-slim-bookworm AS source
 
 ARG PARALLAX_REPO_URL=https://github.com/Noagiannone03/swarm-engine.git
 ARG PARALLAX_COMMIT
@@ -6,20 +6,27 @@ ARG PARALLAX_COMMIT
 RUN test -n "${PARALLAX_COMMIT}" \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential \
         ca-certificates \
         git \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --filter=blob:none --no-checkout "${PARALLAX_REPO_URL}" /opt/parallax \
+    && git -C /opt/parallax fetch --depth 1 origin "${PARALLAX_COMMIT}" \
+    && git -C /opt/parallax checkout --detach FETCH_HEAD \
+    && git -C /opt/parallax rev-parse HEAD | grep -qx "${PARALLAX_COMMIT}" \
+    && rm -rf /opt/parallax/.git
+
+FROM source AS native-builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
         python3 \
         python3-venv \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/build-venv \
     && /opt/build-venv/bin/pip install --no-cache-dir maturin==1.14.1
 
-RUN git clone --filter=blob:none --no-checkout "${PARALLAX_REPO_URL}" /opt/parallax \
-    && git -C /opt/parallax fetch --depth 1 origin "${PARALLAX_COMMIT}" \
-    && git -C /opt/parallax checkout --detach FETCH_HEAD \
-    && git -C /opt/parallax rev-parse HEAD | grep -qx "${PARALLAX_COMMIT}" \
-    && cd /opt/parallax/native/fabi-network \
+RUN cd /opt/parallax/native/fabi-network \
     && /opt/build-venv/bin/maturin build \
         --release \
         --interpreter /opt/build-venv/bin/python \
@@ -45,7 +52,7 @@ RUN pip install --upgrade pip setuptools wheel \
     && pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cpu \
     && pip install "mlx[cpu]==0.31.2" "mlx-lm==0.31.3"
 
-COPY --from=native-builder /opt/parallax /opt/parallax
+COPY --from=source /opt/parallax /opt/parallax
 COPY --from=native-builder /opt/wheels /opt/fabi-network-wheels
 
 RUN pip install /opt/fabi-network-wheels/fabi_network_native-*.whl \
