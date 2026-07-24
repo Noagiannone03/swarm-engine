@@ -100,9 +100,7 @@ def _runtime_args_json(args) -> str:
         try:
             ready_timeout_seconds = int(ready_timeout)
         except ValueError as exc:
-            raise ValueError(
-                "VLLM_ENGINE_READY_TIMEOUT_S must be a non-negative integer"
-            ) from exc
+            raise ValueError("VLLM_ENGINE_READY_TIMEOUT_S must be a non-negative integer") from exc
         if ready_timeout_seconds < 0:
             raise ValueError("VLLM_ENGINE_READY_TIMEOUT_S must be a non-negative integer")
         runtime_args["engine_ready_timeout_secs"] = ready_timeout_seconds
@@ -117,6 +115,17 @@ def _runtime_args_json(args) -> str:
 def launch_vllm_rust_frontend(args) -> VllmRustFrontendProcess:
     """Launch `vllm-rs frontend` as Parallax's only HTTP frontend."""
     binary = resolve_vllm_rs_binary()
+    child_env = os.environ.copy()
+    if child_env.get("FABI_SWARM_V3_MODE", "").strip().lower() == "active":
+        if args.host.strip().lower() not in {"localhost", "127.0.0.1", "::1"}:
+            raise RuntimeError(
+                "Protocol-v3 explicit abort requires the vLLM frontend to remain loopback-only"
+            )
+        # vLLM v0.24 exposes its maintained /abort_requests engine control
+        # endpoint in dev mode. The listener remains loopback-only, while Fabi
+        # exposes a separate route-fenced RPC to the authenticated coordinator.
+        child_env["VLLM_SERVER_DEV_MODE"] = "1"
+
     listener = _bind_listener_socket(args.host, args.port)
     listen_fd = listener.fileno()
     bound_port = listener.getsockname()[1]
@@ -147,7 +156,7 @@ def launch_vllm_rust_frontend(args) -> VllmRustFrontendProcess:
     process = subprocess.Popen(
         cmd,
         pass_fds=(listen_fd,),
-        env=os.environ.copy(),
+        env=child_env,
     )
 
     # The child inherited the listener fd; close the parent's copy so shutdown

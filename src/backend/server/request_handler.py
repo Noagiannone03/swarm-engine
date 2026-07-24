@@ -4,6 +4,7 @@ import time
 from typing import Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
+import anyio
 from fastapi.responses import Response, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool
 
@@ -24,6 +25,7 @@ PARALLAX_ROUTING_TABLE_XARG = "parallax_routing_table"
 PARALLAX_SCHEDULER_REQUEST_ID_XARG = "parallax_scheduler_request_id"
 FABI_ROUTE_ID_XARG = "fabi_route_id"
 FABI_ROUTE_EPOCH_XARG = "fabi_route_epoch"
+ABORT_RPC_TIMEOUT_SEC = 5.0
 
 
 class ClientDisconnectedError(Exception):
@@ -64,6 +66,44 @@ class RequestHandler:
         release = getattr(self.scheduler_manage, "release_routing_table", None)
         if release is not None:
             release(str(request_id))
+
+    @staticmethod
+    def _abort_backend_request(stub, backend_request: Dict) -> None:
+        """Ask the route head to abort one still-active v3 engine request."""
+
+        xargs = backend_request.get("vllm_xargs")
+        if not isinstance(xargs, dict) or not xargs.get(FABI_ROUTE_ID_XARG):
+            return
+        abort_request = {
+            "request_id": str(backend_request["request_id"]),
+            "vllm_xargs": {
+                PARALLAX_ROUTING_TABLE_XARG: list(xargs.get(PARALLAX_ROUTING_TABLE_XARG, ())),
+                PARALLAX_SCHEDULER_REQUEST_ID_XARG: str(
+                    xargs.get(PARALLAX_SCHEDULER_REQUEST_ID_XARG, "")
+                ),
+                FABI_ROUTE_ID_XARG: str(xargs[FABI_ROUTE_ID_XARG]),
+                FABI_ROUTE_EPOCH_XARG: int(xargs.get(FABI_ROUTE_EPOCH_XARG, 0)),
+            },
+        }
+        result = stub.abort_completion(abort_request)
+        wait = getattr(result, "result", None)
+        if wait is not None:
+            wait(timeout=ABORT_RPC_TIMEOUT_SEC)
+
+    async def _best_effort_abort_backend_request(self, stub, backend_request: Dict) -> None:
+        """Propagate cancellation out of band before releasing its route fence."""
+
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._abort_backend_request, stub, backend_request),
+                timeout=ABORT_RPC_TIMEOUT_SEC,
+            )
+        except Exception:
+            logger.warning(
+                "Unable to explicitly abort backend request %s",
+                backend_request.get("request_id"),
+                exc_info=True,
+            )
 
     def _route_is_active(self, request_id: str) -> bool:
         is_active = getattr(self.scheduler_manage, "is_routing_table_active", None)
@@ -154,8 +194,10 @@ class RequestHandler:
         backend_request.pop("rid", None)
         backend_request.pop("routing_table", None)
 
-        if not backend_request.get("request_id"):
-            backend_request["request_id"] = str(request_id)
+        # The scheduler owns the request identity used by route fencing and
+        # explicit engine cancellation. Never let a client-selected extension
+        # split the HTTP request from its signed route authority.
+        backend_request["request_id"] = str(request_id)
 
         model_name = self._get_model_name_for_node(routing_table[0])
         backend_request["model"] = model_name
@@ -396,6 +438,17 @@ class RequestHandler:
                             try:
                                 if response is not None:
                                     response.cancel()
+                                if not stream_finished:
+                                    # Starlette/AnyIO cancels the body task when
+                                    # the HTTP client disappears. Engine cleanup
+                                    # must finish before the signed route fence
+                                    # is released, even inside that cancelled
+                                    # request scope.
+                                    with anyio.CancelScope(shield=True):
+                                        await self._best_effort_abort_backend_request(
+                                            stub,
+                                            backend_request,
+                                        )
                             finally:
                                 self._release_route(request_id)
 
@@ -410,6 +463,8 @@ class RequestHandler:
                     logger.debug(f"Streaming response initiated for {request_id}")
                     return resp
                 else:
+                    response = None
+                    response_finished = False
                     try:
                         response = stub.chat_completion(backend_request)
                         content = await self._next_chunk_until_disconnect(
@@ -417,6 +472,7 @@ class RequestHandler:
                             is_disconnected,
                             str(request_id),
                         )
+                        response_finished = True
                         decoded_response = decode_http_response_envelope(content)
                         if decoded_response is None:
                             status_code = 200
@@ -432,7 +488,17 @@ class RequestHandler:
                             media_type=None,
                         )
                     finally:
-                        self._release_route(request_id)
+                        try:
+                            if response is not None:
+                                response.cancel()
+                            if not response_finished:
+                                with anyio.CancelScope(shield=True):
+                                    await self._best_effort_abort_backend_request(
+                                        stub,
+                                        backend_request,
+                                    )
+                        finally:
+                            self._release_route(request_id)
             except ClientDisconnectedError:
                 logger.info("Client disconnected before request %s completed", request_id)
                 return Response(status_code=499)

@@ -85,16 +85,31 @@ class ForwardingSchedulerManage(DummySchedulerManage):
         return True
 
 
+class V3ForwardingSchedulerManage(ForwardingSchedulerManage):
+    def get_route_authority(self, request_id):
+        return {"route_id": f"route-{request_id}", "epoch": 7}
+
+
+class ImmediateResult:
+    def result(self, timeout=None):
+        return {"ok": True, "timeout": timeout}
+
+
 class StaticStub:
     def __init__(self, chunks):
         self.chunks = chunks
         self.request = None
         self.response = None
+        self.abort_requests = []
 
     def chat_completion(self, request):
         self.request = request
         self.response = CancellableResponse(self.chunks)
         return self.response
+
+    def abort_completion(self, request):
+        self.abort_requests.append(request)
+        return ImmediateResult()
 
 
 class CancellableResponse:
@@ -132,9 +147,16 @@ class BlockingCancellableResponse:
 class BlockingStub:
     def __init__(self):
         self.response = BlockingCancellableResponse()
+        self.request = None
+        self.abort_requests = []
 
     def chat_completion(self, request):
+        self.request = request
         return self.response
+
+    def abort_completion(self, request):
+        self.abort_requests.append(request)
+        return ImmediateResult()
 
 
 def test_prepare_backend_request_uses_vllm_xargs_for_parallax_metadata():
@@ -212,6 +234,22 @@ def test_prepare_backend_request_propagates_active_v3_route_fence():
         "fabi_route_id": "route-7",
         "fabi_route_epoch": 7,
     }
+
+
+def test_prepare_backend_request_replaces_client_selected_request_id():
+    handler = RequestHandler()
+    handler.set_scheduler_manage(AuthoritySchedulerManage())
+
+    backend_request = handler._prepare_backend_request(
+        {
+            "request_id": "client-controlled",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        "scheduler-req",
+        ["node-a"],
+    )
+
+    assert backend_request["request_id"] == "scheduler-req"
 
 
 def test_forward_request_returns_openai_error_when_scheduler_not_ready():
@@ -350,7 +388,7 @@ def test_forward_request_preserves_non_stream_downstream_status_and_content_type
 
 def test_non_stream_disconnect_cancels_rpc_and_releases_route():
     handler = RequestHandler()
-    scheduler_manage = ForwardingSchedulerManage()
+    scheduler_manage = V3ForwardingSchedulerManage()
     handler.set_scheduler_manage(scheduler_manage)
     stub = BlockingStub()
     handler.stubs["node-a"] = stub
@@ -369,6 +407,8 @@ def test_non_stream_disconnect_cancels_rpc_and_releases_route():
 
     assert response.status_code == 499
     assert stub.response.cancelled
+    assert len(stub.abort_requests) == 1
+    assert stub.abort_requests[0]["request_id"] == "disconnected-req"
     assert scheduler_manage.released == ["disconnected-req"]
 
 
@@ -421,12 +461,13 @@ def test_streaming_request_releases_route_after_completion():
 
     assert body.endswith(b"data: [DONE]\n\n")
     assert stub.response.cancelled
+    assert stub.abort_requests == []
     assert scheduler_manage.released == ["stream-req"]
 
 
 def test_incomplete_upstream_stream_emits_error_and_terminal_event():
     handler = RequestHandler()
-    scheduler_manage = ForwardingSchedulerManage()
+    scheduler_manage = V3ForwardingSchedulerManage()
     handler.set_scheduler_manage(scheduler_manage)
     stub = StaticStub([b'data: {"choices":[]}\n\n'])
     handler.stubs["node-a"] = stub
@@ -447,6 +488,17 @@ def test_incomplete_upstream_stream_emits_error_and_terminal_event():
     assert error["error"]["code"] == "upstream_worker_lost"
     assert events[-1] == b"[DONE]"
     assert stub.response.cancelled
+    assert stub.abort_requests == [
+        {
+            "request_id": "incomplete-stream-req",
+            "vllm_xargs": {
+                "parallax_routing_table": ["node-a"],
+                "parallax_scheduler_request_id": "incomplete-stream-req",
+                "fabi_route_id": "route-incomplete-stream-req",
+                "fabi_route_epoch": 7,
+            },
+        }
+    ]
     assert scheduler_manage.released == ["incomplete-stream-req"]
 
 
@@ -484,7 +536,7 @@ def test_streaming_worker_loss_cancels_rpc_emits_error_and_releases_route():
 
 def test_streaming_client_disconnect_cancels_rpc_without_emitting_error():
     handler = RequestHandler()
-    scheduler_manage = ForwardingSchedulerManage()
+    scheduler_manage = V3ForwardingSchedulerManage()
     handler.set_scheduler_manage(scheduler_manage)
     stub = BlockingStub()
     handler.stubs["node-a"] = stub
@@ -505,7 +557,39 @@ def test_streaming_client_disconnect_cancels_rpc_without_emitting_error():
 
     assert body == b""
     assert stub.response.cancelled
+    assert len(stub.abort_requests) == 1
+    assert stub.abort_requests[0]["request_id"] == "disconnected-stream-req"
     assert scheduler_manage.released == ["disconnected-stream-req"]
+
+
+def test_streaming_body_task_cancellation_aborts_before_releasing_route():
+    handler = RequestHandler()
+    scheduler_manage = V3ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    stub = BlockingStub()
+    handler.stubs["node-a"] = stub
+
+    async def cancel_body_task():
+        response = await handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}], "stream": True},
+            "cancelled-body-req",
+            1.0,
+        )
+        next_chunk = asyncio.create_task(anext(response.body_iterator))
+        while "cancelled-body-req" not in scheduler_manage.active_routes or stub.request is None:
+            await asyncio.sleep(0)
+        next_chunk.cancel()
+        try:
+            await next_chunk
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(cancel_body_task())
+
+    assert stub.response.cancelled
+    assert len(stub.abort_requests) == 1
+    assert stub.abort_requests[0]["request_id"] == "cancelled-body-req"
+    assert scheduler_manage.released == ["cancelled-body-req"]
 
 
 def test_openai_models_returns_empty_list_without_scheduler(monkeypatch):

@@ -345,6 +345,52 @@ class TransformerConnectionHandler(ConnectionHandler):
             self.recv_from_peer.send_multipart([b"abort", request.SerializeToString()])
         return forward_pb2.AbortResponse()
 
+    @rpc_method
+    def abort_completion(self, request):
+        """Abort a frontend request through vLLM's maintained engine API.
+
+        Stream cancellation remains useful for transport cleanup, but it is
+        not a sufficient engine control signal when the producer is stalled
+        between chunks. This RPC is deliberately route-fenced and available
+        only to the authenticated coordinator while the reservation is still
+        committed.
+        """
+
+        if self.execution_admission is None:
+            raise PermissionError("explicit completion abort requires active protocol v3")
+        if not isinstance(request, dict):
+            raise TypeError("completion abort request must be an object")
+        request_id = request.get("request_id")
+        xargs = request.get("vllm_xargs")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
+            raise ValueError("completion abort request_id is invalid")
+        if not isinstance(xargs, dict):
+            raise PermissionError("completion abort is missing route authority")
+
+        self.execution_admission.authorize_frontend(
+            request_id=request_id,
+            route_id=str(xargs.get("fabi_route_id", "")),
+            epoch=int(xargs.get("fabi_route_epoch", 0)),
+            routing_table=tuple(xargs.get("parallax_routing_table", ())),
+            caller_endpoint_id=authenticated_rpc_peer_id(),
+        )
+        if self.http_port is None:
+            raise RuntimeError("route head has no local HTTP frontend")
+
+        vllm_request_id = f"chatcmpl-{request_id}"
+        with httpx.Client(
+            timeout=httpx.Timeout(5.0),
+            proxy=None,
+            trust_env=False,
+        ) as client:
+            response = client.post(
+                f"http://localhost:{self.http_port}/abort_requests",
+                json={"request_ids": [vllm_request_id]},
+            )
+            response.raise_for_status()
+        logger.info("Explicitly aborted frontend request %s", request_id)
+        return {"aborted": True, "request_id": request_id}
+
     def ipc_weight_refit(
         self,
         refit_weight_path: str,
