@@ -106,6 +106,7 @@ class TestMessageUtil:
             routing_table=["nodeA"],
             route_id="route-7",
             route_epoch=7,
+            authority_request_id="scheduler-request-7",
             lora_path=None,
         )
 
@@ -141,6 +142,8 @@ class TestMessageUtil:
         assert converted_request.routing_table == original_request.routing_table
         assert converted_request.route_id == "route-7"
         assert converted_request.route_epoch == 7
+        assert converted_request.request_id == self.request_id
+        assert converted_request.authority_request_id == "scheduler-request-7"
 
         np.testing.assert_array_equal(
             np.array(converted_request.hidden_states.tolist()),

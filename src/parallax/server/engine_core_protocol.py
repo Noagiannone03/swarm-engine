@@ -267,27 +267,38 @@ def routing_table_from_engine_core_sampling_params(
 
 def route_fence_from_engine_core_sampling_params(
     params: Optional[Mapping[str, Any]],
-) -> tuple[str, int]:
+) -> tuple[str, int, str]:
     """Extract the signed v3 route identity propagated through vLLM."""
 
     if params is None:
-        return "", 0
+        return "", 0, ""
     params = _normalize_mapping(params)
     extra_args = _sampling_param_value(params, "extra_args", None)
     if extra_args is None:
-        return "", 0
+        return "", 0, ""
     if not isinstance(extra_args, Mapping):
         raise UnsupportedEngineCoreField("EngineCoreSamplingParams.extra_args must be a map")
     normalized = _normalize_mapping(extra_args)
     route_id = normalized.get(FABI_ROUTE_ID_EXTRA_ARG)
     epoch = normalized.get(FABI_ROUTE_EPOCH_EXTRA_ARG)
+    authority_request_id = normalized.get(PARALLAX_SCHEDULER_REQUEST_ID_EXTRA_ARG)
     if route_id is None and epoch is None:
-        return "", 0
+        if authority_request_id is None:
+            return "", 0, ""
+        if not isinstance(authority_request_id, str) or not authority_request_id:
+            raise UnsupportedEngineCoreField(
+                f"{PARALLAX_SCHEDULER_REQUEST_ID_EXTRA_ARG} must be a non-empty string"
+            )
+        return "", 0, authority_request_id
     if not isinstance(route_id, str) or not route_id:
         raise UnsupportedEngineCoreField(f"{FABI_ROUTE_ID_EXTRA_ARG} must be a non-empty string")
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
         raise UnsupportedEngineCoreField(f"{FABI_ROUTE_EPOCH_EXTRA_ARG} must be a positive integer")
-    return route_id, epoch
+    if not isinstance(authority_request_id, str) or not authority_request_id:
+        raise UnsupportedEngineCoreField(
+            f"{PARALLAX_SCHEDULER_REQUEST_ID_EXTRA_ARG} must be a non-empty string"
+        )
+    return route_id, epoch, authority_request_id
 
 
 def sampling_params_from_engine_core(params: Optional[Mapping[str, Any]]) -> SamplingParams:
@@ -356,7 +367,9 @@ def engine_core_request_to_initial_request(
     input_ids = [int(token_id) for token_id in prompt_token_ids]
     raw_sampling_params = decoded.get("sampling_params")
     routing_table = routing_table_from_engine_core_sampling_params(raw_sampling_params)
-    route_id, route_epoch = route_fence_from_engine_core_sampling_params(raw_sampling_params)
+    route_id, route_epoch, authority_request_id = route_fence_from_engine_core_sampling_params(
+        raw_sampling_params
+    )
     sampling_params = sampling_params_from_engine_core(raw_sampling_params)
     max_new_tokens = max(1, int(sampling_params.max_new_tokens))
     max_total_length = len(input_ids) + max_new_tokens
@@ -372,6 +385,7 @@ def engine_core_request_to_initial_request(
         routing_table=routing_table,
         route_id=route_id,
         route_epoch=route_epoch,
+        authority_request_id=authority_request_id or None,
         return_probs=False,
     )
 

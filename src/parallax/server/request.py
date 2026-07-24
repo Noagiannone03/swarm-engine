@@ -98,8 +98,10 @@ class Request:
         lora_path: Optional[str] = None,
         route_id: str = "",
         route_epoch: int = 0,
+        authority_request_id: Optional[str] = None,
     ):
         self.request_id = request_id or str(uuid.uuid4())
+        self.authority_request_id = authority_request_id or self.request_id
         self.status = status
         self.prompt_len = prompt_len
         self.output_ids = output_ids or []
@@ -179,6 +181,7 @@ class InitialRequest(Request):
         routing_table: Optional[List[str]] = None,
         route_id: str = "",
         route_epoch: int = 0,
+        authority_request_id: Optional[str] = None,
     ):
         if not prompt and not input_ids:
             raise ValueError("prompt or input_ids cannot be empty.")
@@ -192,6 +195,7 @@ class InitialRequest(Request):
             lora_path=lora_path,
             route_id=route_id,
             route_epoch=route_epoch,
+            authority_request_id=authority_request_id,
         )
         self.prompt = prompt
         self.return_probs = return_probs
@@ -297,6 +301,7 @@ class IntermediateRequest(Request):
         return_probs: bool = False,
         route_id: str = "",
         route_epoch: int = 0,
+        authority_request_id: Optional[str] = None,
     ):
         super().__init__(
             request_id=request_id,
@@ -307,6 +312,7 @@ class IntermediateRequest(Request):
             lora_path=lora_path,
             route_id=route_id,
             route_epoch=route_epoch,
+            authority_request_id=authority_request_id,
         )
         # Hidden states from the previous peer's computation.
         # Shape:
@@ -379,6 +385,7 @@ class IntermediateRequest(Request):
             return_probs=initial_request.return_probs,
             route_id=initial_request.route_id,
             route_epoch=initial_request.route_epoch,
+            authority_request_id=initial_request.authority_request_id,
         )
 
     @classmethod
@@ -407,6 +414,7 @@ class IntermediateRequest(Request):
             return_probs=old_request.return_probs,
             route_id=old_request.route_id,
             route_epoch=old_request.route_epoch,
+            authority_request_id=old_request.authority_request_id,
         )
 
     def __repr__(self):

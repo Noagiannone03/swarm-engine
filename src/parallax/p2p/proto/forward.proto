@@ -41,6 +41,7 @@ message Req {
   bool terminal_error = 11;  // Pipeline execution failed; abort peers and return ERROR upstream
   string route_id = 12;  // Signed protocol-v3 route identity
   uint64 route_epoch = 13;  // Fencing epoch for retries/failover
+  string authority_request_id = 14;  // Coordinator request identity signed into the route
 }
 
 message SamplingParams {

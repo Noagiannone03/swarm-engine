@@ -251,7 +251,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             caller = authenticated_rpc_peer_id()
             for req in request.reqs:
                 self.execution_admission.authorize_forward(
-                    request_id=req.rid,
+                    request_id=req.authority_request_id or req.rid,
                     route_id=req.route_id,
                     epoch=req.route_epoch,
                     routing_table=tuple(req.routing_table),
@@ -320,7 +320,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             caller = authenticated_rpc_peer_id()
             for req in request.reqs:
                 self.execution_admission.authorize_route_peer(
-                    request_id=req.rid,
+                    request_id=req.authority_request_id or req.rid,
                     route_id=req.route_id,
                     epoch=req.route_epoch,
                     routing_table=tuple(req.routing_table),

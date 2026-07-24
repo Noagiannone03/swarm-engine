@@ -54,6 +54,7 @@ def request_to_proto(
         proto_req.lora_path = request.lora_path if request.lora_path is not None else ""
         proto_req.route_id = request.route_id
         proto_req.route_epoch = request.route_epoch
+        proto_req.authority_request_id = request.authority_request_id
 
         if request.hidden_states is not None:
             proto_req.hidden_states = tensor_to_bytes(request.hidden_states, device=device)
@@ -127,6 +128,7 @@ def proto_to_request(
             return_probs=return_probs,
             route_id=proto_req.route_id,
             route_epoch=proto_req.route_epoch,
+            authority_request_id=proto_req.authority_request_id or None,
         )
 
         requests.append(request)
@@ -147,6 +149,7 @@ def abort_request_to_proto(reqs: List[Request]) -> forward_pb2.AbortRequest:
         )
         req_proto.route_id = req.route_id
         req_proto.route_epoch = req.route_epoch
+        req_proto.authority_request_id = req.authority_request_id
         proto.reqs.append(req_proto)
     return proto
 
@@ -167,6 +170,7 @@ def proto_to_abort_request(proto_request: forward_pb2.AbortRequest) -> List[Inte
             routing_table=list(proto_req.routing_table),
             route_id=proto_req.route_id,
             route_epoch=proto_req.route_epoch,
+            authority_request_id=proto_req.authority_request_id or None,
         )
         request.abort = not terminal_error
         request.terminal_error = terminal_error

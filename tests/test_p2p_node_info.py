@@ -84,6 +84,37 @@ def test_dynamic_span_handler_enqueues_after_standby_assignment():
     assert socket.messages == [[b"forward", request.SerializeToString()]]
 
 
+def test_forward_admission_uses_signed_authority_id_not_engine_request_id(monkeypatch):
+    socket = RecordingSocket()
+    handler = build_forward_handler(socket)
+    calls = []
+    handler.execution_admission = SimpleNamespace(
+        authorize_forward=lambda **values: calls.append(values)
+    )
+    monkeypatch.setattr("parallax.p2p.server.authenticated_rpc_peer_id", lambda: "mac-endpoint")
+    request = forward_pb2.ForwardRequest()
+    request.reqs.add(
+        rid="chatcmpl-engine-request",
+        authority_request_id="scheduler-request",
+        route_id="route-7",
+        route_epoch=7,
+        routing_table=["mac-worker", "rtx-worker"],
+    )
+
+    handler.rpc_pp_forward(request)
+
+    assert calls == [
+        {
+            "request_id": "scheduler-request",
+            "route_id": "route-7",
+            "epoch": 7,
+            "routing_table": ("mac-worker", "rtx-worker"),
+            "caller_endpoint_id": "mac-endpoint",
+        }
+    ]
+    assert socket.messages == [[b"forward", request.SerializeToString()]]
+
+
 def test_autonomous_span_reload_fences_ingress_and_updates_shared_generation():
     server = GradientServer(
         recv_from_peer_addr="",

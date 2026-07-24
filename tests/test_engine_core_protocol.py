@@ -150,6 +150,8 @@ def test_engine_core_request_extracts_parallax_routing_table():
     req = engine_core_request_to_initial_request(encode_engine_core_request(request))
 
     assert req.routing_table == ["node-a", "node-b"]
+    assert req.request_id == "req-1"
+    assert req.authority_request_id == "scheduler-req"
     assert req.route_id == "route-7"
     assert req.route_epoch == 7
 
@@ -160,6 +162,37 @@ def test_engine_core_request_rejects_partial_route_fence():
 
     with pytest.raises(UnsupportedEngineCoreField, match="fabi_route_epoch"):
         engine_core_request_to_initial_request(encode_engine_core_request(request))
+
+
+def test_engine_core_request_rejects_route_without_authority_request_id():
+    request = _engine_request()
+    request[3] = _sampling_params(
+        extra_args={
+            "parallax_routing_table": ["node-a", "node-b"],
+            "fabi_route_id": "route-7",
+            "fabi_route_epoch": 7,
+        }
+    )
+
+    with pytest.raises(UnsupportedEngineCoreField, match="parallax_scheduler_request_id"):
+        engine_core_request_to_initial_request(encode_engine_core_request(request))
+
+
+def test_engine_core_request_accepts_legacy_scheduler_id_without_v3_route():
+    request = _engine_request()
+    request[3] = _sampling_params(
+        extra_args={
+            "parallax_routing_table": ["node-a", "node-b"],
+            "parallax_scheduler_request_id": "scheduler-req",
+        }
+    )
+
+    req = engine_core_request_to_initial_request(encode_engine_core_request(request))
+
+    assert req.request_id == "req-1"
+    assert req.authority_request_id == "scheduler-req"
+    assert req.route_id == ""
+    assert req.route_epoch == 0
 
 
 def test_engine_core_request_rejects_unknown_extra_args():
