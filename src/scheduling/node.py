@@ -285,6 +285,15 @@ class Node:
 
         return bool(self.is_active and self.liveness_state == "healthy")
 
+    @property
+    def uses_autonomous_placement(self) -> bool:
+        """Whether layer ownership comes from the worker-side v3 transaction."""
+
+        return bool(
+            isinstance(self.swarm_v3, dict)
+            and self.swarm_v3.get("placement_mode") == "autonomous"
+        )
+
     def refresh_registration(self, registration: "Node") -> None:
         """Refresh worker-owned capabilities without replacing serving state.
 

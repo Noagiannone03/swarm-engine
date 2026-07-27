@@ -316,6 +316,30 @@ class NodeManager:
         return len(self.standby_nodes)
 
     @property
+    def scheduler_placement_nodes(self) -> List[Node]:
+        """Nodes whose layer ranges are still owned by the legacy allocator."""
+
+        return [node for node in self.nodes if not node.uses_autonomous_placement]
+
+    @property
+    def scheduler_placement_standby_nodes(self) -> List[Node]:
+        """Legacy-placement candidates, excluding worker-owned v3 members."""
+
+        return [
+            node
+            for node in self.standby_nodes
+            if not node.uses_autonomous_placement
+        ]
+
+    @property
+    def num_scheduler_placement_nodes(self) -> int:
+        return len(self.scheduler_placement_nodes)
+
+    @property
+    def num_scheduler_placement_standby_nodes(self) -> int:
+        return len(self.scheduler_placement_standby_nodes)
+
+    @property
     def active_nodes(self) -> List[Node]:
         with self._lock:
             return [

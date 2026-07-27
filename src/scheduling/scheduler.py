@@ -494,11 +494,15 @@ class Scheduler:
                 return True
         # Check if we have enough nodes for bootstraping
         if (
-            self.node_manager.num_nodes < self.min_nodes_bootstrapping
+            self.node_manager.num_scheduler_placement_nodes
+            < self.min_nodes_bootstrapping
             and not overide_min_node_check
         ):
             logger.info(
-                f"[Scheduler] Bootstrap deferred: have {self.node_manager.num_nodes} nodes; need >= {self.min_nodes_bootstrapping}"
+                "[Scheduler] Bootstrap deferred: have %d scheduler-placement "
+                "nodes; need >= %d",
+                self.node_manager.num_scheduler_placement_nodes,
+                self.min_nodes_bootstrapping,
             )
             return False
 
@@ -776,6 +780,10 @@ class Scheduler:
             node.manual_layer_assignment,
             bootstrapped,
         )
+        if node.manual_layer_assignment and node.uses_autonomous_placement:
+            raise ValueError(
+                "a worker cannot combine scheduler-manual and autonomous v3 placement"
+        )
         existing = self.node_manager.get(node.node_id)
         if existing is not None:
             # ``node_join`` is a streaming RPC and can be retried when the
@@ -787,14 +795,30 @@ class Scheduler:
             # capacity and protocol capabilities. This is also required when a
             # heartbeat auto-registers a worker just before its full join after
             # a scheduler restart.
-            existing.refresh_registration(node)
-            logger.info(
-                "Node %s is already registered; refreshed capabilities and preserving "
-                "layers [%s, %s) on repeated join",
-                node.node_id,
-                existing.start_layer,
-                existing.end_layer,
+            transferred_to_autonomous = (
+                node.uses_autonomous_placement
+                and not existing.uses_autonomous_placement
             )
+            if transferred_to_autonomous:
+                if existing.start_layer is not None and existing.end_layer is not None:
+                    self.layer_allocator.deallocate(existing)
+                else:
+                    self.node_manager.standby([existing.node_id])
+            existing.refresh_registration(node)
+            if transferred_to_autonomous:
+                logger.info(
+                    "Node %s transferred layer ownership from the legacy allocator "
+                    "to autonomous v3 placement",
+                    node.node_id,
+                )
+            else:
+                logger.info(
+                    "Node %s is already registered; refreshed capabilities and preserving "
+                    "layers [%s, %s) on repeated join",
+                    node.node_id,
+                    existing.start_layer,
+                    existing.end_layer,
+                )
         else:
             # Automatic workers can reconnect with the last assignment they received.
             # The scheduler owns that state and must allocate the fresh STANDBY node
@@ -802,7 +826,12 @@ class Scheduler:
             if not node.manual_layer_assignment:
                 node.clear_serving_state()
             self.node_manager.upsert(node)
-            if bootstrapped:
+            if node.uses_autonomous_placement:
+                logger.info(
+                    "Registered autonomous v3 worker %s outside legacy layer allocation",
+                    node.node_id,
+                )
+            elif bootstrapped:
                 if self.dynamic_pipelines_router:
                     # for dynamic pipelines router, join the node to the lightest layer
                     candidate = self.layer_allocator.dynamic_join_candidate(node)
@@ -1314,7 +1343,7 @@ class Scheduler:
 
     def _process_joins(self) -> None:
         """Handle pending join events, honoring bootstrap state for assignment."""
-        joined_any = False
+        scheduler_placement_joined_any = False
         had_manual_assignment = False
         while True:
             try:
@@ -1325,10 +1354,11 @@ class Scheduler:
             # After bootstrap, allow dynamic light-weight joins.
             # Exception: manual layer assignments are processed immediately regardless of bootstrap state.
             self.join(node)
-            joined_any = True
+            if not node.uses_autonomous_placement:
+                scheduler_placement_joined_any = True
             if node.manual_layer_assignment:
                 had_manual_assignment = True
-        if joined_any:
+        if scheduler_placement_joined_any:
             self._wake_pending_context_replan()
 
         # If we are not bootstrapped (e.g., after a leave-triggered rebalance) and
@@ -1337,12 +1367,15 @@ class Scheduler:
         # subsequent joins.
         # Skip bootstrap if manual assignments were used (they handle bootstrapping internally).
         if (
-            joined_any
+            scheduler_placement_joined_any
             and self._pending_context_replan is None
             and not self._bootstrapped_event.is_set()
             and not had_manual_assignment
         ):
-            if self.node_manager.num_standby_nodes >= self.min_nodes_bootstrapping:
+            if (
+                self.node_manager.num_scheduler_placement_standby_nodes
+                >= self.min_nodes_bootstrapping
+            ):
                 try:
                     ok = self.bootstrap()
                     if not ok:
@@ -1356,7 +1389,7 @@ class Scheduler:
             else:
                 logger.debug(
                     "Deferring bootstrap: have %d nodes; need >= %d",
-                    self.node_manager.num_standby_nodes,
+                    self.node_manager.num_scheduler_placement_standby_nodes,
                     self.min_nodes_bootstrapping,
                 )
 
@@ -1383,7 +1416,7 @@ class Scheduler:
             return
         allocations = self.list_node_allocations()
         queued: List[str] = []
-        for node in self.node_manager.standby_nodes:
+        for node in self.node_manager.scheduler_placement_standby_nodes:
             if node.manual_layer_assignment:
                 continue
             candidate = self.layer_allocator.dynamic_join_candidate(node)
@@ -1414,7 +1447,10 @@ class Scheduler:
         remains untouched.
         """
 
-        planned_nodes = [copy.deepcopy(node) for node in self.node_manager.nodes]
+        planned_nodes = [
+            copy.deepcopy(node)
+            for node in self.node_manager.scheduler_placement_nodes
+        ]
         for node in planned_nodes:
             node.clear_serving_state()
             node.is_active = False
@@ -1582,19 +1618,24 @@ class Scheduler:
         Important: This is the only place we trigger global rebalance/reboot so leave events
         are serialized by the single event-loop thread.
         """
-        removed_any = False
+        removed_scheduler_placement_any = False
         while True:
             try:
                 node_id = self._pending_leaves.get_nowait()
             except queue.Empty:
                 break
             try:
+                registered = self.node_manager.get(node_id)
                 self.leave(node_id)
-                removed_any = True
+                if (
+                    registered is not None
+                    and not registered.uses_autonomous_placement
+                ):
+                    removed_scheduler_placement_any = True
             except Exception as exc:
                 logger.warning(f"Leave failed for {node_id}: {exc}")
 
-        if removed_any:
+        if removed_scheduler_placement_any:
             self._rebalance_after_leave_pending = True
 
         # After draining all leaves, decide whether to do a single global
@@ -1609,7 +1650,7 @@ class Scheduler:
             self._rebalance_after_leave_pending = False
             return
 
-        nodes = self.node_manager.nodes
+        nodes = self.node_manager.scheduler_placement_nodes
         logger.warning("Global rebalance triggered due to node leave")
 
         # Count manual vs automatic nodes
@@ -1632,9 +1673,18 @@ class Scheduler:
             return
 
         # Move active nodes to standby and re-bootstrap (reboot) once.
-        self.node_manager.standby([n.node_id for n in self.node_manager.active_nodes])
-        assert self.node_manager.num_standby_nodes == self.node_manager.num_nodes, (
-            "All active nodes should be moved to standby"
+        self.node_manager.standby(
+            [
+                node.node_id
+                for node in self.node_manager.active_nodes
+                if not node.uses_autonomous_placement
+            ]
+        )
+        assert (
+            self.node_manager.num_scheduler_placement_standby_nodes
+            == self.node_manager.num_scheduler_placement_nodes
+        ), (
+            "All scheduler-placement nodes should be moved to standby"
         )
         assert self.node_manager.num_active_nodes == 0, "No active nodes before re-bootstrap"
         logger.warning("Re-bootstrapping for global rebalance")
@@ -1655,5 +1705,6 @@ class Scheduler:
     def need_more_nodes(self):
         return (
             not self._bootstrapped_event.is_set()
-            and self.node_manager.num_standby_nodes >= self.min_nodes_bootstrapping
+            and self.node_manager.num_scheduler_placement_standby_nodes
+            >= self.min_nodes_bootstrapping
         )

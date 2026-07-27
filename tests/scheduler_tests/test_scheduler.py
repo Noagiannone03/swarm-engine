@@ -1045,6 +1045,144 @@ def test_automatic_rejoin_discards_stale_worker_layer_assignment():
     assert rejoining.end_layer == model.num_layers
 
 
+def test_autonomous_join_cannot_change_legacy_allocation_or_context_tier():
+    """A worker-owned v3 span must be invisible to the compatibility allocator."""
+
+    model = build_model_info(12)
+    legacy = build_node("legacy-route", model, mem_gb=400.0)
+    sched = Scheduler(
+        model,
+        [legacy],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+    sched.layer_allocator.selected_context_tokens = 32_768
+    allocation_before = sched.list_node_allocations()
+
+    autonomous = build_node("autonomous-cold", model, mem_gb=1.0)
+    autonomous.swarm_v3 = {
+        "placement_mode": "autonomous",
+        "state": "warming",
+    }
+    sched.enqueue_join(autonomous)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    assert sched.list_node_allocations() == allocation_before
+    assert sched.layer_allocator.selected_context_tokens == 32_768
+    assert autonomous in sched.node_manager.standby_nodes
+    assert autonomous.start_layer is None
+    assert autonomous.end_layer is None
+    assert sched._pending_rebalance_node_ids == set()  # type: ignore[attr-defined]
+
+
+def test_autonomous_only_membership_does_not_bootstrap_legacy_allocator():
+    model = build_model_info(12)
+    autonomous = build_node("autonomous-only", model, mem_gb=400.0)
+    autonomous.swarm_v3 = {
+        "placement_mode": "autonomous",
+        "state": "warming",
+    }
+    sched = Scheduler(
+        model,
+        [],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+
+    sched.enqueue_join(autonomous)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    assert sched.get_node(autonomous.node_id) is autonomous
+    assert not sched._bootstrapped_event.is_set()  # type: ignore[attr-defined]
+    assert sched.list_node_allocations() == []
+    assert sched.node_manager.num_scheduler_placement_nodes == 0
+
+
+def test_legacy_bootstrap_ignores_autonomous_standby_capacity():
+    model = build_model_info(12)
+    legacy = build_node(
+        "legacy-small",
+        model,
+        mem_gb=1.0,
+        supports_frontend=False,
+    )
+    autonomous = build_node("autonomous-large", model, mem_gb=400.0)
+    autonomous.swarm_v3 = {
+        "placement_mode": "autonomous",
+        "state": "warming",
+    }
+    sched = Scheduler(
+        model,
+        [legacy, autonomous],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+
+    assert not sched.bootstrap()
+    assert sched.list_node_allocations() == []
+    assert autonomous in sched.node_manager.standby_nodes
+
+
+def test_rejoin_can_transfer_legacy_layer_ownership_to_autonomous_v3():
+    model = build_model_info(12)
+    legacy = build_node("transitioning", model, mem_gb=400.0)
+    sched = Scheduler(
+        model,
+        [legacy],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+    assert sched.list_node_allocations()
+
+    autonomous = build_node("transitioning", model, mem_gb=400.0)
+    autonomous.swarm_v3 = {
+        "placement_mode": "autonomous",
+        "state": "warming",
+    }
+    sched.enqueue_join(autonomous)
+    sched._process_joins()  # type: ignore[attr-defined]
+
+    registered = sched.get_node("transitioning")
+    assert registered is legacy
+    assert registered.uses_autonomous_placement
+    assert registered in sched.node_manager.standby_nodes
+    assert sched.list_node_allocations() == []
+
+
+def test_autonomous_leave_does_not_rebalance_legacy_pipeline():
+    model = build_model_info(12)
+    legacy = build_node("legacy-route", model, mem_gb=400.0)
+    sched = Scheduler(
+        model,
+        [legacy],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+    )
+    assert sched.bootstrap()
+    allocation_before = sched.list_node_allocations()
+
+    autonomous = build_node("autonomous-churn", model, mem_gb=1.0)
+    autonomous.swarm_v3 = {
+        "placement_mode": "autonomous",
+        "state": "ready",
+    }
+    sched.enqueue_join(autonomous)
+    sched._process_joins()  # type: ignore[attr-defined]
+    sched.enqueue_leave(autonomous.node_id)
+    sched._process_leaves()  # type: ignore[attr-defined]
+
+    assert sched.get_node(autonomous.node_id) is None
+    assert sched.list_node_allocations() == allocation_before
+    assert sched._rebalance_after_leave_pending is False  # type: ignore[attr-defined]
+
+
 def test_retried_join_preserves_scheduler_owned_serving_state():
     """A transport retry of node_join must be idempotent after allocation."""
     model = build_model_info(12)

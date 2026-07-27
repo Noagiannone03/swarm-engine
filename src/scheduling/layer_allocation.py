@@ -434,7 +434,7 @@ class BaseLayerAllocator:
     def allocate_standby_nodes(self) -> bool:
         """In case of enabling dynamic pipelines, allocate left-over nodes to the lightest layers using dynamic join."""
         if self.dynamic_pipelines_router:
-            left_over_nodes = self.node_management.standby_nodes
+            left_over_nodes = self.node_management.scheduler_placement_standby_nodes
             for node in left_over_nodes:
                 self.dynamic_join(node)
             return True
@@ -457,7 +457,7 @@ class BaseLayerAllocator:
 
         # TODO: add more imbalance checks
 
-        available_nodes = self.node_management.nodes
+        available_nodes = self.node_management.scheduler_placement_nodes
 
         layer_heap = self.layer_loads_heap
         if len(layer_heap) < 2:
@@ -881,7 +881,7 @@ class GreedyLayerAllocator(BaseLayerAllocator):
         """
         num_total_layers = self.model_info.num_layers
 
-        available_nodes = self.node_management.standby_nodes
+        available_nodes = self.node_management.scheduler_placement_standby_nodes
         if not self._has_required_weight_metadata(available_nodes):
             return False
         if not self._select_context_tier(available_nodes):
@@ -1053,7 +1053,7 @@ class DynamicProgrammingLayerAllocator(BaseLayerAllocator):
         # input so allocation does not depend on worker join order: pipeline
         # heads come first, followed by capacity and a stable identity tie-break.
         available_nodes = sorted(
-            self.node_management.standby_nodes,
+            self.node_management.scheduler_placement_standby_nodes,
             key=lambda node: (
                 not node.supports_frontend,
                 -self._node_capacity(node),
