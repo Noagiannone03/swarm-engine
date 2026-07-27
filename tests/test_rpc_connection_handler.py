@@ -12,6 +12,8 @@ class RecordingScheduler:
         self.update = None
         self.joined = None
         self.full_pipeline = True
+        self.weight_refit_mode = "disk"
+        self.allocation_epoch = 7
 
     def get_node(self, node_id):
         return self.node if node_id == self.node.node_id else None
@@ -150,8 +152,16 @@ def test_node_update_refreshes_registration_when_bootstrap_is_incomplete():
         {
             "node_id": "worker",
             "status": "waiting",
+            "model_name": scheduler.model_info.model_name,
+            "model_revision": scheduler.model_info.model_revision,
             "start_layer": None,
             "end_layer": None,
+            "tp_size": scheduler.node.hardware.num_gpus,
+            "enable_weight_refit": False,
+            "weight_refit_mode": "disk",
+            "model_max_sequence_length": scheduler.model_info.max_context_length,
+            "planned_context_tokens": scheduler.node.max_sequence_length,
+            "allocation_epoch": 7,
             "chunked_prefill_size": 0,
             "outbound_peer_ids": [],
             "authorized_link_peer_ids": [],
@@ -177,6 +187,9 @@ def test_initial_join_acknowledges_registration_before_dp_allocation():
     assert response["status"] == "waiting"
     assert response["start_layer"] is None
     assert response["end_layer"] is None
+    assert response["model_name"] == scheduler.model_info.model_name
+    assert response["model_revision"] == scheduler.model_info.model_revision
+    assert response["planned_context_tokens"] == scheduler.node.max_sequence_length
 
 
 def test_node_join_starts_heartbeat_phase_before_full_dp_pipeline(monkeypatch):

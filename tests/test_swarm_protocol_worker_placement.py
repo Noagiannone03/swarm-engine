@@ -113,6 +113,10 @@ class FakeAdmission:
 class FakePublisher:
     def __init__(self) -> None:
         self.states = []
+        self.bootstrap = []
+
+    def publish_bootstrap_state(self, value):
+        self.bootstrap.append(value)
 
     def publish_span_state(self, value, state):
         self.states.append(state)
@@ -188,3 +192,52 @@ def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():
     assert ready["phase"] == "ready"
     assert ready["current_span"] == [2, 4]
     assert not admission.draining
+
+
+def test_cold_worker_announces_building_before_executor_reload():
+    manifest = model()
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(),
+        leases=(),
+        links=(),
+    )
+    admission = FakeAdmission()
+    publisher = FakePublisher()
+    events = []
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot),
+        admission=admission,
+        state_publisher=publisher,
+        reload_target=lambda span, generation: events.append(("reload", span, generation)),
+        current_span=None,
+    )
+    joining = advertisement(manifest, "cold", 0, 1)
+
+    status = controller.bootstrap(
+        offer=joining.offer,
+        manifest=manifest,
+        context_tokens=10,
+        kv_block_size=1,
+        max_sessions=1,
+        weight_hashes=(HASHES[0],),
+    )
+    deadline = time.monotonic() + 1
+    while status["phase"] != "building" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = controller.bootstrap(
+            offer=joining.offer,
+            manifest=manifest,
+            context_tokens=10,
+            kv_block_size=1,
+            max_sessions=1,
+            weight_hashes=(HASHES[0],),
+        )
+
+    assert status["phase"] == "building"
+    assert len(publisher.bootstrap) == 1
+    intent = publisher.bootstrap[0]
+    assert intent.lease.state is SpanState.BUILDING
+    assert intent.lease.available_kv_bytes_snapshot == 0
+    assert events == [("reload", intent.lease.hosted_span, 1)]

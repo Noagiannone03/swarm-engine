@@ -588,6 +588,7 @@ if __name__ == "__main__":
                     kvcache_mem_ratio=args.kvcache_mem_ratio,
                     gpu_backend=args.gpu_backend,
                     chunked_prefill_size=args.chunked_prefill_size,
+                    kv_block_size=args.kv_block_size,
                     shared_state=shared_state.dict,
                     log_level=args.log_level,
                     conn=conn_main,
@@ -653,6 +654,7 @@ if __name__ == "__main__":
                 kvcache_mem_ratio=args.kvcache_mem_ratio,
                 gpu_backend=args.gpu_backend,
                 chunked_prefill_size=args.chunked_prefill_size,
+                kv_block_size=args.kv_block_size,
                 shared_state=shared_state.dict,  # Pass dict to subprocess
                 log_level=args.log_level,
                 conn=conn_main,

@@ -76,13 +76,15 @@ def lease(
     worker_id: str,
     start: int,
     end: int,
+    *,
+    state: SpanState = SpanState.READY,
 ) -> SpanLease:
     return SpanLease(
         model_swarm_id=model.model_swarm_id,
         worker_id=worker_id,
         hosted_span=LayerSpan(start=start, end=end),
         effective_span_mode=EffectiveSpanMode.FIXED,
-        state=SpanState.READY,
+        state=state,
         weight_hashes=(HASHES[0],),
         kv_geometry=KvGeometry(
             block_size_tokens=1,
@@ -116,6 +118,61 @@ def test_joining_worker_fills_the_only_missing_contiguous_range():
     assert decision.action is PlacementAction.JOIN
     assert decision.span == LayerSpan(start=2, end=4)
     assert decision.required_memory_bytes == 500
+
+
+def test_simultaneous_cold_join_counts_building_intent_for_demand_spreading():
+    model = manifest()
+    decision = AutonomousPlacementPolicy().choose(
+        offer=offer("second-cold-worker"),
+        manifest=model,
+        leases=(lease(model, "first-cold-worker", 0, 2, state=SpanState.BUILDING),),
+        demand=CapacityDemandMap.uniform(4, desired_replicas=1),
+        context_tokens=10,
+        kv_block_size=1,
+        now_ms=SWARM_NOW,
+    )
+
+    assert decision.action is PlacementAction.JOIN
+    assert decision.span == LayerSpan(start=2, end=4)
+
+
+def test_fixed_cold_workers_form_a_complete_route_when_tail_arrives_first():
+    model = manifest()
+    policy = AutonomousPlacementPolicy()
+    tail = policy.choose(
+        offer=offer("tail-first", memory_bytes=500, frontend=False),
+        manifest=model,
+        leases=(),
+        demand=CapacityDemandMap.uniform(4, desired_replicas=2),
+        context_tokens=10,
+        kv_block_size=1,
+        now_ms=SWARM_NOW,
+    )
+    assert tail.action is PlacementAction.JOIN
+    assert tail.span == LayerSpan(start=2, end=4)
+
+    head = policy.choose(
+        offer=offer("head-second", memory_bytes=500, frontend=True),
+        manifest=model,
+        leases=(
+            lease(
+                model,
+                "tail-first",
+                tail.span.start,
+                tail.span.end,
+                state=SpanState.BUILDING,
+            ),
+        ),
+        demand=CapacityDemandMap.uniform(4, desired_replicas=2),
+        context_tokens=10,
+        kv_block_size=1,
+        now_ms=SWARM_NOW + 1,
+    )
+
+    assert head.action is PlacementAction.JOIN
+    assert head.span == LayerSpan(start=0, end=2)
+    assert head.score is not None
+    assert head.score.completes_fixed_route == 1
 
 
 def test_executor_without_http_frontend_can_fill_the_model_tail():

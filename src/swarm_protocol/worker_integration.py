@@ -143,6 +143,52 @@ class WorkerProtocolV3Reporter:
                 return None
             return verified.bundle.manifest
 
+    def resolve_trusted_bundle(
+        self,
+        model_id: str,
+        *,
+        immutable_revision: str,
+    ) -> ModelRegistryBundle:
+        """Resolve a cold worker target through the pinned TUF registry."""
+
+        return self.registry.resolve(
+            model_id,
+            immutable_revision=immutable_revision,
+        )
+
+    def bootstrap_offer(
+        self,
+        *,
+        worker_id: str,
+        endpoint_id: str,
+        backend: BackendKind,
+        stable_memory_envelope_bytes: int,
+        supports_frontend: bool,
+    ) -> WorkerOffer:
+        """Build a fresh signed-endpoint offer before any executor is loaded."""
+
+        if stable_memory_envelope_bytes <= 0:
+            raise ValueError("worker has no positive stable memory envelope")
+        now_ms = time.time_ns() // 1_000_000
+        with self._lock:
+            self._offer_seq += 1
+            offer_seq = self._offer_seq
+        roles = {WorkerRole.EXECUTOR}
+        if supports_frontend:
+            roles.add(WorkerRole.FRONTEND)
+        return WorkerOffer(
+            worker_id=worker_id,
+            endpoint_id=endpoint_id,
+            runtime_version=_runtime_version(),
+            platform=f"{platform.system().lower()}-{platform.machine().lower()}",
+            backend=backend,
+            stable_memory_envelope_bytes=stable_memory_envelope_bytes,
+            supported_roles=frozenset(roles),
+            offer_seq=offer_seq,
+            issued_at_ms=now_ms,
+            expires_at_ms=now_ms + _REPORT_TTL_MS,
+        )
+
     def publish_span_state(
         self,
         advertisement: ModelMemberAdvertisement,
@@ -170,6 +216,16 @@ class WorkerProtocolV3Reporter:
             )
         self._queue_catalog_publish(transitioned)
         return transitioned
+
+    def publish_bootstrap_state(
+        self,
+        advertisement: ModelMemberAdvertisement,
+    ) -> None:
+        """Publish a non-routable cold-join intent derived from signed metadata."""
+
+        if advertisement.lease.state is not SpanState.BUILDING:
+            raise ValueError("cold bootstrap publication must use BUILDING state")
+        self._queue_catalog_publish(advertisement)
 
     @classmethod
     def from_environment(cls) -> "WorkerProtocolV3Reporter | None":

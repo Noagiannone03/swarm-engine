@@ -270,15 +270,43 @@ class RPCConnectionHandler(ConnectionHandler):
         return {}
 
     def pending_join_response(self, current_node_id):
-        """Acknowledge a live worker whose DP layer range is not ready yet."""
+        """Acknowledge a live worker with a model entrypoint, not a layer order.
 
-        if self.scheduler.get_node(current_node_id) is None:
+        Autonomous v3 workers need the immutable model contract before they can
+        choose a span from the signed catalogue. Layer ownership remains null
+        here and is never implied by this model-specific scheduler endpoint.
+        """
+
+        node = self.scheduler.get_node(current_node_id)
+        if node is None:
             return {}
+        model = node.model_info
+        using_mlx = node.hardware.device == "mlx"
+        selected_context = int(
+            getattr(getattr(self.scheduler, "layer_allocator", None), "selected_context_tokens", 0)
+            or 0
+        )
+        context_limits = [
+            int(value)
+            for value in (node.max_sequence_length, getattr(model, "max_context_length", None))
+            if value is not None and int(value) > 0
+        ]
+        planned_context = selected_context or (min(context_limits) if context_limits else 0)
         return {
             "node_id": current_node_id,
             "status": "waiting",
+            "model_name": model.mlx_model_name if using_mlx else model.model_name,
+            "model_revision": (
+                model.mlx_model_revision if using_mlx else model.model_revision
+            ),
             "start_layer": None,
             "end_layer": None,
+            "tp_size": node.hardware.num_gpus,
+            "enable_weight_refit": False,
+            "weight_refit_mode": getattr(self.scheduler, "weight_refit_mode", "disk"),
+            "model_max_sequence_length": getattr(model, "max_context_length", None),
+            "planned_context_tokens": planned_context,
+            "allocation_epoch": int(getattr(self.scheduler, "allocation_epoch", 0)),
             "chunked_prefill_size": 0,
             "outbound_peer_ids": [],
             "authorized_link_peer_ids": [],

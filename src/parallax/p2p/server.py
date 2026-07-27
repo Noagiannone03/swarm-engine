@@ -819,6 +819,7 @@ class GradientServer:
         kvcache_mem_ratio: float = 0.25,
         gpu_backend: str = "sglang",
         chunked_prefill_size: Optional[int] = None,
+        kv_block_size: int = 1,
         conn: Any = None,
     ):
         self.recv_from_peer_addr = recv_from_peer_addr
@@ -851,6 +852,9 @@ class GradientServer:
             0 if chunked_prefill_size is None else int(chunked_prefill_size)
         )
         self.chunked_prefill_size = self.preferred_chunked_prefill_size
+        if kv_block_size <= 0:
+            raise ValueError("KV block size must be positive")
+        self.kv_block_size = int(kv_block_size)
         self.supports_chunked_prefill = False
         self.enable_weight_refit = False
         self.weight_refit_mode = "disk"
@@ -881,6 +885,7 @@ class GradientServer:
         self.swarm_v3_reporter = None
         self.swarm_v3_execution_admission = None
         self.swarm_v3_placement_controller = None
+        self.swarm_v3_bootstrap_thread = None
         self.swarm_v3_placement_mode = (
             os.environ.get(
                 "FABI_SWARM_V3_PLACEMENT",
@@ -986,6 +991,114 @@ class GradientServer:
             span.start,
             span.end,
         )
+
+    def _start_autonomous_bootstrap(self) -> None:
+        """Let an unassigned worker choose and materialize its first v3 span."""
+
+        if self.swarm_v3_placement_mode != "autonomous":
+            return
+        if self.swarm_v3_bootstrap_thread is not None:
+            return
+        if (
+            self.swarm_v3_reporter is None
+            or self.swarm_v3_execution_admission is None
+            or self.iroh_transport is None
+            or self.iroh_transport.catalog_discovery is None
+        ):
+            raise RuntimeError("autonomous bootstrap requires active trusted Iroh discovery")
+        if not self.model_name or not self.model_revision or not self.planned_context_tokens:
+            raise RuntimeError(
+                "autonomous bootstrap requires a model entrypoint contract "
+                "(name, immutable revision and context)"
+            )
+
+        def _bootstrap() -> None:
+            try:
+                bundle = self.swarm_v3_reporter.resolve_trusted_bundle(
+                    str(self.model_name),
+                    immutable_revision=str(self.model_revision),
+                )
+                manifest = bundle.manifest
+                hardware = self._stable_capacity_hardware()
+                backend = (
+                    BackendKind.MLX
+                    if hardware.get("device") == "mlx"
+                    else (
+                        BackendKind.VLLM
+                        if self.gpu_backend == "vllm"
+                        else BackendKind.SGLANG
+                    )
+                )
+                controller = AutonomousWorkerPlacement(
+                    catalog=self.iroh_transport.catalog_discovery,
+                    admission=self.swarm_v3_execution_admission,
+                    state_publisher=self.swarm_v3_reporter,
+                    reload_target=self._apply_v3_span_reload,
+                    current_span=None,
+                )
+                self.swarm_v3_placement_controller = controller
+                offer = None
+                manifest_published = False
+                while not self.stop_event.is_set():
+                    if not manifest_published:
+                        try:
+                            self.iroh_transport.catalog_discovery.publish_manifest(manifest)
+                        except Exception:
+                            logger.warning(
+                                "Could not publish the trusted cold-join manifest; retrying",
+                                exc_info=True,
+                            )
+                            self.stop_event.wait(1.0)
+                            continue
+                        manifest_published = True
+                    now_ms = time.time_ns() // 1_000_000
+                    if offer is None or offer.expires_at_ms <= now_ms + 5_000:
+                        offer = self.swarm_v3_reporter.bootstrap_offer(
+                            worker_id=self.iroh_transport.peer_id(),
+                            endpoint_id=self.iroh_transport.peer_id(),
+                            backend=backend,
+                            stable_memory_envelope_bytes=int(
+                                hardware["usable_memory_bytes"]
+                            ),
+                            supports_frontend=self.supports_frontend,
+                        )
+                    placement = controller.bootstrap(
+                        offer=offer,
+                        manifest=manifest,
+                        context_tokens=int(self.planned_context_tokens),
+                        kv_block_size=self.kv_block_size,
+                        max_sessions=max(1, int(self.max_batch_size or 1)),
+                        # BUILDING binds the signed collection identity without
+                        # expanding a potentially huge shard list into the DHT.
+                        # READY later contains the exact locally verified files.
+                        weight_hashes=(manifest.weight_collection_hash,),
+                        outgoing_links=self._v3_outgoing_link_metrics(),
+                    )
+                    if self._shared_state is not None:
+                        self._shared_state.update(
+                            swarm_v3_placement_generation=placement["generation"],
+                            swarm_v3_placement_phase=placement["phase"],
+                        )
+                    if placement["phase"] == "building":
+                        logger.info(
+                            "Autonomous v3 cold join selected layers %s",
+                            placement["target_span"],
+                        )
+                        return
+                    self.stop_event.wait(0.5)
+            except Exception as exc:  # noqa: BLE001 - worker bootstrap status boundary
+                self.swarm_v3_init_error = {
+                    "code": type(exc).__name__,
+                    "detail": str(exc)[:256],
+                }
+                logger.exception("Autonomous v3 cold join failed")
+
+        self.swarm_v3_bootstrap_thread = threading.Thread(
+            target=_bootstrap,
+            name="SwarmV3ColdJoin",
+            daemon=True,
+        )
+        self.swarm_v3_bootstrap_thread.start()
 
     def check_and_release_disk_weight(self):
         """Only save 3 history versions of weight"""
@@ -1273,9 +1386,15 @@ class GradientServer:
 
                 logger.info(f"Join scheduler response: {response}")
 
-                if not self.manual_layer_assignment:
+                if (
+                    not self.manual_layer_assignment
+                    and self.swarm_v3_placement_mode != "autonomous"
+                ):
                     self.block_start_index = response.get("start_layer")
                     self.block_end_index = response.get("end_layer")
+                elif self.swarm_v3_placement_mode == "autonomous":
+                    self.block_start_index = None
+                    self.block_end_index = None
                 self.model_name = response.get("model_name")
                 self.model_revision = response.get("model_revision")
                 self.tp_size = response.get("tp_size")
@@ -1322,6 +1441,8 @@ class GradientServer:
 
         if self.scheduler_addr is not None:
             self.start_direct_peer_prober()
+        if self.swarm_v3_placement_mode == "autonomous":
+            self._start_autonomous_bootstrap()
         self.start_node_announcer()  # thread
         self.start_node_sender()  # main loop
 
@@ -1994,10 +2115,10 @@ class GradientServer:
                                 allocation_epoch = response.get("allocation_epoch")
                                 has_model_context = "model_max_sequence_length" in response
                                 negotiated_chunk_size = response.get("chunked_prefill_size")
-                                if self.swarm_v3_placement_controller is not None:
+                                if self.swarm_v3_placement_mode == "autonomous":
                                     # The qualified scheduler still supplies model and wire
                                     # contracts during migration, but layer ownership belongs to
-                                    # the worker-side v3 transaction once it has started.
+                                    # the worker-side v3 transaction even before its first span.
                                     start_layer = self.block_start_index
                                     end_layer = self.block_end_index
                                 if start_layer is not None and end_layer is not None:
@@ -2092,7 +2213,8 @@ class GradientServer:
                                     f"Heartbeat: No layer allocation received yet, response: {response}"
                                 )
                                 self.status = ServerState.JOINING
-                                self.model_name = None
+                                if self.swarm_v3_placement_mode != "autonomous":
+                                    self.model_name = None
                                 if self._shared_state is not None:
                                     self._shared_state.set_status(self.status.value)
                                     self._shared_state.update_metrics(current_requests=0)
@@ -2423,6 +2545,8 @@ class GradientServer:
                 self.direct_peer_prober.join(timeout=1)
             if self.routing_table_updater is not None:
                 self.routing_table_updater.join(timeout=1)
+            if self.swarm_v3_bootstrap_thread is not None:
+                self.swarm_v3_bootstrap_thread.join(timeout=1)
         except Exception:
             logger.debug("Failed to join P2P background threads", exc_info=True)
         finally:
@@ -2457,6 +2581,7 @@ def _run_p2p_server_process(
     kvcache_mem_ratio: float = 0.25,
     gpu_backend: str = "sglang",
     chunked_prefill_size: Optional[int] = None,
+    kv_block_size: int = 1,
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
     conn: Any = None,
@@ -2505,6 +2630,7 @@ def _run_p2p_server_process(
             kvcache_mem_ratio=kvcache_mem_ratio,
             gpu_backend=gpu_backend,
             chunked_prefill_size=chunked_prefill_size,
+            kv_block_size=kv_block_size,
             conn=conn,
         )
         # Attach shared state to server for syncing layer allocation
@@ -2557,6 +2683,7 @@ def launch_p2p_server_process(
     kvcache_mem_ratio: float = 0.25,
     gpu_backend: str = "sglang",
     chunked_prefill_size: Optional[int] = None,
+    kv_block_size: int = 1,
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
     conn: Optional[Any] = None,
@@ -2594,6 +2721,7 @@ def launch_p2p_server_process(
             kvcache_mem_ratio,
             gpu_backend,
             chunked_prefill_size,
+            kv_block_size,
             shared_state,
             log_level,
             conn,

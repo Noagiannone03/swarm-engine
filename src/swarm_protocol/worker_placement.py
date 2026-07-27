@@ -8,11 +8,16 @@ from collections.abc import Callable
 from typing import Protocol
 
 from swarm_protocol.contracts import (
+    EffectiveSpanMode,
+    KvGeometry,
     LayerSpan,
+    LinkMetric,
     ModelManifest,
     ModelMemberAdvertisement,
     ReservationState,
+    SpanLease,
     SpanState,
+    WorkerOffer,
 )
 from swarm_protocol.discovery import DiscoverySnapshot
 from swarm_protocol.execution import WorkerExecutionAdmission
@@ -35,6 +40,11 @@ class PlacementCatalog(Protocol):
 
 
 class SpanStatePublisher(Protocol):
+    def publish_bootstrap_state(
+        self,
+        advertisement: ModelMemberAdvertisement,
+    ) -> None: ...
+
     def publish_span_state(
         self,
         advertisement: ModelMemberAdvertisement,
@@ -52,7 +62,7 @@ class AutonomousWorkerPlacement:
         admission: WorkerExecutionAdmission,
         state_publisher: SpanStatePublisher,
         reload_target: Callable[[LayerSpan, int], None],
-        current_span: LayerSpan,
+        current_span: LayerSpan | None = None,
         policy: AutonomousPlacementPolicy | None = None,
     ) -> None:
         self._catalog = catalog
@@ -72,6 +82,103 @@ class AutonomousWorkerPlacement:
         self._announced_transition: tuple[object, ...] | None = None
         self._error: dict[str, str] | None = None
         self._lock = threading.RLock()
+
+    def bootstrap(
+        self,
+        *,
+        offer: WorkerOffer,
+        manifest: ModelManifest,
+        context_tokens: int,
+        kv_block_size: int,
+        max_sessions: int,
+        weight_hashes: tuple[str, ...],
+        outgoing_links: tuple[LinkMetric, ...] = (),
+    ) -> dict[str, object]:
+        """Choose and announce a cold span before starting its executor.
+
+        This follows Petals' JOINING lifecycle: an eventually-consistent intent
+        is visible before expensive materialization starts, while route planning
+        continues to admit READY leases only.
+        """
+
+        if context_tokens <= 0 or kv_block_size <= 0 or max_sessions <= 0:
+            raise ValueError("bootstrap context, KV block size and sessions must be positive")
+        if not weight_hashes:
+            raise ValueError("bootstrap intent must bind signed weight identities")
+
+        state = self._materializer.snapshot()
+        if state.phase is not MaterializationPhase.STANDBY:
+            return self._status(state, decision="materializing", error=None)
+
+        self._refresh_async(manifest.model_swarm_id)
+        with self._lock:
+            snapshot = (
+                self._snapshot
+                if self._snapshot_model_id == manifest.model_swarm_id
+                else None
+            )
+            read_error = self._error
+        if snapshot is None:
+            return self._status(state, decision="waiting_catalog", error=read_error)
+        if snapshot.manifest(manifest.model_swarm_id) != manifest:
+            return self._status(
+                state,
+                decision="catalog_manifest_mismatch",
+                error={"code": "TrustError", "detail": "DHT manifest differs from registry"},
+            )
+
+        decision = self._policy.choose(
+            offer=offer,
+            manifest=manifest,
+            leases=snapshot.leases,
+            demand=CapacityDemandMap.uniform(manifest.num_layers, desired_replicas=2),
+            context_tokens=context_tokens,
+            kv_block_size=kv_block_size,
+            current_span=None,
+            current_reservations=0,
+            now_ms=time.time_ns() // 1_000_000,
+        )
+        if decision.action is PlacementAction.STANDBY:
+            return self._status(state, decision=decision.reason, error=read_error)
+        if decision.action is not PlacementAction.JOIN or decision.span is None:
+            raise RuntimeError("cold placement policy returned an invalid transition")
+
+        span = decision.span
+        rounded_tokens = (
+            (context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
+        )
+        allocatable_kv_bytes = rounded_tokens * sum(
+            manifest.kv_bytes_per_token_by_layer[span.start : span.end]
+        )
+        now_ms = time.time_ns() // 1_000_000
+        building = ModelMemberAdvertisement(
+            offer=offer,
+            lease=SpanLease(
+                model_swarm_id=manifest.model_swarm_id,
+                worker_id=offer.worker_id,
+                hosted_span=span,
+                effective_span_mode=EffectiveSpanMode.FIXED,
+                state=SpanState.BUILDING,
+                weight_hashes=weight_hashes,
+                kv_geometry=KvGeometry(
+                    block_size_tokens=kv_block_size,
+                    bytes_per_token_by_layer=manifest.kv_bytes_per_token_by_layer,
+                    allocatable_bytes=allocatable_kv_bytes,
+                ),
+                available_kv_bytes_snapshot=0,
+                max_sessions=max_sessions,
+                lease_seq=0,
+                issued_at_ms=now_ms,
+                expires_at_ms=now_ms + 45_000,
+            ),
+            outgoing_links=outgoing_links,
+        )
+        # Publish intent before loading so simultaneous cold joins can spread
+        # across deficits instead of stampeding the same layers.
+        self._state_publisher.publish_bootstrap_state(building)
+        state = self._materializer.reconcile(decision)
+        self._announced_transition = (state.phase, state.generation, state.target_span)
+        return self._status(state, decision=decision.reason, error=read_error)
 
     def observe(
         self,

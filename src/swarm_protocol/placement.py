@@ -235,14 +235,18 @@ class CapacityDemandMap(BaseModel):
 
 @dataclass(frozen=True)
 class PlacementScore:
+    completes_fixed_route: int
+    fixed_route_progress: int
     minimum_ready_coverage: int
     weighted_deficit_filled: float
     weighted_coverage: float
     span_length: int
     deterministic_tiebreaker: int
 
-    def rank(self) -> tuple[int, float, float, int, int]:
+    def rank(self) -> tuple[int, int, int, float, float, int, int]:
         return (
+            self.completes_fixed_route,
+            self.fixed_route_progress,
             self.minimum_ready_coverage,
             self.weighted_deficit_filled,
             self.weighted_coverage,
@@ -344,13 +348,14 @@ class AutonomousPlacementPolicy:
         leases: tuple[SpanLease, ...],
         *,
         exclude_worker_id: str,
+        states: frozenset[SpanState] = frozenset({SpanState.READY}),
     ) -> list[int]:
         coverage = [0] * manifest.num_layers
         for lease in leases:
             if (
                 lease.model_swarm_id != manifest.model_swarm_id
                 or lease.worker_id == exclude_worker_id
-                or lease.state != SpanState.READY
+                or lease.state not in states
             ):
                 continue
             for layer in range(lease.hosted_span.start, lease.hosted_span.end):
@@ -371,6 +376,9 @@ class AutonomousPlacementPolicy:
         span: LayerSpan,
         base_coverage: list[int],
         demand: CapacityDemandMap,
+        prefix_boundaries: frozenset[int],
+        suffix_boundaries: frozenset[int],
+        model_num_layers: int,
     ) -> PlacementScore:
         after = [
             count + int(span.start <= layer < span.end) for layer, count in enumerate(base_coverage)
@@ -385,13 +393,52 @@ class AutonomousPlacementPolicy:
             min(count, demand.desired_replicas_by_layer[layer]) * weight
             for layer, (count, weight) in enumerate(zip(after, demand.demand_weight_by_layer))
         )
+        completes_fixed_route = int(
+            span.start in prefix_boundaries and span.end in suffix_boundaries
+        )
+        fixed_route_progress = max(
+            span.end if span.start in prefix_boundaries else 0,
+            model_num_layers - span.start if span.end in suffix_boundaries else 0,
+        )
         return PlacementScore(
+            completes_fixed_route=completes_fixed_route,
+            fixed_route_progress=fixed_route_progress,
             minimum_ready_coverage=min(after),
             weighted_deficit_filled=deficit_filled,
             weighted_coverage=weighted_coverage,
             span_length=span.length,
             deterministic_tiebreaker=self._tiebreaker(worker_id, span),
         )
+
+    @staticmethod
+    def _fixed_route_boundaries(
+        manifest: ModelManifest,
+        leases: tuple[SpanLease, ...],
+        *,
+        exclude_worker_id: str,
+    ) -> tuple[frozenset[int], frozenset[int]]:
+        """Return exact prefix/suffix boundaries reachable through live intents."""
+
+        spans = tuple(
+            lease.hosted_span
+            for lease in leases
+            if lease.model_swarm_id == manifest.model_swarm_id
+            and lease.worker_id != exclude_worker_id
+            and lease.state in {SpanState.BUILDING, SpanState.WARMING, SpanState.READY}
+        )
+        prefix = {0}
+        suffix = {manifest.num_layers}
+        changed = True
+        while changed:
+            changed = False
+            for span in spans:
+                if span.start in prefix and span.end not in prefix:
+                    prefix.add(span.end)
+                    changed = True
+                if span.end in suffix and span.start not in suffix:
+                    suffix.add(span.start)
+                    changed = True
+        return frozenset(prefix), frozenset(suffix)
 
     @staticmethod
     def _preserves_coverage(
@@ -441,7 +488,21 @@ class AutonomousPlacementPolicy:
                 reason="no_exact_span_fits_the_stable_memory_envelope",
             )
 
-        base_coverage = self._coverage(
+        # BUILDING/WARMING leases are demand intents, like Petals' JOINING
+        # modules. They spread simultaneous joins but never make a route
+        # executable and never protect a serving worker from a coverage hole.
+        planned_coverage = self._coverage(
+            manifest,
+            leases,
+            exclude_worker_id=offer.worker_id,
+            states=frozenset({SpanState.BUILDING, SpanState.WARMING, SpanState.READY}),
+        )
+        ready_coverage = self._coverage(
+            manifest,
+            leases,
+            exclude_worker_id=offer.worker_id,
+        )
+        prefix_boundaries, suffix_boundaries = self._fixed_route_boundaries(
             manifest,
             leases,
             exclude_worker_id=offer.worker_id,
@@ -453,15 +514,18 @@ class AutonomousPlacementPolicy:
                 self._score(
                     worker_id=offer.worker_id,
                     span=span,
-                    base_coverage=base_coverage,
+                    base_coverage=planned_coverage,
                     demand=demand,
+                    prefix_boundaries=prefix_boundaries,
+                    suffix_boundaries=suffix_boundaries,
+                    model_num_layers=manifest.num_layers,
                 ),
             )
             for span, required in feasible
             if self._preserves_coverage(
                 current_span=current_span,
                 candidate=span,
-                base_coverage=base_coverage,
+                base_coverage=ready_coverage,
             )
         ]
         if not candidates:
@@ -479,8 +543,11 @@ class AutonomousPlacementPolicy:
                     score=self._score(
                         worker_id=offer.worker_id,
                         span=current_span,
-                        base_coverage=base_coverage,
+                        base_coverage=planned_coverage,
                         demand=demand,
+                        prefix_boundaries=prefix_boundaries,
+                        suffix_boundaries=suffix_boundaries,
+                        model_num_layers=manifest.num_layers,
                     ),
                     reason="movement_would_remove_the_last_ready_coverage",
                 )
@@ -518,8 +585,11 @@ class AutonomousPlacementPolicy:
             current_score = self._score(
                 worker_id=offer.worker_id,
                 span=current_span,
-                base_coverage=base_coverage,
+                base_coverage=planned_coverage,
                 demand=demand,
+                prefix_boundaries=prefix_boundaries,
+                suffix_boundaries=suffix_boundaries,
+                model_num_layers=manifest.num_layers,
             )
         else:
             _, current_required, current_score = current
