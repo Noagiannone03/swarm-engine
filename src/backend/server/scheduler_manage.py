@@ -234,7 +234,16 @@ class SchedulerManage:
                     int(self.scheduler.allocation_epoch) if self.scheduler else None
                 ),
                 "runtime_memory_contract_ready": (
-                    self.scheduler.runtime_memory_contract_ready() if self.scheduler else False
+                    (
+                        self.max_supported_context_tokens()
+                        >= int(self.scheduler.layer_allocator.planning_context_tokens)
+                    )
+                    if self.scheduler is not None and self.swarm_v3_mode == "active"
+                    else (
+                        self.scheduler.runtime_memory_contract_ready()
+                        if self.scheduler
+                        else False
+                    )
                 ),
                 "max_supported_context_tokens": self.max_supported_context_tokens(),
                 "node_join_command": get_node_join_command(
@@ -376,6 +385,9 @@ class SchedulerManage:
             ),
             require_exact_weight_metadata=True,
             epoch_allocator=self.epoch_allocator,
+            placement_authority=(
+                "worker_dht" if self.swarm_v3_mode == "active" else "scheduler"
+            ),
         )
 
         # Run the scheduler's event/dispatch loops in background so the process
@@ -558,11 +570,17 @@ class SchedulerManage:
     def requires_exact_frontend_tokenization(self) -> bool:
         """Return whether route admission must use the serving frontend's IDs."""
 
-        return self.active_v3_routes is not None
+        return self.swarm_v3_mode == "active"
 
     def max_supported_context_tokens(self) -> int:
         if self.scheduler is None:
             return 0
+        if self.swarm_v3_mode == "active":
+            if self.active_v3_routes is None:
+                return 0
+            return self.active_v3_routes.max_supported_context_tokens(
+                int(self.scheduler.model_info.max_context_length)
+            )
         return self.scheduler.max_supported_context_tokens()
 
     def get_routing_table(
@@ -583,6 +601,9 @@ class SchedulerManage:
         - [..]: valid routing path, return immediately
         """
         logger.debug(f"Routing table requested for request_id={request_id}")
+        if self.swarm_v3_mode == "active" and self.active_v3_routes is None:
+            logger.warning("Protocol-v3 route runtime is not initialized; failing closed")
+            return []
         if self.active_v3_routes is not None:
             planner = getattr(self.scheduler, "swarm_v3_shadow", None)
             dht_workers = planner.live_worker_ids() if planner is not None else None

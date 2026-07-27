@@ -36,6 +36,34 @@ def test_product_readiness_accepts_complete_external_v3_route():
     assert sched.product_serving_ready()
 
 
+def test_worker_dht_authority_never_falls_back_to_legacy_readiness(monkeypatch):
+    sched = Scheduler(build_model_info(12), [], placement_authority="worker_dht")
+    monkeypatch.setattr(sched, "serving_ready", lambda: True)
+
+    assert not sched.product_serving_ready()
+
+    sched.external_serving_ready = lambda: True
+    assert sched.product_serving_ready()
+
+
+def test_worker_dht_authority_rejects_legacy_join_before_allocation():
+    model = build_model_info(12)
+    legacy = build_node("legacy", model, mem_gb=80.0)
+    sched = Scheduler(
+        model,
+        [],
+        placement_authority="worker_dht",
+        min_nodes_bootstrapping=1,
+    )
+    sched.enqueue_join(legacy)
+
+    sched._process_joins()
+
+    assert sched.get_node("legacy") is None
+    assert sched.node_manager.num_active_nodes == 0
+    assert sched.node_manager.num_standby_nodes == 0
+
+
 def test_bootstrap_rolls_back_partial_allocation_after_allocator_exception(monkeypatch):
     model = build_model_info(12)
     node = build_node("partial", model, mem_gb=80.0)

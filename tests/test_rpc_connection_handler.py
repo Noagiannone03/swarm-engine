@@ -225,6 +225,33 @@ def test_autonomous_node_update_bypasses_legacy_bootstrap_gate():
     }
 
 
+def test_worker_dht_product_authority_rejects_legacy_update():
+    scheduler = RecordingScheduler()
+    scheduler.placement_authority = "worker_dht"
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = scheduler
+
+    response = handler.node_update(
+        {
+            "node_id": "worker",
+            "hardware": {
+                "node_id": "worker",
+                "num_gpus": 1,
+                "tflops_fp16": 8.52,
+                "gpu_name": "Apple M4",
+                "memory_gb": 16.0,
+                "memory_bandwidth_gbps": 100.0,
+                "device": "mlx",
+            },
+            "is_active": True,
+        }
+    )
+
+    assert response == ({}, {})
+    assert scheduler.joined is None
+    assert scheduler.update is None
+
+
 def test_initial_join_acknowledges_registration_before_dp_allocation():
     scheduler = RecordingScheduler()
     scheduler.full_pipeline = False

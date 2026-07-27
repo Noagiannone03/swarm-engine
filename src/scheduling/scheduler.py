@@ -82,6 +82,7 @@ class Scheduler:
         preferred_context_tokens: int = 32_768,
         require_exact_weight_metadata: bool = False,
         epoch_allocator: EpochAllocator | None = None,
+        placement_authority: Literal["scheduler", "worker_dht"] = "scheduler",
     ) -> None:
         """Initialize the scheduler.
 
@@ -103,10 +104,15 @@ class Scheduler:
             raise ValueError(f"Unsupported layer allocation strategy: {strategy}")
         if routing_strategy not in ("rr", "dp"):
             raise ValueError(f"Unsupported request routing strategy: {routing_strategy}")
+        if placement_authority not in ("scheduler", "worker_dht"):
+            raise ValueError(f"Unsupported placement authority: {placement_authority}")
 
         self.model_info = model_info
         self.num_layers = model_info.num_layers
         self.routing_strategy: Literal["rr", "dp"] = routing_strategy
+        self.placement_authority: Literal["scheduler", "worker_dht"] = (
+            placement_authority
+        )
         self.enable_weight_refit = enable_weight_refit
         self.weight_refit_mode = weight_refit_mode
         self.refit_request = {}
@@ -321,9 +327,9 @@ class Scheduler:
         )
 
     def product_serving_ready(self) -> bool:
-        """Whether either compatibility routing or a complete v3 DHT route is ready."""
+        """Whether the configured product routing authority is ready."""
 
-        if self.serving_ready():
+        if self.placement_authority == "scheduler" and self.serving_ready():
             return True
         if self.external_serving_ready is None:
             return False
@@ -1365,6 +1371,13 @@ class Scheduler:
                 node = self._pending_joins.get_nowait()
             except queue.Empty:
                 break
+            if self.placement_authority == "worker_dht" and not node.uses_autonomous_placement:
+                logger.warning(
+                    "Rejecting legacy scheduler-placement worker %s: product placement "
+                    "authority is worker_dht",
+                    node.node_id,
+                )
+                continue
             # During bootstrap (no full pipeline yet), only declare nodes; no dynamic assignment.
             # After bootstrap, allow dynamic light-weight joins.
             # Exception: manual layer assignments are processed immediately regardless of bootstrap state.
@@ -1718,6 +1731,8 @@ class Scheduler:
             self._node_count_cv.notify_all()
 
     def need_more_nodes(self):
+        if self.placement_authority == "worker_dht":
+            return not self.product_serving_ready()
         return (
             not self._bootstrapped_event.is_set()
             and self.node_manager.num_scheduler_placement_standby_nodes

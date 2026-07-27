@@ -272,6 +272,34 @@ class ActiveRouteRuntime:
             self._readiness_cache[required] = (now_steady_ms, available)
         return available
 
+    def max_supported_context_tokens(self, upper_bound: int) -> int:
+        """Return the exact largest context admitted by a complete live route.
+
+        Route feasibility is monotonic with respect to the requested KV token
+        budget: a route that cannot hold ``n`` tokens cannot hold more than
+        ``n`` with the same immutable leases. Binary search therefore avoids a
+        configured tier or hardware estimate and asks the same verified planner
+        used for real requests.
+        """
+
+        maximum = int(upper_bound)
+        if maximum < 2:
+            return 0
+        if not self.route_available(2):
+            return 0
+        if self.route_available(maximum):
+            return maximum
+
+        supported = 2
+        rejected = maximum
+        while supported + 1 < rejected:
+            candidate = (supported + rejected) // 2
+            if self.route_available(candidate):
+                supported = candidate
+            else:
+                rejected = candidate
+        return supported
+
     def is_active(self, request_id: str) -> bool:
         with self._lock:
             route = self._routes.get(str(request_id))

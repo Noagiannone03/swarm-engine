@@ -100,6 +100,16 @@ class RPCConnectionHandler(ConnectionHandler):
         logger.info("receive node_join request: %s", node_log_summary(message))
         try:
             node = self.build_node(message)
+            if (
+                getattr(self.scheduler, "placement_authority", "scheduler") == "worker_dht"
+                and not node.uses_autonomous_placement
+            ):
+                logger.warning(
+                    "Rejecting legacy node_join from %s: product placement authority "
+                    "is worker_dht",
+                    node.node_id,
+                )
+                return {}
             self.scheduler.enqueue_join(node)
 
             # A full DP pipeline may require several workers. A blocking join
@@ -136,6 +146,16 @@ class RPCConnectionHandler(ConnectionHandler):
         logger.debug("receive node_update request: %s", node_log_summary(message))
         try:
             node = self.build_node(message)
+            if (
+                getattr(self.scheduler, "placement_authority", "scheduler") == "worker_dht"
+                and not node.uses_autonomous_placement
+            ):
+                logger.warning(
+                    "Rejecting legacy node_update from %s: product placement authority "
+                    "is worker_dht",
+                    node.node_id,
+                )
+                return {}, {}
             # Check if node exists in scheduler
             if self.scheduler.get_node(node.node_id) is None:
                 # Node not found, automatically join it (e.g., after model switch)

@@ -261,6 +261,7 @@ def test_scheduler_manager_forwards_dynamic_dp_configuration():
         preferred_context_tokens=32_768,
         require_exact_weight_metadata=True,
         epoch_allocator=manager.epoch_allocator,
+        placement_authority="scheduler",
     )
     thread_class.return_value.start.assert_called_once_with()
 
@@ -428,6 +429,23 @@ def test_active_v3_scheduler_requires_persistent_epoch_storage(monkeypatch):
         manager._start_scheduler("Qwen/Qwen3-1.7B", 1)
 
 
+def test_active_v3_scheduler_uses_worker_dht_placement_authority(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
+    monkeypatch.setenv("FABI_SWARM_V3_EPOCH_DB", str(tmp_path / "epochs.sqlite3"))
+    manager = SchedulerManage()
+
+    with (
+        patch.object(scheduler_manage_module, "get_model_info", return_value=object()),
+        patch.object(scheduler_manage_module, "Scheduler") as scheduler_class,
+        patch.object(scheduler_manage_module.threading, "Thread"),
+    ):
+        manager._start_scheduler("Qwen/Qwen3-1.7B", 1)
+
+    assert scheduler_class.call_args.kwargs["placement_authority"] == "worker_dht"
+
+
 def test_active_v3_routing_receives_exact_token_budget(monkeypatch):
     monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
     calls = []
@@ -458,6 +476,23 @@ def test_active_v3_routing_receives_exact_token_budget(monkeypatch):
             "recovery_level": RecoveryLevel.RESTARTABLE,
         }
     ]
+
+
+def test_active_v3_routing_fails_closed_before_runtime_initialization(monkeypatch):
+    monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
+    manager = SchedulerManage()
+    manager.scheduler = SimpleNamespace()
+
+    assert (
+        manager.get_routing_table(
+            "request",
+            1.0,
+            16_316,
+            prompt_tokens=12_220,
+            reserved_output_tokens=4_096,
+        )
+        == []
+    )
 
 
 def test_context_tokenizer_is_canonical_cached_and_offline_aware():

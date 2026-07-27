@@ -36,6 +36,7 @@ class FakePlanner:
     def __init__(self):
         self.epochs = []
         self.fail_planning = False
+        self.max_context_tokens = None
 
     def ready_model_swarm_id(self, nodes):
         assert nodes
@@ -74,6 +75,11 @@ class FakePlanner:
         del nodes
         if self.fail_planning:
             raise NoFeasibleRoute("no complete route")
+        if (
+            self.max_context_tokens is not None
+            and request.required_context_tokens > self.max_context_tokens
+        ):
+            raise NoFeasibleRoute("context exceeds route capacity")
         self.epochs.append(epoch)
         primary = RoutePlan(
             request_id=request.request_id,
@@ -242,6 +248,18 @@ def test_readiness_probe_plans_without_reserving_or_advancing_epoch():
         now[0] += 1_001
         assert not active.route_available(16_384)
         assert coordinator.reserved == []
+    finally:
+        active.close()
+
+
+def test_max_supported_context_uses_exact_route_planner_capacity():
+    now = [1_000]
+    active, planner, coordinator, _ = runtime(now)
+    planner.max_context_tokens = 32_896
+    try:
+        assert active.max_supported_context_tokens(40_960) == 32_896
+        assert coordinator.reserved == []
+        assert set(planner.epochs) == {0}
     finally:
         active.close()
 
