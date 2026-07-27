@@ -27,6 +27,15 @@ def test_scheduler_rejects_unknown_allocation_and_routing_strategies():
         Scheduler(model, [], routing_strategy="unknown")  # type: ignore[arg-type]
 
 
+def test_product_readiness_accepts_complete_external_v3_route():
+    sched = Scheduler(build_model_info(12), [])
+    assert not sched.serving_ready()
+    assert not sched.product_serving_ready()
+
+    sched.external_serving_ready = lambda: True
+    assert sched.product_serving_ready()
+
+
 def test_bootstrap_rolls_back_partial_allocation_after_allocator_exception(monkeypatch):
     model = build_model_info(12)
     node = build_node("partial", model, mem_gb=80.0)

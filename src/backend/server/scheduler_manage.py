@@ -514,6 +514,14 @@ class SchedulerManage:
             epoch_allocator=self.epoch_allocator,
         )
         self.scheduler.external_routes_active = self.active_v3_routes.has_active_routes
+        self.scheduler.external_ready_worker_ids = planner.ready_worker_ids
+        planning_context_tokens = int(
+            self.scheduler.layer_allocator.planning_context_tokens
+        )
+        self.scheduler.external_serving_ready = (
+            lambda: self.active_v3_routes is not None
+            and self.active_v3_routes.route_available(planning_context_tokens)
+        )
         logger.info("Protocol-v3 active route admission is ready")
 
     def _attach_v3_catalog(self) -> None:
@@ -943,7 +951,11 @@ class SchedulerManage:
             return NODE_STATUS_WAITING
 
         # todo rebalance status
-        status = NODE_STATUS_AVAILABLE if self.scheduler.serving_ready() else NODE_STATUS_WAITING
+        status = (
+            NODE_STATUS_AVAILABLE
+            if self.scheduler.product_serving_ready()
+            else NODE_STATUS_WAITING
+        )
         logger.debug(f"SchedulerManage status queried: {status}")
         return status
 

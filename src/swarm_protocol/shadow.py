@@ -15,6 +15,7 @@ from swarm_protocol.contracts import (
     ModelMemberAdvertisement,
     RecoveryLevel,
     RequestContract,
+    SpanState,
 )
 from swarm_protocol.discovery import DiscoverySnapshot
 from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
@@ -418,6 +419,23 @@ class SchedulerProtocolV3Shadow:
                 for snapshot in self._catalog_snapshots.values()
                 for offer in snapshot.offers
             )
+
+    def ready_worker_ids(self) -> frozenset[str] | None:
+        """Return workers with both an unexpired offer and a READY DHT lease."""
+
+        with self._lock:
+            if self._catalog is None:
+                return None
+            ready: set[str] = set()
+            for snapshot in self._catalog_snapshots.values():
+                offered = {offer.worker_id for offer in snapshot.offers}
+                ready.update(
+                    lease.worker_id
+                    for lease in snapshot.leases
+                    if lease.state is SpanState.READY
+                    and lease.worker_id in offered
+                )
+            return frozenset(ready)
 
     def _fetch_bundle(self, model_swarm_id: str) -> None:
         try:

@@ -208,11 +208,13 @@ def test_active_planning_uses_dht_membership_not_legacy_scheduler_nodes():
         ModelMemberAdvertisement.model_validate(node.swarm_v3["advertisement"])
         for node in nodes
     ]
+    building = _advertisement(bundle, "building", 0, 1, "rtx")
     catalog_snapshot = DiscoverySnapshot(
         captured_at_ms=time.time_ns() // 1_000_000,
         manifests=(bundle.manifest,),
-        offers=tuple(item.offer for item in advertisements),
-        leases=tuple(item.lease for item in advertisements),
+        offers=tuple(item.offer for item in advertisements) + (building.offer,),
+        leases=tuple(item.lease for item in advertisements)
+        + (building.lease.model_copy(update={"state": SpanState.BUILDING}),),
         links=tuple(link for item in advertisements for link in item.outgoing_links),
     )
     planner = SchedulerProtocolV3Shadow(_Registry(bundle), mode="active")
@@ -242,4 +244,5 @@ def test_active_planning_uses_dht_membership_not_legacy_scheduler_nodes():
 
     assert tuple(stage.worker_id for stage in planned.plan.stages) == ("mac", "rtx")
     assert planner.ready_model_swarm_id(nodes) == bundle.model_swarm_id
-    assert planner.live_worker_ids() == frozenset({"mac", "rtx"})
+    assert planner.live_worker_ids() == frozenset({"mac", "rtx", "building"})
+    assert planner.ready_worker_ids() == frozenset({"mac", "rtx"})

@@ -1,9 +1,10 @@
 """Admission control for Fabi's ``contribute while you consume`` contract.
 
 This is deliberately not a credit ledger.  The scheduler derives a short-lived
-capability from its own live node registry on every admission: an account may
-start inference only while it owns at least one ready worker with a real layer
-allocation in this model's serving pipeline.
+capability from authenticated live membership on every admission: an account
+may start inference only while it owns at least one initialized worker. During
+the v3 migration, a legacy worker must have a scheduler allocation; an
+autonomous worker must have both a verified READY lease and a live DHT offer.
 
 Only a SHA-256 account identifier is retained on ``Node`` objects.  The account
 credential itself is accepted from the encrypted worker RPC and the HTTPS
@@ -22,6 +23,7 @@ from typing import Optional
 
 from parallax_utils.logging_config import get_logger
 from scheduling.node import node_is_routable
+from swarm_protocol.contracts import ModelMemberAdvertisement, SpanState
 
 logger = get_logger(__name__)
 
@@ -74,7 +76,7 @@ class ContributionAdmission:
 
 
 class ContributionGate:
-    """Binary, scheduler-authoritative contribution admission gate.
+    """Binary contribution admission bound to account and live worker identity.
 
     One eligible worker grants one concurrent request by default.  This keeps
     the product free of balances and currencies while preventing a single tiny
@@ -104,20 +106,64 @@ class ContributionGate:
         )
 
     @staticmethod
-    def _eligible_workers(scheduler, identity: str, now: float) -> int:
+    def _external_ready_worker_ids(scheduler) -> frozenset[str] | None:
+        provider = getattr(scheduler, "external_ready_worker_ids", None)
+        if not callable(provider):
+            return None
+        try:
+            workers = provider()
+        except Exception:
+            logger.warning("Unable to read authoritative v3 membership for contribution")
+            return frozenset()
+        return None if workers is None else frozenset(str(worker) for worker in workers)
+
+    @classmethod
+    def _eligible_workers(cls, scheduler, identity: str, now: float) -> int:
         if scheduler is None:
             return 0
         timeout = max(0.0, float(getattr(scheduler, "heartbeat_timeout", 0.0)))
+        external_workers = cls._external_ready_worker_ids(scheduler)
+        candidates = (
+            scheduler.node_manager.nodes
+            if external_workers is not None
+            else scheduler.node_manager.active_nodes
+        )
         workers = 0
-        for node in scheduler.node_manager.active_nodes:
+        for node in candidates:
             if getattr(node, "account_hash", None) != identity:
                 continue
             if not node_is_routable(node):
                 continue
-            start = getattr(node, "start_layer", None)
-            end = getattr(node, "end_layer", None)
-            if start is None or end is None or int(end) <= int(start):
-                continue
+            report = getattr(node, "swarm_v3", None)
+            autonomous = bool(
+                getattr(node, "uses_autonomous_placement", False)
+                or (
+                    isinstance(report, dict)
+                    and report.get("placement_mode") == "autonomous"
+                )
+            )
+            if autonomous:
+                if external_workers is None or str(node.node_id) not in external_workers:
+                    continue
+                if not isinstance(report, dict) or report.get("state") != "ready":
+                    continue
+                try:
+                    advertisement = ModelMemberAdvertisement.model_validate(
+                        report.get("advertisement")
+                    )
+                except Exception:
+                    continue
+                if (
+                    advertisement.offer.worker_id != str(node.node_id)
+                    or advertisement.lease.worker_id != str(node.node_id)
+                    or advertisement.lease.state is not SpanState.READY
+                ):
+                    continue
+            else:
+                start = getattr(node, "start_layer", None)
+                end = getattr(node, "end_layer", None)
+                if start is None or end is None or int(end) <= int(start):
+                    continue
             # Current schedulers decide from a monotonic adaptive detector.
             # Keep the wall-clock timeout only for legacy projections that do
             # not expose liveness, avoiding false gate closure after an OS clock
@@ -143,7 +189,15 @@ class ContributionGate:
             reason = "missing_credential" if not credential else "invalid_credential"
             return ContributionStatus(False, reason)
 
-        serving_ready = bool(scheduler is not None and scheduler.serving_ready())
+        product_ready = getattr(scheduler, "product_serving_ready", None)
+        serving_ready = bool(
+            scheduler is not None
+            and (
+                product_ready()
+                if callable(product_ready)
+                else scheduler.serving_ready()
+            )
+        )
         eligible = self._eligible_workers(scheduler, identity, time.time())
         with self._lock:
             active = self._active_requests.get(identity, 0)

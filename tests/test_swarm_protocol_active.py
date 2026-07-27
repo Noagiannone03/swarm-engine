@@ -16,6 +16,7 @@ from swarm_protocol.contracts import (
     RouteStage,
 )
 from swarm_protocol.coordinator import CommittedRoute
+from swarm_protocol.routing import NoFeasibleRoute
 
 SWARM_ID = "40" * 32
 COORDINATOR_ID = "10" * 32
@@ -34,6 +35,7 @@ class FakePlanner:
 
     def __init__(self):
         self.epochs = []
+        self.fail_planning = False
 
     def ready_model_swarm_id(self, nodes):
         assert nodes
@@ -70,6 +72,8 @@ class FakePlanner:
         plan_expires_at_ms,
     ):
         del nodes
+        if self.fail_planning:
+            raise NoFeasibleRoute("no complete route")
         self.epochs.append(epoch)
         primary = RoutePlan(
             request_id=request.request_id,
@@ -86,7 +90,7 @@ class FakePlanner:
                     hosted_span=LayerSpan(start=0, end=2),
                     effective_span=LayerSpan(start=0, end=2),
                     path_to_next=PathKind.DIRECT,
-                    rounded_context_tokens=128,
+                    rounded_context_tokens=max(128, request.required_context_tokens),
                     exact_kv_bytes=1024,
                 ),
             ),
@@ -106,7 +110,10 @@ class FakePlanner:
                             hosted_span=LayerSpan(start=0, end=2),
                             effective_span=LayerSpan(start=0, end=2),
                             path_to_next=PathKind.DIRECT,
-                            rounded_context_tokens=128,
+                            rounded_context_tokens=max(
+                                128,
+                                request.required_context_tokens,
+                            ),
                             exact_kv_bytes=1024,
                         ),
                     ),
@@ -216,6 +223,25 @@ def test_active_runtime_routes_only_after_complete_reservation():
         assert not active.is_active("request")
         assert active.authority("request") is None
         assert len(coordinator.released) == 1
+    finally:
+        active.close()
+
+
+def test_readiness_probe_plans_without_reserving_or_advancing_epoch():
+    now = [1_000]
+    active, planner, coordinator, _ = runtime(now)
+    try:
+        assert active.route_available(16_384)
+        assert planner.epochs == [0]
+        assert coordinator.reserved == []
+
+        # The bounded cache avoids rebuilding the same large DHT graph for
+        # every IDE status poll.
+        planner.fail_planning = True
+        assert active.route_available(16_384)
+        now[0] += 1_001
+        assert not active.route_available(16_384)
+        assert coordinator.reserved == []
     finally:
         active.close()
 

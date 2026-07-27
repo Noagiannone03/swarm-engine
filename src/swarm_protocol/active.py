@@ -18,6 +18,7 @@ from swarm_protocol.coordinator import (
     RouteReservationError,
 )
 from swarm_protocol.epochs import EpochAllocator, InMemoryEpochAllocator
+from swarm_protocol.routing import RoutePlanningError
 from swarm_protocol.shadow import SchedulerProtocolV3Shadow
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,7 @@ class ActiveRouteRuntime:
         self._request_locks: dict[str, threading.Lock] = {}
         self._failures: deque[dict[str, object]] = deque(maxlen=64)
         self._recovery_degradations: deque[dict[str, object]] = deque(maxlen=64)
+        self._readiness_cache: dict[int, tuple[int, bool]] = {}
         self._lock = threading.RLock()
         self._capacity_changed = threading.Condition(self._lock)
         self._stop_event = threading.Event()
@@ -228,6 +230,47 @@ class ActiveRouteRuntime:
             with self._lock:
                 self._routes[request_key] = active
             return tuple(stage.worker_id for stage in active.committed.plan.stages)
+
+    def route_available(self, required_context_tokens: int) -> bool:
+        """Probe one complete DHT route without reserving capacity or burning an epoch."""
+
+        required = int(required_context_tokens)
+        if required < 2:
+            raise ValueError("readiness probe requires at least two context tokens")
+        now_steady_ms = self._steady_now_ms()
+        with self._lock:
+            cached = self._readiness_cache.get(required)
+            if cached is not None and now_steady_ms - cached[0] <= 1_000:
+                return cached[1]
+
+        output_tokens = min(4_096, required - 1)
+        prompt_tokens = required - output_tokens
+        nodes = self.nodes_provider()
+        try:
+            model_swarm_id = self.planner.ready_model_swarm_id(nodes)
+            request = RequestContract(
+                request_id=f"readiness-{required}-{now_steady_ms}",
+                model_swarm_id=model_swarm_id,
+                prompt_tokens=prompt_tokens,
+                reserved_output_tokens=output_tokens,
+                recovery_level=RecoveryLevel.RESTARTABLE,
+            )
+            now_ms = self._now_ms()
+            self.planner.plan_request(
+                nodes,
+                request=request,
+                coordinator_id=self.transport.peer_id(),
+                epoch=self.epoch_allocator.current(),
+                reservation_deadline_ms=now_ms + self.prepare_ttl_ms,
+                plan_expires_at_ms=now_ms + self.plan_ttl_ms,
+            )
+        except RoutePlanningError:
+            available = False
+        else:
+            available = True
+        with self._lock:
+            self._readiness_cache[required] = (now_steady_ms, available)
+        return available
 
     def is_active(self, request_id: str) -> bool:
         with self._lock:

@@ -3,6 +3,17 @@ from types import SimpleNamespace
 
 from backend.server.contribution_gate import ContributionGate, account_hash
 from backend.server.rpc_connection_handler import node_log_summary
+from swarm_protocol import (
+    BackendKind,
+    EffectiveSpanMode,
+    KvGeometry,
+    LayerSpan,
+    ModelMemberAdvertisement,
+    SpanLease,
+    SpanState,
+    WorkerOffer,
+    WorkerRole,
+)
 
 
 CREDENTIAL = "ab" * 32
@@ -31,6 +42,57 @@ def scheduler(*nodes, serving=True, timeout=30):
         node_manager=SimpleNamespace(active_nodes=list(nodes)),
         heartbeat_timeout=timeout,
         serving_ready=lambda: serving,
+    )
+
+
+def autonomous_worker(credential=CREDENTIAL, *, state="ready"):
+    now_ms = time.time_ns() // 1_000_000
+    worker_id = "autonomous-worker"
+    advertisement = ModelMemberAdvertisement(
+        offer=WorkerOffer(
+            worker_id=worker_id,
+            endpoint_id=worker_id,
+            runtime_version="test",
+            platform="test",
+            backend=BackendKind.MLX,
+            stable_memory_envelope_bytes=1_000_000,
+            supported_roles=frozenset({WorkerRole.EXECUTOR, WorkerRole.FRONTEND}),
+            offer_seq=1,
+            issued_at_ms=now_ms,
+            expires_at_ms=now_ms + 60_000,
+        ),
+        lease=SpanLease(
+            model_swarm_id="11" * 32,
+            worker_id=worker_id,
+            hosted_span=LayerSpan(start=0, end=1),
+            effective_span_mode=EffectiveSpanMode.FIXED,
+            state=SpanState.READY,
+            weight_hashes=("22" * 32,),
+            kv_geometry=KvGeometry(
+                block_size_tokens=16,
+                bytes_per_token_by_layer=(16,),
+                allocatable_bytes=1_000_000,
+            ),
+            available_kv_bytes_snapshot=1_000_000,
+            max_sessions=1,
+            lease_seq=1,
+            issued_at_ms=now_ms,
+            expires_at_ms=now_ms + 60_000,
+        ),
+    )
+    return SimpleNamespace(
+        node_id=worker_id,
+        account_hash=account_hash(credential),
+        is_active=True,
+        liveness_state="healthy",
+        uses_autonomous_placement=True,
+        last_heartbeat=time.time(),
+        effective_kv_cache_token_capacity=32_768,
+        swarm_v3={
+            "placement_mode": "autonomous",
+            "state": state,
+            "advertisement": advertisement.model_dump(mode="json"),
+        },
     )
 
 
@@ -78,6 +140,39 @@ def test_complete_swarm_is_a_separate_admission_precondition(monkeypatch):
     assert status.allowed is False
     assert status.reason == "swarm_not_ready"
     assert status.eligible_workers == 1
+
+
+def test_autonomous_contributor_is_bound_to_ready_dht_membership(monkeypatch):
+    monkeypatch.setenv("FABI_GATE", "on")
+    gate = ContributionGate()
+    node = autonomous_worker()
+    live_ids = {node.node_id}
+    sched = SimpleNamespace(
+        node_manager=SimpleNamespace(nodes=[node], active_nodes=[]),
+        heartbeat_timeout=30,
+        external_ready_worker_ids=lambda: frozenset(live_ids),
+        product_serving_ready=lambda: True,
+        serving_ready=lambda: False,
+    )
+
+    assert gate.status(CREDENTIAL, sched).allowed is True
+    live_ids.clear()
+    assert gate.status(CREDENTIAL, sched).reason == "no_eligible_worker"
+
+
+def test_autonomous_contributor_must_publish_verified_ready_lease(monkeypatch):
+    monkeypatch.setenv("FABI_GATE", "on")
+    gate = ContributionGate()
+    node = autonomous_worker(state="warming")
+    sched = SimpleNamespace(
+        node_manager=SimpleNamespace(nodes=[node], active_nodes=[]),
+        heartbeat_timeout=30,
+        external_ready_worker_ids=lambda: frozenset({node.node_id}),
+        product_serving_ready=lambda: True,
+        serving_ready=lambda: False,
+    )
+
+    assert gate.status(CREDENTIAL, sched).reason == "no_eligible_worker"
 
 
 def test_one_concurrent_request_per_ready_worker(monkeypatch):

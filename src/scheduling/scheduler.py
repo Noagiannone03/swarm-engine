@@ -172,6 +172,8 @@ class Scheduler:
         self._bootstrapped_event: threading.Event = threading.Event()
         self._admission_paused: bool = False
         self.external_routes_active: Callable[[], bool] | None = None
+        self.external_ready_worker_ids: Callable[[], frozenset[str] | None] | None = None
+        self.external_serving_ready: Callable[[], bool] | None = None
         # Engine construction parameters are immutable in upstream Parallax,
         # vLLM and SGLang.  Keep the negotiated wire contract monotonic within
         # one allocation generation: compatibility may force it down, but a
@@ -317,6 +319,19 @@ class Scheduler:
             and self.request_router.routing_ready()
             and self.runtime_memory_contract_ready()
         )
+
+    def product_serving_ready(self) -> bool:
+        """Whether either compatibility routing or a complete v3 DHT route is ready."""
+
+        if self.serving_ready():
+            return True
+        if self.external_serving_ready is None:
+            return False
+        try:
+            return bool(self.external_serving_ready())
+        except Exception:
+            logger.warning("External v3 readiness probe failed", exc_info=True)
+            return False
 
     def runtime_memory_contract_ready(self) -> bool:
         """Require executor-measured KV geometry to satisfy the selected plan."""

@@ -376,6 +376,49 @@ def test_active_v3_mode_fails_closed_without_verified_planner(monkeypatch):
         manager._start_active_v3_routes()
 
 
+def test_active_v3_mode_wires_dht_liveness_and_product_readiness(monkeypatch):
+    monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
+    planner = SimpleNamespace(
+        mode="active",
+        live_worker_ids=lambda: frozenset({"worker"}),
+        ready_worker_ids=lambda: frozenset({"worker"}),
+    )
+    active = SimpleNamespace(
+        has_active_routes=lambda: False,
+        route_available=lambda required: required == 16_384,
+        close=lambda: None,
+    )
+    scheduler = SimpleNamespace(
+        swarm_v3_shadow=planner,
+        node_manager=SimpleNamespace(nodes=[]),
+        layer_allocator=SimpleNamespace(planning_context_tokens=16_384),
+        external_routes_active=None,
+        external_ready_worker_ids=None,
+        external_serving_ready=None,
+    )
+    manager = SchedulerManage()
+    manager.scheduler = scheduler
+    manager.iroh_transport = SimpleNamespace()
+    monkeypatch.setattr(
+        scheduler_manage_module,
+        "ActiveRouteRuntime",
+        lambda **_kwargs: active,
+    )
+
+    manager._start_active_v3_routes()
+
+    assert scheduler.external_ready_worker_ids() == frozenset({"worker"})
+    assert scheduler.external_serving_ready() is True
+    assert scheduler.external_routes_active() is False
+
+
+def test_scheduler_status_accepts_product_ready_v3_route():
+    manager = SchedulerManage()
+    manager.scheduler = SimpleNamespace(product_serving_ready=lambda: True)
+
+    assert manager.get_schedule_status() == "available"
+
+
 def test_active_v3_scheduler_requires_persistent_epoch_storage(monkeypatch):
     monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
     monkeypatch.delenv("FABI_SWARM_V3_EPOCH_DB", raising=False)
