@@ -67,6 +67,7 @@ from swarm_protocol.worker_integration import (
 )
 from swarm_protocol.worker_placement import (
     AutonomousWorkerPlacement,
+    autonomous_peer_topology,
     autonomous_context_tiers,
 )
 
@@ -918,6 +919,7 @@ class GradientServer:
         self.connection_handler = None
         self.outbound_peer_ids = []
         self.authorized_link_peer_ids = []
+        self._authorized_link_peer_id_set = set()
         self.direct_peer_ids = []
         self.reachable_peer_ids = []
         self.relayed_peer_ids = []
@@ -1038,6 +1040,7 @@ class GradientServer:
                     state_publisher=self.swarm_v3_reporter,
                     reload_target=self._apply_v3_span_reload,
                     current_span=None,
+                    topology_observer=self._observe_autonomous_topology,
                 )
                 self.swarm_v3_placement_controller = controller
                 offer = None
@@ -1452,7 +1455,8 @@ class GradientServer:
             notify_url=self.notify_url,
             iroh_transport=self.iroh_transport,
             execution_admission=self.swarm_v3_execution_admission,
-            link_probe_authorizer=lambda peer_id: peer_id in self.authorized_link_peer_ids,
+            link_probe_authorizer=lambda peer_id: peer_id
+            in self._authorized_link_peer_id_set,
             link_probe_idle=self._link_probe_idle,
         )  # thread
         if self.iroh_transport is not None:
@@ -1494,6 +1498,10 @@ class GradientServer:
 
     def _update_outbound_peers(self, allocation):
         """Store scheduler-selected candidates for this shard's next stage."""
+        if self.swarm_v3_placement_mode == "autonomous":
+            # V3 peers are derived from signed model membership snapshots.
+            # An empty legacy scheduler allocation must never erase them.
+            return
         peers = allocation.get("outbound_peer_ids") if isinstance(allocation, dict) else None
         if peers is not None:
             outbound_peer_ids = sorted(
@@ -1526,6 +1534,55 @@ class GradientServer:
         if authorized is not None:
             self.authorized_link_peer_ids = sorted(
                 {str(peer_id) for peer_id in authorized if str(peer_id) != self.lattica.peer_id()}
+            )
+            self._authorized_link_peer_id_set = set(self.authorized_link_peer_ids)
+
+    def _observe_autonomous_topology(self, snapshot) -> None:
+        """Project one verified DHT snapshot onto the bounded probe graph."""
+
+        if self.swarm_v3_placement_mode != "autonomous" or self.lattica is None:
+            return
+        manifests = tuple(snapshot.manifests)
+        if len(manifests) != 1:
+            raise RuntimeError("autonomous topology requires one model-specific snapshot")
+        topology = autonomous_peer_topology(
+            snapshot,
+            worker_id=self.lattica.peer_id(),
+            model_num_layers=manifests[0].num_layers,
+        )
+        with self.link_topology_lock:
+            outbound = list(topology.outbound_worker_ids)
+            retained = set(outbound)
+            changed = (
+                outbound != self.outbound_peer_ids
+                or list(topology.authorized_worker_ids) != self.authorized_link_peer_ids
+            )
+            self.outbound_peer_ids = outbound
+            self.authorized_link_peer_ids = list(topology.authorized_worker_ids)
+            self._authorized_link_peer_id_set = set(topology.authorized_worker_ids)
+            self.direct_peer_ids = sorted(retained.intersection(self.direct_peer_ids))
+            self.reachable_peer_ids = sorted(retained.intersection(self.reachable_peer_ids))
+            self.relayed_peer_ids = sorted(retained.intersection(self.relayed_peer_ids))
+            self.link_path_observed_at_ms = {
+                peer_id: measured_at_ms
+                for peer_id, measured_at_ms in self.link_path_observed_at_ms.items()
+                if peer_id in retained
+            }
+            self.link_path_rtts_ms = {
+                peer_id: rtt_ms
+                for peer_id, rtt_ms in self.link_path_rtts_ms.items()
+                if peer_id in retained
+            }
+            self.link_health_failures = {
+                peer_id: failures
+                for peer_id, failures in self.link_health_failures.items()
+                if peer_id in retained
+            }
+        if changed:
+            logger.info(
+                "Autonomous DHT topology: outbound=%s authorized_inbound=%s",
+                topology.outbound_worker_ids,
+                topology.authorized_worker_ids,
             )
 
     def _probe_outbound_peers(self):
@@ -2532,6 +2589,7 @@ class GradientServer:
                                         state_publisher=self.swarm_v3_reporter,
                                         reload_target=self._apply_v3_span_reload,
                                         current_span=advertisement.lease.hosted_span,
+                                        topology_observer=self._observe_autonomous_topology,
                                     )
                                 placement = self.swarm_v3_placement_controller.observe(
                                     advertisement=advertisement,

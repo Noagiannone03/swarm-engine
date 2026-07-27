@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 from swarm_protocol.contracts import (
@@ -20,6 +22,7 @@ from swarm_protocol.contracts import (
     SpanLease,
     SpanState,
     WorkerOffer,
+    WorkerRole,
 )
 from swarm_protocol.discovery import DiscoverySnapshot
 from swarm_protocol.execution import WorkerExecutionAdmission
@@ -31,6 +34,8 @@ from swarm_protocol.placement import (
     PlacementMaterializer,
 )
 from swarm_protocol.routing import ExactRoutePlanner, RoutePlanningError
+
+logger = logging.getLogger(__name__)
 
 
 class PlacementCatalog(Protocol):
@@ -53,6 +58,132 @@ class SpanStatePublisher(Protocol):
         advertisement: ModelMemberAdvertisement,
         state: SpanState,
     ) -> ModelMemberAdvertisement: ...
+
+
+@dataclass(frozen=True)
+class AutonomousPeerTopology:
+    """Bounded DHT-derived peers needed by one worker's serving edges.
+
+    ``outbound_worker_ids`` are actively qualified by this worker.  The
+    separate authorization set contains potential predecessors that may
+    qualify an inbound edge.  Keeping these sets distinct avoids an O(N^2)
+    active probe mesh while still allowing every adjacent pipeline edge and
+    the mandatory tail-to-head decode closure to form without scheduler-owned
+    assignments.
+    """
+
+    outbound_worker_ids: tuple[str, ...]
+    authorized_worker_ids: tuple[str, ...]
+
+
+def _can_transition(left: SpanLease, right: SpanLease) -> bool:
+    """Return whether a forward route can switch from ``left`` to ``right``."""
+
+    if left.worker_id == right.worker_id:
+        return False
+    left_span = left.hosted_span
+    right_span = right.hosted_span
+    if left.effective_span_mode is EffectiveSpanMode.FIXED:
+        transition = left_span.end
+        if right.effective_span_mode is EffectiveSpanMode.FIXED:
+            return transition == right_span.start
+        return right_span.start <= transition < right_span.end
+    if right.effective_span_mode is EffectiveSpanMode.FIXED:
+        transition = right_span.start
+        return left_span.start < transition <= left_span.end
+    # Elastic spans may meet at any strictly-progressing layer contained by
+    # the right span and reachable within the left span.
+    return max(left_span.start + 1, right_span.start) <= min(
+        left_span.end,
+        right_span.end - 1,
+    )
+
+
+def autonomous_peer_topology(
+    snapshot: DiscoverySnapshot,
+    *,
+    worker_id: str,
+    model_num_layers: int,
+    max_outbound_peers: int = 8,
+) -> AutonomousPeerTopology:
+    """Derive a sparse executable link graph from a signed DHT snapshot.
+
+    Petals discovers serving spans from its DHT and connects to the selected
+    servers on demand.  Fabi's fixed Parallax pipeline additionally needs
+    authenticated directed activation links before a request is admitted.
+    Each worker therefore qualifies only plausible successors plus the
+    tail-to-head closure, while authorizing plausible predecessors.  This is
+    worker-owned topology; the scheduler does not nominate peers.
+    """
+
+    if not worker_id:
+        raise ValueError("worker_id must not be empty")
+    if model_num_layers <= 0:
+        raise ValueError("model_num_layers must be positive")
+    if max_outbound_peers <= 0:
+        raise ValueError("max_outbound_peers must be positive")
+
+    offers = {offer.worker_id: offer for offer in snapshot.offers}
+    leases = {
+        lease.worker_id: lease
+        for lease in snapshot.leases
+        if lease.state in {SpanState.BUILDING, SpanState.READY}
+        and lease.worker_id in offers
+    }
+    current = leases.get(worker_id)
+    if current is None:
+        return AutonomousPeerTopology((), ())
+
+    others = tuple(lease for peer, lease in leases.items() if peer != worker_id)
+
+    def _rank(lease: SpanLease) -> tuple[int, int, int, str]:
+        return (
+            int(lease.state is not SpanState.READY),
+            -lease.hosted_span.end,
+            lease.hosted_span.start,
+            lease.worker_id,
+        )
+
+    successors = sorted(
+        (lease for lease in others if _can_transition(current, lease)),
+        key=_rank,
+    )
+    predecessors = {
+        lease.worker_id for lease in others if _can_transition(lease, current)
+    }
+
+    # Decode returns sampled tokens from a tail stage to a frontend-capable
+    # head.  This closure is a real directed edge in Fabi's cyclic request
+    # path, not an implicit scheduler hop.
+    heads = sorted(
+        (
+            lease
+            for lease in others
+            if lease.hosted_span.start == 0
+            and WorkerRole.FRONTEND in offers[lease.worker_id].supported_roles
+        ),
+        key=_rank,
+    )
+    tails = {
+        lease.worker_id
+        for lease in others
+        if lease.hosted_span.end == model_num_layers
+    }
+    if current.hosted_span.end == model_num_layers:
+        successors = heads + [
+            lease for lease in successors if lease.worker_id not in {x.worker_id for x in heads}
+        ]
+    if current.hosted_span.start == 0 and WorkerRole.FRONTEND in offers[worker_id].supported_roles:
+        predecessors.update(tails)
+
+    outbound = tuple(
+        dict.fromkeys(lease.worker_id for lease in successors)
+    )[:max_outbound_peers]
+    # Authorizing a signed current model member is cheap and passive.  Do not
+    # cap this set with the active probe budget: otherwise a valid predecessor
+    # could select us while being rejected solely because of local ordering.
+    authorized = tuple(sorted(predecessors))
+    return AutonomousPeerTopology(outbound, authorized)
 
 
 def autonomous_context_tiers(
@@ -93,11 +224,13 @@ class AutonomousWorkerPlacement:
         reload_target: Callable[[LayerSpan, int], None],
         current_span: LayerSpan | None = None,
         policy: AutonomousPlacementPolicy | None = None,
+        topology_observer: Callable[[DiscoverySnapshot], None] | None = None,
     ) -> None:
         self._catalog = catalog
         self._admission = admission
         self._state_publisher = state_publisher
         self._policy = policy or AutonomousPlacementPolicy()
+        self._topology_observer = topology_observer
         self._materializer = PlacementMaterializer(
             drain=admission,
             reload_target=reload_target,
@@ -391,6 +524,14 @@ class AutonomousWorkerPlacement:
             self._error = None
             self._retry_after = time.monotonic() + 2
             self._read_pending = False
+        if self._topology_observer is not None:
+            try:
+                self._topology_observer(snapshot)
+            except Exception:  # noqa: BLE001 - telemetry callback boundary
+                # Placement must continue from the verified snapshot.  The
+                # missing link will keep route admission fail-closed and a
+                # later refresh retries topology publication.
+                logger.warning("Autonomous topology projection failed", exc_info=True)
 
     def _status(self, state, *, decision: str, error) -> dict[str, object]:
         return {

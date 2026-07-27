@@ -16,6 +16,7 @@ from swarm_protocol import (
     SpanState,
     WorkerOffer,
     WorkerRole,
+    autonomous_peer_topology,
     autonomous_context_tiers,
 )
 
@@ -41,6 +42,78 @@ def test_autonomous_context_tiers_reject_non_positive_contracts():
             pass
         else:
             raise AssertionError("non-positive context tier contract was accepted")
+
+
+def test_autonomous_topology_forms_sparse_forward_edges_and_decode_closure():
+    manifest = model()
+    head = advertisement(manifest, "head", 0, 1)
+    middle = advertisement(manifest, "middle", 1, 3)
+    tail = advertisement(manifest, "tail", 3, 4)
+    unrelated = advertisement(manifest, "unrelated", 1, 2)
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(head.offer, middle.offer, tail.offer, unrelated.offer),
+        leases=(head.lease, middle.lease, tail.lease, unrelated.lease),
+        links=(),
+    )
+
+    assert autonomous_peer_topology(
+        snapshot,
+        worker_id="head",
+        model_num_layers=4,
+    ).outbound_worker_ids == ("middle", "unrelated")
+    assert autonomous_peer_topology(
+        snapshot,
+        worker_id="head",
+        model_num_layers=4,
+    ).authorized_worker_ids == ("tail",)
+    assert autonomous_peer_topology(
+        snapshot,
+        worker_id="middle",
+        model_num_layers=4,
+    ).outbound_worker_ids == ("tail",)
+    assert autonomous_peer_topology(
+        snapshot,
+        worker_id="middle",
+        model_num_layers=4,
+    ).authorized_worker_ids == ("head",)
+    assert autonomous_peer_topology(
+        snapshot,
+        worker_id="tail",
+        model_num_layers=4,
+    ).outbound_worker_ids == ("head",)
+    assert autonomous_peer_topology(
+        snapshot,
+        worker_id="tail",
+        model_num_layers=4,
+    ).authorized_worker_ids == ("middle",)
+
+
+def test_autonomous_topology_never_probes_every_non_adjacent_member():
+    manifest = model()
+    current = advertisement(manifest, "current", 0, 1)
+    non_adjacent = [
+        advertisement(manifest, f"peer-{index}", 2, 4) for index in range(20)
+    ]
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(current.offer, *(item.offer for item in non_adjacent)),
+        leases=(current.lease, *(item.lease for item in non_adjacent)),
+        links=(),
+    )
+
+    topology = autonomous_peer_topology(
+        snapshot,
+        worker_id="current",
+        model_num_layers=4,
+    )
+
+    assert topology.outbound_worker_ids == ()
+    assert set(topology.authorized_worker_ids) == {
+        item.offer.worker_id for item in non_adjacent
+    }
 
 
 def model() -> ModelManifest:
@@ -216,6 +289,34 @@ def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():
     assert ready["phase"] == "ready"
     assert ready["current_span"] == [2, 4]
     assert not admission.draining
+
+
+def test_worker_placement_delivers_verified_snapshots_to_topology_observer():
+    manifest = model()
+    current = advertisement(manifest, "current", 0, 4)
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(current.offer,),
+        leases=(current.lease,),
+        links=(),
+    )
+    observed = []
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot),
+        admission=FakeAdmission(),
+        state_publisher=FakePublisher(),
+        reload_target=lambda span, generation: None,
+        current_span=current.lease.hosted_span,
+        topology_observer=observed.append,
+    )
+
+    controller.observe(advertisement=current, manifest=manifest, context_tokens=10)
+    deadline = time.monotonic() + 1
+    while not observed and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert observed == [snapshot]
 
 
 def test_worker_placement_does_not_churn_on_disconnected_coverage():

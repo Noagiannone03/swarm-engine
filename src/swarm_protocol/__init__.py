@@ -101,7 +101,9 @@ from swarm_protocol.routing import (
     RoutePlanningError,
 )
 from swarm_protocol.worker_placement import (
+    AutonomousPeerTopology,
     AutonomousWorkerPlacement,
+    autonomous_peer_topology,
     autonomous_context_tiers,
 )
 
@@ -110,7 +112,9 @@ __all__ = [
     "ArtifactDescriptor",
     "ArtifactRole",
     "AutonomousPlacementPolicy",
+    "AutonomousPeerTopology",
     "AutonomousWorkerPlacement",
+    "autonomous_peer_topology",
     "autonomous_context_tiers",
     "BackendKind",
     "ContributionReceipt",

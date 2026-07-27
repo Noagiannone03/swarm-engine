@@ -207,6 +207,24 @@ def test_global_legacy_tier_cannot_resize_autonomous_generation():
     assert fenced == (0, 5, 32768, 11)
 
 
+def test_empty_legacy_topology_cannot_erase_autonomous_dht_peers():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.swarm_v3_placement_mode = "autonomous"
+    server.outbound_peer_ids = ["dht-successor"]
+    server.authorized_link_peer_ids = ["dht-predecessor"]
+
+    server._update_outbound_peers(
+        {"outbound_peer_ids": [], "authorized_link_peer_ids": []}
+    )
+
+    assert server.outbound_peer_ids == ["dht-successor"]
+    assert server.authorized_link_peer_ids == ["dht-predecessor"]
+
+
 def test_forward_enqueue_failure_is_not_reported_as_success():
     handler = build_forward_handler(RecordingSocket(error=RuntimeError("enqueue failed")))
     request = forward_pb2.ForwardRequest()
