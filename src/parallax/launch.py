@@ -471,6 +471,18 @@ def _wait_for_initial_layer_allocation(
         time.sleep(poll_seconds)
 
 
+def _consume_initial_autonomous_reload(shared_state: SharedState) -> bool:
+    """Consume the wake-up flag for a cold span that has never run before."""
+
+    if (
+        shared_state.get("swarm_v3_placement_phase") != "building"
+        or int(shared_state.get("swarm_v3_placement_generation", 0) or 0) <= 0
+    ):
+        return False
+    shared_state.set("_layer_allocation_changed", False)
+    return True
+
+
 def _build_memory_pressure_guards():
     """Create host-RAM and CUDA-VRAM guards from maintained OS/runtime APIs."""
 
@@ -668,6 +680,10 @@ if __name__ == "__main__":
 
             # Get layer allocation from shared state
             _update_args_from_shared_state(args, shared_state, force_update=False)
+            # A cold join has no previous executor generation to stop. The
+            # controller uses this flag to wake the initial wait above; consume
+            # it before starting the selected span.
+            _consume_initial_autonomous_reload(shared_state)
 
             logger.debug(
                 f"Start Executor with start_layer: {args.start_layer}, end_layer: {args.end_layer}, "

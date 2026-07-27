@@ -2212,16 +2212,7 @@ class GradientServer:
                                 logger.warning(
                                     f"Heartbeat: No layer allocation received yet, response: {response}"
                                 )
-                                self.status = ServerState.JOINING
-                                if self.swarm_v3_placement_mode != "autonomous":
-                                    self.model_name = None
-                                if self._shared_state is not None:
-                                    self._shared_state.set_status(self.status.value)
-                                    self._shared_state.update_metrics(current_requests=0)
-                                    self._shared_state.set("model_name", None)
-                                logger.debug(
-                                    "Status set to JOINING and model_name to None because no valid layer allocation received yet."
-                                )
+                                self._handle_empty_scheduler_allocation()
                             if refit_message and isinstance(refit_message, dict):
                                 if self.enable_weight_refit:
                                     logger.info("Server begin weight refit process.")
@@ -2279,6 +2270,26 @@ class GradientServer:
                 return shared_status
         # When running in same process, use local status
         return self.status.value
+
+    def _handle_empty_scheduler_allocation(self) -> None:
+        """Keep autonomous state when the legacy allocator has no response."""
+
+        if self.swarm_v3_placement_mode == "autonomous":
+            logger.debug(
+                "Ignoring an empty legacy allocation response; "
+                "worker-local v3 placement owns the serving lifecycle"
+            )
+            return
+        self.status = ServerState.JOINING
+        self.model_name = None
+        if self._shared_state is not None:
+            self._shared_state.set_status(self.status.value)
+            self._shared_state.update_metrics(current_requests=0)
+            self._shared_state.set("model_name", None)
+        logger.debug(
+            "Status set to JOINING and model_name to None because no valid "
+            "layer allocation was received."
+        )
 
     def get_node_info(self, is_update: bool = False):
         # A dedicated topology thread owns network probes. Heartbeats only read

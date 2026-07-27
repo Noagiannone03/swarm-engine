@@ -158,6 +158,33 @@ def test_autonomous_span_reload_fences_ingress_and_updates_shared_generation():
     assert values["swarm_v3_placement_phase"] == "building"
 
 
+def test_empty_legacy_response_cannot_demote_autonomous_worker():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    values = {
+        "status": ServerState.READY.value,
+        "model_name": "Qwen/Qwen3-4B",
+    }
+    server.swarm_v3_placement_mode = "autonomous"
+    server.status = ServerState.READY
+    server.model_name = "Qwen/Qwen3-4B"
+    server._shared_state = SimpleNamespace(
+        set_status=lambda value: values.update(status=value),
+        update_metrics=lambda **changes: values.update(changes),
+        set=lambda key, value: values.update({key: value}),
+    )
+
+    server._handle_empty_scheduler_allocation()
+
+    assert server.status is ServerState.READY
+    assert server.model_name == "Qwen/Qwen3-4B"
+    assert values["status"] == ServerState.READY.value
+    assert values["model_name"] == "Qwen/Qwen3-4B"
+
+
 def test_forward_enqueue_failure_is_not_reported_as_success():
     handler = build_forward_handler(RecordingSocket(error=RuntimeError("enqueue failed")))
     request = forward_pb2.ForwardRequest()

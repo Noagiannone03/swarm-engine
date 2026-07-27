@@ -7,6 +7,7 @@ import pytest
 from parallax.launch import (
     MemoryPressureGuard,
     _build_memory_pressure_guards,
+    _consume_initial_autonomous_reload,
     _prepare_engine_core_generation,
     _update_args_from_shared_state,
     _wait_executors_check_layer_change,
@@ -92,6 +93,28 @@ def test_initial_allocation_operator_deadline_is_optional(monkeypatch):
             timeout_seconds=1,
             poll_seconds=0,
         )
+
+
+def test_cold_join_consumes_only_its_initial_reload_wakeup():
+    cold = SharedState(
+        {
+            "swarm_v3_placement_phase": "building",
+            "swarm_v3_placement_generation": 1,
+            "_layer_allocation_changed": True,
+        }
+    )
+    legacy = SharedState(
+        {
+            "swarm_v3_placement_phase": "legacy",
+            "swarm_v3_placement_generation": 0,
+            "_layer_allocation_changed": True,
+        }
+    )
+
+    assert _consume_initial_autonomous_reload(cold) is True
+    assert cold.get_layer_allocation_changed() is False
+    assert _consume_initial_autonomous_reload(legacy) is False
+    assert legacy.get_layer_allocation_changed() is True
 
 
 def test_scheduler_model_name_is_kept_as_alias_for_local_weights():
