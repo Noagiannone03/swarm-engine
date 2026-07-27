@@ -71,7 +71,14 @@ class RouteReservationCoordinator:
         return now
 
     def _stub(self, stage: RouteStage):
-        return self.transport.stub(stage.endpoint_id, WorkerExecutionControlService)
+        stub = self.transport.stub(stage.endpoint_id, WorkerExecutionControlService)
+        with_timeout = getattr(stub, "with_timeout", None)
+        if with_timeout is not None:
+            # Future.result(timeout=...) only bounds the local waiter. Bound the
+            # underlying QUIC request as well so a timed-out mutation cannot be
+            # applied minutes later after a route has already been fenced.
+            stub = with_timeout(self.command_ttl_ms / 1000)
+        return stub
 
     def _verify_lease(
         self,
@@ -107,19 +114,27 @@ class RouteReservationCoordinator:
     def _resolve_all(
         self,
         pending: list[tuple[RouteStage, Future | object]],
+        *,
+        operation: str,
     ) -> list[tuple[RouteStage, object]]:
+        deadline = time.monotonic() + self.command_ttl_ms / 1000
         resolved = []
         for stage, result in pending:
-            resolved.append(
-                (
-                    stage,
-                    (
-                        result.result(timeout=self.command_ttl_ms / 1000)
-                        if hasattr(result, "result")
-                        else result
-                    ),
+            try:
+                value = (
+                    result.result(timeout=max(0.0, deadline - time.monotonic()))
+                    if hasattr(result, "result")
+                    else result
                 )
-            )
+            except TimeoutError as exc:
+                raise RouteReservationError(
+                    f"{operation} timed out waiting for worker {stage.worker_id}"
+                ) from exc
+            except Exception as exc:
+                raise RouteReservationError(
+                    f"{operation} failed on worker {stage.worker_id}: {exc}"
+                ) from exc
+            resolved.append((stage, value))
         return resolved
 
     def _command(
@@ -173,7 +188,7 @@ class RouteReservationCoordinator:
             )
             for stage in stages
         ]
-        return self._resolve_all(pending)
+        return self._resolve_all(pending, operation=action.value)
 
     def reserve(self, plan: RoutePlan) -> CommittedRoute:
         """Prepare every stage, then commit every stage before returning traffic authority."""
@@ -197,7 +212,7 @@ class RouteReservationCoordinator:
                 )
                 for stage in plan.stages
             ]
-            for stage, raw in self._resolve_all(pending):
+            for stage, raw in self._resolve_all(pending, operation="prepare"):
                 self._verify_lease(
                     raw,
                     stage=stage,

@@ -15,6 +15,7 @@ from swarm_protocol.coordinator import (
     CommittedRoute,
     ControlTransport,
     RouteReservationCoordinator,
+    RouteReservationError,
 )
 from swarm_protocol.epochs import EpochAllocator, InMemoryEpochAllocator
 from swarm_protocol.shadow import SchedulerProtocolV3Shadow
@@ -26,11 +27,18 @@ def _system_clock_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+def _steady_clock_ms() -> int:
+    return time.monotonic_ns() // 1_000_000
+
+
 @dataclass
 class _ActiveRoute:
     committed: CommittedRoute
     active: bool = True
     next_renew_at_ms: int = 0
+    lease_deadline_ms: int = 0
+    consecutive_renewal_failures: int = 0
+    last_renewal_error: str | None = None
     operation_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -39,7 +47,9 @@ class ActiveRouteRuntime:
 
     The maintenance thread is intentionally independent of HTTP streaming and
     worker status RPCs. A long prefill therefore cannot starve reservation
-    renewal. Any failed renewal fences the route out of the data plane.
+    renewal. Transient renewal failures are retried only while the last
+    acknowledged lease is still provably valid; expiry or worker departure
+    fences the route out of the data plane.
     """
 
     def __init__(
@@ -49,10 +59,13 @@ class ActiveRouteRuntime:
         transport: ControlTransport,
         nodes_provider: Callable[[], list[Any]],
         clock_ms: Callable[[], int] = _system_clock_ms,
+        steady_clock_ms: Callable[[], int] = _steady_clock_ms,
         prepare_ttl_ms: int = 5_000,
         plan_ttl_ms: int = 10_000,
         session_ttl_ms: int = 60_000,
         renew_interval_ms: int = 20_000,
+        renew_retry_interval_ms: int = 2_000,
+        lease_expiry_guard_ms: int = 1_000,
         coordinator: RouteReservationCoordinator | None = None,
         epoch_allocator: EpochAllocator | None = None,
     ) -> None:
@@ -62,17 +75,33 @@ class ActiveRouteRuntime:
             raise ValueError("plan TTL must be greater than the positive prepare TTL")
         if renew_interval_ms <= 0 or session_ttl_ms <= renew_interval_ms * 2:
             raise ValueError("session TTL must exceed two renewal intervals")
+        if renew_retry_interval_ms <= 0 or renew_retry_interval_ms >= renew_interval_ms:
+            raise ValueError("renew retry interval must be positive and below renew interval")
+        if lease_expiry_guard_ms <= 0:
+            raise ValueError("lease expiry guard must be positive")
         self.planner = planner
         self.transport = transport
         self.nodes_provider = nodes_provider
         self._clock_ms = clock_ms
+        self._steady_clock_ms = steady_clock_ms
         self.prepare_ttl_ms = prepare_ttl_ms
         self.plan_ttl_ms = plan_ttl_ms
         self.session_ttl_ms = session_ttl_ms
         self.renew_interval_ms = renew_interval_ms
+        self.renew_retry_interval_ms = renew_retry_interval_ms
+        self.lease_expiry_guard_ms = lease_expiry_guard_ms
         self.coordinator = coordinator or RouteReservationCoordinator(
             transport, clock_ms=clock_ms, session_ttl_ms=session_ttl_ms
         )
+        self._renew_attempt_budget_ms = int(
+            getattr(self.coordinator, "command_ttl_ms", prepare_ttl_ms)
+        )
+        if (
+            self._renew_attempt_budget_ms <= 0
+            or session_ttl_ms
+            <= self._renew_attempt_budget_ms + self.lease_expiry_guard_ms
+        ):
+            raise ValueError("session TTL leaves no safe renewal retry window")
         self.epoch_allocator = epoch_allocator or InMemoryEpochAllocator()
         self._routes: dict[str, _ActiveRoute] = {}
         self._request_locks: dict[str, threading.Lock] = {}
@@ -91,6 +120,12 @@ class ActiveRouteRuntime:
         now = int(self._clock_ms())
         if now < 0:
             raise RuntimeError("active route clock returned a negative timestamp")
+        return now
+
+    def _steady_now_ms(self) -> int:
+        now = int(self._steady_clock_ms())
+        if now < 0:
+            raise RuntimeError("active route steady clock returned a negative timestamp")
         return now
 
     def reserve(
@@ -134,9 +169,25 @@ class ActiveRouteRuntime:
                 reservation_deadline_ms=now_ms + self.prepare_ttl_ms,
                 plan_expires_at_ms=now_ms + self.plan_ttl_ms,
             )
+            # Measure lease safety against the coordinator's monotonic progress,
+            # not worker-produced wall-clock timestamps. Starting the local
+            # deadline before the RPC is conservative: the worker can only
+            # install its full TTL after this point.
+            lease_started_at_ms = self._steady_now_ms()
+            committed = self.coordinator.reserve(planned.plan)
+            acknowledged_at_ms = self._steady_now_ms()
+            lease_deadline_ms = lease_started_at_ms + self.session_ttl_ms
+            if acknowledged_at_ms >= lease_deadline_ms - self.lease_expiry_guard_ms:
+                try:
+                    self.coordinator.release(committed)
+                finally:
+                    raise RouteReservationError(
+                        "route session lease was acknowledged too close to expiry"
+                    )
             active = _ActiveRoute(
-                committed=self.coordinator.reserve(planned.plan),
-                next_renew_at_ms=self._now_ms() + self.renew_interval_ms,
+                committed=committed,
+                next_renew_at_ms=acknowledged_at_ms + self.renew_interval_ms,
+                lease_deadline_ms=lease_deadline_ms,
             )
             with self._lock:
                 self._routes[request_key] = active
@@ -145,18 +196,30 @@ class ActiveRouteRuntime:
     def is_active(self, request_id: str) -> bool:
         with self._lock:
             route = self._routes.get(str(request_id))
-            return route is not None and route.active
+            return (
+                route is not None
+                and route.active
+                and self._steady_now_ms() < route.lease_deadline_ms
+            )
 
     def has_active_routes(self) -> bool:
         with self._lock:
-            return any(route.active for route in self._routes.values())
+            now_ms = self._steady_now_ms()
+            return any(
+                route.active and now_ms < route.lease_deadline_ms
+                for route in self._routes.values()
+            )
 
     def authority(self, request_id: str) -> dict[str, object] | None:
         """Return the immutable data-plane fence for one active request."""
 
         with self._lock:
             route = self._routes.get(str(request_id))
-            if route is None or not route.active:
+            if (
+                route is None
+                or not route.active
+                or self._steady_now_ms() >= route.lease_deadline_ms
+            ):
                 return None
             plan = route.committed.plan
             return {
@@ -192,13 +255,21 @@ class ActiveRouteRuntime:
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
+            steady_now_ms = self._steady_now_ms()
             routes = [
                 {
                     "request_id": request_id,
                     "route_id": route.committed.plan.route_id,
                     "epoch": route.committed.plan.epoch,
                     "workers": [stage.worker_id for stage in route.committed.plan.stages],
-                    "expires_at_ms": min(lease.expires_at_ms for lease in route.committed.leases),
+                    # Remote lease timestamps use worker clocks. Expose only
+                    # the remaining duration measured by the local steady
+                    # clock, never a meaningless cross-machine wall timestamp.
+                    "lease_expires_in_ms": max(
+                        0, route.lease_deadline_ms - steady_now_ms
+                    ),
+                    "renewal_failures": route.consecutive_renewal_failures,
+                    "last_renewal_error": route.last_renewal_error,
                 }
                 for request_id, route in sorted(self._routes.items())
                 if route.active
@@ -209,6 +280,8 @@ class ActiveRouteRuntime:
                 "recent_failures": list(self._failures),
                 "session_ttl_ms": self.session_ttl_ms,
                 "renew_interval_ms": self.renew_interval_ms,
+                "renew_retry_interval_ms": self.renew_retry_interval_ms,
+                "lease_expiry_guard_ms": self.lease_expiry_guard_ms,
             }
 
     def close(self) -> None:
@@ -244,7 +317,7 @@ class ActiveRouteRuntime:
             }
         with self._lock:
             routes = list(self._routes.items())
-        now_ms = self._now_ms()
+        now_ms = self._steady_now_ms()
         for request_id, route in routes:
             route_workers = {stage.worker_id for stage in route.committed.plan.stages}
             departed = sorted(route_workers - active_workers)
@@ -291,28 +364,79 @@ class ActiveRouteRuntime:
                     self._capacity_changed.notify_all()
 
     def _renew_one(self, request_id: str, route: _ActiveRoute) -> None:
+        renewal_error: Exception | None = None
         with route.operation_lock:
             with self._lock:
                 if self._routes.get(request_id) is not route or not route.active:
                     return
-            try:
-                renewed = self.coordinator.renew(
-                    route.committed,
-                    ttl_ms=self.session_ttl_ms,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Protocol-v3 route %s lost its session lease: %s",
-                    request_id,
-                    exc,
-                )
-                # Release outside this lock through the shared invalidation
-                # path after relinquishing the operation guard.
-                renewal_error = exc
-            else:
-                with self._lock:
-                    if self._routes.get(request_id) is route and route.active:
-                        route.committed = renewed
-                        route.next_renew_at_ms = self._now_ms() + self.renew_interval_ms
-                return
+                attempt_started_at_ms = self._steady_now_ms()
+                if (
+                    attempt_started_at_ms
+                    + self._renew_attempt_budget_ms
+                    + self.lease_expiry_guard_ms
+                    >= route.lease_deadline_ms
+                ):
+                    renewal_error = TimeoutError(
+                        "no safe lease window remains for another renewal attempt"
+                    )
+            if renewal_error is None:
+                try:
+                    renewed = self.coordinator.renew(
+                        route.committed,
+                        ttl_ms=self.session_ttl_ms,
+                    )
+                except Exception as exc:
+                    now_ms = self._steady_now_ms()
+                    with self._lock:
+                        if self._routes.get(request_id) is not route or not route.active:
+                            return
+                        route.consecutive_renewal_failures += 1
+                        route.last_renewal_error = f"{type(exc).__name__}: {exc}"[:256]
+                        safe_retry_deadline = (
+                            route.lease_deadline_ms
+                            - self._renew_attempt_budget_ms
+                            - self.lease_expiry_guard_ms
+                        )
+                        if now_ms + self.renew_retry_interval_ms < safe_retry_deadline:
+                            route.next_renew_at_ms = (
+                                now_ms + self.renew_retry_interval_ms
+                            )
+                            logger.warning(
+                                "Protocol-v3 route %s lease renewal failed "
+                                "(attempt %d); retrying before acknowledged expiry: %s",
+                                request_id,
+                                route.consecutive_renewal_failures,
+                                exc,
+                            )
+                            return
+                    renewal_error = exc
+                else:
+                    acknowledged_at_ms = self._steady_now_ms()
+                    with self._lock:
+                        if self._routes.get(request_id) is not route or not route.active:
+                            return
+                        if (
+                            acknowledged_at_ms
+                            >= route.lease_deadline_ms - self.lease_expiry_guard_ms
+                        ):
+                            renewal_error = TimeoutError(
+                                "lease renewal acknowledgement arrived after the safe deadline"
+                            )
+                        else:
+                            route.committed = renewed
+                            route.lease_deadline_ms = (
+                                attempt_started_at_ms + self.session_ttl_ms
+                            )
+                            route.next_renew_at_ms = (
+                                acknowledged_at_ms + self.renew_interval_ms
+                            )
+                            route.consecutive_renewal_failures = 0
+                            route.last_renewal_error = None
+                            return
+        assert renewal_error is not None
+        logger.error(
+            "Protocol-v3 route %s lost its session lease: %s",
+            request_id,
+            renewal_error,
+        )
         self._invalidate(request_id, route, renewal_error)

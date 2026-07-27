@@ -152,6 +152,11 @@ class AdmissionStub:
         self.admission = admission
         self.fail_prepare = fail_prepare
         self.fail_commit = fail_commit
+        self.native_timeouts = []
+
+    def with_timeout(self, timeout_seconds):
+        self.native_timeouts.append(timeout_seconds)
+        return self
 
     @staticmethod
     def _future(function):
@@ -252,7 +257,11 @@ def test_coordinator_commits_and_releases_every_stage():
         ReservationState.COMMITTED,
     ]
     assert {lease.expires_at_ms for lease in committed.leases} == {61_000}
+    assert transport.stubs[HEAD_ENDPOINT].native_timeouts == [5.0, 5.0, 5.0]
+    assert transport.stubs[TAIL_ENDPOINT].native_timeouts == [5.0, 5.0, 5.0]
     coordinator.release(committed)
+    assert transport.stubs[HEAD_ENDPOINT].native_timeouts == [5.0, 5.0, 5.0, 5.0]
+    assert transport.stubs[TAIL_ENDPOINT].native_timeouts == [5.0, 5.0, 5.0, 5.0]
     assert head.snapshot()[0].state == ReservationState.RELEASED
     assert tail.snapshot()[0].state == ReservationState.RELEASED
 
@@ -312,3 +321,37 @@ def test_route_coordinator_identity_is_fenced_before_any_rpc():
 
     assert head.snapshot() == ()
     assert tail.snapshot() == ()
+
+
+def test_parallel_results_share_one_command_deadline(monkeypatch):
+    now = [1_000]
+    head, tail = lab(now)
+    coordinator = RouteReservationCoordinator(
+        InProcessTransport(
+            {
+                HEAD_ENDPOINT: AdmissionStub(head),
+                TAIL_ENDPOINT: AdmissionStub(tail),
+            }
+        ),
+        clock_ms=lambda: now[0],
+        command_ttl_ms=5_000,
+    )
+    observed_timeouts = []
+
+    class RecordingFuture:
+        def result(self, *, timeout):
+            observed_timeouts.append(timeout)
+            return object()
+
+    monotonic = iter((10.0, 10.0, 12.0))
+    monkeypatch.setattr("swarm_protocol.coordinator.time.monotonic", lambda: next(monotonic))
+
+    coordinator._resolve_all(
+        [
+            (route(now[0]).stages[0], RecordingFuture()),
+            (route(now[0]).stages[1], RecordingFuture()),
+        ],
+        operation="prepare",
+    )
+
+    assert observed_timeouts == [5.0, 3.0]

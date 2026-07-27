@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 import time
 import urllib.error
@@ -41,6 +42,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sentinel", default=DEFAULT_SENTINEL)
     parser.add_argument("--expect-http", type=int, default=200)
     parser.add_argument(
+        "--bearer-token-file",
+        help=(
+            "Read the HTTP bearer credential from this file. Use '-' to read one line "
+            "from stdin. The credential is never printed or placed in the process arguments."
+        ),
+    )
+    parser.add_argument(
         "--allow-tokenizer-download",
         action="store_true",
         help="Allow AutoTokenizer to contact Hugging Face instead of requiring its local cache.",
@@ -52,6 +60,20 @@ def parse_args() -> argparse.Namespace:
     if not 100 <= args.expect_http <= 599:
         parser.error("--expect-http must be a valid HTTP status")
     return args
+
+
+def read_bearer_token(path: str | None) -> str | None:
+    """Read an optional bearer credential without accepting it on the command line."""
+
+    if path is None:
+        return None
+    raw = sys.stdin.readline() if path == "-" else Path(path).read_text(encoding="utf-8")
+    token = raw.strip()
+    if not token:
+        raise ValueError("bearer token file is empty")
+    if "\r" in token or "\n" in token:
+        raise ValueError("bearer token must be a single line")
+    return token
 
 
 def tool_schemas() -> list[dict[str, Any]]:
@@ -207,11 +229,20 @@ def calibrate(tokenizer: Any, target: int, sentinel: str) -> CalibratedRequest:
     raise RuntimeError(f"unable to calibrate exact prompt size; last measurement was {measured}")
 
 
-def post_json(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, Any]:
+def post_json(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float,
+    *,
+    bearer_token: str | None = None,
+) -> tuple[int, Any]:
+    headers = {"Content-Type": "application/json"}
+    if bearer_token is not None:
+        headers["Authorization"] = f"Bearer {bearer_token}"
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -228,6 +259,11 @@ def post_json(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, A
 
 def main() -> int:
     args = parse_args()
+    try:
+        bearer_token = read_bearer_token(args.bearer_token_file)
+    except (OSError, ValueError) as exc:
+        print(f"unable to read bearer credential: {exc}", file=sys.stderr)
+        return 2
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
         local_files_only=not args.allow_tokenizer_download,
@@ -262,6 +298,7 @@ def main() -> int:
             f"{args.url.rstrip('/')}/v1/chat/completions",
             payload,
             args.timeout,
+            bearer_token=bearer_token,
         )
         elapsed = time.perf_counter() - started
         content = ""

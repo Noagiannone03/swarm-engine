@@ -116,7 +116,7 @@ class FakeCoordinator:
         self.released.append(route)
 
 
-def runtime(now, *, nodes=None):
+def runtime(now, *, nodes=None, wall_clock=None):
     planner = FakePlanner()
     coordinator = FakeCoordinator(now)
     current_nodes = [SimpleNamespace(node_id="worker", is_active=True)] if nodes is None else nodes
@@ -124,9 +124,14 @@ def runtime(now, *, nodes=None):
         planner=planner,
         transport=FakeTransport(),
         nodes_provider=lambda: current_nodes,
-        clock_ms=lambda: now[0],
+        clock_ms=lambda: (wall_clock or now)[0],
+        steady_clock_ms=lambda: now[0],
+        prepare_ttl_ms=100,
+        plan_ttl_ms=300,
         session_ttl_ms=600,
         renew_interval_ms=200,
+        renew_retry_interval_ms=50,
+        lease_expiry_guard_ms=25,
         coordinator=coordinator,
     )
     return active, planner, coordinator, current_nodes
@@ -154,7 +159,26 @@ def test_active_runtime_routes_only_after_complete_reservation():
         active.close()
 
 
-def test_active_runtime_renews_and_fences_failed_route():
+def test_active_runtime_lease_ignores_wall_clock_jumps():
+    steady = [1_000]
+    wall = [1_000]
+    active, _, _, _ = runtime(steady, wall_clock=wall)
+    try:
+        active.reserve(
+            request_id="request",
+            prompt_tokens=100,
+            reserved_output_tokens=20,
+        )
+
+        wall[0] += 24 * 60 * 60 * 1_000
+
+        assert active.is_active("request")
+        assert active.snapshot()["active_routes"][0]["lease_expires_in_ms"] == 600
+    finally:
+        active.close()
+
+
+def test_active_runtime_retries_transient_renewal_failure_before_expiry():
     now = [1_000]
     active, _, coordinator, _ = runtime(now)
     try:
@@ -170,6 +194,36 @@ def test_active_runtime_renews_and_fences_failed_route():
 
         coordinator.fail_renew = True
         now[0] += 201
+        active.maintain_once()
+        assert active.is_active("request")
+        assert len(coordinator.released) == 0
+        assert active.snapshot()["active_routes"][0]["renewal_failures"] == 1
+
+        coordinator.fail_renew = False
+        now[0] += 51
+        active.maintain_once()
+        assert active.is_active("request")
+        assert len(coordinator.renewed) == 2
+        assert active.snapshot()["active_routes"][0]["renewal_failures"] == 0
+    finally:
+        active.close()
+
+
+def test_active_runtime_fences_when_no_safe_renewal_window_remains():
+    now = [1_000]
+    active, _, coordinator, _ = runtime(now)
+    try:
+        active.reserve(
+            request_id="request",
+            prompt_tokens=100,
+            reserved_output_tokens=20,
+        )
+        coordinator.fail_renew = True
+        now[0] += 201
+        active.maintain_once()
+        assert active.is_active("request")
+
+        now[0] = 1_476
         active.maintain_once()
         assert not active.is_active("request")
         assert len(coordinator.released) == 1
