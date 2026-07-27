@@ -157,16 +157,19 @@ class FakeCatalog:
 def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():
     manifest = model()
     current = advertisement(manifest, "current", 0, 2)
+    independent_route = advertisement(manifest, "independent", 0, 4)
     snapshot = DiscoverySnapshot(
         captured_at_ms=NOW,
         manifests=(manifest,),
         offers=(
             current.offer,
             advertisement(manifest, "replica", 0, 2).offer,
+            independent_route.offer,
         ),
         leases=(
             current.lease,
             advertisement(manifest, "replica", 0, 2).lease,
+            independent_route.lease,
         ),
         links=(),
     )
@@ -213,6 +216,47 @@ def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():
     assert ready["phase"] == "ready"
     assert ready["current_span"] == [2, 4]
     assert not admission.draining
+
+
+def test_worker_placement_does_not_churn_on_disconnected_coverage():
+    manifest = model()
+    current = advertisement(manifest, "current", 0, 2)
+    replica = advertisement(manifest, "replica", 0, 2)
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(current.offer, replica.offer),
+        leases=(current.lease, replica.lease),
+        links=(),
+    )
+    reloads = []
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot),
+        admission=FakeAdmission(),
+        state_publisher=FakePublisher(),
+        reload_target=lambda span, generation: reloads.append((span, generation)),
+        current_span=current.lease.hosted_span,
+        policy=AutonomousPlacementPolicy(movement_cooldown_ms=0),
+    )
+
+    deadline = time.monotonic() + 1
+    status = controller.observe(
+        advertisement=current,
+        manifest=manifest,
+        context_tokens=10,
+    )
+    while status["decision"] == "waiting_catalog" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = controller.observe(
+            advertisement=current,
+            manifest=manifest,
+            context_tokens=10,
+        )
+
+    assert status["decision"] == "movement_would_remove_the_last_executable_route"
+    assert status["phase"] == "ready"
+    assert status["current_span"] == [0, 2]
+    assert reloads == []
 
 
 def test_cold_worker_announces_building_before_executor_reload():

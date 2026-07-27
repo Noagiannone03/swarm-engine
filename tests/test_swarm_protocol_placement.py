@@ -258,6 +258,7 @@ def test_active_reservation_and_cooldown_prevent_oscillating_reload():
         context_tokens=10,
         kv_block_size=1,
         current_span=LayerSpan(start=0, end=2),
+        serving_route_survives_movement=True,
         now_ms=20_000,
     )
 
@@ -286,6 +287,7 @@ def test_placement_is_independent_from_catalogue_arrival_order():
         context_tokens=10,
         kv_block_size=1,
         current_span=LayerSpan(start=0, end=2),
+        serving_route_survives_movement=True,
         now_ms=20_000,
     )
 
@@ -294,6 +296,31 @@ def test_placement_is_independent_from_catalogue_arrival_order():
 
     assert forward == reverse
     assert forward.action is PlacementAction.MOVE
+
+
+def test_ready_worker_never_moves_without_a_complete_independent_route():
+    model = manifest()
+    decision = AutonomousPlacementPolicy(movement_cooldown_ms=0).choose(
+        offer=offer("current", memory_bytes=500),
+        manifest=model,
+        leases=(
+            lease(model, "current", 0, 2),
+            lease(model, "head-copy", 0, 2),
+            lease(model, "tail", 2, 4),
+        ),
+        demand=CapacityDemandMap(
+            desired_replicas_by_layer=(1, 1, 3, 3),
+            demand_weight_by_layer=(1, 1, 10, 10),
+        ),
+        context_tokens=10,
+        kv_block_size=1,
+        current_span=LayerSpan(start=0, end=2),
+        serving_route_survives_movement=False,
+        now_ms=20_000,
+    )
+
+    assert decision.action is PlacementAction.KEEP
+    assert decision.reason == "movement_would_remove_the_last_executable_route"
 
 
 class FakeDrain:

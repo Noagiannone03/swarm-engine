@@ -467,6 +467,7 @@ class AutonomousPlacementPolicy:
         current_span: LayerSpan | None = None,
         current_reservations: int = 0,
         last_moved_at_ms: int | None = None,
+        serving_route_survives_movement: bool = False,
         now_ms: int,
     ) -> PlacementDecision:
         if len(demand.desired_replicas_by_layer) != manifest.num_layers:
@@ -608,6 +609,21 @@ class AutonomousPlacementPolicy:
                 required_memory_bytes=current_required,
                 score=current_score,
                 reason="active_reservations_must_drain_before_movement",
+            )
+        # Petals refuses a voluntary move that would make the advertised
+        # blocks disjoint. Layer coverage alone is not a sufficient analogue
+        # for Fabi: fixed pipeline stages also need compatible context,
+        # endpoint ownership and authenticated directed links (including the
+        # tail-to-frontend return edge). The worker-side controller proves that
+        # a complete request route remains without this worker; uncertainty is
+        # deliberately fail-closed.
+        if not serving_route_survives_movement:
+            return PlacementDecision(
+                action=PlacementAction.KEEP,
+                span=current_span,
+                required_memory_bytes=current_required,
+                score=current_score,
+                reason="movement_would_remove_the_last_executable_route",
             )
         if last_moved_at_ms is not None and now_ms - last_moved_at_ms < self.movement_cooldown_ms:
             return PlacementDecision(

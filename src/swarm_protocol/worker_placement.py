@@ -14,6 +14,8 @@ from swarm_protocol.contracts import (
     LinkMetric,
     ModelManifest,
     ModelMemberAdvertisement,
+    RecoveryLevel,
+    RequestContract,
     ReservationState,
     SpanLease,
     SpanState,
@@ -28,6 +30,7 @@ from swarm_protocol.placement import (
     PlacementAction,
     PlacementMaterializer,
 )
+from swarm_protocol.routing import ExactRoutePlanner, RoutePlanningError
 
 
 class PlacementCatalog(Protocol):
@@ -104,7 +107,11 @@ class AutonomousWorkerPlacement:
         self._snapshot_model_id: str | None = None
         self._read_pending = False
         self._retry_after = 0.0
-        self._last_moved_at_ms: int | None = None
+        # A process that adopts an already loaded legacy span must not treat it
+        # as infinitely old and immediately churn on its first DHT snapshot.
+        self._last_moved_at_ms: int | None = (
+            time.time_ns() // 1_000_000 if current_span is not None else None
+        )
         self._announced_transition: tuple[object, ...] | None = None
         self._error: dict[str, str] | None = None
         self._context_tokens: int | None = None
@@ -271,6 +278,12 @@ class AutonomousWorkerPlacement:
             lease.state in {ReservationState.PREPARED, ReservationState.COMMITTED}
             for lease in self._admission.snapshot()
         )
+        serving_route_survives_movement = self._route_survives_without_worker(
+            snapshot=snapshot,
+            manifest=manifest,
+            worker_id=advertisement.offer.worker_id,
+            context_tokens=context_tokens,
+        )
         decision = self._policy.choose(
             offer=advertisement.offer,
             manifest=manifest,
@@ -281,12 +294,51 @@ class AutonomousWorkerPlacement:
             current_span=state.current_span,
             current_reservations=active_reservations,
             last_moved_at_ms=self._last_moved_at_ms,
+            serving_route_survives_movement=serving_route_survives_movement,
             now_ms=time.time_ns() // 1_000_000,
         )
         if decision.action in {PlacementAction.JOIN, PlacementAction.MOVE}:
             state = self._materializer.reconcile(decision)
             self._announce_transition_once(advertisement, state)
         return self._status(state, decision=decision.reason, error=read_error)
+
+    @staticmethod
+    def _route_survives_without_worker(
+        *,
+        snapshot: DiscoverySnapshot,
+        manifest: ModelManifest,
+        worker_id: str,
+        context_tokens: int,
+    ) -> bool:
+        """Prove that one executable route remains during a voluntary reload."""
+
+        reserved_output_tokens = min(4_096, context_tokens - 1)
+        request = RequestContract(
+            request_id=f"placement-safety-{worker_id}-{snapshot.captured_at_ms}",
+            model_swarm_id=manifest.model_swarm_id,
+            prompt_tokens=context_tokens - reserved_output_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            recovery_level=RecoveryLevel.RESTARTABLE,
+        )
+        try:
+            ExactRoutePlanner().plan(
+                manifest=manifest,
+                request=request,
+                offers=tuple(
+                    offer for offer in snapshot.offers if offer.worker_id != worker_id
+                ),
+                leases=tuple(
+                    lease for lease in snapshot.leases if lease.worker_id != worker_id
+                ),
+                links=snapshot.links,
+                snapshot_time_ms=snapshot.captured_at_ms,
+                coordinator_id=worker_id,
+                reservation_deadline_ms=snapshot.captured_at_ms + 30_000,
+                plan_expires_at_ms=snapshot.captured_at_ms + 60_000,
+            )
+        except RoutePlanningError:
+            return False
+        return True
 
     def mark_failed(self, *, generation: int, error: Exception) -> dict[str, object]:
         """Fence a backend failure and start the materializer's safe rollback."""
