@@ -149,7 +149,15 @@ class RPCConnectionHandler(ConnectionHandler):
                 response = self.wait_join_registration(node.node_id, wait_seconds=5)
                 return response, {}
 
-            if not self.scheduler.has_full_pipeline():
+            registered = self.scheduler.get_node(node.node_id)
+            autonomous_placement = bool(
+                node.uses_autonomous_placement
+                or (
+                    registered is not None
+                    and registered.uses_autonomous_placement
+                )
+            )
+            if not self.scheduler.has_full_pipeline() and not autonomous_placement:
                 # A scheduler restart can receive lightweight heartbeats before a
                 # full node_join.  That auto-registers a STANDBY node, then later
                 # node_update carries the complete worker-owned capabilities
@@ -162,6 +170,15 @@ class RPCConnectionHandler(ConnectionHandler):
                 )
                 self.scheduler.enqueue_join(node)
                 return self.pending_join_response(node.node_id), {}
+
+            # Autonomous v3 workers deliberately never establish a legacy
+            # scheduler-owned pipeline: their layer span is committed and
+            # advertised through the DHT.  Their heartbeats must still flow
+            # through the normal update path so executor readiness, measured KV
+            # geometry and link telemetry reach the v3 route planner.  Treating
+            # ``has_full_pipeline() == False`` as an incomplete registration here
+            # would re-enqueue JOIN forever and keep the valid DHT route fenced as
+            # ``scheduler_transition``.
 
             # Node exists, update its info
             self.scheduler.enqueue_node_update(

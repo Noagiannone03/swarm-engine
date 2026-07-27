@@ -175,6 +175,56 @@ def test_node_update_refreshes_registration_when_bootstrap_is_incomplete():
     assert scheduler.joined.hardware.usable_memory_bytes == 8 * 1024**3
 
 
+def test_autonomous_node_update_bypasses_legacy_bootstrap_gate():
+    scheduler = RecordingScheduler()
+    scheduler.full_pipeline = False
+    scheduler.node.swarm_v3 = {"placement_mode": "autonomous", "state": "warming"}
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = scheduler
+
+    response = handler.node_update(
+        {
+            "node_id": "worker",
+            "hardware": {
+                "node_id": "worker",
+                "num_gpus": 1,
+                "tflops_fp16": 8.52,
+                "gpu_name": "Apple M4",
+                "memory_gb": 16.0,
+                "memory_bandwidth_gbps": 100.0,
+                "device": "mlx",
+            },
+            "kvcache_mem_ratio": 0.25,
+            "param_mem_ratio": 0.65,
+            "max_concurrent_requests": 1,
+            "max_sequence_length": 65536,
+            "kv_cache_token_capacity": 32768,
+            "kv_cache_block_size": 32,
+            "current_requests": 0,
+            "layer_latency_ms": 1.5,
+            "is_active": True,
+            "start_layer": 0,
+            "end_layer": 5,
+            "direct_peer_ids": ["tail"],
+            "reachable_peer_ids": ["tail"],
+            "swarm_v3": {"placement_mode": "autonomous", "state": "ready"},
+        }
+    )
+
+    assert response == ({}, {})
+    assert scheduler.joined is None
+    assert scheduler.update is not None
+    node_id, update = scheduler.update
+    assert node_id == "worker"
+    assert update["is_active"] is True
+    assert update["kv_cache_token_capacity"] == 32768
+    assert update["direct_peer_ids"] == ["tail"]
+    assert update["swarm_v3"] == {
+        "placement_mode": "autonomous",
+        "state": "ready",
+    }
+
+
 def test_initial_join_acknowledges_registration_before_dp_allocation():
     scheduler = RecordingScheduler()
     scheduler.full_pipeline = False
