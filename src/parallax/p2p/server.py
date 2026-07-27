@@ -426,6 +426,109 @@ class TransformerConnectionHandler(ConnectionHandler):
         logger.info("Explicitly aborted frontend request %s", request_id)
         return {"aborted": True, "request_id": request_id}
 
+    @rpc_method
+    def tokenize_chat(self, request):
+        """Render one chat with the exact qualified frontend tokenizer.
+
+        The coordinator first reserves a provisional route, so this read-only
+        preflight uses the same signed route authority as generation. It keeps
+        context admission and recovery tied to the token IDs the engine will
+        actually execute instead of assuming that Python and Rust chat-template
+        implementations are byte-for-byte identical.
+        """
+
+        if not isinstance(request, dict):
+            raise TypeError("chat tokenization request must be an object")
+        request_id = self._authorize_frontend_request(
+            request.get("request_id"),
+            request.get("vllm_xargs"),
+            purpose="chat tokenization",
+        )
+        chat_request = request.get("request")
+        if not isinstance(chat_request, dict):
+            raise ValueError("chat tokenization payload must be an object")
+        tool_choice = chat_request.get("tool_choice")
+        if tool_choice not in (None, "auto", "none"):
+            return {
+                "ok": False,
+                "request_id": request_id,
+                "status_code": 400,
+                "error": (
+                    "this qualified Rust frontend supports tool_choice only as "
+                    "'auto' or 'none'"
+                ),
+            }
+
+        allowed_fields = {
+            "model",
+            "messages",
+            "tools",
+            "chat_template",
+            "chat_template_kwargs",
+            "add_generation_prompt",
+            "continue_final_message",
+            "add_special_tokens",
+        }
+        tokenize_request = {
+            key: value for key, value in chat_request.items() if key in allowed_fields
+        }
+        tokenize_request["return_token_strs"] = False
+        if "messages" not in tokenize_request:
+            raise ValueError("chat tokenization payload has no messages")
+
+        with httpx.Client(
+            timeout=httpx.Timeout(30.0),
+            proxy=None,
+            trust_env=False,
+        ) as client:
+            response = client.post(
+                f"http://localhost:{self.http_port}/tokenize",
+                json=tokenize_request,
+            )
+        if response.status_code >= 400:
+            detail = "qualified frontend rejected chat tokenization"
+            try:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    error = payload.get("error")
+                    if isinstance(error, dict) and isinstance(error.get("message"), str):
+                        detail = error["message"][:512]
+                    elif isinstance(payload.get("detail"), str):
+                        detail = payload["detail"][:512]
+            except ValueError:
+                pass
+            return {
+                "ok": False,
+                "request_id": request_id,
+                "status_code": response.status_code,
+                "error": detail,
+            }
+
+        payload = response.json()
+        tokens = payload.get("tokens") if isinstance(payload, dict) else None
+        count = payload.get("count") if isinstance(payload, dict) else None
+        if (
+            not isinstance(tokens, list)
+            or not tokens
+            or len(tokens) > 262_144
+            or count != len(tokens)
+            or any(
+                isinstance(token_id, bool)
+                or not isinstance(token_id, int)
+                or token_id < 0
+                or token_id > 2**32 - 1
+                for token_id in tokens
+            )
+        ):
+            raise ValueError("qualified frontend returned invalid prompt token IDs")
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "tokens": tokens,
+            "count": len(tokens),
+            "max_model_len": payload.get("max_model_len"),
+        }
+
     @rpc_stream_iter
     def replay_generation(self, request):
         """Proxy token-exact chat replay to the qualified vLLM frontend."""

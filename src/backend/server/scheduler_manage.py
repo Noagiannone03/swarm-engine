@@ -547,6 +547,11 @@ class SchedulerManage:
         """Tokenize the fully rendered chat and reserve its requested output."""
         return build_context_budget(self._get_context_tokenizer(), request_data)
 
+    def requires_exact_frontend_tokenization(self) -> bool:
+        """Return whether route admission must use the serving frontend's IDs."""
+
+        return self.active_v3_routes is not None
+
     def max_supported_context_tokens(self) -> int:
         if self.scheduler is None:
             return 0

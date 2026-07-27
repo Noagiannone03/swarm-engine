@@ -25,8 +25,17 @@ class FakeAdmission:
 
 
 class FakeHttpResponse:
+    status_code = 200
+
     def raise_for_status(self):
         return None
+
+    def json(self):
+        return {
+            "count": 3,
+            "max_model_len": 4096,
+            "tokens": [10, 20, 30],
+        }
 
 
 class FakeStreamResponse(FakeHttpResponse):
@@ -119,6 +128,86 @@ def test_abort_completion_fails_closed_without_active_v3():
 
     with pytest.raises(PermissionError, match="active protocol v3"):
         handler.abort_completion({"request_id": "request", "vllm_xargs": {}})
+
+
+def test_chat_tokenization_is_route_fenced_and_uses_official_frontend(monkeypatch):
+    admission = FakeAdmission()
+    handler = make_handler(admission)
+    FakeHttpClient.instances.clear()
+    monkeypatch.setattr(p2p_server, "authenticated_rpc_peer_id", lambda: "coordinator")
+    monkeypatch.setattr(p2p_server.httpx, "Client", FakeHttpClient)
+
+    result = handler.tokenize_chat(
+        {
+            "request_id": "scheduler-request",
+            "vllm_xargs": {
+                "fabi_route_id": "route-7",
+                "fabi_route_epoch": 7,
+                "parallax_routing_table": ["worker-a", "worker-b"],
+            },
+            "request": {
+                "model": "Qwen/Qwen3-4B",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [],
+                "chat_template_kwargs": {"enable_thinking": False},
+                "max_completion_tokens": 128,
+                "stream": True,
+            },
+        }
+    )
+
+    assert result == {
+        "ok": True,
+        "request_id": "scheduler-request",
+        "tokens": [10, 20, 30],
+        "count": 3,
+        "max_model_len": 4096,
+    }
+    assert admission.calls == [
+        {
+            "request_id": "scheduler-request",
+            "route_id": "route-7",
+            "epoch": 7,
+            "routing_table": ("worker-a", "worker-b"),
+            "caller_endpoint_id": "coordinator",
+        }
+    ]
+    assert FakeHttpClient.instances[0].posts == [
+        (
+            "http://localhost:3000/tokenize",
+            {
+                "model": "Qwen/Qwen3-4B",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [],
+                "chat_template_kwargs": {"enable_thinking": False},
+                "return_token_strs": False,
+            },
+        )
+    ]
+
+
+def test_chat_tokenization_rejects_unsupported_forced_tool_choice(monkeypatch):
+    handler = make_handler(FakeAdmission())
+    monkeypatch.setattr(p2p_server, "authenticated_rpc_peer_id", lambda: "coordinator")
+
+    result = handler.tokenize_chat(
+        {
+            "request_id": "request",
+            "vllm_xargs": {
+                "fabi_route_id": "route",
+                "fabi_route_epoch": 1,
+                "parallax_routing_table": ["worker"],
+            },
+            "request": {
+                "messages": [{"role": "user", "content": "hello"}],
+                "tool_choice": "required",
+            },
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["status_code"] == 400
+    assert "tool_choice" in result["error"]
 
 
 def test_generation_replay_is_route_fenced_and_uses_qualified_chat_api(monkeypatch):

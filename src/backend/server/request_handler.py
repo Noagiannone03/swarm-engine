@@ -33,6 +33,8 @@ PARALLAX_SCHEDULER_REQUEST_ID_XARG = "parallax_scheduler_request_id"
 FABI_ROUTE_ID_XARG = "fabi_route_id"
 FABI_ROUTE_EPOCH_XARG = "fabi_route_epoch"
 ABORT_RPC_TIMEOUT_SEC = 5.0
+TOKENIZE_RPC_TIMEOUT_SEC = 30.0
+MAX_EXACT_TOKEN_REPLANS = 2
 
 
 class ClientDisconnectedError(Exception):
@@ -232,6 +234,53 @@ class RequestHandler:
         backend_request["vllm_xargs"] = vllm_xargs
         return backend_request
 
+    @staticmethod
+    def _frontend_context_budget(stub, backend_request: Dict, budget: ContextBudget) -> ContextBudget:
+        """Ask the qualified route head for the prompt IDs it will execute."""
+
+        for unsupported in ("documents", "reasoning_effort"):
+            if backend_request.get(unsupported) is not None:
+                raise ContextRequestError(
+                    f"exact frontend tokenization does not support {unsupported}"
+                )
+        result = stub.tokenize_chat(
+            {
+                "request_id": backend_request.get("request_id"),
+                "vllm_xargs": backend_request.get("vllm_xargs"),
+                "request": backend_request,
+            }
+        )
+        wait = getattr(result, "result", None)
+        if wait is not None:
+            result = wait(timeout=TOKENIZE_RPC_TIMEOUT_SEC)
+        if not isinstance(result, dict):
+            raise RuntimeError("qualified frontend returned an invalid tokenization response")
+        if result.get("ok") is not True:
+            detail = result.get("error")
+            if not isinstance(detail, str) or not detail:
+                detail = "qualified frontend rejected chat tokenization"
+            raise ContextRequestError(detail)
+        token_ids = result.get("tokens")
+        if (
+            not isinstance(token_ids, list)
+            or not token_ids
+            or len(token_ids) > 262_144
+            or result.get("count") != len(token_ids)
+            or any(
+                isinstance(token_id, bool)
+                or not isinstance(token_id, int)
+                or token_id < 0
+                or token_id > 2**32 - 1
+                for token_id in token_ids
+            )
+        ):
+            raise RuntimeError("qualified frontend returned invalid prompt token IDs")
+        return ContextBudget(
+            prompt_tokens=len(token_ids),
+            max_output_tokens=budget.max_output_tokens,
+            prompt_token_ids=tuple(token_ids),
+        )
+
     async def _forward_request(
         self,
         request_data: Dict,
@@ -301,6 +350,8 @@ class RequestHandler:
 
         # Try to get a success response
         forward_attempts = 0
+        exact_token_replans = 0
+        verified_frontend_token_ids: tuple[int, ...] | None = None
         while forward_attempts < self.MAX_FORWARD_RETRY:
             # Try to resolve routing; retry if table is an empty list (capacity full)
             attempts = 0
@@ -366,6 +417,96 @@ class RequestHandler:
                     str(request_id),
                     routing_table,
                 )
+                stub = self.get_stub(routing_table[0])
+                requires_exact_tokens = bool(
+                    getattr(
+                        self.scheduler_manage,
+                        "requires_exact_frontend_tokenization",
+                        lambda: False,
+                    )()
+                )
+                if requires_exact_tokens:
+                    try:
+                        frontend_budget = await asyncio.to_thread(
+                            self._frontend_context_budget,
+                            stub,
+                            backend_request,
+                            budget,
+                        )
+                    except ContextRequestError as exc:
+                        self._release_route(request_id)
+                        return openai_error_response(
+                            str(exc),
+                            status_code=400,
+                            err_type="invalid_request_error",
+                            param="messages",
+                            code="context_validation_error",
+                        )
+                    except Exception:
+                        self._release_route(request_id)
+                        logger.exception(
+                            "Unable to obtain exact frontend token IDs for %s",
+                            request_id,
+                        )
+                        return openai_error_response(
+                            "The qualified model frontend could not tokenize this request",
+                            status_code=503,
+                            err_type="server_unavailable",
+                            code="frontend_tokenizer_unavailable",
+                        )
+
+                    if (
+                        verified_frontend_token_ids is not None
+                        and frontend_budget.prompt_token_ids != verified_frontend_token_ids
+                    ):
+                        self._release_route(request_id)
+                        logger.error(
+                            "Qualified route heads disagree on prompt token IDs for %s",
+                            request_id,
+                        )
+                        return openai_error_response(
+                            "Qualified workers disagree on the model tokenizer",
+                            status_code=503,
+                            err_type="server_unavailable",
+                            code="frontend_tokenizer_mismatch",
+                        )
+                    verified_frontend_token_ids = frontend_budget.prompt_token_ids
+
+                    if frontend_budget.prompt_token_ids != budget.prompt_token_ids:
+                        self._release_route(request_id)
+                        exact_token_replans += 1
+                        if exact_token_replans > MAX_EXACT_TOKEN_REPLANS:
+                            return openai_error_response(
+                                "Unable to stabilize the exact model token budget",
+                                status_code=503,
+                                err_type="server_unavailable",
+                                code="frontend_tokenizer_unstable",
+                            )
+                        if frontend_budget.required_tokens > max_supported_context():
+                            return openai_error_response(
+                                (
+                                    f"This request requires {frontend_budget.required_tokens} "
+                                    f"tokens ({frontend_budget.prompt_tokens} prompt + "
+                                    f"{frontend_budget.max_output_tokens} maximum output), but "
+                                    "no available pipeline supports that context."
+                                ),
+                                status_code=400,
+                                err_type="invalid_request_error",
+                                param="messages",
+                                code="context_length_exceeded",
+                            )
+                        logger.info(
+                            "Replanning request %s with qualified frontend budget %s "
+                            "(scheduler tokenizer estimated %s)",
+                            request_id,
+                            frontend_budget.prompt_tokens,
+                            budget.prompt_tokens,
+                        )
+                        budget = frontend_budget
+                        required_context_tokens = budget.required_tokens
+                        continue
+                    budget = frontend_budget
+
                 original_replay_request = dict(backend_request)
                 capture_tokens = bool(
                     is_stream
@@ -385,7 +526,6 @@ class RequestHandler:
                     # client's original visibility choice.
                     backend_request["return_token_ids"] = True
                     backend_request["include_reasoning"] = True
-                stub = self.get_stub(routing_table[0])
                 if is_stream:
 
                     async def stream_generator():

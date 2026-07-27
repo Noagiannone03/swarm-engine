@@ -430,6 +430,9 @@ class ActiveRouteRuntime:
                     "route_id": route.committed.plan.route_id,
                     "epoch": route.committed.plan.epoch,
                     "workers": [stage.worker_id for stage in route.committed.plan.stages],
+                    "prompt_tokens": route.committed.plan.prompt_tokens,
+                    "reserved_output_tokens": route.committed.plan.reserved_output_tokens,
+                    "required_context_tokens": route.committed.plan.required_context_tokens,
                     "recovery_route_id": (
                         route.recovery_committed.plan.route_id
                         if route.recovery_committed is not None

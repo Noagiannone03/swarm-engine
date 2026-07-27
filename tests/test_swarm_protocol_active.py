@@ -207,6 +207,10 @@ def test_active_runtime_routes_only_after_complete_reservation():
             "epoch": 1,
             "recovery_level": "restartable",
         }
+        snapshot = active.snapshot()["active_routes"][0]
+        assert snapshot["prompt_tokens"] == 100
+        assert snapshot["reserved_output_tokens"] == 20
+        assert snapshot["required_context_tokens"] == 120
 
         assert active.release("request")
         assert not active.is_active("request")

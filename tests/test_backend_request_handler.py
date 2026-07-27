@@ -95,6 +95,11 @@ class V3ForwardingSchedulerManage(ForwardingSchedulerManage):
         return {"route_id": f"route-{request_id}", "epoch": 7}
 
 
+class ExactTokenForwardingSchedulerManage(V3ForwardingSchedulerManage):
+    def requires_exact_frontend_tokenization(self):
+        return True
+
+
 class RecoveryForwardingSchedulerManage(V3ForwardingSchedulerManage):
     def __init__(self):
         super().__init__(
@@ -206,6 +211,34 @@ class StaticStub:
         self.replay_request = request
         self.response = CancellableResponse(self.chunks)
         return self.response
+
+
+class ValueResult:
+    def __init__(self, value):
+        self.value = value
+
+    def result(self, timeout=None):
+        del timeout
+        return self.value
+
+
+class TokenizingStub(StaticStub):
+    def __init__(self, chunks, token_ids):
+        super().__init__(chunks)
+        self.token_ids = list(token_ids)
+        self.tokenize_requests = []
+
+    def tokenize_chat(self, request):
+        self.tokenize_requests.append(request)
+        return ValueResult(
+            {
+                "ok": True,
+                "request_id": request["request_id"],
+                "tokens": self.token_ids,
+                "count": len(self.token_ids),
+                "max_model_len": 4096,
+            }
+        )
 
 
 class CancellableResponse:
@@ -437,6 +470,83 @@ def test_forward_request_routes_with_exact_required_context():
             RecoveryLevel.RESTARTABLE,
         )
     ]
+
+
+def test_active_v3_replans_with_qualified_frontend_token_ids():
+    handler = RequestHandler()
+    scheduler_manage = ExactTokenForwardingSchedulerManage(
+        context_budget=ContextBudget(
+            prompt_tokens=2,
+            max_output_tokens=16,
+            prompt_token_ids=(10, 20),
+        ),
+        max_context=4096,
+    )
+    handler.set_scheduler_manage(scheduler_manage)
+    stub = TokenizingStub([b'{"choices":[]}'], [10, 20, 30])
+    handler.stubs["node-a"] = stub
+
+    response = asyncio.run(
+        handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}]},
+            "exact-token-req",
+            1.0,
+        )
+    )
+
+    assert response.status_code == 200
+    assert scheduler_manage.routing_requests == [
+        (
+            "exact-token-req",
+            18,
+            2,
+            16,
+            RecoveryLevel.RESTARTABLE,
+        ),
+        (
+            "exact-token-req",
+            19,
+            3,
+            16,
+            RecoveryLevel.RESTARTABLE,
+        ),
+    ]
+    assert scheduler_manage.released == ["exact-token-req", "exact-token-req"]
+    assert len(stub.tokenize_requests) == 2
+    assert stub.request is not None
+
+
+def test_active_v3_rejects_frontend_tokenizer_disagreement():
+    handler = RequestHandler()
+    scheduler_manage = ExactTokenForwardingSchedulerManage(
+        context_budget=ContextBudget(
+            prompt_tokens=2,
+            max_output_tokens=16,
+            prompt_token_ids=(10, 20),
+        ),
+        max_context=4096,
+    )
+    handler.set_scheduler_manage(scheduler_manage)
+
+    class ChangingTokenizingStub(TokenizingStub):
+        def tokenize_chat(self, request):
+            self.token_ids = [10, 20, 30] if not self.tokenize_requests else [10, 20, 31]
+            return super().tokenize_chat(request)
+
+    stub = ChangingTokenizingStub([b'{"choices":[]}'], [])
+    handler.stubs["node-a"] = stub
+
+    response = asyncio.run(
+        handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}]},
+            "mismatched-tokenizer-req",
+            1.0,
+        )
+    )
+
+    assert response.status_code == 503
+    assert json.loads(response.body)["error"]["code"] == "frontend_tokenizer_mismatch"
+    assert stub.request is None
 
 
 def test_forward_request_wakes_when_capacity_becomes_available():
