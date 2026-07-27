@@ -1,0 +1,26 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG PARALLAX_COMMIT
+ARG PARALLAX_BASE_REVISION
+ARG FABI_SOURCE_ONLY_UPDATE
+
+# This deliberately reuses the qualified native wheel and dependency graph.
+# Callers must opt in explicitly and record the exact base revision; changes to
+# native/, pyproject.toml or install.sh require the full scheduler Dockerfile.
+RUN test "${FABI_SOURCE_ONLY_UPDATE}" = "1" \
+    && test -n "${PARALLAX_COMMIT}" \
+    && test -n "${PARALLAX_BASE_REVISION}"
+
+COPY . /opt/parallax-next
+
+RUN rm -rf /opt/parallax \
+    && mv /opt/parallax-next /opt/parallax \
+    && pip install --no-cache-dir --no-deps --force-reinstall /opt/parallax \
+    && python -c "import fabi_network_native; assert fabi_network_native.PROTOCOL_VERSION == 1" \
+    && python -c "from backend.server.request_handler import RequestHandler; assert hasattr(RequestHandler, '_frontend_context_budget')" \
+    && python -c "from parallax.p2p.server import TransformerConnectionHandler; assert hasattr(TransformerConnectionHandler, 'tokenize_chat')"
+
+LABEL org.opencontainers.image.source="https://github.com/Noagiannone03/swarm-engine" \
+      org.opencontainers.image.revision="${PARALLAX_COMMIT}" \
+      org.opencontainers.image.base.revision="${PARALLAX_BASE_REVISION}"
