@@ -58,6 +58,8 @@ class RouteEstimate:
 class PlannedRoute:
     plan: RoutePlan
     estimate: RouteEstimate
+    recovery_plan: RoutePlan | None = None
+    recovery_estimate: RouteEstimate | None = None
 
 
 @dataclass(frozen=True)
@@ -142,9 +144,7 @@ class ExactRoutePlanner:
             manifest.activation_bytes_per_token / metric.throughput_bytes_per_second * 1000
         )
         return RouteEstimate(
-            ttft_ms=(one_way_latency_ms + prefill_transfer_ms)
-            * multiplier
-            * reliability_penalty,
+            ttft_ms=(one_way_latency_ms + prefill_transfer_ms) * multiplier * reliability_penalty,
             inter_token_ms=(one_way_latency_ms + decode_transfer_ms)
             * multiplier
             * reliability_penalty,
@@ -235,38 +235,26 @@ class ExactRoutePlanner:
             <= lease.available_kv_bytes_snapshot
         )
 
-    def plan(
+    def _best_complete_path(
         self,
         *,
         manifest: ModelManifest,
         request: RequestContract,
-        offers: tuple[WorkerOffer, ...],
-        leases: tuple[SpanLease, ...],
-        links: tuple[LinkMetric, ...],
-        snapshot_time_ms: int,
-        coordinator_id: str,
-        reservation_deadline_ms: int,
-        plan_expires_at_ms: int,
-        epoch: int = 0,
-        route_id: str | None = None,
-    ) -> PlannedRoute:
-        if request.model_swarm_id != manifest.model_swarm_id:
-            raise NoFeasibleRoute("request and model manifest identify different swarms")
-        if request.recovery_level == RecoveryLevel.RECOVERABLE:
-            raise NoFeasibleRoute("recoverable routing requires an alternate coverage plan")
+        candidates: tuple[RouteCandidate, ...],
+        link_map: dict[tuple[str, str], LinkMetric],
+        excluded_worker_ids: frozenset[str] = frozenset(),
+    ) -> _PartialPath | None:
+        """Return the best exact cycle after applying a worker exclusion set."""
 
-        candidates = self._eligible_candidates(
-            request=request,
-            offers=offers,
-            leases=leases,
-            snapshot_time_ms=snapshot_time_ms,
-        )
-        link_map = self._link_map(links, snapshot_time_ms, manifest, request)
-        best_complete: _PartialPath | None = None
-
-        heads = [
+        eligible = tuple(
             candidate
             for candidate in candidates
+            if candidate.offer.worker_id not in excluded_worker_ids
+        )
+        best_complete: _PartialPath | None = None
+        heads = [
+            candidate
+            for candidate in eligible
             if candidate.lease.hosted_span.start == 0
             and WorkerRole.FRONTEND in candidate.offer.supported_roles
         ]
@@ -314,7 +302,7 @@ class ExactRoutePlanner:
                                 best_complete = complete
                             continue
 
-                        for candidate in candidates:
+                        for candidate in eligible:
                             if candidate.offer.worker_id == previous_worker:
                                 continue
                             link = link_map.get((previous_worker, candidate.offer.worker_id))
@@ -344,21 +332,26 @@ class ExactRoutePlanner:
                                     request.reserved_output_tokens
                                 ) < previous.score(request.reserved_output_tokens):
                                     states[key] = proposed
+        return best_complete
 
-        if best_complete is None:
-            raise NoFeasibleRoute(
-                "no complete route satisfies model, context, endpoint and link constraints"
-            )
-
-        segments = best_complete.segments
+    @staticmethod
+    def _route_stages(
+        *,
+        path: _PartialPath,
+        link_map: dict[tuple[str, str], LinkMetric],
+        request: RequestContract,
+    ) -> tuple[RouteStage, ...]:
         route_stages = []
-        for index, segment in enumerate(segments):
-            next_segment = segments[(index + 1) % len(segments)]
+        for index, segment in enumerate(path.segments):
+            next_segment = path.segments[(index + 1) % len(path.segments)]
             if segment.candidate.offer.worker_id == next_segment.candidate.offer.worker_id:
                 path_kind = PathKind.DIRECT
             else:
                 metric = link_map[
-                    (segment.candidate.offer.worker_id, next_segment.candidate.offer.worker_id)
+                    (
+                        segment.candidate.offer.worker_id,
+                        next_segment.candidate.offer.worker_id,
+                    )
                 ]
                 path_kind = metric.path_kind
             geometry = segment.candidate.lease.kv_geometry
@@ -371,25 +364,128 @@ class ExactRoutePlanner:
                     path_to_next=path_kind,
                     rounded_context_tokens=geometry.rounded_tokens(request.required_context_tokens),
                     exact_kv_bytes=geometry.required_bytes(
-                        segment.effective_span, request.required_context_tokens
+                        segment.effective_span,
+                        request.required_context_tokens,
                     ),
                 )
             )
+        return tuple(route_stages)
 
-        plan = RoutePlan(
+    def _build_plan(
+        self,
+        *,
+        path: _PartialPath,
+        link_map: dict[tuple[str, str], LinkMetric],
+        manifest: ModelManifest,
+        request: RequestContract,
+        coordinator_id: str,
+        reservation_deadline_ms: int,
+        plan_expires_at_ms: int,
+        epoch: int,
+        route_id: str,
+    ) -> RoutePlan:
+        return RoutePlan(
             request_id=request.request_id,
-            route_id=route_id or uuid.uuid4().hex,
+            route_id=route_id,
             epoch=epoch,
             model_swarm_id=request.model_swarm_id,
             model_num_layers=manifest.num_layers,
             prompt_tokens=request.prompt_tokens,
             reserved_output_tokens=request.reserved_output_tokens,
-            stages=tuple(route_stages),
+            stages=self._route_stages(
+                path=path,
+                link_map=link_map,
+                request=request,
+            ),
             recovery_level=request.recovery_level,
             coordinator_id=coordinator_id,
             reservation_deadline_ms=reservation_deadline_ms,
             plan_expires_at_ms=plan_expires_at_ms,
         )
+
+    def plan(
+        self,
+        *,
+        manifest: ModelManifest,
+        request: RequestContract,
+        offers: tuple[WorkerOffer, ...],
+        leases: tuple[SpanLease, ...],
+        links: tuple[LinkMetric, ...],
+        snapshot_time_ms: int,
+        coordinator_id: str,
+        reservation_deadline_ms: int,
+        plan_expires_at_ms: int,
+        epoch: int = 0,
+        route_id: str | None = None,
+    ) -> PlannedRoute:
+        if request.model_swarm_id != manifest.model_swarm_id:
+            raise NoFeasibleRoute("request and model manifest identify different swarms")
+
+        candidates = self._eligible_candidates(
+            request=request,
+            offers=offers,
+            leases=leases,
+            snapshot_time_ms=snapshot_time_ms,
+        )
+        link_map = self._link_map(links, snapshot_time_ms, manifest, request)
+        best_complete = self._best_complete_path(
+            manifest=manifest,
+            request=request,
+            candidates=candidates,
+            link_map=link_map,
+        )
+
+        if best_complete is None:
+            raise NoFeasibleRoute(
+                "no complete route satisfies model, context, endpoint and link constraints"
+            )
+
+        primary_route_id = route_id or uuid.uuid4().hex
+        plan = self._build_plan(
+            path=best_complete,
+            link_map=link_map,
+            manifest=manifest,
+            request=request,
+            coordinator_id=coordinator_id,
+            reservation_deadline_ms=reservation_deadline_ms,
+            plan_expires_at_ms=plan_expires_at_ms,
+            epoch=epoch,
+            route_id=primary_route_id,
+        )
+        recovery_path: _PartialPath | None = None
+        recovery_plan: RoutePlan | None = None
+        recovery_estimate: RouteEstimate | None = None
+        if request.recovery_level == RecoveryLevel.RECOVERABLE:
+            primary_workers = frozenset(
+                segment.candidate.offer.worker_id for segment in best_complete.segments
+            )
+            recovery_path = self._best_complete_path(
+                manifest=manifest,
+                request=request,
+                candidates=candidates,
+                link_map=link_map,
+                excluded_worker_ids=primary_workers,
+            )
+            if recovery_path is None:
+                raise NoFeasibleRoute(
+                    "recoverable request requires a worker-disjoint complete backup route"
+                )
+            recovery_plan = self._build_plan(
+                path=recovery_path,
+                link_map=link_map,
+                manifest=manifest,
+                request=request,
+                coordinator_id=coordinator_id,
+                reservation_deadline_ms=reservation_deadline_ms,
+                plan_expires_at_ms=plan_expires_at_ms,
+                epoch=epoch,
+                route_id=f"{primary_route_id}-recovery",
+            )
+            recovery_estimate = RouteEstimate(
+                recovery_path.ttft_ms,
+                recovery_path.inter_token_ms,
+                complete=recovery_path.unknown_cost_components == 0,
+            )
         return PlannedRoute(
             plan=plan,
             estimate=RouteEstimate(
@@ -397,4 +493,6 @@ class ExactRoutePlanner:
                 best_complete.inter_token_ms,
                 complete=best_complete.unknown_cost_components == 0,
             ),
+            recovery_plan=recovery_plan,
+            recovery_estimate=recovery_estimate,
         )

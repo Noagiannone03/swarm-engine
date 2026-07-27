@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -9,6 +10,8 @@ from backend.server.constants import NODE_STATUS_AVAILABLE, NODE_STATUS_WAITING
 from backend.server.context_admission import ContextBudget
 from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.request_handler import RequestHandler
+from swarm_protocol.contracts import RecoveryLevel
+from swarm_protocol.recovery import RecoveryConflict, RecoveryState
 
 
 class DummySchedulerManage:
@@ -58,6 +61,7 @@ class ForwardingSchedulerManage(DummySchedulerManage):
         *,
         prompt_tokens=None,
         reserved_output_tokens=None,
+        recovery_level=RecoveryLevel.RESTARTABLE,
     ):
         self.routing_requests.append(
             (
@@ -65,6 +69,7 @@ class ForwardingSchedulerManage(DummySchedulerManage):
                 required_context_tokens,
                 prompt_tokens,
                 reserved_output_tokens,
+                recovery_level,
             )
         )
         if self.routing_table:
@@ -88,6 +93,39 @@ class ForwardingSchedulerManage(DummySchedulerManage):
 class V3ForwardingSchedulerManage(ForwardingSchedulerManage):
     def get_route_authority(self, request_id):
         return {"route_id": f"route-{request_id}", "epoch": 7}
+
+
+class RecoveryForwardingSchedulerManage(V3ForwardingSchedulerManage):
+    def __init__(self):
+        super().__init__(
+            context_budget=ContextBudget(
+                prompt_tokens=3,
+                max_output_tokens=16,
+                prompt_token_ids=(10, 20, 30),
+            )
+        )
+        self.journal_calls = []
+
+    def preferred_recovery_level(self, request_data):
+        assert request_data["temperature"] == 0
+        return RecoveryLevel.RECOVERABLE
+
+    def should_capture_generation_tokens(self, request_id, request_data):
+        assert request_id == "recoverable-stream"
+        return True
+
+    def begin_generation_journal(self, request_id, **kwargs):
+        self.journal_calls.append(("begin", request_id, kwargs))
+        return SimpleNamespace(epoch=7)
+
+    def commit_generation_prefill(self, request_id, *, epoch):
+        self.journal_calls.append(("prefill", request_id, epoch))
+
+    def commit_generation_tokens(self, request_id, *, epoch, token_ids):
+        self.journal_calls.append(("tokens", request_id, epoch, token_ids))
+
+    def finish_generation_journal(self, request_id, *, epoch, state, failure=None):
+        self.journal_calls.append(("finish", request_id, epoch, state, failure))
 
 
 class ImmediateResult:
@@ -332,7 +370,15 @@ def test_forward_request_routes_with_exact_required_context():
     )
 
     assert response.status_code == 200
-    assert scheduler_manage.routing_requests == [("accepted-req", 32768, 28672, 4096)]
+    assert scheduler_manage.routing_requests == [
+        (
+            "accepted-req",
+            32768,
+            28672,
+            4096,
+            RecoveryLevel.RESTARTABLE,
+        )
+    ]
 
 
 def test_forward_request_wakes_when_capacity_becomes_available():
@@ -463,6 +509,106 @@ def test_streaming_request_releases_route_after_completion():
     assert stub.response.cancelled
     assert stub.abort_requests == []
     assert scheduler_manage.released == ["stream-req"]
+
+
+def test_recoverable_stream_commits_official_tokens_before_sanitized_sse():
+    handler = RequestHandler()
+    scheduler_manage = RecoveryForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    wire = b"".join(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}],'
+            b'"prompt_token_ids":[10,20,30]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"reasoning":"hidden"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"content":"ok"},'
+            b'"token_ids":[41],"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    handler.stubs["node-a"] = StaticStub([wire[:23], wire[23:91], wire[91:]])
+
+    async def consume_stream():
+        response = await handler.v1_chat_completions(
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "temperature": 0,
+                "include_reasoning": False,
+            },
+            "recoverable-stream",
+            1.0,
+        )
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    body = asyncio.run(consume_stream())
+
+    assert handler.stubs["node-a"].request["return_token_ids"] is True
+    assert handler.stubs["node-a"].request["include_reasoning"] is True
+    assert b"prompt_token_ids" not in body
+    assert b"token_ids" not in body
+    assert b"hidden" not in body
+    assert b'"content":"ok"' in body
+    assert body.endswith(b"data: [DONE]\n\n")
+    assert scheduler_manage.journal_calls == [
+        (
+            "begin",
+            "recoverable-stream",
+            {
+                "engine_prompt_token_ids": (10, 20, 30),
+                "expected_prompt_token_ids": (10, 20, 30),
+                "request_data": {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                    "temperature": 0,
+                    "include_reasoning": False,
+                },
+            },
+        ),
+        ("prefill", "recoverable-stream", 7),
+        ("tokens", "recoverable-stream", 7, (40,)),
+        ("tokens", "recoverable-stream", 7, (41,)),
+        ("finish", "recoverable-stream", 7, RecoveryState.COMPLETED, None),
+    ]
+    assert scheduler_manage.routing_requests[0][-1] == RecoveryLevel.RECOVERABLE
+    assert scheduler_manage.released == ["recoverable-stream"]
+
+
+def test_recoverable_stream_fails_closed_on_prompt_token_mismatch():
+    handler = RequestHandler()
+    scheduler_manage = RecoveryForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+
+    def reject_mismatch(request_id, **kwargs):
+        raise RecoveryConflict("engine prompt token IDs differ")
+
+    scheduler_manage.begin_generation_journal = reject_mismatch
+    handler.stubs["node-a"] = StaticStub(
+        [
+            b'data: {"choices":[],"prompt_token_ids":[99]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    async def consume_stream():
+        response = await handler.v1_chat_completions(
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "temperature": 0,
+            },
+            "recoverable-stream",
+            1.0,
+        )
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    body = asyncio.run(consume_stream())
+    events = [line.removeprefix(b"data: ") for line in body.splitlines() if line]
+    error = json.loads(events[0])
+
+    assert error["error"]["code"] == "recovery_contract_violation"
+    assert events[-1] == b"[DONE]"
+    assert scheduler_manage.released == ["recoverable-stream"]
 
 
 def test_incomplete_upstream_stream_emits_error_and_terminal_event():

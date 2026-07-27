@@ -7,6 +7,7 @@ from backend.server import scheduler_manage as scheduler_manage_module
 from backend.server.scheduler_manage import SchedulerManage
 from backend.server.server_args import parse_args
 from parallax.p2p.liveness import DEFAULT_SCHEDULER_HEARTBEAT_TIMEOUT_SECONDS
+from swarm_protocol.contracts import RecoveryLevel
 
 
 def test_backend_scheduler_defaults_to_dynamic_dp(monkeypatch):
@@ -219,6 +220,7 @@ def test_active_v3_routing_receives_exact_token_budget(monkeypatch):
             "request_id": "request",
             "prompt_tokens": 12_220,
             "reserved_output_tokens": 4_096,
+            "recovery_level": RecoveryLevel.RESTARTABLE,
         }
     ]
 

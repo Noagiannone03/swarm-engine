@@ -394,6 +394,15 @@ class SchedulerProtocolV3Shadow:
             raise NoFeasibleRoute("no verified model swarm has a trusted registry bundle")
         return min(ready, key=lambda swarm_id: (-ready[swarm_id], swarm_id))
 
+    def trusted_manifest(self, model_swarm_id: str) -> ModelManifest:
+        """Return the immutable registry manifest used for route admission."""
+
+        with self._lock:
+            bundle = self._bundles.get(str(model_swarm_id))
+            if bundle is None:
+                raise NoFeasibleRoute("trusted model bundle is not ready")
+            return bundle.manifest
+
     def live_worker_ids(self) -> frozenset[str] | None:
         """Return DHT liveness when the catalogue is authoritative.
 

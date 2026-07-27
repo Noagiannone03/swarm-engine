@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from swarm_protocol.active import ActiveRouteRuntime
 from swarm_protocol.contracts import (
     LayerSpan,
+    ModelManifest,
     PathKind,
     RecoveryLevel,
     ReservationLease,
@@ -17,6 +20,8 @@ from swarm_protocol.coordinator import CommittedRoute
 SWARM_ID = "40" * 32
 COORDINATOR_ID = "10" * 32
 WORKER_ENDPOINT = "20" * 32
+RECOVERY_ENDPOINT = "30" * 32
+HASHES = tuple(f"{digit:x}" * 64 for digit in range(1, 7))
 
 
 class FakeTransport:
@@ -34,6 +39,26 @@ class FakePlanner:
         assert nodes
         return SWARM_ID
 
+    def trusted_manifest(self, model_swarm_id):
+        assert model_swarm_id == SWARM_ID
+        return ModelManifest(
+            model_id="fabi/test",
+            immutable_revision="revision",
+            architecture_graph_hash=HASHES[0],
+            tokenizer_hash=HASHES[1],
+            weight_collection_hash=HASHES[2],
+            weight_format="safetensors",
+            quantization="bf16",
+            dtype="bfloat16",
+            num_layers=2,
+            activation_bytes_per_token=4096,
+            kv_bytes_per_token_by_layer=(512, 512),
+            rope_context_contract_hash=HASHES[3],
+            attention_kv_contract_hash=HASHES[4],
+            prefill_contract_hash=HASHES[5],
+            wire_protocol_version=1,
+        )
+
     def plan_request(
         self,
         nodes,
@@ -46,44 +71,64 @@ class FakePlanner:
     ):
         del nodes
         self.epochs.append(epoch)
-        return SimpleNamespace(
-            plan=RoutePlan(
-                request_id=request.request_id,
-                route_id=f"route-{epoch}",
-                epoch=epoch,
-                model_swarm_id=request.model_swarm_id,
-                model_num_layers=2,
-                prompt_tokens=request.prompt_tokens,
-                reserved_output_tokens=request.reserved_output_tokens,
-                stages=(
-                    RouteStage(
-                        worker_id="worker",
-                        endpoint_id=WORKER_ENDPOINT,
-                        hosted_span=LayerSpan(start=0, end=2),
-                        effective_span=LayerSpan(start=0, end=2),
-                        path_to_next=PathKind.DIRECT,
-                        rounded_context_tokens=128,
-                        exact_kv_bytes=1024,
-                    ),
+        primary = RoutePlan(
+            request_id=request.request_id,
+            route_id=f"route-{epoch}",
+            epoch=epoch,
+            model_swarm_id=request.model_swarm_id,
+            model_num_layers=2,
+            prompt_tokens=request.prompt_tokens,
+            reserved_output_tokens=request.reserved_output_tokens,
+            stages=(
+                RouteStage(
+                    worker_id="worker",
+                    endpoint_id=WORKER_ENDPOINT,
+                    hosted_span=LayerSpan(start=0, end=2),
+                    effective_span=LayerSpan(start=0, end=2),
+                    path_to_next=PathKind.DIRECT,
+                    rounded_context_tokens=128,
+                    exact_kv_bytes=1024,
                 ),
-                recovery_level=RecoveryLevel.RESTARTABLE,
-                coordinator_id=coordinator_id,
-                reservation_deadline_ms=reservation_deadline_ms,
-                plan_expires_at_ms=plan_expires_at_ms,
-            )
+            ),
+            recovery_level=request.recovery_level,
+            coordinator_id=coordinator_id,
+            reservation_deadline_ms=reservation_deadline_ms,
+            plan_expires_at_ms=plan_expires_at_ms,
         )
+        recovery = (
+            primary.model_copy(
+                update={
+                    "route_id": f"route-{epoch}-recovery",
+                    "stages": (
+                        RouteStage(
+                            worker_id="recovery-worker",
+                            endpoint_id=RECOVERY_ENDPOINT,
+                            hosted_span=LayerSpan(start=0, end=2),
+                            effective_span=LayerSpan(start=0, end=2),
+                            path_to_next=PathKind.DIRECT,
+                            rounded_context_tokens=128,
+                            exact_kv_bytes=1024,
+                        ),
+                    ),
+                }
+            )
+            if request.recovery_level == RecoveryLevel.RECOVERABLE
+            else None
+        )
+        return SimpleNamespace(plan=primary, recovery_plan=recovery)
 
 
 def committed(plan: RoutePlan, expires_at_ms: int) -> CommittedRoute:
+    stage = plan.stages[0]
     return CommittedRoute(
         plan=plan,
         leases=(
             ReservationLease(
-                reservation_id=f"{plan.route_id}:worker",
+                reservation_id=f"{plan.route_id}:{stage.worker_id}",
                 request_id=plan.request_id,
                 route_id=plan.route_id,
                 epoch=plan.epoch,
-                worker_id="worker",
+                worker_id=stage.worker_id,
                 effective_span=LayerSpan(start=0, end=2),
                 exact_kv_bytes=1024,
                 state=ReservationState.COMMITTED,
@@ -101,13 +146,17 @@ class FakeCoordinator:
         self.renewed = []
         self.released = []
         self.fail_renew = False
+        self.fail_renew_route = None
+        self.fail_reserve_route = None
 
     def reserve(self, plan):
+        if plan.route_id == self.fail_reserve_route:
+            raise RuntimeError("backup capacity disappeared")
         self.reserved.append(plan)
         return committed(plan, self.now[0] + 60_000)
 
     def renew(self, route, *, ttl_ms):
-        if self.fail_renew:
+        if self.fail_renew or route.plan.route_id == self.fail_renew_route:
             raise RuntimeError("worker unreachable")
         self.renewed.append(route)
         return committed(route.plan, self.now[0] + ttl_ms)
@@ -149,12 +198,136 @@ def test_active_runtime_routes_only_after_complete_reservation():
         assert active.is_active("request")
         assert planner.epochs == [1]
         assert len(coordinator.reserved) == 1
-        assert active.authority("request") == {"route_id": "route-1", "epoch": 1}
+        assert active.authority("request") == {
+            "route_id": "route-1",
+            "epoch": 1,
+            "recovery_level": "restartable",
+        }
 
         assert active.release("request")
         assert not active.is_active("request")
         assert active.authority("request") is None
         assert len(coordinator.released) == 1
+    finally:
+        active.close()
+
+
+def test_recoverable_runtime_reserves_renews_and_releases_backup_route():
+    now = [1_000]
+    nodes = [
+        SimpleNamespace(node_id="worker", is_active=True),
+        SimpleNamespace(node_id="recovery-worker", is_active=True),
+    ]
+    active, _, coordinator, _ = runtime(now, nodes=nodes)
+    try:
+        assert active.reserve(
+            request_id="request",
+            prompt_tokens=100,
+            reserved_output_tokens=20,
+            recovery_level=RecoveryLevel.RECOVERABLE,
+        ) == ("worker",)
+        assert [route.route_id for route in coordinator.reserved] == [
+            "route-1",
+            "route-1-recovery",
+        ]
+        snapshot = active.snapshot()["active_routes"][0]
+        assert snapshot["recovery_route_id"] == "route-1-recovery"
+        assert snapshot["recovery_workers"] == ["recovery-worker"]
+        context = active.execution_context("request")
+        assert context is not None
+        assert context.manifest.model_id == "fabi/test"
+        assert context.primary_plan.route_id == "route-1"
+        assert context.recovery_plan is not None
+        assert context.recovery_plan.route_id == "route-1-recovery"
+
+        now[0] += 201
+        active.maintain_once()
+        assert [route.plan.route_id for route in coordinator.renewed] == [
+            "route-1",
+            "route-1-recovery",
+        ]
+
+        assert active.release("request")
+        assert [route.plan.route_id for route in coordinator.released] == [
+            "route-1-recovery",
+            "route-1",
+        ]
+    finally:
+        active.close()
+
+
+def test_recoverable_runtime_rolls_back_primary_when_backup_prepare_fails():
+    now = [1_000]
+    active, _, coordinator, _ = runtime(now)
+    coordinator.fail_reserve_route = "route-1-recovery"
+    try:
+        with pytest.raises(RuntimeError, match="backup capacity"):
+            active.reserve(
+                request_id="request",
+                prompt_tokens=100,
+                reserved_output_tokens=20,
+                recovery_level=RecoveryLevel.RECOVERABLE,
+            )
+        assert not active.is_active("request")
+        assert [route.plan.route_id for route in coordinator.released] == ["route-1"]
+    finally:
+        active.close()
+
+
+def test_lost_backup_downgrades_recovery_without_killing_healthy_primary():
+    now = [1_000]
+    nodes = [
+        SimpleNamespace(node_id="worker", is_active=True),
+        SimpleNamespace(node_id="recovery-worker", is_active=True),
+    ]
+    active, _, coordinator, _ = runtime(now, nodes=nodes)
+    try:
+        active.reserve(
+            request_id="request",
+            prompt_tokens=100,
+            reserved_output_tokens=20,
+            recovery_level=RecoveryLevel.RECOVERABLE,
+        )
+        nodes[1].is_active = False
+
+        active.maintain_once()
+
+        assert active.is_active("request")
+        assert active.authority("request")["recovery_level"] == "restartable"
+        context = active.execution_context("request")
+        assert context is not None
+        assert context.recovery_plan is None
+        assert context.effective_recovery_level == RecoveryLevel.RESTARTABLE
+        assert [route.plan.route_id for route in coordinator.released] == ["route-1-recovery"]
+        degradation = active.snapshot()["recent_recovery_degradations"][0]
+        assert degradation["recovery_route_id"] == "route-1-recovery"
+    finally:
+        active.close()
+
+
+def test_backup_renewal_failure_downgrades_after_primary_renewal():
+    now = [1_000]
+    nodes = [
+        SimpleNamespace(node_id="worker", is_active=True),
+        SimpleNamespace(node_id="recovery-worker", is_active=True),
+    ]
+    active, _, coordinator, _ = runtime(now, nodes=nodes)
+    try:
+        active.reserve(
+            request_id="request",
+            prompt_tokens=100,
+            reserved_output_tokens=20,
+            recovery_level=RecoveryLevel.RECOVERABLE,
+        )
+        coordinator.fail_renew_route = "route-1-recovery"
+        now[0] += 201
+
+        active.maintain_once()
+
+        assert active.is_active("request")
+        assert [route.plan.route_id for route in coordinator.renewed] == ["route-1"]
+        assert [route.plan.route_id for route in coordinator.released] == ["route-1-recovery"]
+        assert active.snapshot()["active_routes"][0]["effective_recovery_level"] == ("restartable")
     finally:
         active.close()
 

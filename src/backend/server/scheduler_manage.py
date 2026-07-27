@@ -22,7 +22,16 @@ from scheduling.node import RequestSignal, node_is_routable
 from scheduling.scheduler import Scheduler
 from swarm_protocol.active import ActiveRouteRuntime
 from swarm_protocol.coordinator import RouteReservationError
+from swarm_protocol.contracts import RecoveryLevel
 from swarm_protocol.epochs import InMemoryEpochAllocator, SqliteEpochAllocator
+from swarm_protocol.recovery import (
+    InMemoryRecoveryJournal,
+    RecoveryConflict,
+    RecoveryState,
+    RequestRecoverySnapshot,
+    RequestRecoverySpec,
+    sampling_replay_contract,
+)
 from swarm_protocol.routing import RoutePlanningError
 
 logger = get_logger(__name__)
@@ -69,6 +78,9 @@ class SchedulerManage:
             self.swarm_v3_mode = "off"
         if self.swarm_v3_mode not in {"off", "shadow", "active"}:
             raise ValueError("FABI_SWARM_V3_MODE supports only off, shadow, or active")
+        self.swarm_v3_recovery = os.environ.get("FABI_SWARM_V3_RECOVERY", "prefer").strip().lower()
+        if self.swarm_v3_recovery not in {"off", "prefer", "require"}:
+            raise ValueError("FABI_SWARM_V3_RECOVERY supports only off, prefer, or require")
         self.model_name = None
         self.init_nodes_num = None
         self.scheduler = None
@@ -81,6 +93,7 @@ class SchedulerManage:
         self._context_tokenizer = None
         self._context_tokenizer_model = None
         self._context_tokenizer_lock = threading.Lock()
+        self.recovery_journal = InMemoryRecoveryJournal()
         epoch_db = os.environ.get("FABI_SWARM_V3_EPOCH_DB")
         self.epoch_allocator = (
             SqliteEpochAllocator(epoch_db, namespace="scheduler-control-plane")
@@ -235,6 +248,10 @@ class SchedulerManage:
                     if self.active_v3_routes is not None
                     else {"mode": "off", "active_routes": []}
                 ),
+                "swarm_v3_recovery": {
+                    "policy": self.swarm_v3_recovery,
+                    **self.recovery_journal.status(),
+                },
                 "max_running_request": (
                     self.scheduler.report_pipeline_capacity()[1] if self.scheduler else 0
                 ),
@@ -541,6 +558,7 @@ class SchedulerManage:
         *,
         prompt_tokens: int | None = None,
         reserved_output_tokens: int | None = None,
+        recovery_level: RecoveryLevel = RecoveryLevel.RESTARTABLE,
     ):
         """Block briefly until the scheduler assigns a routing path for the request.
 
@@ -567,9 +585,31 @@ class SchedulerManage:
                         request_id=str(request_id),
                         prompt_tokens=prompt_tokens,
                         reserved_output_tokens=reserved_output_tokens,
+                        recovery_level=recovery_level,
                     )
                 )
             except (RoutePlanningError, RouteReservationError) as exc:
+                if (
+                    recovery_level == RecoveryLevel.RECOVERABLE
+                    and self.swarm_v3_recovery == "prefer"
+                ):
+                    logger.info(
+                        "No fully reserved recovery route for %s; falling back to an "
+                        "explicitly restartable route: %s",
+                        request_id,
+                        exc,
+                    )
+                    try:
+                        return list(
+                            self.active_v3_routes.reserve(
+                                request_id=str(request_id),
+                                prompt_tokens=prompt_tokens,
+                                reserved_output_tokens=reserved_output_tokens,
+                                recovery_level=RecoveryLevel.RESTARTABLE,
+                            )
+                        )
+                    except (RoutePlanningError, RouteReservationError) as fallback_exc:
+                        exc = fallback_exc
                 logger.info("Protocol-v3 route not currently admissible: %s", exc)
                 return []
 
@@ -622,6 +662,151 @@ class SchedulerManage:
         if self.active_v3_routes is None:
             return None
         return self.active_v3_routes.authority(str(request_id))
+
+    def preferred_recovery_level(self, request_data) -> RecoveryLevel:
+        """Choose only guarantees the current data plane can reproduce exactly."""
+
+        if (
+            self.active_v3_routes is None
+            or self.swarm_v3_recovery == "off"
+            or not request_data.get("stream", False)
+            or sampling_replay_contract(request_data) is None
+        ):
+            return RecoveryLevel.RESTARTABLE
+        return RecoveryLevel.RECOVERABLE
+
+    def should_capture_generation_tokens(self, request_id: str, request_data) -> bool:
+        """Return whether this admitted request has an exact token journal contract."""
+
+        return (
+            self.active_v3_routes is not None
+            and self.active_v3_routes.execution_context(str(request_id)) is not None
+            and sampling_replay_contract(request_data) is not None
+        )
+
+    def begin_generation_journal(
+        self,
+        request_id: str,
+        *,
+        engine_prompt_token_ids: tuple[int, ...],
+        expected_prompt_token_ids: tuple[int, ...],
+        request_data,
+    ) -> RequestRecoverySnapshot:
+        """Bind official engine token IDs to the admitted route before decode."""
+
+        if self.active_v3_routes is None:
+            raise RecoveryConflict("active v3 routing is not enabled")
+        context = self.active_v3_routes.execution_context(str(request_id))
+        if context is None:
+            raise RecoveryConflict("request route is no longer active")
+        if engine_prompt_token_ids != expected_prompt_token_ids:
+            raise RecoveryConflict(
+                "engine prompt token IDs differ from scheduler context admission"
+            )
+        plan = context.primary_plan
+        if len(engine_prompt_token_ids) != plan.prompt_tokens:
+            raise RecoveryConflict("engine prompt token count differs from the reserved route")
+        sampling = sampling_replay_contract(request_data)
+        if sampling is None:
+            raise RecoveryConflict("request sampling is not exactly replayable")
+        manifest = context.manifest
+        if manifest.model_swarm_id != plan.model_swarm_id:
+            raise RecoveryConflict("active route and trusted manifest identify different swarms")
+        if context.effective_recovery_level == RecoveryLevel.RECOVERABLE:
+            recovery_plan = context.recovery_plan
+            if (
+                recovery_plan is None
+                or recovery_plan.model_swarm_id != plan.model_swarm_id
+                or recovery_plan.epoch != plan.epoch
+            ):
+                raise RecoveryConflict("recoverable route has no compatible reserved backup")
+        return self.recovery_journal.begin(
+            RequestRecoverySpec(
+                request_id=str(request_id),
+                model_swarm_id=manifest.model_swarm_id,
+                immutable_revision=manifest.immutable_revision,
+                tokenizer_hash=manifest.tokenizer_hash,
+                dtype=manifest.dtype,
+                prefill_contract_hash=manifest.prefill_contract_hash,
+                attention_kv_contract_hash=manifest.attention_kv_contract_hash,
+                prompt_token_ids=engine_prompt_token_ids,
+                sampling=sampling,
+                recovery_level=context.effective_recovery_level,
+                primary_route_id=plan.route_id,
+                epoch=plan.epoch,
+                reserved_context_tokens=plan.required_context_tokens,
+            )
+        )
+
+    def commit_generation_prefill(self, request_id: str, *, epoch: int) -> None:
+        snapshot = self._reconcile_generation_recovery(str(request_id), epoch=epoch)
+        if snapshot is None:
+            raise RecoveryConflict("request is not present in the recovery journal")
+        self.recovery_journal.commit_prefill(
+            str(request_id),
+            epoch=epoch,
+            prompt_checksum=snapshot.prompt_checksum,
+        )
+
+    def commit_generation_tokens(
+        self,
+        request_id: str,
+        *,
+        epoch: int,
+        token_ids: tuple[int, ...],
+    ) -> None:
+        self._reconcile_generation_recovery(str(request_id), epoch=epoch)
+        for token_id in token_ids:
+            snapshot = self.recovery_journal.get(str(request_id))
+            if snapshot is None:
+                raise RecoveryConflict("request is not present in the recovery journal")
+            self.recovery_journal.commit_token(
+                str(request_id),
+                epoch=epoch,
+                position=snapshot.committed_position,
+                token_id=token_id,
+            )
+
+    def finish_generation_journal(
+        self,
+        request_id: str,
+        *,
+        epoch: int,
+        state: RecoveryState,
+        failure: str | None = None,
+    ) -> None:
+        if self._reconcile_generation_recovery(str(request_id), epoch=epoch) is None:
+            return
+        self.recovery_journal.finish(
+            str(request_id),
+            epoch=epoch,
+            state=state,
+            failure=failure,
+        )
+
+    def _reconcile_generation_recovery(
+        self,
+        request_id: str,
+        *,
+        epoch: int,
+    ) -> RequestRecoverySnapshot | None:
+        """Keep the journal's live guarantee aligned with reserved topology."""
+
+        snapshot = self.recovery_journal.get(str(request_id))
+        if (
+            snapshot is None
+            or snapshot.effective_recovery_level != RecoveryLevel.RECOVERABLE
+            or self.active_v3_routes is None
+        ):
+            return snapshot
+        context = self.active_v3_routes.execution_context(str(request_id))
+        if context is not None and context.effective_recovery_level == RecoveryLevel.RESTARTABLE:
+            return self.recovery_journal.downgrade_to_restartable(
+                str(request_id),
+                epoch=epoch,
+                reason="reserved backup route is no longer available",
+            )
+        return snapshot
 
     def wait_for_routing_capacity(self, timeout: float) -> bool:
         """Block until a route can be admitted or the bounded wait expires."""

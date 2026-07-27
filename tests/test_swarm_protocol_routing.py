@@ -112,13 +112,19 @@ def link(
     )
 
 
-def request(model: ModelManifest, *, prompt: int = 100, output: int = 20) -> RequestContract:
+def request(
+    model: ModelManifest,
+    *,
+    prompt: int = 100,
+    output: int = 20,
+    recovery: RecoveryLevel = RecoveryLevel.RESTARTABLE,
+) -> RequestContract:
     return RequestContract(
         request_id="request",
         model_swarm_id=model.model_swarm_id,
         prompt_tokens=prompt,
         reserved_output_tokens=output,
-        recovery_level=RecoveryLevel.RESTARTABLE,
+        recovery_level=recovery,
     )
 
 
@@ -316,3 +322,53 @@ def test_cold_worker_without_throughput_is_admissible_but_estimate_is_unknown() 
 
     assert [stage.worker_id for stage in result.plan.stages] == ["cold"]
     assert result.estimate.complete is False
+
+
+def test_recoverable_route_reserves_a_worker_disjoint_complete_backup() -> None:
+    model = manifest()
+    result = plan(
+        model,
+        request(model, recovery=RecoveryLevel.RECOVERABLE),
+        [
+            offer("primary-head"),
+            offer("primary-tail", frontend=False),
+            offer("backup-head"),
+            offer("backup-tail", frontend=False),
+        ],
+        [
+            lease(model, "primary-head", 0, 4),
+            lease(model, "primary-tail", 4, 8),
+            lease(model, "backup-head", 0, 4),
+            lease(model, "backup-tail", 4, 8),
+        ],
+        [
+            link("primary-head", "primary-tail", rtt_ms=1),
+            link("primary-tail", "primary-head", rtt_ms=1),
+            link("backup-head", "backup-tail", rtt_ms=20),
+            link("backup-tail", "backup-head", rtt_ms=20),
+        ],
+    )
+
+    assert [stage.worker_id for stage in result.plan.stages] == [
+        "primary-head",
+        "primary-tail",
+    ]
+    assert result.recovery_plan is not None
+    assert [stage.worker_id for stage in result.recovery_plan.stages] == [
+        "backup-head",
+        "backup-tail",
+    ]
+    assert result.recovery_plan.route_id == "route-recovery"
+    assert result.recovery_estimate is not None
+
+
+def test_recoverable_route_fails_closed_without_disjoint_backup_coverage() -> None:
+    model = manifest()
+    with pytest.raises(NoFeasibleRoute, match="worker-disjoint"):
+        plan(
+            model,
+            request(model, recovery=RecoveryLevel.RECOVERABLE),
+            [offer("head"), offer("tail", frontend=False)],
+            [lease(model, "head", 0, 4), lease(model, "tail", 4, 8)],
+            [link("head", "tail"), link("tail", "head")],
+        )

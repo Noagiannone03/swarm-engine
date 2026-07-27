@@ -14,6 +14,7 @@ class ContextRequestError(ValueError):
 class ContextBudget:
     prompt_tokens: int
     max_output_tokens: int
+    prompt_token_ids: tuple[int, ...] = ()
 
     @property
     def required_tokens(self) -> int:
@@ -67,7 +68,7 @@ def _template_kwargs(request_data: Mapping[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
-def _token_count(tokenized: Any) -> int:
+def _token_ids(tokenized: Any) -> tuple[int, ...]:
     if isinstance(tokenized, Mapping):
         tokenized = tokenized.get("input_ids")
     if hasattr(tokenized, "tolist"):
@@ -80,7 +81,9 @@ def _token_count(tokenized: Any) -> int:
         tokenized = tokenized[0]
     if any(isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in tokenized):
         raise ContextRequestError("chat tokenizer returned invalid token ids")
-    return len(tokenized)
+    if any(token_id < 0 or token_id > 2**32 - 1 for token_id in tokenized):
+        raise ContextRequestError("chat tokenizer returned out-of-range token ids")
+    return tuple(tokenized)
 
 
 def build_context_budget(tokenizer: Any, request_data: Mapping[str, Any]) -> ContextBudget:
@@ -99,7 +102,9 @@ def build_context_budget(tokenizer: Any, request_data: Mapping[str, Any]) -> Con
     except Exception as exc:
         raise ContextRequestError(f"unable to render chat template: {exc}") from exc
 
+    prompt_token_ids = _token_ids(tokenized)
     return ContextBudget(
-        prompt_tokens=_token_count(tokenized),
+        prompt_tokens=len(prompt_token_ids),
         max_output_tokens=max_output_tokens,
+        prompt_token_ids=prompt_token_ids,
     )

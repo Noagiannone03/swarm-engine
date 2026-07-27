@@ -44,6 +44,7 @@ def test_budget_uses_rendered_chat_tools_and_reserved_output():
     )
 
     assert budget.prompt_tokens == 17
+    assert budget.prompt_token_ids == tuple(range(17))
     assert budget.max_output_tokens == 2048
     assert budget.required_tokens == 2065
     assert tokenizer.messages == messages
@@ -69,6 +70,7 @@ def test_budget_supports_max_tokens_alias_and_default():
     )
 
     assert alias_budget.required_tokens == 67
+    assert alias_budget.prompt_token_ids == (1, 2, 3)
     assert default_budget.required_tokens == 3 + DEFAULT_MAX_OUTPUT_TOKENS
 
 

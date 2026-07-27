@@ -9,14 +9,20 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool
 
 from backend.server.constants import NODE_STATUS_AVAILABLE
-from backend.server.context_admission import ContextRequestError
+from backend.server.context_admission import ContextBudget, ContextRequestError
 from backend.server.openai_compat import (
     decode_http_response_envelope,
     openai_error_payload,
     openai_error_response,
 )
+from backend.server.recovery_stream import (
+    OpenAIRecoveryStream,
+    RecoveryStreamProtocolError,
+)
 from parallax_utils.logging_config import get_logger
 from parallax_utils.request_metrics import get_request_metrics
+from swarm_protocol.contracts import RecoveryLevel
+from swarm_protocol.recovery import RecoveryConflict, RecoveryState
 
 logger = get_logger(__name__)
 
@@ -246,6 +252,7 @@ class RequestHandler:
             )
 
         required_context_tokens = 0
+        budget = ContextBudget(prompt_tokens=0, max_output_tokens=0)
         build_budget = getattr(self.scheduler_manage, "build_context_budget", None)
         max_supported_context = getattr(self.scheduler_manage, "max_supported_context_tokens", None)
         if build_budget is not None and max_supported_context is not None:
@@ -299,12 +306,18 @@ class RequestHandler:
             routing_table = None
             while attempts < self.MAX_ROUTING_RETRY:
                 try:
+                    preferred_recovery = getattr(
+                        self.scheduler_manage,
+                        "preferred_recovery_level",
+                        lambda _request: RecoveryLevel.RESTARTABLE,
+                    )(request_data)
                     routing_table = self.scheduler_manage.get_routing_table(
                         request_id,
                         received_ts,
                         required_context_tokens,
                         prompt_tokens=budget.prompt_tokens,
                         reserved_output_tokens=budget.max_output_tokens,
+                        recovery_level=preferred_recovery,
                     )
                     logger.debug(
                         f"get_routing_table for request {request_id} return: {routing_table} (attempt {attempts + 1})"
@@ -352,6 +365,24 @@ class RequestHandler:
                     str(request_id),
                     routing_table,
                 )
+                capture_tokens = bool(
+                    is_stream
+                    and getattr(
+                        self.scheduler_manage,
+                        "should_capture_generation_tokens",
+                        lambda _request_id, _request: False,
+                    )(str(request_id), request_data)
+                )
+                client_requested_token_ids = bool(request_data.get("return_token_ids", False))
+                client_requested_reasoning = bool(request_data.get("include_reasoning", True))
+                if capture_tokens:
+                    # Both maintained vLLM frontends return the exact rendered
+                    # prompt once and delta token IDs per update. Force
+                    # reasoning internally so hidden tokens cannot disappear
+                    # from the recovery journal; the sanitizer preserves the
+                    # client's original visibility choice.
+                    backend_request["return_token_ids"] = True
+                    backend_request["include_reasoning"] = True
                 stub = self.get_stub(routing_table[0])
                 if is_stream:
 
@@ -361,6 +392,40 @@ class RequestHandler:
                         last_chunk = None
                         last_token_time = None
                         stream_finished = False
+                        journal_started = False
+                        journal_terminal = False
+                        prefill_committed = False
+                        recovery_epoch = None
+                        recovery_stream = (
+                            OpenAIRecoveryStream(
+                                expose_token_ids=client_requested_token_ids,
+                                expose_reasoning=client_requested_reasoning,
+                            )
+                            if capture_tokens
+                            else None
+                        )
+
+                        def finish_journal(
+                            state: RecoveryState,
+                            failure: str | None = None,
+                        ) -> None:
+                            nonlocal journal_terminal
+                            if not journal_started or journal_terminal or recovery_epoch is None:
+                                return
+                            try:
+                                self.scheduler_manage.finish_generation_journal(
+                                    str(request_id),
+                                    epoch=recovery_epoch,
+                                    state=state,
+                                    failure=failure,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Unable to finalize recovery journal for %s",
+                                    request_id,
+                                )
+                            journal_terminal = True
+
                         try:
                             response = stub.chat_completion(backend_request)
                             iterator = iterate_in_threadpool(response)
@@ -373,7 +438,21 @@ class RequestHandler:
                                         iterator,
                                     )
                                 except StopAsyncIteration:
+                                    if recovery_stream is not None:
+                                        try:
+                                            recovery_stream.finalize()
+                                        except RecoveryStreamProtocolError as exc:
+                                            finish_journal(RecoveryState.FAILED, str(exc))
+                                            logger.warning(
+                                                "Invalid exact-token stream for request %s: %s",
+                                                request_id,
+                                                exc,
+                                            )
                                     if not stream_finished:
+                                        finish_journal(
+                                            RecoveryState.FAILED,
+                                            "upstream stream ended without a terminal event",
+                                        )
                                         logger.warning(
                                             "Upstream stream ended without a terminal event "
                                             "for request %s",
@@ -390,12 +469,20 @@ class RequestHandler:
                                         yield b"data: [DONE]\n\n"
                                     break
                                 except ClientDisconnectedError:
+                                    finish_journal(
+                                        RecoveryState.ABORTED,
+                                        "streaming client disconnected",
+                                    )
                                     logger.info(
                                         "Streaming client disconnected during request %s",
                                         request_id,
                                     )
                                     return
                                 except DownstreamRouteLostError:
+                                    finish_journal(
+                                        RecoveryState.FAILED,
+                                        "worker route was lost during generation",
+                                    )
                                     logger.warning(
                                         "Worker route was lost during streaming request %s",
                                         request_id,
@@ -410,17 +497,92 @@ class RequestHandler:
                                     )
                                     yield b"data: [DONE]\n\n"
                                     return
-                                if chunk is not None and b"data: [DONE]" in chunk:
-                                    stream_finished = True
-                                last_token_time = time.time()
-                                if first_token_time is None:
-                                    first_token_time = last_token_time
-                                if chunk is not None and not chunk.decode("utf-8").startswith(
-                                    "data: [DONE]"
-                                ):
-                                    last_chunk = chunk
-                                yield chunk
+                                if recovery_stream is None:
+                                    if chunk is not None and b"data: [DONE]" in chunk:
+                                        stream_finished = True
+                                    last_token_time = time.time()
+                                    if first_token_time is None:
+                                        first_token_time = last_token_time
+                                    if chunk is not None and not chunk.decode("utf-8").startswith(
+                                        "data: [DONE]"
+                                    ):
+                                        last_chunk = chunk
+                                    yield chunk
+                                    continue
+
+                                try:
+                                    events = recovery_stream.feed(chunk)
+                                    for event in events:
+                                        if event.prompt_token_ids is not None:
+                                            snapshot = self.scheduler_manage.begin_generation_journal(
+                                                str(request_id),
+                                                engine_prompt_token_ids=event.prompt_token_ids,
+                                                expected_prompt_token_ids=budget.prompt_token_ids,
+                                                request_data=request_data,
+                                            )
+                                            recovery_epoch = snapshot.epoch
+                                            journal_started = True
+                                        if (
+                                            event.output_token_ids
+                                            or event.finish_reason is not None
+                                        ):
+                                            if not journal_started or recovery_epoch is None:
+                                                raise RecoveryStreamProtocolError(
+                                                    "output arrived before exact prompt token IDs"
+                                                )
+                                            if not prefill_committed:
+                                                self.scheduler_manage.commit_generation_prefill(
+                                                    str(request_id),
+                                                    epoch=recovery_epoch,
+                                                )
+                                                prefill_committed = True
+                                            self.scheduler_manage.commit_generation_tokens(
+                                                str(request_id),
+                                                epoch=recovery_epoch,
+                                                token_ids=event.output_token_ids,
+                                            )
+                                        if event.output_token_ids:
+                                            last_token_time = time.time()
+                                            if first_token_time is None:
+                                                first_token_time = last_token_time
+                                        if event.done:
+                                            if not journal_started or recovery_epoch is None:
+                                                raise RecoveryStreamProtocolError(
+                                                    "[DONE] arrived before exact prompt token IDs"
+                                                )
+                                            if not prefill_committed:
+                                                self.scheduler_manage.commit_generation_prefill(
+                                                    str(request_id),
+                                                    epoch=recovery_epoch,
+                                                )
+                                                prefill_committed = True
+                                            finish_journal(RecoveryState.COMPLETED)
+                                            stream_finished = True
+                                        if not event.done:
+                                            last_chunk = event.client_bytes
+                                        # Token commits above happen before this
+                                        # exact event becomes visible to OpenCode.
+                                        yield event.client_bytes
+                                except (RecoveryStreamProtocolError, RecoveryConflict) as exc:
+                                    finish_journal(RecoveryState.FAILED, str(exc))
+                                    logger.warning(
+                                        "Exact recovery stream rejected for request %s: %s",
+                                        request_id,
+                                        exc,
+                                    )
+                                    yield self._stream_error_chunk(
+                                        "The generation stream violated its exact recovery contract.",
+                                        err_type="upstream_error",
+                                        code="recovery_contract_violation",
+                                    )
+                                    yield b"data: [DONE]\n\n"
+                                    return
                         finally:
+                            if journal_started and not journal_terminal:
+                                finish_journal(
+                                    RecoveryState.ABORTED,
+                                    "stream ended before a committed terminal event",
+                                )
                             if last_chunk is not None:
                                 tps, ttft, input_tokens, output_tokens = get_request_metrics(
                                     last_chunk, start_time, first_token_time, last_token_time

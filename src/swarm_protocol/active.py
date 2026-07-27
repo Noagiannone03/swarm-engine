@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from swarm_protocol.contracts import RecoveryLevel, RequestContract
+from swarm_protocol.contracts import ModelManifest, RecoveryLevel, RequestContract, RoutePlan
 from swarm_protocol.coordinator import (
     CommittedRoute,
     ControlTransport,
@@ -34,12 +34,23 @@ def _steady_clock_ms() -> int:
 @dataclass
 class _ActiveRoute:
     committed: CommittedRoute
+    recovery_committed: CommittedRoute | None = None
     active: bool = True
     next_renew_at_ms: int = 0
     lease_deadline_ms: int = 0
     consecutive_renewal_failures: int = 0
     last_renewal_error: str | None = None
     operation_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass(frozen=True)
+class ActiveRouteContext:
+    """Immutable recovery inputs for one admitted data-plane route."""
+
+    manifest: ModelManifest
+    primary_plan: RoutePlan
+    recovery_plan: RoutePlan | None
+    effective_recovery_level: RecoveryLevel
 
 
 class ActiveRouteRuntime:
@@ -98,14 +109,14 @@ class ActiveRouteRuntime:
         )
         if (
             self._renew_attempt_budget_ms <= 0
-            or session_ttl_ms
-            <= self._renew_attempt_budget_ms + self.lease_expiry_guard_ms
+            or session_ttl_ms <= self._renew_attempt_budget_ms + self.lease_expiry_guard_ms
         ):
             raise ValueError("session TTL leaves no safe renewal retry window")
         self.epoch_allocator = epoch_allocator or InMemoryEpochAllocator()
         self._routes: dict[str, _ActiveRoute] = {}
         self._request_locks: dict[str, threading.Lock] = {}
         self._failures: deque[dict[str, object]] = deque(maxlen=64)
+        self._recovery_degradations: deque[dict[str, object]] = deque(maxlen=64)
         self._lock = threading.RLock()
         self._capacity_changed = threading.Condition(self._lock)
         self._stop_event = threading.Event()
@@ -174,18 +185,42 @@ class ActiveRouteRuntime:
             # deadline before the RPC is conservative: the worker can only
             # install its full TTL after this point.
             lease_started_at_ms = self._steady_now_ms()
-            committed = self.coordinator.reserve(planned.plan)
+            committed: CommittedRoute | None = None
+            recovery_committed: CommittedRoute | None = None
+            try:
+                committed = self.coordinator.reserve(planned.plan)
+                recovery_plan = getattr(planned, "recovery_plan", None)
+                if request.recovery_level == RecoveryLevel.RECOVERABLE:
+                    if recovery_plan is None:
+                        raise RouteReservationError("recoverable planner omitted its backup route")
+                    recovery_committed = self.coordinator.reserve(recovery_plan)
+            except Exception:
+                for partial in (recovery_committed, committed):
+                    if partial is not None:
+                        try:
+                            self.coordinator.release(partial)
+                        except Exception:
+                            logger.warning(
+                                "Failed to roll back partial recoverable route %s",
+                                request_key,
+                                exc_info=True,
+                            )
+                raise
+            assert committed is not None
             acknowledged_at_ms = self._steady_now_ms()
             lease_deadline_ms = lease_started_at_ms + self.session_ttl_ms
             if acknowledged_at_ms >= lease_deadline_ms - self.lease_expiry_guard_ms:
                 try:
-                    self.coordinator.release(committed)
+                    for reserved in (recovery_committed, committed):
+                        if reserved is not None:
+                            self.coordinator.release(reserved)
                 finally:
                     raise RouteReservationError(
                         "route session lease was acknowledged too close to expiry"
                     )
             active = _ActiveRoute(
                 committed=committed,
+                recovery_committed=recovery_committed,
                 next_renew_at_ms=acknowledged_at_ms + self.renew_interval_ms,
                 lease_deadline_ms=lease_deadline_ms,
             )
@@ -206,8 +241,7 @@ class ActiveRouteRuntime:
         with self._lock:
             now_ms = self._steady_now_ms()
             return any(
-                route.active and now_ms < route.lease_deadline_ms
-                for route in self._routes.values()
+                route.active and now_ms < route.lease_deadline_ms for route in self._routes.values()
             )
 
     def authority(self, request_id: str) -> dict[str, object] | None:
@@ -225,7 +259,38 @@ class ActiveRouteRuntime:
             return {
                 "route_id": plan.route_id,
                 "epoch": plan.epoch,
+                "recovery_level": (
+                    RecoveryLevel.RECOVERABLE.value
+                    if route.recovery_committed is not None
+                    else RecoveryLevel.RESTARTABLE.value
+                ),
             }
+
+    def execution_context(self, request_id: str) -> ActiveRouteContext | None:
+        """Return exact route and manifest contracts while a lease is active."""
+
+        with self._lock:
+            route = self._routes.get(str(request_id))
+            if (
+                route is None
+                or not route.active
+                or self._steady_now_ms() >= route.lease_deadline_ms
+            ):
+                return None
+            primary_plan = route.committed.plan
+            recovery_plan = (
+                route.recovery_committed.plan if route.recovery_committed is not None else None
+            )
+        return ActiveRouteContext(
+            manifest=self.planner.trusted_manifest(primary_plan.model_swarm_id),
+            primary_plan=primary_plan,
+            recovery_plan=recovery_plan,
+            effective_recovery_level=(
+                RecoveryLevel.RECOVERABLE
+                if recovery_plan is not None
+                else RecoveryLevel.RESTARTABLE
+            ),
+        )
 
     def release(self, request_id: str) -> bool:
         request_key = str(request_id)
@@ -240,7 +305,7 @@ class ActiveRouteRuntime:
                     return False
                 route.active = False
             try:
-                self.coordinator.release(route.committed)
+                self._release_committed(route)
             finally:
                 with self._capacity_changed:
                     self._routes.pop(request_key, None)
@@ -262,12 +327,25 @@ class ActiveRouteRuntime:
                     "route_id": route.committed.plan.route_id,
                     "epoch": route.committed.plan.epoch,
                     "workers": [stage.worker_id for stage in route.committed.plan.stages],
+                    "recovery_route_id": (
+                        route.recovery_committed.plan.route_id
+                        if route.recovery_committed is not None
+                        else None
+                    ),
+                    "recovery_workers": (
+                        [stage.worker_id for stage in route.recovery_committed.plan.stages]
+                        if route.recovery_committed is not None
+                        else []
+                    ),
+                    "effective_recovery_level": (
+                        RecoveryLevel.RECOVERABLE.value
+                        if route.recovery_committed is not None
+                        else RecoveryLevel.RESTARTABLE.value
+                    ),
                     # Remote lease timestamps use worker clocks. Expose only
                     # the remaining duration measured by the local steady
                     # clock, never a meaningless cross-machine wall timestamp.
-                    "lease_expires_in_ms": max(
-                        0, route.lease_deadline_ms - steady_now_ms
-                    ),
+                    "lease_expires_in_ms": max(0, route.lease_deadline_ms - steady_now_ms),
                     "renewal_failures": route.consecutive_renewal_failures,
                     "last_renewal_error": route.last_renewal_error,
                 }
@@ -278,6 +356,7 @@ class ActiveRouteRuntime:
                 "mode": "active",
                 "active_routes": routes,
                 "recent_failures": list(self._failures),
+                "recent_recovery_degradations": list(self._recovery_degradations),
                 "session_ttl_ms": self.session_ttl_ms,
                 "renew_interval_ms": self.renew_interval_ms,
                 "renew_retry_interval_ms": self.renew_retry_interval_ms,
@@ -319,16 +398,71 @@ class ActiveRouteRuntime:
             routes = list(self._routes.items())
         now_ms = self._steady_now_ms()
         for request_id, route in routes:
-            route_workers = {stage.worker_id for stage in route.committed.plan.stages}
-            departed = sorted(route_workers - active_workers)
-            if departed:
+            primary_workers = {stage.worker_id for stage in route.committed.plan.stages}
+            departed_primary = sorted(primary_workers - active_workers)
+            if departed_primary:
                 self._invalidate(
                     request_id,
                     route,
-                    RuntimeError(f"route workers departed: {departed}"),
+                    RuntimeError(f"primary route workers departed: {departed_primary}"),
                 )
-            elif route.next_renew_at_ms <= now_ms:
+                continue
+            if route.recovery_committed is not None:
+                recovery_workers = {
+                    stage.worker_id for stage in route.recovery_committed.plan.stages
+                }
+                departed_recovery = sorted(recovery_workers - active_workers)
+                if departed_recovery:
+                    self._degrade_recovery(
+                        request_id,
+                        route,
+                        RuntimeError(f"reserved recovery workers departed: {departed_recovery}"),
+                    )
+            if route.next_renew_at_ms <= now_ms:
                 self._renew_one(request_id, route)
+
+    def _degrade_recovery(
+        self,
+        request_id: str,
+        route: _ActiveRoute,
+        exc: Exception,
+    ) -> None:
+        """Keep a healthy primary alive while explicitly dropping its lost SLA."""
+
+        with route.operation_lock:
+            self._degrade_recovery_under_operation_lock(request_id, route, exc)
+
+    def _degrade_recovery_under_operation_lock(
+        self,
+        request_id: str,
+        route: _ActiveRoute,
+        exc: Exception,
+    ) -> None:
+        with self._lock:
+            if self._routes.get(request_id) is not route or not route.active:
+                return
+            recovery = route.recovery_committed
+            if recovery is None:
+                return
+            route.recovery_committed = None
+            self._recovery_degradations.append(
+                {
+                    "request_id": request_id,
+                    "route_id": route.committed.plan.route_id,
+                    "epoch": route.committed.plan.epoch,
+                    "recovery_route_id": recovery.plan.route_id,
+                    "error": f"{type(exc).__name__}: {exc}"[:256],
+                    "degraded_at_ms": self._now_ms(),
+                }
+            )
+        try:
+            self.coordinator.release(recovery)
+        except Exception:
+            logger.warning(
+                "Failed to release degraded recovery route %s",
+                request_id,
+                exc_info=True,
+            )
 
     def _invalidate(
         self,
@@ -351,7 +485,7 @@ class ActiveRouteRuntime:
                     }
                 )
             try:
-                self.coordinator.release(route.committed)
+                self._release_committed(route)
             except Exception:
                 logger.warning(
                     "Failed to clean up lost v3 route %s",
@@ -381,7 +515,7 @@ class ActiveRouteRuntime:
                     )
             if renewal_error is None:
                 try:
-                    renewed = self.coordinator.renew(
+                    renewed_primary = self.coordinator.renew(
                         route.committed,
                         ttl_ms=self.session_ttl_ms,
                     )
@@ -398,9 +532,7 @@ class ActiveRouteRuntime:
                             - self.lease_expiry_guard_ms
                         )
                         if now_ms + self.renew_retry_interval_ms < safe_retry_deadline:
-                            route.next_renew_at_ms = (
-                                now_ms + self.renew_retry_interval_ms
-                            )
+                            route.next_renew_at_ms = now_ms + self.renew_retry_interval_ms
                             logger.warning(
                                 "Protocol-v3 route %s lease renewal failed "
                                 "(attempt %d); retrying before acknowledged expiry: %s",
@@ -411,6 +543,16 @@ class ActiveRouteRuntime:
                             return
                     renewal_error = exc
                 else:
+                    renewed_recovery = None
+                    recovery_error = None
+                    if route.recovery_committed is not None:
+                        try:
+                            renewed_recovery = self.coordinator.renew(
+                                route.recovery_committed,
+                                ttl_ms=self.session_ttl_ms,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - degrade only the backup
+                            recovery_error = exc
                     acknowledged_at_ms = self._steady_now_ms()
                     with self._lock:
                         if self._routes.get(request_id) is not route or not route.active:
@@ -423,16 +565,21 @@ class ActiveRouteRuntime:
                                 "lease renewal acknowledgement arrived after the safe deadline"
                             )
                         else:
-                            route.committed = renewed
-                            route.lease_deadline_ms = (
-                                attempt_started_at_ms + self.session_ttl_ms
-                            )
-                            route.next_renew_at_ms = (
-                                acknowledged_at_ms + self.renew_interval_ms
-                            )
+                            route.committed = renewed_primary
+                            if recovery_error is None:
+                                route.recovery_committed = renewed_recovery
+                            route.lease_deadline_ms = attempt_started_at_ms + self.session_ttl_ms
+                            route.next_renew_at_ms = acknowledged_at_ms + self.renew_interval_ms
                             route.consecutive_renewal_failures = 0
                             route.last_renewal_error = None
-                            return
+                    if renewal_error is None:
+                        if recovery_error is not None:
+                            self._degrade_recovery_under_operation_lock(
+                                request_id,
+                                route,
+                                recovery_error,
+                            )
+                        return
         assert renewal_error is not None
         logger.error(
             "Protocol-v3 route %s lost its session lease: %s",
@@ -440,3 +587,17 @@ class ActiveRouteRuntime:
             renewal_error,
         )
         self._invalidate(request_id, route, renewal_error)
+
+    def _release_committed(self, route: _ActiveRoute) -> None:
+        """Release backup then primary while attempting both on partial failure."""
+
+        failure: Exception | None = None
+        for committed in (route.recovery_committed, route.committed):
+            if committed is None:
+                continue
+            try:
+                self.coordinator.release(committed)
+            except Exception as exc:  # noqa: BLE001 - preserve both cleanup attempts
+                failure = failure or exc
+        if failure is not None:
+            raise failure
