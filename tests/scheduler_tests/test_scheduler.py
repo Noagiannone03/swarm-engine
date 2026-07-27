@@ -959,7 +959,9 @@ def test_bootstrap_starts_a_fresh_heartbeat_lease_for_waiting_nodes():
     assert sched._pending_leaves.empty()  # type: ignore[attr-defined]
 
 
-def test_stale_standby_node_is_removed_by_heartbeat_cleanup():
+def test_stale_standby_node_is_removed_by_heartbeat_cleanup(monkeypatch):
+    monotonic_now = [100.0]
+    monkeypatch.setattr("scheduling.scheduler.time.monotonic", lambda: monotonic_now[0])
     model = build_model_info(12)
     active = build_node("active", model, mem_gb=400.0)
     stale_standby = build_node("stale-standby", model, mem_gb=16.0)
@@ -973,14 +975,48 @@ def test_stale_standby_node_is_removed_by_heartbeat_cleanup():
     )
     assert sched.bootstrap()
 
-    stale_standby.last_heartbeat = time.time() - 60.0
     sched.node_manager.upsert(stale_standby)
+    sched._record_node_heartbeat(stale_standby, sample_interval=False)  # type: ignore[attr-defined]
+    monotonic_now[0] += 20.0
+    sched._record_node_heartbeat(active, sample_interval=False)  # type: ignore[attr-defined]
+    monotonic_now[0] += 11.0
 
     sched.checking_node_heartbeat()
     sched._process_leaves()  # type: ignore[attr-defined]
 
     assert sched.node_manager.get(stale_standby.node_id) is None
     assert sched.node_manager.has_full_pipeline(model.num_layers)
+
+
+def test_adaptive_suspicion_pauses_new_routes_without_destroying_allocation(monkeypatch):
+    monotonic_now = [100.0]
+    monkeypatch.setattr("scheduling.scheduler.time.monotonic", lambda: monotonic_now[0])
+    model = build_model_info(12)
+    node = build_node("worker", model, mem_gb=400.0)
+    sched = Scheduler(
+        model,
+        [node],
+        strategy="dp",
+        routing_strategy="dp",
+        min_nodes_bootstrapping=1,
+        heartbeat_timeout=120.0,
+    )
+    assert sched.bootstrap()
+    node.is_active = True
+
+    monotonic_now[0] += 60.0
+    sched.checking_node_heartbeat()
+
+    assert node.liveness_state == "suspect"
+    assert not node.is_routable
+    assert sched.node_manager.has_full_pipeline(model.num_layers)
+    assert sched._pending_leaves.empty()  # type: ignore[attr-defined]
+
+    sched.update_node_info(node, is_active=True)
+
+    assert node.liveness_state == "healthy"
+    assert node.is_routable
+    assert sched.node_manager.has_full_pipeline(model.num_layers, ready_only=True)
 
 
 def test_automatic_rejoin_discards_stale_worker_layer_assignment():

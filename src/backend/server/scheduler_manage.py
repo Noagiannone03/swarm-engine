@@ -18,7 +18,7 @@ from parallax.p2p.liveness import (
 from parallax.p2p.server import TransformerConnectionHandler
 from parallax.p2p.utils import log_nat_traversal_preflight, mdns_enabled_for_topology
 from parallax_utils.logging_config import get_logger
-from scheduling.node import RequestSignal
+from scheduling.node import RequestSignal, node_is_routable
 from scheduling.scheduler import Scheduler
 from swarm_protocol.active import ActiveRouteRuntime
 from swarm_protocol.coordinator import RouteReservationError
@@ -260,7 +260,7 @@ class SchedulerManage:
             swarm_v3_error = None
         return {
             "node_id": node.node_id,
-            "status": NODE_STATUS_AVAILABLE if node.is_active else NODE_STATUS_WAITING,
+            "status": (NODE_STATUS_AVAILABLE if node_is_routable(node) else NODE_STATUS_WAITING),
             "gpu_num": node.hardware.num_gpus,
             "gpu_name": node.hardware.gpu_name,
             "gpu_memory": node.hardware.memory_gb,
@@ -296,6 +296,22 @@ class SchedulerManage:
                 else None
             ),
             "rtt_to_nodes_ms": dict(getattr(node, "rtt_to_nodes", {}) or {}),
+            "liveness": {
+                "state": getattr(node, "liveness_state", "healthy"),
+                "phi": round(float(getattr(node, "liveness_phi", 0.0)), 6),
+                "heartbeat_age_seconds": round(
+                    float(getattr(node, "heartbeat_age_seconds", 0.0)), 3
+                ),
+                "mean_interval_seconds": round(
+                    float(getattr(node, "heartbeat_mean_interval_seconds", 0.0)), 3
+                ),
+                "std_deviation_seconds": round(
+                    float(getattr(node, "heartbeat_std_deviation_seconds", 0.0)),
+                    3,
+                ),
+                "samples": int(getattr(node, "heartbeat_samples", 0)),
+                "local_health_multiplier": int(getattr(node, "local_health_multiplier", 1)),
+            },
         }
 
     def _start_scheduler(self, model_name, init_nodes_num):
@@ -308,9 +324,7 @@ class SchedulerManage:
         if self.scheduler is not None:
             logger.info("Scheduler already running, stopping it first for re-initialization")
             self.stop()
-        if self.swarm_v3_mode == "active" and not os.environ.get(
-            "FABI_SWARM_V3_EPOCH_DB"
-        ):
+        if self.swarm_v3_mode == "active" and not os.environ.get("FABI_SWARM_V3_EPOCH_DB"):
             raise RuntimeError(
                 "active protocol-v3 requires FABI_SWARM_V3_EPOCH_DB on persistent storage"
             )

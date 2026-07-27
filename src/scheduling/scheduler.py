@@ -14,6 +14,11 @@ from math import isfinite
 from typing import Callable, Deque, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 from parallax_utils.logging_config import get_logger
+from parallax.p2p.liveness import (
+    LivenessSnapshot,
+    LocalHealthAwareness,
+    PhiAccrualFailureDetector,
+)
 from scheduling.layer_allocation import (
     DynamicProgrammingLayerAllocator,
     GreedyLayerAllocator,
@@ -141,6 +146,9 @@ class Scheduler:
         self._capacity_cv = threading.Condition()
         self.request_arrival_horizon_sec = request_arrival_horizon_sec
         self.heartbeat_timeout = heartbeat_timeout
+        self._liveness_lock = threading.RLock()
+        self._liveness_detectors: Dict[str, PhiAccrualFailureDetector] = {}
+        self._local_health = LocalHealthAwareness()
         self._arrival_ts: Deque[float] = deque()
 
         # Event queues for main loop orchestration (thread-safe)
@@ -209,6 +217,8 @@ class Scheduler:
         self.refit_request = {}
         self.refit_set = set()
         self.last_refit_time = 0.0
+        for node in self.node_manager.nodes:
+            self._record_node_heartbeat(node, sample_interval=False)
 
     def list_node_allocations(
         self, total_layers: Optional[int] = None
@@ -522,6 +532,7 @@ class Scheduler:
         lease_started_at = time.time()
         for node in self.node_manager.active_nodes:
             node.last_heartbeat = lease_started_at
+            self._record_node_heartbeat(node, sample_interval=False)
         self.allocation_epoch = self.epoch_allocator.next_epoch()
         self._bootstrapped_event.set()
         self._queue_bootstrap_standby_rebalances()
@@ -602,6 +613,7 @@ class Scheduler:
         if memory_contract_failure is not None:
             self._record_memory_contract_failure(node, memory_contract_failure)
         node.last_heartbeat = time.time()
+        self._record_node_heartbeat(node)
 
     # Async-style event enqueuers for main loop
     def enqueue_join(self, node: Node) -> None:
@@ -662,12 +674,81 @@ class Scheduler:
         )
         self._wake_event.set()
 
+    def _record_node_heartbeat(self, node: Node, *, sample_interval: bool = True) -> None:
+        """Refresh adaptive liveness after one successfully handled heartbeat."""
+
+        now = time.monotonic()
+        multiplier = self._local_health.multiplier
+        with self._liveness_lock:
+            detector = self._liveness_detectors.get(node.node_id)
+            if detector is None:
+                detector = PhiAccrualFailureDetector()
+                self._liveness_detectors[node.node_id] = detector
+            detector.heartbeat(
+                now=now,
+                local_health_multiplier=multiplier,
+                sample_interval=sample_interval,
+            )
+            snapshot = detector.snapshot(
+                now=now,
+                local_health_multiplier=multiplier,
+                hard_timeout_seconds=self.heartbeat_timeout,
+            )
+        self._apply_liveness_snapshot(node, snapshot)
+
+    @staticmethod
+    def _apply_liveness_snapshot(node: Node, snapshot: LivenessSnapshot) -> None:
+        """Publish one detector snapshot for routing and observability."""
+
+        node.liveness_state = snapshot.state
+        node.liveness_phi = snapshot.phi
+        node.heartbeat_age_seconds = snapshot.heartbeat_age_seconds or 0.0
+        node.heartbeat_mean_interval_seconds = snapshot.mean_interval_seconds
+        node.heartbeat_std_deviation_seconds = snapshot.std_deviation_seconds
+        node.heartbeat_samples = snapshot.samples
+        node.local_health_multiplier = snapshot.local_health_multiplier
+
     def checking_node_heartbeat(self) -> None:
-        """Check the heartbeat of all nodes."""
+        """Update reversible suspicion and expire only the hard heartbeat lease."""
+
+        now = time.monotonic()
+        multiplier = self._local_health.multiplier
         for node in self.node_manager.nodes:
-            if time.time() - node.last_heartbeat > self.heartbeat_timeout:
-                logger.debug(f"Node {node.node_id} heartbeat timeout")
-                # Route leave through the event loop so global rebalance/reboot is serialized.
+            with self._liveness_lock:
+                detector = self._liveness_detectors.get(node.node_id)
+                if detector is None:
+                    detector = PhiAccrualFailureDetector()
+                    self._liveness_detectors[node.node_id] = detector
+                    detector.heartbeat(now=now, local_health_multiplier=multiplier)
+                snapshot = detector.snapshot(
+                    now=now,
+                    local_health_multiplier=multiplier,
+                    hard_timeout_seconds=self.heartbeat_timeout,
+                )
+
+            previous_state = node.liveness_state
+            self._apply_liveness_snapshot(node, snapshot)
+            if snapshot.state != previous_state:
+                log = logger.warning if snapshot.state != "healthy" else logger.info
+                log(
+                    "Node %s liveness %s -> %s (phi=%.3f age=%.3fs local_multiplier=%d)",
+                    node.node_id,
+                    previous_state,
+                    snapshot.state,
+                    snapshot.phi,
+                    snapshot.heartbeat_age_seconds or 0.0,
+                    snapshot.local_health_multiplier,
+                )
+                with self._capacity_cv:
+                    self._capacity_cv.notify_all()
+
+            if snapshot.state == "expired":
+                logger.warning(
+                    "Node %s hard heartbeat lease expired after %.3fs",
+                    node.node_id,
+                    snapshot.heartbeat_age_seconds or 0.0,
+                )
+                # Route leave through the event loop so fencing/rebalance is serialized.
                 self.enqueue_leave(node.node_id)
 
     # Dynamic node management
@@ -781,6 +862,12 @@ class Scheduler:
         # Notify waiters that node count changed
         # Snapshot at INFO after join since allocations/pipelines may have changed.
         self.emit_alloc_log_snapshot(reason=f"after join {node.node_id}")
+        registered = self.node_manager.get(node.node_id)
+        if registered is not None:
+            # JOIN is a lifecycle retry, not a periodic heartbeat sample.  It
+            # refreshes liveness without teaching the detector an artificial
+            # near-zero interval when a worker retries registration quickly.
+            self._record_node_heartbeat(registered, sample_interval=False)
         with self._node_count_cv:
             self._node_count_cv.notify_all()
 
@@ -807,6 +894,8 @@ class Scheduler:
                 invalidated,
             )
         self.node_manager.remove(node_id)
+        with self._liveness_lock:
+            self._liveness_detectors.pop(node_id, None)
 
         if not self.node_manager.list_node_allocations(self.num_layers):
             self._reset_prefill_contract()
@@ -988,7 +1077,7 @@ class Scheduler:
             _, _, remaining = self.node_manager.report_pipeline_capacity(ready_only=True)
             return remaining > 0
         return any(
-            node.is_active and not node.is_overloaded for node in self.node_manager.active_nodes
+            node.is_routable and not node.is_overloaded for node in self.node_manager.active_nodes
         )
 
     def wait_for_routing_capacity(self, timeout: float) -> bool:
@@ -1088,7 +1177,7 @@ class Scheduler:
     # === Modularized worker loops ===
     def _event_loop(self, poll_interval: float) -> None:
         """Process joins/leaves/updates and perform heartbeat checks."""
-        last_hb_check = 0.0
+        last_hb_check: float | None = None
         last_v3_shadow_check = 0.0
         while not self._stop_event.is_set():
             self._process_node_updates()
@@ -1121,9 +1210,16 @@ class Scheduler:
                 except Exception:
                     logger.warning("Protocol-v3 shadow comparison failed", exc_info=True)
                 last_v3_shadow_check = now
-            if now - last_hb_check >= max(0.5, poll_interval):
+            monotonic_now = time.monotonic()
+            heartbeat_check_interval = max(0.5, poll_interval)
+            if last_hb_check is None or monotonic_now - last_hb_check >= heartbeat_check_interval:
+                if last_hb_check is not None:
+                    self._local_health.observe_loop_delay(
+                        monotonic_now - last_hb_check,
+                        heartbeat_check_interval,
+                    )
                 self.checking_node_heartbeat()
-                last_hb_check = now
+                last_hb_check = monotonic_now
             self._wake_event.wait(timeout=poll_interval)
             self._wake_event.clear()
 
@@ -1406,6 +1502,7 @@ class Scheduler:
         lease_started_at = time.time()
         for node in self.node_manager.active_nodes:
             node.last_heartbeat = lease_started_at
+            self._record_node_heartbeat(node, sample_interval=False)
         self.allocation_epoch = self.epoch_allocator.next_epoch()
         self._bootstrapped_event.set()
         self.emit_alloc_log_snapshot(reason="after drained global rebalance")

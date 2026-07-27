@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+from scheduling.node import node_is_routable
 from swarm_protocol.contracts import (
     ModelManifest,
     ModelMemberAdvertisement,
@@ -235,8 +236,12 @@ class SchedulerProtocolV3Shadow:
         rejected_workers: dict[str, str] = {}
         for node in nodes:
             report = getattr(node, "swarm_v3", None)
-            if not getattr(node, "is_active", False):
-                rejected_workers[str(node.node_id)] = "scheduler_transition"
+            if not node_is_routable(node):
+                rejected_workers[str(node.node_id)] = (
+                    "liveness_suspect"
+                    if getattr(node, "liveness_state", "healthy") != "healthy"
+                    else "scheduler_transition"
+                )
                 continue
             if not isinstance(report, dict) or report.get("state") not in {"ready", "warming"}:
                 if isinstance(report, dict):
@@ -283,6 +288,10 @@ class SchedulerProtocolV3Shadow:
                 raise NoFeasibleRoute("coherent DHT membership snapshot is not ready")
             if catalog_snapshot.manifest(request.model_swarm_id) != bundle.manifest:
                 raise NoFeasibleRoute("DHT manifest does not match the trusted registry bundle")
+            # The coherent DHT snapshot is the v3 membership authority.  Do not
+            # intersect it with the legacy scheduler's local node table: doing
+            # so would make an autonomous route depend on the central v2 view
+            # and break multi-routing-node operation.
             offers = catalog_snapshot.offers
             leases = catalog_snapshot.leases
             links = catalog_snapshot.links
@@ -460,8 +469,8 @@ class SchedulerProtocolV3Shadow:
         with self._lock:
             self._catalog_status = status
             self._catalog_manifest_pending.discard(bundle.model_swarm_id)
-            self._catalog_manifest_publish_after[bundle.model_swarm_id] = (
-                time.monotonic() + (120 if status["state"] == "published" else 5)
+            self._catalog_manifest_publish_after[bundle.model_swarm_id] = time.monotonic() + (
+                120 if status["state"] == "published" else 5
             )
 
     @staticmethod
@@ -470,7 +479,7 @@ class SchedulerProtocolV3Shadow:
         for node in nodes:
             start = getattr(node, "start_layer", None)
             end = getattr(node, "end_layer", None)
-            if not getattr(node, "is_active", False) or start is None or end is None:
+            if not node_is_routable(node) or start is None or end is None:
                 continue
             by_start.setdefault(int(start), []).append(node)
 

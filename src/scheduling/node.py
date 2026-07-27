@@ -20,6 +20,19 @@ from scheduling.model_info import ModelInfo
 logger = get_logger(__name__)
 
 
+def node_is_routable(node: object) -> bool:
+    """Return new-route eligibility across current and legacy node views.
+
+    Production ``Node`` instances expose ``is_routable``.  Older RPC/test
+    projections expose only ``is_active``; treat those as healthy unless they
+    explicitly publish a liveness state.  Keeping this compatibility rule in
+    one place prevents API projections from silently excluding old workers.
+    """
+
+    ready = getattr(node, "is_routable", getattr(node, "is_active", False))
+    return bool(ready and getattr(node, "liveness_state", "healthy") == "healthy")
+
+
 @dataclass
 class NodeHardwareInfo:
     """
@@ -220,6 +233,16 @@ class Node:
     # todo upload is_active
     is_active: bool = True
     last_heartbeat: float = 0.0
+    # Liveness is separate from executor readiness. A suspect worker keeps its
+    # layers and active leases but is excluded from *new* routes until a
+    # successful heartbeat makes the suspicion reversible.
+    liveness_state: str = "healthy"
+    liveness_phi: float = 0.0
+    heartbeat_age_seconds: float = 0.0
+    heartbeat_mean_interval_seconds: float = 0.0
+    heartbeat_std_deviation_seconds: float = 0.0
+    heartbeat_samples: int = 0
+    local_health_multiplier: int = 1
     # Will be updated by node broadcasting
     # otherwise, use roofline performance model to estimate
     avg_layer_latency_ms: Optional[float] = None
@@ -255,6 +278,12 @@ class Node:
             self.last_heartbeat = time.time()
         if self.rtt_to_nodes is None:
             self.rtt_to_nodes = {}
+
+    @property
+    def is_routable(self) -> bool:
+        """Whether this initialized worker may receive a new request."""
+
+        return bool(self.is_active and self.liveness_state == "healthy")
 
     def refresh_registration(self, registration: "Node") -> None:
         """Refresh worker-owned capabilities without replacing serving state.

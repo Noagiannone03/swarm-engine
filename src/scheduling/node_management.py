@@ -112,13 +112,13 @@ class Pipeline:
 
     @property
     def is_ready(self) -> bool:
-        """True iff all member nodes are currently active/ready for RR serving.
+        """True iff all member nodes are currently routable for RR serving.
 
         RR fixed pipelines are registered at bootstrap, but node liveness/load can
-        change over time. This property checks the *live* `Node.is_active` flag for
-        every stage.
+        change over time. Adaptive suspicion pauses new assignments without
+        destroying the registered pipeline.
         """
-        return all(bool(getattr(n, "is_active", False)) for n in self.nodes)
+        return all(bool(getattr(n, "is_routable", False)) for n in self.nodes)
 
     def capacity_report(self) -> Tuple[int, int]:
         """Backward-compatible helper returning (min_node_capacity, min_remaining_capacity).
@@ -338,7 +338,9 @@ class NodeManager:
         segments: List[Tuple[str, int, int]] = []
         with self._lock:
             for nid, node in self._nodes.items():
-                if self._state.get(nid) != NodeState.ACTIVE or (ready_only and not node.is_active):
+                if self._state.get(nid) != NodeState.ACTIVE or (
+                    ready_only and not node.is_routable
+                ):
                     continue
                 s, e = node.start_layer, node.end_layer
                 if s is None or e is None:

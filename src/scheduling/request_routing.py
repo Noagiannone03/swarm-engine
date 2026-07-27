@@ -113,7 +113,7 @@ def max_complete_pipeline_context(nodes: List[Node], num_layers: int) -> int:
         (
             node
             for node in nodes
-            if node.is_active
+            if node.is_routable
             and node.start_layer is not None
             and node.end_layer is not None
             and node.end_layer > node.start_layer
@@ -151,8 +151,8 @@ def find_turning_points(nodes: List[Node], num_layers: int) -> List[Tuple[str, i
 
     # Build host lists per layer using start/end layer ranges
     layer_hosts: List[List[int]] = []
-    for l in range(num_layers):
-        hosts = [i for i, n in enumerate(nodes) if n.hosts_layer(l)]
+    for layer in range(num_layers):
+        hosts = [i for i, n in enumerate(nodes) if n.hosts_layer(layer)]
         layer_hosts.append(hosts)
 
     # If any layer lacks a host, return empty
@@ -168,14 +168,14 @@ def find_turning_points(nodes: List[Node], num_layers: int) -> List[Tuple[str, i
         dp[0][i] = nodes[i].layer_latency_ms
 
     # Recurrrence: dp[l+1][g] = min_g' (dp[l][g] + rtt(g,g') + latency(g'))
-    for l in range(1, num_layers):
-        curr: Dict[int, float] = {i: float("inf") for i in layer_hosts[l]}
-        prev_back: Dict[int, Optional[int]] = {i: None for i in layer_hosts[l]}
-        for i in layer_hosts[l]:
+    for layer in range(1, num_layers):
+        curr: Dict[int, float] = {i: float("inf") for i in layer_hosts[layer]}
+        prev_back: Dict[int, Optional[int]] = {i: None for i in layer_hosts[layer]}
+        for i in layer_hosts[layer]:
             node_i = nodes[i]
             best_cost = float("inf")
             best_j: Optional[int] = None
-            for j, prev_cost in dp[l - 1].items():
+            for j, prev_cost in dp[layer - 1].items():
                 if prev_cost == float("inf"):
                     continue
                 node_j = nodes[j]
@@ -193,8 +193,8 @@ def find_turning_points(nodes: List[Node], num_layers: int) -> List[Tuple[str, i
     last = dp[-1]
     end_i = min(last, key=lambda k: last[k])
     path_idx: List[int] = [end_i]
-    for l in range(num_layers - 1, 0, -1):
-        prev_i = back[l][path_idx[-1]]
+    for layer in range(num_layers - 1, 0, -1):
+        prev_i = back[layer][path_idx[-1]]
         if prev_i is None:
             break
         path_idx.append(prev_i)
@@ -202,21 +202,21 @@ def find_turning_points(nodes: List[Node], num_layers: int) -> List[Tuple[str, i
 
     # Identify turning points: tail truncations when switching away
     turning: List[Tuple[str, int, str]] = []
-    for l in range(1, len(path_idx)):
-        prev_i = path_idx[l - 1]
-        cur_i = path_idx[l]
+    for layer in range(1, len(path_idx)):
+        prev_i = path_idx[layer - 1]
+        cur_i = path_idx[layer]
         if prev_i == cur_i:
             continue
         prev_node = nodes[prev_i]
-        if prev_node.hosts_layer(l):
-            turning.append((nodes[prev_i].node_id, l, "tail"))
+        if prev_node.hosts_layer(layer):
+            turning.append((nodes[prev_i].node_id, layer, "tail"))
     # Identify front truncations: for each node on the path, if the first
     # layer used is greater than its hosted start, we can drop the prefix
     # [start, first_used_layer)
     first_used: Dict[int, int] = {}
-    for l, idx in enumerate(path_idx):
+    for layer, idx in enumerate(path_idx):
         if idx not in first_used:
-            first_used[idx] = l
+            first_used[idx] = layer
     for idx, l0 in first_used.items():
         n = nodes[idx]
         if n.start_layer is None:
@@ -382,7 +382,7 @@ class DynamicProgrammingRouting(RequestRoutingStrategy):
                 n.start_layer is None
                 or n.end_layer is None
                 or n.end_layer <= n.start_layer
-                or n.is_active is False
+                or not n.is_routable
                 or not n.can_accept_request(required_context_tokens)
             ):
                 continue

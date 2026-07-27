@@ -57,6 +57,21 @@ def test_status_endpoint_is_account_scoped(monkeypatch):
     }
 
 
+def test_gate_uses_monotonic_liveness_for_current_workers(monkeypatch):
+    monkeypatch.setenv("FABI_GATE", "on")
+    gate = ContributionGate()
+    scheduler = live_scheduler()
+    node = scheduler.node_manager.active_nodes[0]
+    node.liveness_state = "healthy"
+    node.is_routable = True
+    node.last_heartbeat = time.time() - 3_600
+
+    assert gate.status(CREDENTIAL, scheduler).allowed is True
+
+    node.liveness_state = "suspect"
+    assert gate.status(CREDENTIAL, scheduler).allowed is False
+
+
 def test_chat_rejects_non_contributors_before_inference(monkeypatch):
     install_gate(monkeypatch)
     called = False

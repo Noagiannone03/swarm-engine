@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from parallax_utils.logging_config import get_logger
+from scheduling.node import node_is_routable
 
 logger = get_logger(__name__)
 
@@ -111,15 +112,20 @@ class ContributionGate:
         for node in scheduler.node_manager.active_nodes:
             if getattr(node, "account_hash", None) != identity:
                 continue
-            if not bool(getattr(node, "is_active", False)):
+            if not node_is_routable(node):
                 continue
             start = getattr(node, "start_layer", None)
             end = getattr(node, "end_layer", None)
             if start is None or end is None or int(end) <= int(start):
                 continue
-            heartbeat = float(getattr(node, "last_heartbeat", 0.0))
-            if timeout > 0 and now - heartbeat > timeout:
-                continue
+            # Current schedulers decide from a monotonic adaptive detector.
+            # Keep the wall-clock timeout only for legacy projections that do
+            # not expose liveness, avoiding false gate closure after an OS clock
+            # correction.
+            if not hasattr(node, "liveness_state"):
+                heartbeat = float(getattr(node, "last_heartbeat", 0.0))
+                if timeout > 0 and now - heartbeat > timeout:
+                    continue
             # Measured executor KV telemetry is part of the product serving
             # contract.  A worker that merely claims READY without an initialized
             # cache is not yet a contributor eligible to unlock consumption.
