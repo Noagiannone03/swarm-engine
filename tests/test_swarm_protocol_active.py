@@ -145,6 +145,7 @@ class FakeCoordinator:
         self.reserved = []
         self.renewed = []
         self.released = []
+        self.fenced = []
         self.fail_renew = False
         self.fail_renew_route = None
         self.fail_reserve_route = None
@@ -163,6 +164,9 @@ class FakeCoordinator:
 
     def release(self, route):
         self.released.append(route)
+
+    def fence(self, route, *, epoch):
+        self.fenced.append((route, epoch))
 
 
 def runtime(now, *, nodes=None, wall_clock=None):
@@ -301,6 +305,83 @@ def test_lost_backup_downgrades_recovery_without_killing_healthy_primary():
         assert [route.plan.route_id for route in coordinator.released] == ["route-1-recovery"]
         degradation = active.snapshot()["recent_recovery_degradations"][0]
         assert degradation["recovery_route_id"] == "route-1-recovery"
+    finally:
+        active.close()
+
+
+def test_departed_primary_is_retained_only_until_reserved_backup_promotion():
+    now = [1_000]
+    nodes = [
+        SimpleNamespace(node_id="worker", is_active=True),
+        SimpleNamespace(node_id="recovery-worker", is_active=True),
+    ]
+    active, _, coordinator, _ = runtime(now, nodes=nodes)
+    try:
+        active.reserve(
+            request_id="request",
+            prompt_tokens=100,
+            reserved_output_tokens=20,
+            recovery_level=RecoveryLevel.RECOVERABLE,
+        )
+        nodes[0].is_active = False
+
+        active.maintain_once()
+
+        assert not active.is_active("request")
+        assert active.authority("request") is None
+        pending = active.snapshot()["active_routes"][0]
+        assert pending["primary_failure"] is not None
+        assert pending["recovery_route_id"] == "route-1-recovery"
+
+        promoted = active.promote_recovery("request", failed_epoch=1)
+
+        assert promoted.primary_plan.route_id == "route-1-recovery-promotion-2"
+        assert promoted.primary_plan.epoch == 2
+        assert promoted.recovery_plan is None
+        assert promoted.effective_recovery_level == RecoveryLevel.RESTARTABLE
+        assert active.is_active("request")
+        assert active.authority("request") == {
+            "route_id": "route-1-recovery-promotion-2",
+            "epoch": 2,
+            "recovery_level": "restartable",
+        }
+        assert [plan.route_id for plan in coordinator.reserved] == [
+            "route-1",
+            "route-1-recovery",
+            "route-1-recovery-promotion-2",
+        ]
+        assert [(route.plan.route_id, epoch) for route, epoch in coordinator.fenced] == [
+            ("route-1", 2)
+        ]
+    finally:
+        active.close()
+
+
+def test_promotion_failure_invalidates_primary_and_backup_capacity():
+    now = [1_000]
+    nodes = [
+        SimpleNamespace(node_id="worker", is_active=True),
+        SimpleNamespace(node_id="recovery-worker", is_active=True),
+    ]
+    active, _, coordinator, _ = runtime(now, nodes=nodes)
+    try:
+        active.reserve(
+            request_id="request",
+            prompt_tokens=100,
+            reserved_output_tokens=20,
+            recovery_level=RecoveryLevel.RECOVERABLE,
+        )
+        coordinator.fail_reserve_route = "route-1-recovery-promotion-2"
+
+        with pytest.raises(RuntimeError, match="promotion failed"):
+            active.promote_recovery("request", failed_epoch=1)
+
+        assert not active.is_active("request")
+        assert active.execution_context("request") is None
+        assert [route.plan.route_id for route in coordinator.released] == [
+            "route-1-recovery",
+            "route-1",
+        ]
     finally:
         active.close()
 

@@ -1,0 +1,411 @@
+diff --git a/rust/src/chat/src/error.rs b/rust/src/chat/src/error.rs
+index bbd9957..8cb7052 100644
+--- a/rust/src/chat/src/error.rs
++++ b/rust/src/chat/src/error.rs
+@@ -62,0 +63,9 @@ pub enum Error {
++    #[error(
++        "recovery prompt token mismatch: expected {expected_len} tokens, rendered {actual_len} \
++         tokens, first mismatch at position {first_mismatch}"
++    )]
++    ReplayPromptMismatch {
++        expected_len: usize,
++        actual_len: usize,
++        first_mismatch: usize,
++    },
+diff --git a/rust/src/chat/src/lib.rs b/rust/src/chat/src/lib.rs
+index 0123077..bf3754d 100644
+--- a/rust/src/chat/src/lib.rs
++++ b/rust/src/chat/src/lib.rs
+@@ -20 +20,3 @@ pub use event::{
+-use futures::{StreamExt, TryStreamExt as _};
++use std::sync::Arc;
++
++use futures::{StreamExt, TryStreamExt as _, stream as futures_stream};
+@@ -54 +56 @@ use vllm_engine_core_client::protocol::ModelDtype;
+-use vllm_llm::Llm;
++use vllm_llm::{GenerateOutput, GeneratePromptInfo, Llm};
+@@ -210,0 +213,105 @@ impl ChatLlm {
++    /// Rebuild a lost chat generation from exact committed token IDs.
++    ///
++    /// The replacement engine receives `original prompt || committed output`
++    /// as its prefill prompt, which reconstructs the attention cache without
++    /// sampling the already-visible prefix again. The committed output is also
++    /// injected once into the ordinary text decoder and chat output processor,
++    /// restoring incremental reasoning and tool-parser state. Callers must
++    /// suppress those replayed events and expose only events after the exact
++    /// committed-token boundary.
++    pub async fn chat_replay(
++        &self,
++        mut request: ChatRequest,
++        expected_prompt_token_ids: Vec<u32>,
++        committed_output_token_ids: Vec<u32>,
++    ) -> Result<ChatEventStream> {
++        request.validate()?;
++
++        let output_processor = self.backend.new_chat_output_processor(
++            &mut request,
++            NewChatOutputProcessorOptions {
++                tool_call_parser: &self.tool_call_parser,
++                reasoning_parser: &self.reasoning_parser,
++            },
++        )?;
++        let rendered = self.backend.chat_renderer().render(&request)?;
++        let (prompt, mm_features) = multimodal::finalize_rendered_prompt(
++            &request,
++            rendered,
++            self.backend.multimodal_model_info(),
++            self.model_dtype,
++        )
++        .await?;
++
++        let tokenizer = self.text.tokenizer();
++        let prompt_token_ids = match prompt {
++            Prompt::Text(text) => tokenizer.encode(&text, request.add_special_tokens)?,
++            Prompt::TokenIds(ids) => ids,
++        };
++        if prompt_token_ids != expected_prompt_token_ids {
++            return Err(Error::ReplayPromptMismatch {
++                expected_len: expected_prompt_token_ids.len(),
++                actual_len: prompt_token_ids.len(),
++                first_mismatch: prompt_token_ids
++                    .iter()
++                    .zip(&expected_prompt_token_ids)
++                    .position(|(actual, expected)| actual != expected)
++                    .unwrap_or(prompt_token_ids.len().min(expected_prompt_token_ids.len())),
++            });
++        }
++
++        let mut replay_prompt_token_ids =
++            Vec::with_capacity(prompt_token_ids.len() + committed_output_token_ids.len());
++        replay_prompt_token_ids.extend_from_slice(&prompt_token_ids);
++        replay_prompt_token_ids.extend_from_slice(&committed_output_token_ids);
++
++        let text_request = TextRequest {
++            request_id: request.request_id.clone(),
++            prompt: Prompt::TokenIds(replay_prompt_token_ids),
++            mm_features,
++            sampling_params: request.sampling_params,
++            decode_options: request.decode_options.clone(),
++            intermediate: request.intermediate,
++            priority: request.priority,
++            cache_salt: request.cache_salt,
++            add_special_tokens: false,
++            data_parallel_rank: request.data_parallel_rank,
++            lora_request: request.lora_request,
++        };
++        let raw_stream = self.text.generate_raw(text_request).await?;
++        let replay_output = GenerateOutput {
++            request_id: request.request_id.clone(),
++            prompt_info: Some(GeneratePromptInfo {
++                prompt_token_ids: Arc::from(prompt_token_ids),
++                prompt_logprobs: None,
++            }),
++            token_ids: committed_output_token_ids,
++            logprobs: None,
++            finish_reason: None,
++            cached_token_count: 0,
++            kv_transfer_params: None,
++        };
++        let future_stream = raw_stream.map(|next| {
++            next.map(|mut output| {
++                // The engine saw the extended replay prompt. Northbound
++                // decoders must instead keep the original chat prompt emitted
++                // by the synthetic replay output above.
++                output.prompt_info = None;
++                output
++            })
++        });
++        let replay_stream = futures_stream::iter([Ok(replay_output)]).chain(future_stream);
++        let decoded_stream = vllm_text::output::decoded_text_event_stream(
++            request.request_id.clone(),
++            tokenizer,
++            replay_stream,
++            request.decode_options,
++            request.intermediate,
++        )
++        .map_err(Error::from)
++        .boxed();
++        let structured_stream = output_processor.process(decoded_stream)?;
++
++        Ok(ChatEventStream::new(request.request_id, structured_stream))
++    }
++
+diff --git a/rust/src/server/src/error.rs b/rust/src/server/src/error.rs
+index b32b281..30a3645 100644
+--- a/rust/src/server/src/error.rs
++++ b/rust/src/server/src/error.rs
+@@ -91 +91,3 @@ pub fn chat_submit_error(context: &'static str, error: vllm_chat::Error) -> ApiE
+-        vllm_chat::Error::PromptTooLong { .. } => invalid_request!("{error}"),
++        vllm_chat::Error::PromptTooLong { .. } | vllm_chat::Error::ReplayPromptMismatch { .. } => {
++            invalid_request!("{error}")
++        }
+diff --git a/rust/src/server/src/routes.rs b/rust/src/server/src/routes.rs
+index ce94e2e..1e082af 100644
+--- a/rust/src/server/src/routes.rs
++++ b/rust/src/server/src/routes.rs
+@@ -81 +81,2 @@ fn build_router_with_options(
+-        .route("/inference/v1/generate", post(inference::generate));
++        .route("/inference/v1/generate", post(inference::generate))
++        .route("/inference/v1/chat-replay", post(openai::chat_replay));
+diff --git a/rust/src/server/src/routes/openai/chat_completions.rs b/rust/src/server/src/routes/openai/chat_completions.rs
+index 60cd14f..51474d3 100644
+--- a/rust/src/server/src/routes/openai/chat_completions.rs
++++ b/rust/src/server/src/routes/openai/chat_completions.rs
+@@ -32 +32 @@ use crate::routes::openai::chat_completions::types::{
+-    ChatMessageDelta,
++    ChatMessageDelta, ChatReplayRequest,
+@@ -108,0 +109,74 @@ pub async fn chat_completions(
++/// Rebuild one interrupted chat stream from its exact committed token prefix.
++///
++/// This endpoint deliberately keeps the ordinary vLLM chat renderer, decoder,
++/// reasoning parser, and tool parser in the loop. It is intended for an
++/// authenticated local distributed-worker proxy, not direct OpenAI clients.
++pub async fn chat_replay(
++    State(state): State<Arc<AppState>>,
++    headers: HeaderMap,
++    ValidatedJson(body): ValidatedJson<ChatReplayRequest>,
++) -> Response {
++    let ChatReplayRequest {
++        mut request,
++        original_prompt_token_ids,
++        committed_output_token_ids,
++    } = body;
++    if !request.stream {
++        return ApiError::InvalidRequest {
++            message: "chat replay requires stream=true".to_string(),
++            param: Some("stream"),
++        }
++        .into_response();
++    }
++
++    // Token IDs and reasoning are required internally to find the exact replay
++    // boundary. The distributed scheduler strips either field according to the
++    // original client request before forwarding future events.
++    request.return_token_ids = Some(true);
++    request.include_reasoning = true;
++    request.echo = false;
++
++    let request_context = resolve_request_context(&headers, request.request_id.as_deref());
++    let lora_resolution = state.resolve_model_with_loras(Some(&request.model)).await;
++    let prepared = match prepare_chat_request(request, &lora_resolution, request_context) {
++        Ok(prepared) => prepared,
++        Err(error) => return error.into_response(),
++    };
++    let request_span = tracing::info_span!(
++        "chat_replay",
++        request_id = %prepared.request_id,
++        engine_request_id = tracing::field::Empty,
++        committed_output_tokens = committed_output_token_ids.len(),
++    );
++    let created = unix_timestamp();
++    let api_server_options = state.api_server_options;
++
++    let chat_stream = match state
++        .chat
++        .chat_replay(
++            prepared.chat_request,
++            original_prompt_token_ids,
++            committed_output_token_ids,
++        )
++        .instrument(request_span.clone())
++        .await
++    {
++        Ok(stream) => stream,
++        Err(error) => {
++            return chat_submit_error("failed to submit chat replay request", error)
++                .into_response();
++        }
++    };
++
++    let chunk_stream = chat_completion_chunk_stream(
++        chat_stream,
++        prepared.request_id,
++        prepared.response_model,
++        created,
++        api_server_options,
++        prepared.options,
++    );
++    let sse_stream = chat_completion_sse_stream(chunk_stream).instrument(request_span);
++    Sse::new(sse_stream).into_response()
++}
++
+diff --git a/rust/src/server/src/routes/openai/chat_completions/types.rs b/rust/src/server/src/routes/openai/chat_completions/types.rs
+index a76a52b..7c2b4e6 100644
+--- a/rust/src/server/src/routes/openai/chat_completions/types.rs
++++ b/rust/src/server/src/routes/openai/chat_completions/types.rs
+@@ -241,0 +242,14 @@ pub struct ChatCompletionRequest {
++/// Private token-exact replay envelope used by distributed frontends after a
++/// route loss. The nested request remains an ordinary validated chat request.
++#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
++pub struct ChatReplayRequest {
++    #[validate(nested)]
++    pub request: ChatCompletionRequest,
++    #[validate(length(min = 1, max = 262144))]
++    pub original_prompt_token_ids: Vec<u32>,
++    #[validate(length(max = 262144))]
++    pub committed_output_token_ids: Vec<u32>,
++}
++
++impl Normalizable for ChatReplayRequest {}
++
+diff --git a/rust/src/server/src/routes/openai/mod.rs b/rust/src/server/src/routes/openai/mod.rs
+index 0cc8887..885184d 100644
+--- a/rust/src/server/src/routes/openai/mod.rs
++++ b/rust/src/server/src/routes/openai/mod.rs
+@@ -6 +6 @@ pub(crate) mod utils;
+-pub use chat_completions::chat_completions;
++pub use chat_completions::{chat_completions, chat_replay};
+diff --git a/rust/src/server/src/routes/tests.rs b/rust/src/server/src/routes/tests.rs
+index 164b938..29b36b2 100644
+--- a/rust/src/server/src/routes/tests.rs
++++ b/rust/src/server/src/routes/tests.rs
+@@ -3476,0 +3477,149 @@ async fn chat_completions_header_request_id_takes_precedence() {
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++#[serial]
++async fn chat_replay_prefills_exact_prefix_and_restores_chat_stream_state() {
++    let ipc = IpcNamespace::new().expect("create ipc namespace");
++    let handshake_address = ipc.handshake_endpoint();
++    let engine_id = b"engine-chat-replay".to_vec();
++    let original_prompt_token_ids =
++        b"user: hello\nassistant:".iter().copied().map(u32::from).collect::<Vec<_>>();
++    let committed_output_token_ids = vec![b'h' as u32, b'i' as u32];
++    let mut expected_engine_prompt = original_prompt_token_ids.clone();
++    expected_engine_prompt.extend_from_slice(&committed_output_token_ids);
++
++    let engine_task = MockEngineTask::new(spawn_mock_engine_task(
++        handshake_address.clone(),
++        engine_id.clone(),
++        move |dealer, push| {
++            boxed_test_future(async move {
++                let add = recv_engine_message(dealer).await;
++                let request: EngineCoreRequest =
++                    rmp_serde::from_slice(&add[1]).expect("decode request");
++                assert_eq!(
++                    request.prompt_token_ids.as_deref(),
++                    Some(expected_engine_prompt.as_slice())
++                );
++                assert_eq!(
++                    request.external_req_id.as_deref(),
++                    Some("chatcmpl-replay-req")
++                );
++
++                send_outputs(
++                    push,
++                    engine_outputs_for_request(
++                        &request.request_id,
++                        vec![(vec![b'!' as u32], Some(EngineCoreFinishReason::Length))],
++                    ),
++                )
++                .await;
++            })
++        },
++    ));
++
++    let client = EngineCoreClient::connect(
++        EngineCoreClientConfig::new_single(handshake_address)
++            .with_model_name("test-model")
++            .with_local_input_output_addresses(
++                Some(ipc.input_endpoint()),
++                Some(ipc.output_endpoint()),
++            ),
++    )
++    .await
++    .expect("connect client");
++    let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
++    let mut app = build_router(Arc::new(AppState::new(
++        vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
++        chat,
++    )));
++
++    let response = app
++        .call(
++            Request::builder()
++                .method("POST")
++                .uri("/inference/v1/chat-replay")
++                .header("content-type", "application/json")
++                .body(Body::from(
++                    json!({
++                        "request": {
++                            "model": "Qwen/Qwen1.5-0.5B-Chat",
++                            "request_id": "replay-req",
++                            "stream": true,
++                            "messages": [{"role": "user", "content": "hello"}],
++                            "temperature": 0,
++                            "max_completion_tokens": 1
++                        },
++                        "original_prompt_token_ids": original_prompt_token_ids,
++                        "committed_output_token_ids": committed_output_token_ids
++                    })
++                    .to_string(),
++                ))
++                .expect("build request"),
++        )
++        .await
++        .expect("call app");
++
++    assert_eq!(response.status(), StatusCode::OK);
++    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
++    engine_task.await.expect("mock engine task");
++    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
++    let payloads = sse_data_payloads(&text);
++    assert_eq!(payloads.len(), 5, "{text}");
++
++    let start: serde_json::Value = serde_json::from_str(payloads[0]).expect("start chunk");
++    assert_eq!(
++        start["prompt_token_ids"],
++        json!(b"user: hello\nassistant:".iter().copied().map(u32::from).collect::<Vec<_>>())
++    );
++    let replay: serde_json::Value = serde_json::from_str(payloads[1]).expect("replay chunk");
++    assert_eq!(replay["choices"][0]["delta"]["content"], "hi");
++    assert_eq!(
++        replay["choices"][0]["token_ids"],
++        json!([b'h' as u32, b'i' as u32])
++    );
++    let future: serde_json::Value = serde_json::from_str(payloads[2]).expect("future chunk");
++    assert_eq!(future["choices"][0]["delta"]["content"], "!");
++    assert_eq!(future["choices"][0]["token_ids"], json!([b'!' as u32]));
++    let terminal: serde_json::Value = serde_json::from_str(payloads[3]).expect("terminal chunk");
++    assert_eq!(terminal["choices"][0]["finish_reason"], "length");
++    assert_eq!(payloads[4], "[DONE]");
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++#[serial]
++async fn chat_replay_rejects_a_different_rendered_prompt() {
++    let mut app = test_app().await;
++    let response = app
++        .call(
++            Request::builder()
++                .method("POST")
++                .uri("/inference/v1/chat-replay")
++                .header("content-type", "application/json")
++                .body(Body::from(
++                    json!({
++                        "request": {
++                            "model": "Qwen/Qwen1.5-0.5B-Chat",
++                            "stream": true,
++                            "messages": [{"role": "user", "content": "hello"}],
++                            "temperature": 0,
++                            "max_completion_tokens": 1
++                        },
++                        "original_prompt_token_ids": [1, 2, 3],
++                        "committed_output_token_ids": [4]
++                    })
++                    .to_string(),
++                ))
++                .expect("build request"),
++        )
++        .await
++        .expect("call app");
++
++    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
++    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
++    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
++    assert_eq!(json["error"]["code"], "invalid_request_error");
++    assert!(
++        json["error"]["message"]
++            .as_str()
++            .is_some_and(|message| message.contains("recovery prompt token mismatch"))
++    );
++}
++

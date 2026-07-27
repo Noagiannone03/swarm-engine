@@ -300,3 +300,15 @@ class RouteReservationCoordinator:
             stages=route.plan.stages,
             action=ReservationAction.RELEASE,
         )
+
+    def fence(self, route: CommittedRoute, *, epoch: int) -> None:
+        """Best-effort fence a superseded route with a strictly newer epoch."""
+
+        if epoch <= route.plan.epoch:
+            raise ValueError("fencing epoch must be newer than the route epoch")
+        fenced_plan = route.plan.model_copy(update={"epoch": epoch})
+        self._send_command(
+            plan=fenced_plan,
+            stages=fenced_plan.stages,
+            action=ReservationAction.FENCE,
+        )

@@ -266,6 +266,26 @@ def test_coordinator_commits_and_releases_every_stage():
     assert tail.snapshot()[0].state == ReservationState.RELEASED
 
 
+def test_coordinator_fences_every_superseded_stage_with_newer_epoch():
+    now = [1_000]
+    head, tail = lab(now)
+    transport = InProcessTransport(
+        {
+            HEAD_ENDPOINT: AdmissionStub(head),
+            TAIL_ENDPOINT: AdmissionStub(tail),
+        }
+    )
+    coordinator = RouteReservationCoordinator(transport, clock_ms=lambda: now[0])
+    committed = coordinator.reserve(route(now[0]))
+
+    coordinator.fence(committed, epoch=2)
+
+    assert all(lease.state == ReservationState.RELEASED for lease in head.snapshot())
+    assert all(lease.state == ReservationState.RELEASED for lease in tail.snapshot())
+    with pytest.raises(ValueError, match="newer"):
+        coordinator.fence(committed, epoch=1)
+
+
 def test_prepare_failure_releases_parallel_successes():
     now = [1_000]
     head, tail = lab(now)

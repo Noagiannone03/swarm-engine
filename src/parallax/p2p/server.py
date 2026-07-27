@@ -373,6 +373,26 @@ class TransformerConnectionHandler(ConnectionHandler):
             self.recv_from_peer.send_multipart([b"abort", request.SerializeToString()])
         return forward_pb2.AbortResponse()
 
+    def _authorize_frontend_request(
+        self, request_id: object, xargs: object, *, purpose: str
+    ) -> str:
+        if self.execution_admission is None:
+            raise PermissionError(f"{purpose} requires active protocol v3")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
+            raise ValueError(f"{purpose} request_id is invalid")
+        if not isinstance(xargs, dict):
+            raise PermissionError(f"{purpose} is missing route authority")
+        self.execution_admission.authorize_frontend(
+            request_id=request_id,
+            route_id=str(xargs.get("fabi_route_id", "")),
+            epoch=int(xargs.get("fabi_route_epoch", 0)),
+            routing_table=tuple(xargs.get("parallax_routing_table", ())),
+            caller_endpoint_id=authenticated_rpc_peer_id(),
+        )
+        if self.http_port is None:
+            raise RuntimeError("route head has no local HTTP frontend")
+        return request_id
+
     @rpc_method
     def abort_completion(self, request):
         """Abort a frontend request through vLLM's maintained engine API.
@@ -384,26 +404,13 @@ class TransformerConnectionHandler(ConnectionHandler):
         committed.
         """
 
-        if self.execution_admission is None:
-            raise PermissionError("explicit completion abort requires active protocol v3")
         if not isinstance(request, dict):
             raise TypeError("completion abort request must be an object")
-        request_id = request.get("request_id")
-        xargs = request.get("vllm_xargs")
-        if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
-            raise ValueError("completion abort request_id is invalid")
-        if not isinstance(xargs, dict):
-            raise PermissionError("completion abort is missing route authority")
-
-        self.execution_admission.authorize_frontend(
-            request_id=request_id,
-            route_id=str(xargs.get("fabi_route_id", "")),
-            epoch=int(xargs.get("fabi_route_epoch", 0)),
-            routing_table=tuple(xargs.get("parallax_routing_table", ())),
-            caller_endpoint_id=authenticated_rpc_peer_id(),
+        request_id = self._authorize_frontend_request(
+            request.get("request_id"),
+            request.get("vllm_xargs"),
+            purpose="completion abort",
         )
-        if self.http_port is None:
-            raise RuntimeError("route head has no local HTTP frontend")
 
         vllm_request_id = f"chatcmpl-{request_id}"
         with httpx.Client(
@@ -418,6 +425,88 @@ class TransformerConnectionHandler(ConnectionHandler):
             response.raise_for_status()
         logger.info("Explicitly aborted frontend request %s", request_id)
         return {"aborted": True, "request_id": request_id}
+
+    @rpc_stream_iter
+    def replay_generation(self, request):
+        """Proxy token-exact chat replay to the qualified vLLM frontend."""
+
+        try:
+            if not isinstance(request, dict):
+                raise TypeError("generation replay request must be an object")
+            chat_request = request.get("request")
+            if not isinstance(chat_request, dict):
+                raise ValueError("generation replay chat request must be an object")
+            authority_request_id = self._authorize_frontend_request(
+                request.get("authority_request_id"),
+                chat_request.get("vllm_xargs"),
+                purpose="generation replay",
+            )
+            request_id = chat_request.get("request_id")
+            if request_id != authority_request_id:
+                raise ValueError("generation replay request_id differs from route authority")
+            if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
+                raise ValueError("generation replay engine request_id is invalid")
+            original_prompt_token_ids = request.get("original_prompt_token_ids")
+            if (
+                not isinstance(original_prompt_token_ids, list)
+                or not original_prompt_token_ids
+                or len(original_prompt_token_ids) > 262_144
+                or any(
+                    isinstance(token_id, bool)
+                    or not isinstance(token_id, int)
+                    or token_id < 0
+                    or token_id > 2**32 - 1
+                    for token_id in original_prompt_token_ids
+                )
+            ):
+                raise ValueError("generation replay original prompt token_ids are invalid")
+            committed_output_token_ids = request.get("committed_output_token_ids")
+            if (
+                not isinstance(committed_output_token_ids, list)
+                or len(committed_output_token_ids) > 65_536
+                or any(
+                    isinstance(token_id, bool)
+                    or not isinstance(token_id, int)
+                    or token_id < 0
+                    or token_id > 2**32 - 1
+                    for token_id in committed_output_token_ids
+                )
+            ):
+                raise ValueError("generation replay committed token_ids are invalid")
+            if chat_request.get("stream") is not True:
+                raise ValueError("generation replay must use streaming")
+            max_tokens = chat_request.get("max_completion_tokens")
+            if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
+                raise ValueError("generation replay max_tokens must be positive")
+
+            local_request = dict(request)
+            local_request.pop("authority_request_id", None)
+            with httpx.Client(timeout=10 * 60, proxy=None, trust_env=False) as client:
+                with client.stream(
+                    "POST",
+                    f"http://localhost:{self.http_port}/inference/v1/chat-replay",
+                    json=local_request,
+                ) as response:
+                    response.raise_for_status()
+                    for chunk in response.iter_bytes():
+                        if chunk:
+                            yield chunk
+            logger.info(
+                "Exact chat replay completed for %s through engine request %s",
+                authority_request_id,
+                request_id,
+            )
+        except Exception as exc:
+            logger.exception("Error in exact generation replay: %s", exc)
+            yield encode_http_response_envelope(
+                status_code=502,
+                content_type="application/json",
+                body=(
+                    b'{"error":{"message":"Generation replay failed",'
+                    b'"type":"upstream_error","param":null,'
+                    b'"code":"generation_replay_failed"}}'
+                ),
+            )
 
     def ipc_weight_refit(
         self,
@@ -443,15 +532,10 @@ class TransformerConnectionHandler(ConnectionHandler):
         logger.debug(f"Chat completion request: {request}, type: {type(request)}")
         try:
             if getattr(self, "execution_admission", None) is not None:
-                xargs = request.get("vllm_xargs")
-                if not isinstance(xargs, dict):
-                    raise PermissionError("active v3 request is missing route authority")
-                self.execution_admission.authorize_frontend(
-                    request_id=str(request.get("request_id", "")),
-                    route_id=str(xargs.get("fabi_route_id", "")),
-                    epoch=int(xargs.get("fabi_route_epoch", 0)),
-                    routing_table=tuple(xargs.get("parallax_routing_table", ())),
-                    caller_endpoint_id=authenticated_rpc_peer_id(),
+                self._authorize_frontend_request(
+                    request.get("request_id"),
+                    request.get("vllm_xargs"),
+                    purpose="active v3 request",
                 )
             with httpx.Client(timeout=10 * 60, proxy=None, trust_env=False) as client:
                 if request.get("stream", False):
@@ -970,9 +1054,7 @@ class GradientServer:
             )
             bounded_stub = _with_rpc_timeout(self.scheduler_stub, call_timeout)
             try:
-                response = bounded_stub.rpc_health({}).result(
-                    timeout=call_timeout + 1.0
-                )
+                response = bounded_stub.rpc_health({}).result(timeout=call_timeout + 1.0)
             except Exception as exc:
                 elapsed = time.monotonic() - started_at
                 if connect_deadline and elapsed >= connect_deadline:
@@ -1006,9 +1088,7 @@ class GradientServer:
                 continue
 
             if not isinstance(response, dict) or response.get("peer_id") != self.scheduler_peer_id:
-                raise RuntimeError(
-                    "Iroh scheduler health response has the wrong endpoint identity"
-                )
+                raise RuntimeError("Iroh scheduler health response has the wrong endpoint identity")
             path = self.iroh_transport.selected_path(self.scheduler_peer_id)
             logger.info(
                 "Qualified Iroh scheduler connection after %d attempt(s): path=%s",
@@ -1041,9 +1121,7 @@ class GradientServer:
                     delay,
                 )
                 if self.stop_event.wait(delay):
-                    raise RuntimeError(
-                        "scheduler registration stopped during shutdown"
-                    ) from exc
+                    raise RuntimeError("scheduler registration stopped during shutdown") from exc
                 self._qualify_iroh_scheduler()
                 backoff_ceiling = min(
                     backoff_ceiling * 2,
@@ -1433,7 +1511,9 @@ class GradientServer:
                 for lease in admission.snapshot()
             )
         except Exception:
-            logger.warning("Unable to inspect execution reservations before link probe", exc_info=True)
+            logger.warning(
+                "Unable to inspect execution reservations before link probe", exc_info=True
+            )
             return False
 
     def _probe_peer_goodput(self, peer_id: str) -> bool:

@@ -4,6 +4,11 @@ from pathlib import Path
 
 
 INSTALL_SCRIPT = Path(__file__).parents[1] / "install.sh"
+VLLM_REPLAY_PATCH = (
+    Path(__file__).parents[1]
+    / "patches"
+    / "vllm-v0.24.0-fabi-chat-replay.patch"
+)
 PORTABILITY_SCRIPT = (
     Path(__file__).parents[1] / "scripts" / "check-vllm-rs-portability.sh"
 )
@@ -20,6 +25,16 @@ def test_install_help_documents_frontend_only_mode():
     assert "--frontend-only" in result.stdout
     assert "PARALLAX_VENV_DIR" in result.stdout
     assert "PCRE2_SYS_STATIC=1" in INSTALL_SCRIPT.read_text()
+
+
+def test_frontend_build_pins_and_hashes_the_fabi_replay_patch():
+    install_script = INSTALL_SCRIPT.read_text()
+
+    assert VLLM_REPLAY_PATCH.is_file()
+    assert "ee0da84ab9e04ac7610e28580af62c365e898389" in install_script
+    assert 'git -C "$clone_root" apply --unidiff-zero --check' in install_script
+    assert 'hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest()' in install_script
+    assert "/inference/v1/chat-replay" in VLLM_REPLAY_PATCH.read_text()
 
 
 def test_frontend_only_requires_existing_posix_virtualenv(tmp_path):

@@ -12,7 +12,7 @@ may split or combine SSE events at arbitrary positions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import re
 from typing import Any
@@ -118,6 +118,8 @@ class OpenAIRecoveryStream:
             raise RecoveryStreamProtocolError("upstream SSE data is not valid JSON") from exc
         if not isinstance(payload, dict):
             raise RecoveryStreamProtocolError("upstream SSE JSON must be an object")
+        if "error" in payload:
+            raise RecoveryStreamProtocolError("upstream frontend returned an SSE error")
 
         prompt_token_ids = None
         if "prompt_token_ids" in payload and payload["prompt_token_ids"] is not None:
@@ -175,6 +177,140 @@ class OpenAIRecoveryStream:
             output_token_ids=tuple(output_token_ids),
             finish_reason=finish_reason,
         )
+
+
+class OpenAIChatReplayStream:
+    """Suppress an exact chat prefix while restoring vLLM parser state.
+
+    The patched vLLM frontend emits the original prompt IDs, then the complete
+    committed output prefix through its ordinary reasoning/tool parsers. Those
+    events rebuild frontend state but must never be sent to the client twice.
+    Once the exact token boundary is verified, subsequent sanitized events are
+    returned unchanged.
+    """
+
+    def __init__(
+        self,
+        *,
+        expected_prompt_token_ids: tuple[int, ...],
+        committed_output_token_ids: tuple[int, ...],
+        expose_token_ids: bool = False,
+        expose_reasoning: bool = True,
+        max_event_bytes: int = 4 * 1024 * 1024,
+    ) -> None:
+        if not expected_prompt_token_ids:
+            raise ValueError("expected replay prompt token IDs must not be empty")
+        _validated_token_ids(list(expected_prompt_token_ids), field="expected_prompt_token_ids")
+        _validated_token_ids(
+            list(committed_output_token_ids),
+            field="committed_output_token_ids",
+        )
+        self.expected_prompt_token_ids = expected_prompt_token_ids
+        self.committed_output_token_ids = committed_output_token_ids
+        self._decoder = OpenAIRecoveryStream(
+            expose_token_ids=expose_token_ids,
+            expose_reasoning=expose_reasoning,
+            max_event_bytes=max_event_bytes,
+        )
+        self._matched_output_tokens = 0
+        self._future_output_tokens = 0
+        self._prompt_verified = False
+        self._replay_complete = False
+
+    @property
+    def replay_complete(self) -> bool:
+        return self._replay_complete
+
+    @property
+    def done(self) -> bool:
+        return self._decoder.done
+
+    def feed(self, chunk: bytes) -> tuple[RecoveryStreamEvent, ...]:
+        visible_events: list[RecoveryStreamEvent] = []
+        for event in self._decoder.feed(chunk):
+            if event.prompt_token_ids is not None:
+                if event.prompt_token_ids != self.expected_prompt_token_ids:
+                    raise RecoveryStreamProtocolError(
+                        "replay prompt token IDs differ from the recovery journal"
+                    )
+                self._prompt_verified = True
+
+            if self._replay_complete:
+                self._future_output_tokens += len(event.output_token_ids)
+                event = self._normalize_visible_usage(event)
+                visible_events.append(event)
+                continue
+
+            if event.done or event.finish_reason is not None:
+                raise RecoveryStreamProtocolError(
+                    "replay terminated before the committed token boundary"
+                )
+            if event.output_token_ids:
+                start = self._matched_output_tokens
+                end = start + len(event.output_token_ids)
+                if end > len(self.committed_output_token_ids):
+                    raise RecoveryStreamProtocolError(
+                        "replay emitted tokens beyond the committed boundary"
+                    )
+                if event.output_token_ids != self.committed_output_token_ids[start:end]:
+                    raise RecoveryStreamProtocolError(
+                        "replay output token IDs differ from the recovery journal"
+                    )
+                self._matched_output_tokens = end
+
+            # The replayed role/content/tool events are intentionally hidden.
+            # Transition only after both prompt identity and the entire output
+            # prefix have been proven.
+            if self._prompt_verified and self._matched_output_tokens == len(
+                self.committed_output_token_ids
+            ):
+                self._replay_complete = True
+
+        return tuple(visible_events)
+
+    def _normalize_visible_usage(
+        self,
+        event: RecoveryStreamEvent,
+    ) -> RecoveryStreamEvent:
+        """Restore client-visible token accounting after the hidden replay."""
+
+        marker = b"data: "
+        data_marker = event.client_bytes.rfind(marker)
+        data_end = event.client_bytes.rfind(b"\n\n")
+        if data_marker < 0 or data_end < data_marker:
+            return event
+        data_start = data_marker + len(marker)
+        try:
+            payload = json.loads(event.client_bytes[data_start:data_end])
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return event
+        if not isinstance(payload, dict):
+            return event
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            return event
+
+        prompt_tokens = len(self.expected_prompt_token_ids)
+        completion_tokens = len(self.committed_output_token_ids) + self._future_output_tokens
+        usage["prompt_tokens"] = prompt_tokens
+        usage["completion_tokens"] = completion_tokens
+        usage["total_tokens"] = prompt_tokens + completion_tokens
+        # The replacement engine only knows which replay-prompt tokens it
+        # cached and which future tokens belong to reasoning. Those details do
+        # not describe the original client request, so omitting them is more
+        # accurate than exposing fabricated sub-counts.
+        usage.pop("prompt_tokens_details", None)
+        usage.pop("completion_tokens_details", None)
+        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return replace(
+            event,
+            client_bytes=event.client_bytes[:data_marker] + marker + encoded + b"\n\n",
+        )
+
+    def finalize(self) -> None:
+        self._decoder.finalize()
+        if not self._replay_complete:
+            raise RecoveryStreamProtocolError("replay ended before the committed token boundary")
 
 
 def _validated_token_ids(value: Any, *, field: str) -> tuple[int, ...]:

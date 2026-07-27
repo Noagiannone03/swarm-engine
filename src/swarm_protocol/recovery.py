@@ -219,6 +219,7 @@ _SAMPLING_FIELDS = (
     "ignore_eos",
     "include_stop_str_in_output",
     "length_penalty",
+    "logprobs",
     "logit_bias",
     "max_completion_tokens",
     "max_tokens",
@@ -226,6 +227,7 @@ _SAMPLING_FIELDS = (
     "min_tokens",
     "n",
     "presence_penalty",
+    "prompt_logprobs",
     "repetition_detection",
     "repetition_penalty",
     "response_format",
@@ -236,12 +238,64 @@ _SAMPLING_FIELDS = (
     "stop_token_ids",
     "structured_outputs",
     "temperature",
+    "thinking_token_budget",
     "tool_choice",
     "tools",
     "top_k",
     "top_p",
     "use_beam_search",
 )
+
+_UNSUPPORTED_COLD_REPLAY_FIELDS = frozenset(
+    {
+        "allowed_token_ids",
+        "bad_words",
+        "best_of",
+        "early_stopping",
+        "frequency_penalty",
+        "guided_choice",
+        "guided_decoding_backend",
+        "guided_grammar",
+        "guided_json",
+        "guided_regex",
+        "length_penalty",
+        "logprobs",
+        "logit_bias",
+        "presence_penalty",
+        "prompt_logprobs",
+        "repetition_penalty",
+        "repetition_detection",
+        "response_format",
+        "stop",
+        "structured_outputs",
+        "thinking_token_budget",
+        "use_beam_search",
+    }
+)
+
+_RAW_REPLAY_SAMPLING_FIELDS = frozenset(
+    {
+        "ignore_eos",
+        "min_p",
+        "seed",
+        "stop_token_ids",
+        "temperature",
+        "top_k",
+        "top_p",
+    }
+)
+
+
+def _cold_replay_field_is_active(field: str, value: Any) -> bool:
+    """Return whether an unsupported option changes token selection semantics."""
+
+    if value in (None, False, [], {}):
+        return False
+    if field in {"frequency_penalty", "presence_penalty"}:
+        return isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) != 0.0
+    if field == "repetition_penalty":
+        return isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) != 1.0
+    return True
 
 
 def sampling_replay_contract(
@@ -268,6 +322,11 @@ def sampling_replay_contract(
     top_k_is_one = not isinstance(top_k, bool) and isinstance(top_k, int) and top_k == 1
     if not (temperature_is_zero or top_k_is_one):
         return None
+    if any(
+        field in request_data and _cold_replay_field_is_active(field, request_data[field])
+        for field in _UNSUPPORTED_COLD_REPLAY_FIELDS
+    ):
+        return None
 
     params = {
         field: request_data[field]
@@ -283,6 +342,36 @@ def sampling_replay_contract(
         )
     except (TypeError, ValueError):
         return None
+
+
+def exact_replay_sampling_params(
+    contract: SamplingReplayContract,
+    *,
+    committed_output_tokens: int,
+    remaining_output_tokens: int,
+) -> dict[str, Any]:
+    """Lower a chat sampling contract into vLLM's token-in/token-out API."""
+
+    if committed_output_tokens < 0 or remaining_output_tokens <= 0:
+        raise ValueError("replay token counts are invalid")
+    params = json.loads(contract.params_json)
+    unsupported = sorted(
+        field
+        for field in _UNSUPPORTED_COLD_REPLAY_FIELDS
+        if field in params and _cold_replay_field_is_active(field, params[field])
+    )
+    if unsupported:
+        raise RecoveryConflict(
+            "sampling contract cannot use exact cold replay: " + ", ".join(unsupported)
+        )
+
+    replay = {field: params[field] for field in _RAW_REPLAY_SAMPLING_FIELDS if field in params}
+    original_min_tokens = params.get("min_tokens", 0)
+    if isinstance(original_min_tokens, bool) or not isinstance(original_min_tokens, int):
+        raise RecoveryConflict("sampling min_tokens is not an integer")
+    replay["min_tokens"] = max(0, original_min_tokens - committed_output_tokens)
+    replay["max_tokens"] = remaining_output_tokens
+    return replay
 
 
 class InMemoryRecoveryJournal:
@@ -503,6 +592,10 @@ class InMemoryRecoveryJournal:
                     state=RecoveryState.RECOVERING,
                     epoch=new_epoch,
                     route_ids=(*current.route_ids, replacement_route_id),
+                    # The one reserved backup is now being consumed. A second
+                    # failure is restartable unless another backup is reserved
+                    # after replay.
+                    effective_recovery_level=RecoveryLevel.RESTARTABLE,
                 )
             )
 

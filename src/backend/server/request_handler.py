@@ -16,6 +16,7 @@ from backend.server.openai_compat import (
     openai_error_response,
 )
 from backend.server.recovery_stream import (
+    OpenAIChatReplayStream,
     OpenAIRecoveryStream,
     RecoveryStreamProtocolError,
 )
@@ -365,6 +366,7 @@ class RequestHandler:
                     str(request_id),
                     routing_table,
                 )
+                original_replay_request = dict(backend_request)
                 capture_tokens = bool(
                     is_stream
                     and getattr(
@@ -387,7 +389,9 @@ class RequestHandler:
                 if is_stream:
 
                     async def stream_generator():
+                        nonlocal backend_request, stub
                         response = None
+                        iterator = None
                         first_token_time = None
                         last_chunk = None
                         last_token_time = None
@@ -396,6 +400,7 @@ class RequestHandler:
                         journal_terminal = False
                         prefill_committed = False
                         recovery_epoch = None
+                        replay_completion_committed = False
                         recovery_stream = (
                             OpenAIRecoveryStream(
                                 expose_token_ids=client_requested_token_ids,
@@ -426,6 +431,74 @@ class RequestHandler:
                                 )
                             journal_terminal = True
 
+                        async def promote_stream_recovery() -> bool:
+                            """Promote the reserved route and start exact chat replay."""
+
+                            nonlocal backend_request
+                            nonlocal iterator
+                            nonlocal recovery_epoch
+                            nonlocal recovery_stream
+                            nonlocal replay_completion_committed
+                            nonlocal response
+                            nonlocal stub
+
+                            if (
+                                not capture_tokens
+                                or not journal_started
+                                or journal_terminal
+                                or recovery_epoch is None
+                            ):
+                                return False
+                            try:
+                                if response is not None:
+                                    response.cancel()
+                                recovering, promoted = await asyncio.to_thread(
+                                    self.scheduler_manage.promote_generation_recovery,
+                                    str(request_id),
+                                    failed_epoch=recovery_epoch,
+                                )
+                                recovery_epoch = recovering.epoch
+                                head = promoted.primary_plan.stages[0].worker_id
+                                model_name = self._get_model_name_for_node(head)
+                                if not model_name:
+                                    raise RecoveryStreamProtocolError(
+                                        "promoted route has no qualified model name"
+                                    )
+                                head, replay_request = await asyncio.to_thread(
+                                    self.scheduler_manage.build_generation_replay_request,
+                                    str(request_id),
+                                    original_request=original_replay_request,
+                                    model_name=model_name,
+                                )
+                                stub = self.get_stub(head)
+                                backend_request = replay_request["request"]
+                                response = stub.replay_generation(replay_request)
+                                iterator = iterate_in_threadpool(response)
+                                recovery_stream = OpenAIChatReplayStream(
+                                    expected_prompt_token_ids=recovering.spec.prompt_token_ids,
+                                    committed_output_token_ids=(
+                                        recovering.committed_output_token_ids
+                                    ),
+                                    expose_token_ids=client_requested_token_ids,
+                                    expose_reasoning=client_requested_reasoning,
+                                )
+                                replay_completion_committed = False
+                                logger.info(
+                                    "Promoted request %s to recovery route %s at epoch %s "
+                                    "after %s committed output tokens",
+                                    request_id,
+                                    promoted.primary_plan.route_id,
+                                    recovery_epoch,
+                                    len(recovering.committed_output_token_ids),
+                                )
+                                return True
+                            except Exception:
+                                logger.exception(
+                                    "Unable to promote exact recovery for request %s",
+                                    request_id,
+                                )
+                                return False
+
                         try:
                             response = stub.chat_completion(backend_request)
                             iterator = iterate_in_threadpool(response)
@@ -438,6 +511,8 @@ class RequestHandler:
                                         iterator,
                                     )
                                 except StopAsyncIteration:
+                                    if not stream_finished and await promote_stream_recovery():
+                                        continue
                                     if recovery_stream is not None:
                                         try:
                                             recovery_stream.finalize()
@@ -479,9 +554,11 @@ class RequestHandler:
                                     )
                                     return
                                 except DownstreamRouteLostError:
+                                    if await promote_stream_recovery():
+                                        continue
                                     finish_journal(
                                         RecoveryState.FAILED,
-                                        "worker route was lost during generation",
+                                        "worker route was lost and exact recovery was unavailable",
                                     )
                                     logger.warning(
                                         "Worker route was lost during streaming request %s",
@@ -512,6 +589,20 @@ class RequestHandler:
 
                                 try:
                                     events = recovery_stream.feed(chunk)
+                                    if (
+                                        isinstance(recovery_stream, OpenAIChatReplayStream)
+                                        and recovery_stream.replay_complete
+                                        and not replay_completion_committed
+                                    ):
+                                        if recovery_epoch is None:
+                                            raise RecoveryStreamProtocolError(
+                                                "replay completed without a recovery epoch"
+                                            )
+                                        self.scheduler_manage.complete_generation_replay(
+                                            str(request_id),
+                                            epoch=recovery_epoch,
+                                        )
+                                        replay_completion_committed = True
                                     for event in events:
                                         if event.prompt_token_ids is not None:
                                             snapshot = self.scheduler_manage.begin_generation_journal(

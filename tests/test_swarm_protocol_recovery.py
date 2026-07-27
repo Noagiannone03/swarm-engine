@@ -14,6 +14,7 @@ from swarm_protocol.recovery import (
     SamplingReplayContract,
     SamplingReplayMode,
     StaleRecoveryEpoch,
+    exact_replay_sampling_params,
     replay_sequence_checksum,
     sampling_replay_contract,
     token_sequence_checksum,
@@ -83,6 +84,7 @@ def test_exact_cold_replay_state_machine_fences_the_old_epoch() -> None:
     )
     assert recovering.state == RecoveryState.RECOVERING
     assert recovering.route_ids == ("route-primary", "route-replacement")
+    assert recovering.effective_recovery_level == RecoveryLevel.RESTARTABLE
 
     with pytest.raises(StaleRecoveryEpoch):
         journal.commit_token(
@@ -225,6 +227,49 @@ def test_sampling_contract_is_canonical_and_only_admits_deterministic_requests()
     assert "private" not in contract.params_json
     assert sampling_replay_contract({"temperature": 0.7}) is None
     assert sampling_replay_contract({"top_k": 1, "n": 2}) is None
+    assert sampling_replay_contract({"temperature": 0, "stop": ["END"]}) is None
+    assert sampling_replay_contract({"temperature": 0, "guided_regex": "[a-z]+"}) is None
+    assert sampling_replay_contract({"temperature": 0, "frequency_penalty": 0.5}) is None
+    assert sampling_replay_contract({"temperature": 0, "presence_penalty": 0.5}) is None
+    assert sampling_replay_contract({"temperature": 0, "repetition_penalty": 1.1}) is None
+    assert sampling_replay_contract({"temperature": 0, "thinking_token_budget": 128}) is None
+    assert sampling_replay_contract({"temperature": 0, "logprobs": True}) is None
+    assert sampling_replay_contract({"temperature": 0, "prompt_logprobs": 1}) is None
+    assert (
+        sampling_replay_contract(
+            {
+                "temperature": 0,
+                "frequency_penalty": 0,
+                "presence_penalty": 0.0,
+                "repetition_penalty": 1.0,
+            }
+        )
+        is not None
+    )
+
+
+def test_exact_replay_sampling_subtracts_committed_minimum_and_output_budget() -> None:
+    contract = sampling_replay_contract(
+        {
+            "temperature": 0,
+            "top_p": 0.9,
+            "min_tokens": 8,
+            "max_tokens": 32,
+            "tools": [{"type": "function", "function": {"name": "read"}}],
+        }
+    )
+    assert contract is not None
+
+    assert exact_replay_sampling_params(
+        contract,
+        committed_output_tokens=3,
+        remaining_output_tokens=29,
+    ) == {
+        "temperature": 0,
+        "top_p": 0.9,
+        "min_tokens": 5,
+        "max_tokens": 29,
+    }
 
 
 def test_restartable_request_cannot_be_promoted_to_recoverable_after_failure() -> None:

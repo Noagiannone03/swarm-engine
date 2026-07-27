@@ -40,6 +40,7 @@ class _ActiveRoute:
     lease_deadline_ms: int = 0
     consecutive_renewal_failures: int = 0
     last_renewal_error: str | None = None
+    primary_failure: str | None = None
     operation_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -234,6 +235,7 @@ class ActiveRouteRuntime:
             return (
                 route is not None
                 and route.active
+                and route.primary_failure is None
                 and self._steady_now_ms() < route.lease_deadline_ms
             )
 
@@ -252,6 +254,7 @@ class ActiveRouteRuntime:
             if (
                 route is None
                 or not route.active
+                or route.primary_failure is not None
                 or self._steady_now_ms() >= route.lease_deadline_ms
             ):
                 return None
@@ -291,6 +294,106 @@ class ActiveRouteRuntime:
                 else RecoveryLevel.RESTARTABLE
             ),
         )
+
+    def promote_recovery(
+        self,
+        request_id: str,
+        *,
+        failed_epoch: int,
+    ) -> ActiveRouteContext:
+        """Fence a failed primary and atomically consume its reserved backup."""
+
+        request_key = str(request_id)
+        with self._lock:
+            route = self._routes.get(request_key)
+        if route is None:
+            raise RouteReservationError("request has no active route to recover")
+
+        with route.operation_lock:
+            with self._lock:
+                if self._routes.get(request_key) is not route or not route.active:
+                    raise RouteReservationError("request route is no longer recoverable")
+                primary = route.committed
+                recovery = route.recovery_committed
+                if primary.plan.epoch != failed_epoch:
+                    raise RouteReservationError(
+                        "failed route epoch no longer matches active authority"
+                    )
+                if recovery is None:
+                    raise RouteReservationError("request has no reserved recovery route")
+
+            new_epoch = self.epoch_allocator.next_epoch()
+            if new_epoch <= failed_epoch:
+                raise RuntimeError("epoch allocator did not advance during recovery")
+            now_ms = self._now_ms()
+            promotion_plan = recovery.plan.model_copy(
+                update={
+                    "route_id": f"{recovery.plan.route_id}-promotion-{new_epoch}",
+                    "epoch": new_epoch,
+                    "recovery_level": RecoveryLevel.RESTARTABLE,
+                    "reservation_deadline_ms": now_ms + self.prepare_ttl_ms,
+                    "plan_expires_at_ms": now_ms + self.plan_ttl_ms,
+                }
+            )
+            attempt_started_at_ms = self._steady_now_ms()
+            try:
+                promoted = self.coordinator.reserve(promotion_plan)
+            except Exception as exc:
+                self._invalidate_under_operation_lock(request_key, route, exc)
+                raise RouteReservationError(
+                    f"reserved recovery route promotion failed: {exc}"
+                ) from exc
+
+            acknowledged_at_ms = self._steady_now_ms()
+            if (
+                acknowledged_at_ms
+                >= attempt_started_at_ms + self.session_ttl_ms - self.lease_expiry_guard_ms
+            ):
+                try:
+                    self.coordinator.release(promoted)
+                finally:
+                    error = RouteReservationError(
+                        "promoted route lease was acknowledged too close to expiry"
+                    )
+                    self._invalidate_under_operation_lock(request_key, route, error)
+                raise error
+
+            with self._lock:
+                if self._routes.get(request_key) is not route or not route.active:
+                    try:
+                        self.coordinator.release(promoted)
+                    finally:
+                        raise RouteReservationError(
+                            "request route changed while recovery was being promoted"
+                        )
+                route.committed = promoted
+                route.recovery_committed = None
+                route.primary_failure = None
+                route.lease_deadline_ms = attempt_started_at_ms + self.session_ttl_ms
+                route.next_renew_at_ms = acknowledged_at_ms + self.renew_interval_ms
+                route.consecutive_renewal_failures = 0
+                route.last_renewal_error = None
+
+            # The journal epoch is the authoritative last line of defense, but
+            # explicitly fence reachable old stages as well. A partitioned
+            # stage will expire its old lease even if this best-effort RPC
+            # cannot reach it.
+            try:
+                self.coordinator.fence(primary, epoch=new_epoch)
+            except Exception:
+                logger.warning(
+                    "Unable to contact every superseded primary stage for request %s; "
+                    "journal fencing and lease expiry remain active",
+                    request_key,
+                    exc_info=True,
+                )
+
+            return ActiveRouteContext(
+                manifest=self.planner.trusted_manifest(promotion_plan.model_swarm_id),
+                primary_plan=promotion_plan,
+                recovery_plan=None,
+                effective_recovery_level=RecoveryLevel.RESTARTABLE,
+            )
 
     def release(self, request_id: str) -> bool:
         request_key = str(request_id)
@@ -348,6 +451,7 @@ class ActiveRouteRuntime:
                     "lease_expires_in_ms": max(0, route.lease_deadline_ms - steady_now_ms),
                     "renewal_failures": route.consecutive_renewal_failures,
                     "last_renewal_error": route.last_renewal_error,
+                    "primary_failure": route.primary_failure,
                 }
                 for request_id, route in sorted(self._routes.items())
                 if route.active
@@ -401,6 +505,17 @@ class ActiveRouteRuntime:
             primary_workers = {stage.worker_id for stage in route.committed.plan.stages}
             departed_primary = sorted(primary_workers - active_workers)
             if departed_primary:
+                if route.recovery_committed is not None:
+                    recovery_workers = {
+                        stage.worker_id for stage in route.recovery_committed.plan.stages
+                    }
+                    if recovery_workers <= active_workers:
+                        self._mark_primary_lost(
+                            request_id,
+                            route,
+                            RuntimeError(f"primary route workers departed: {departed_primary}"),
+                        )
+                        continue
                 self._invalidate(
                     request_id,
                     route,
@@ -420,6 +535,31 @@ class ActiveRouteRuntime:
                     )
             if route.next_renew_at_ms <= now_ms:
                 self._renew_one(request_id, route)
+
+    def _mark_primary_lost(
+        self,
+        request_id: str,
+        route: _ActiveRoute,
+        exc: Exception,
+    ) -> None:
+        """Stop stale traffic while retaining a reserved route for promotion."""
+
+        with route.operation_lock:
+            with self._lock:
+                if self._routes.get(request_id) is not route or not route.active:
+                    return
+                if route.primary_failure is None:
+                    route.primary_failure = f"{type(exc).__name__}: {exc}"[:256]
+                    self._failures.append(
+                        {
+                            "request_id": request_id,
+                            "route_id": route.committed.plan.route_id,
+                            "epoch": route.committed.plan.epoch,
+                            "error": route.primary_failure,
+                            "failed_at_ms": self._now_ms(),
+                            "recovery_pending": True,
+                        }
+                    )
 
     def _degrade_recovery(
         self,
@@ -471,31 +611,39 @@ class ActiveRouteRuntime:
         exc: Exception,
     ) -> None:
         with route.operation_lock:
-            with self._lock:
-                if self._routes.get(request_id) is not route or not route.active:
-                    return
-                route.active = False
-                self._failures.append(
-                    {
-                        "request_id": request_id,
-                        "route_id": route.committed.plan.route_id,
-                        "epoch": route.committed.plan.epoch,
-                        "error": f"{type(exc).__name__}: {exc}"[:256],
-                        "failed_at_ms": self._now_ms(),
-                    }
-                )
-            try:
-                self._release_committed(route)
-            except Exception:
-                logger.warning(
-                    "Failed to clean up lost v3 route %s",
-                    request_id,
-                    exc_info=True,
-                )
-            finally:
-                with self._capacity_changed:
-                    self._routes.pop(request_id, None)
-                    self._capacity_changed.notify_all()
+            self._invalidate_under_operation_lock(request_id, route, exc)
+
+    def _invalidate_under_operation_lock(
+        self,
+        request_id: str,
+        route: _ActiveRoute,
+        exc: Exception,
+    ) -> None:
+        with self._lock:
+            if self._routes.get(request_id) is not route or not route.active:
+                return
+            route.active = False
+            self._failures.append(
+                {
+                    "request_id": request_id,
+                    "route_id": route.committed.plan.route_id,
+                    "epoch": route.committed.plan.epoch,
+                    "error": f"{type(exc).__name__}: {exc}"[:256],
+                    "failed_at_ms": self._now_ms(),
+                }
+            )
+        try:
+            self._release_committed(route)
+        except Exception:
+            logger.warning(
+                "Failed to clean up lost v3 route %s",
+                request_id,
+                exc_info=True,
+            )
+        finally:
+            with self._capacity_changed:
+                self._routes.pop(request_id, None)
+                self._capacity_changed.notify_all()
 
     def _renew_one(self, request_id: str, route: _ActiveRoute) -> None:
         renewal_error: Exception | None = None

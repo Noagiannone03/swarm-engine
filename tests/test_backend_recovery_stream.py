@@ -3,6 +3,7 @@ import json
 import pytest
 
 from backend.server.recovery_stream import (
+    OpenAIChatReplayStream,
     OpenAIRecoveryStream,
     RecoveryStreamProtocolError,
 )
@@ -133,6 +134,7 @@ def test_explicit_token_id_client_keeps_official_vllm_fields():
         (sse({"choices": [{"index": 1, "delta": {}, "token_ids": [1]}]}), "choice index"),
         (sse({"choices": [{"index": 0, "delta": {}, "token_ids": [True]}]}), "invalid"),
         (sse({"choices": [{"index": 0, "delta": {}, "token_ids": [-1]}]}), "invalid"),
+        (sse({"error": {"message": "failed"}}), "SSE error"),
     ],
 )
 def test_invalid_exact_token_stream_fails_closed(wire, match):
@@ -162,3 +164,164 @@ def test_truncated_and_oversized_events_fail_closed():
     bounded = OpenAIRecoveryStream(max_event_bytes=8)
     with pytest.raises(RecoveryStreamProtocolError, match="exceeds"):
         bounded.feed(b"data: " + b"x" * 9)
+
+
+def test_fragmented_chat_replay_suppresses_exact_prefix_and_returns_future_events():
+    wire = (
+        sse(
+            {
+                "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+                "prompt_token_ids": [10, 20, 30],
+            }
+        )
+        + sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": '{"path":"README'},
+                                }
+                            ]
+                        },
+                        "token_ids": [40, 41],
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+        + sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "future"},
+                        "token_ids": [42],
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+        + sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "token_ids": [],
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+        + sse(
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "total_tokens": 6,
+                    "prompt_tokens_details": {"cached_tokens": 5},
+                    "completion_tokens_details": {"reasoning_tokens": 0},
+                },
+            }
+        )
+        + sse("[DONE]")
+    )
+    decoder = OpenAIChatReplayStream(
+        expected_prompt_token_ids=(10, 20, 30),
+        committed_output_token_ids=(40, 41),
+    )
+    events = []
+    for byte in wire:
+        events.extend(decoder.feed(bytes([byte])))
+    decoder.finalize()
+
+    assert decoder.replay_complete
+    assert [event.output_token_ids for event in events] == [(42,), (), (), ()]
+    assert b"README" not in b"".join(event.client_bytes for event in events)
+    assert b"future" in events[0].client_bytes
+    assert events[1].finish_reason == "stop"
+    usage = json.loads(events[2].client_bytes.removeprefix(b"data: "))
+    assert usage["usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 3,
+        "total_tokens": 6,
+    }
+    assert events[-1].done
+
+
+@pytest.mark.parametrize(
+    "wire,match",
+    [
+        (
+            sse({"choices": [], "prompt_token_ids": [99]}),
+            "prompt token IDs",
+        ),
+        (
+            sse({"choices": [], "prompt_token_ids": [10, 20, 30]})
+            + sse(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "wrong"},
+                            "token_ids": [99],
+                        }
+                    ]
+                }
+            ),
+            "output token IDs",
+        ),
+        (
+            sse({"choices": [], "prompt_token_ids": [10, 20, 30]})
+            + sse(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "token_ids": [40, 41, 42],
+                        }
+                    ]
+                }
+            ),
+            "beyond",
+        ),
+        (
+            sse({"choices": [], "prompt_token_ids": [10, 20, 30]})
+            + sse(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "token_ids": [40],
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ),
+            "terminated before",
+        ),
+    ],
+)
+def test_invalid_chat_replay_stream_fails_closed(wire, match):
+    decoder = OpenAIChatReplayStream(
+        expected_prompt_token_ids=(10, 20, 30),
+        committed_output_token_ids=(40, 41),
+    )
+    with pytest.raises(RecoveryStreamProtocolError, match=match):
+        decoder.feed(wire)
+
+
+def test_chat_replay_done_requires_exact_boundary():
+    decoder = OpenAIChatReplayStream(
+        expected_prompt_token_ids=(10, 20, 30),
+        committed_output_token_ids=(40, 41),
+    )
+    with pytest.raises(RecoveryStreamProtocolError, match="committed token boundary"):
+        decoder.feed(sse({"choices": [], "prompt_token_ids": [10, 20, 30]}) + sse("[DONE]"))

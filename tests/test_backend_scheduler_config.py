@@ -1,3 +1,4 @@
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,6 +9,11 @@ from backend.server.scheduler_manage import SchedulerManage
 from backend.server.server_args import parse_args
 from parallax.p2p.liveness import DEFAULT_SCHEDULER_HEARTBEAT_TIMEOUT_SECONDS
 from swarm_protocol.contracts import RecoveryLevel
+from swarm_protocol.recovery import (
+    RecoveryState,
+    SamplingReplayContract,
+    SamplingReplayMode,
+)
 
 
 def test_backend_scheduler_defaults_to_dynamic_dp(monkeypatch):
@@ -43,6 +49,192 @@ def test_scheduler_manager_rejects_unknown_v3_mode(monkeypatch):
 
     with pytest.raises(ValueError, match="off, shadow, or active"):
         SchedulerManage()
+
+
+def test_scheduler_manager_rejects_unknown_recovery_policy(monkeypatch):
+    monkeypatch.setenv("FABI_SWARM_V3_RECOVERY", "sometimes")
+
+    with pytest.raises(ValueError, match="off, prefer, or require"):
+        SchedulerManage()
+
+
+def test_scheduler_prefers_recovery_only_for_exact_streaming_sampling():
+    manager = SchedulerManage()
+    manager.active_v3_routes = object()
+
+    assert (
+        manager.preferred_recovery_level({"stream": True, "temperature": 0})
+        == RecoveryLevel.RECOVERABLE
+    )
+    assert (
+        manager.preferred_recovery_level({"stream": False, "temperature": 0})
+        == RecoveryLevel.RESTARTABLE
+    )
+    assert (
+        manager.preferred_recovery_level({"stream": True, "temperature": 0.7})
+        == RecoveryLevel.RESTARTABLE
+    )
+
+
+def test_scheduler_promotes_route_before_fencing_recovery_journal():
+    manager = SchedulerManage()
+    calls = []
+    promoted = SimpleNamespace(primary_plan=SimpleNamespace(epoch=8, route_id="backup-promotion-8"))
+    manager.active_v3_routes = SimpleNamespace(
+        promote_recovery=lambda request_id, failed_epoch: (
+            calls.append(("route", request_id, failed_epoch)) or promoted
+        ),
+        release=lambda request_id: calls.append(("release", request_id)),
+    )
+    snapshot = SimpleNamespace(epoch=7)
+    recovering = SimpleNamespace(epoch=8)
+    manager.recovery_journal = SimpleNamespace(
+        get=lambda request_id: snapshot,
+        begin_recovery=lambda request_id, **kwargs: (
+            calls.append(("journal", request_id, kwargs)) or recovering
+        ),
+    )
+
+    assert manager.promote_generation_recovery("request", failed_epoch=7) == (
+        recovering,
+        promoted,
+    )
+    assert calls == [
+        ("route", "request", 7),
+        (
+            "journal",
+            "request",
+            {
+                "failed_epoch": 7,
+                "new_epoch": 8,
+                "replacement_route_id": "backup-promotion-8",
+            },
+        ),
+    ]
+
+
+def test_scheduler_releases_promoted_route_if_journal_fence_fails():
+    manager = SchedulerManage()
+    released = []
+    manager.active_v3_routes = SimpleNamespace(
+        promote_recovery=lambda request_id, failed_epoch: SimpleNamespace(
+            primary_plan=SimpleNamespace(epoch=8, route_id="backup-promotion-8")
+        ),
+        release=released.append,
+    )
+
+    def fail_begin(*args, **kwargs):
+        raise RuntimeError("journal unavailable")
+
+    manager.recovery_journal = SimpleNamespace(
+        get=lambda request_id: SimpleNamespace(epoch=7),
+        begin_recovery=fail_begin,
+    )
+
+    with pytest.raises(RuntimeError, match="journal unavailable"):
+        manager.promote_generation_recovery("request", failed_epoch=7)
+    assert released == ["request"]
+
+
+def test_scheduler_builds_exact_route_fenced_chat_replay_request():
+    manager = SchedulerManage()
+    sampling = SamplingReplayContract(
+        params_json='{"min_tokens":4,"temperature":0,"top_p":0.9}',
+        params_hash=hashlib.sha256(b'{"min_tokens":4,"temperature":0,"top_p":0.9}').hexdigest(),
+        mode=SamplingReplayMode.GREEDY,
+    )
+    snapshot = SimpleNamespace(
+        state=RecoveryState.RECOVERING,
+        epoch=8,
+        route_ids=("primary", "backup-promotion-8"),
+        committed_position=2,
+        committed_output_token_ids=(40, 50),
+        replay_token_ids=(10, 20, 30, 40, 50),
+        spec=SimpleNamespace(
+            model_swarm_id="ab" * 32,
+            prompt_token_ids=(10, 20, 30),
+            reserved_context_tokens=19,
+            sampling=sampling,
+        ),
+    )
+    plan = SimpleNamespace(
+        epoch=8,
+        route_id="backup-promotion-8",
+        model_swarm_id="ab" * 32,
+        stages=(
+            SimpleNamespace(worker_id="backup-head"),
+            SimpleNamespace(worker_id="backup-tail"),
+        ),
+    )
+    manager.recovery_journal = SimpleNamespace(get=lambda request_id: snapshot)
+    manager.active_v3_routes = SimpleNamespace(
+        execution_context=lambda request_id: SimpleNamespace(
+            primary_plan=plan,
+            manifest=SimpleNamespace(model_id="Qwen/Qwen3-4B"),
+        )
+    )
+
+    original = {
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": True,
+        "temperature": 0,
+        "min_tokens": 4,
+        "max_completion_tokens": 16,
+        "tools": [{"type": "function", "function": {"name": "read"}}],
+    }
+    head, request = manager.build_generation_replay_request(
+        "request",
+        original_request=original,
+        model_name="Qwen/Qwen3-4B",
+    )
+
+    assert head == "backup-head"
+    assert request == {
+        "authority_request_id": "request",
+        "request": {
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "temperature": 0,
+            "min_tokens": 2,
+            "top_p": 0.9,
+            "max_completion_tokens": 14,
+            "tools": [{"type": "function", "function": {"name": "read"}}],
+            "request_id": "request",
+            "model": "Qwen/Qwen3-4B",
+            "vllm_xargs": {
+                "parallax_routing_table": ["backup-head", "backup-tail"],
+                "parallax_scheduler_request_id": "request",
+                "fabi_route_id": "backup-promotion-8",
+                "fabi_route_epoch": 8,
+            },
+        },
+        "original_prompt_token_ids": [10, 20, 30],
+        "committed_output_token_ids": [40, 50],
+    }
+    assert original["min_tokens"] == 4
+
+
+def test_scheduler_completes_replay_with_the_journal_checksum_and_rng_position():
+    manager = SchedulerManage()
+    snapshot = SimpleNamespace(sequence_checksum="cd" * 32, rng_position=0)
+    calls = []
+    manager.recovery_journal = SimpleNamespace(
+        get=lambda request_id: snapshot,
+        complete_replay=lambda request_id, **kwargs: calls.append((request_id, kwargs)),
+    )
+
+    manager.complete_generation_replay("request", epoch=8)
+
+    assert calls == [
+        (
+            "request",
+            {
+                "epoch": 8,
+                "sequence_checksum": "cd" * 32,
+                "rng_position": 0,
+            },
+        )
+    ]
 
 
 def test_scheduler_manager_forwards_dynamic_dp_configuration():

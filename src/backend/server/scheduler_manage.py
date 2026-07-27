@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from collections.abc import Mapping
 from typing import List, Literal
 
 from lattica import Lattica
@@ -20,7 +21,7 @@ from parallax.p2p.utils import log_nat_traversal_preflight, mdns_enabled_for_top
 from parallax_utils.logging_config import get_logger
 from scheduling.node import RequestSignal, node_is_routable
 from scheduling.scheduler import Scheduler
-from swarm_protocol.active import ActiveRouteRuntime
+from swarm_protocol.active import ActiveRouteContext, ActiveRouteRuntime
 from swarm_protocol.coordinator import RouteReservationError
 from swarm_protocol.contracts import RecoveryLevel
 from swarm_protocol.epochs import InMemoryEpochAllocator, SqliteEpochAllocator
@@ -30,6 +31,7 @@ from swarm_protocol.recovery import (
     RecoveryState,
     RequestRecoverySnapshot,
     RequestRecoverySpec,
+    exact_replay_sampling_params,
     sampling_replay_contract,
 )
 from swarm_protocol.routing import RoutePlanningError
@@ -782,6 +784,117 @@ class SchedulerManage:
             epoch=epoch,
             state=state,
             failure=failure,
+        )
+
+    def promote_generation_recovery(
+        self,
+        request_id: str,
+        *,
+        failed_epoch: int,
+    ) -> tuple[RequestRecoverySnapshot, ActiveRouteContext]:
+        """Promote the reserved route and fence the exact journal in one operation."""
+
+        if self.active_v3_routes is None:
+            raise RecoveryConflict("active v3 routing is not enabled")
+        snapshot = self.recovery_journal.get(str(request_id))
+        if snapshot is None:
+            raise RecoveryConflict("request is not present in the recovery journal")
+        if snapshot.epoch != failed_epoch:
+            raise RecoveryConflict("failed route epoch differs from the recovery journal")
+
+        promoted_context = self.active_v3_routes.promote_recovery(
+            str(request_id),
+            failed_epoch=failed_epoch,
+        )
+        try:
+            recovering = self.recovery_journal.begin_recovery(
+                str(request_id),
+                failed_epoch=failed_epoch,
+                new_epoch=promoted_context.primary_plan.epoch,
+                replacement_route_id=promoted_context.primary_plan.route_id,
+            )
+        except Exception:
+            # The replacement must never carry traffic without a matching
+            # journal fence. Releasing it is safer than retaining an
+            # unjournalled generation.
+            self.active_v3_routes.release(str(request_id))
+            raise
+        return recovering, promoted_context
+
+    def build_generation_replay_request(
+        self,
+        request_id: str,
+        *,
+        original_request: Mapping[str, object],
+        model_name: str,
+    ) -> tuple[str, dict[str, object]]:
+        """Build one route-fenced token-exact chat replay request."""
+
+        if self.active_v3_routes is None:
+            raise RecoveryConflict("active v3 routing is not enabled")
+        if not isinstance(original_request, Mapping):
+            raise TypeError("original replay request must be a mapping")
+        if not isinstance(model_name, str) or not model_name:
+            raise ValueError("replay model_name must not be empty")
+        snapshot = self.recovery_journal.get(str(request_id))
+        if snapshot is None or snapshot.state != RecoveryState.RECOVERING:
+            raise RecoveryConflict("request is not awaiting exact replay")
+        context = self.active_v3_routes.execution_context(str(request_id))
+        if context is None:
+            raise RecoveryConflict("promoted recovery route is no longer active")
+        plan = context.primary_plan
+        if (
+            plan.epoch != snapshot.epoch
+            or plan.route_id != snapshot.route_ids[-1]
+            or plan.model_swarm_id != snapshot.spec.model_swarm_id
+        ):
+            raise RecoveryConflict("promoted route differs from the recovery journal fence")
+
+        output_budget = snapshot.spec.reserved_context_tokens - len(snapshot.spec.prompt_token_ids)
+        remaining_output_tokens = output_budget - snapshot.committed_position
+        if remaining_output_tokens <= 0:
+            raise RecoveryConflict("recovered request has no output budget remaining")
+        sampling_params = exact_replay_sampling_params(
+            snapshot.spec.sampling,
+            committed_output_tokens=snapshot.committed_position,
+            remaining_output_tokens=remaining_output_tokens,
+        )
+        routing_table = [stage.worker_id for stage in plan.stages]
+        route_xargs = {
+            "parallax_routing_table": routing_table,
+            "parallax_scheduler_request_id": str(request_id),
+            "fabi_route_id": plan.route_id,
+            "fabi_route_epoch": plan.epoch,
+        }
+        replay_chat_request = dict(original_request)
+        replay_chat_request.pop("rid", None)
+        replay_chat_request.pop("routing_table", None)
+        replay_chat_request.pop("max_tokens", None)
+        replay_chat_request["request_id"] = str(request_id)
+        replay_chat_request["model"] = model_name
+        replay_chat_request["stream"] = True
+        replay_chat_request["max_completion_tokens"] = sampling_params.pop("max_tokens")
+        replay_chat_request.update(sampling_params)
+        replay_chat_request["vllm_xargs"] = route_xargs
+        request = {
+            "authority_request_id": str(request_id),
+            "request": replay_chat_request,
+            "original_prompt_token_ids": list(snapshot.spec.prompt_token_ids),
+            "committed_output_token_ids": list(snapshot.committed_output_token_ids),
+        }
+        return plan.stages[0].worker_id, request
+
+    def complete_generation_replay(self, request_id: str, *, epoch: int) -> None:
+        """Accept rebuilt parser/KV state only at the journal's exact boundary."""
+
+        snapshot = self.recovery_journal.get(str(request_id))
+        if snapshot is None:
+            raise RecoveryConflict("request is not present in the recovery journal")
+        self.recovery_journal.complete_replay(
+            str(request_id),
+            epoch=epoch,
+            sequence_checksum=snapshot.sequence_checksum,
+            rng_position=snapshot.rng_position,
         )
 
     def _reconcile_generation_recovery(

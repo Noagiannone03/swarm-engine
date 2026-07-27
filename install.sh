@@ -14,8 +14,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXTRAS="${PARALLAX_EXTRAS:-}"
 PYTHON_VERSION="${PARALLAX_PYTHON_VERSION:-3.12}"
 VENV_DIR="${PARALLAX_VENV_DIR:-$SCRIPT_DIR/.venv}"
-VLLM_REF="${VLLM_REF:-v0.24.0}"
+VLLM_REF="${VLLM_REF:-ee0da84ab9e04ac7610e28580af62c365e898389}"
 VLLM_MINIJINJA_VERSION="${VLLM_MINIJINJA_VERSION-2.20.0}"
+VLLM_FABI_PATCH="$SCRIPT_DIR/patches/vllm-v0.24.0-fabi-chat-replay.patch"
 FRONTEND_ONLY=false
 
 show_help() {
@@ -38,6 +39,7 @@ Environment:
   PARALLAX_PYTHON_VERSION Same as --python.
   PARALLAX_VENV_DIR       Virtualenv to create/use. Defaults to ./.venv.
   VLLM_REF                vLLM git branch, tag, or full commit hash to clone.
+                          Defaults to the immutable v0.24.0 commit qualified by Fabi.
   VLLM_MINIJINJA_VERSION  MiniJinja/minijinja-contrib version to use when
                           building vllm-rs. Defaults to 2.20.0.
 EOF
@@ -280,6 +282,7 @@ build_vllm_rust_frontend() {
 
     ensure_rust_toolchain "$toolchain"
     ensure_protoc
+    apply_vllm_fabi_patch "$vllm_clone_root"
     update_vllm_minijinja "$rust_dir" "$toolchain"
 
     # pcre2-sys préfère la bibliothèque dynamique trouvée sur la machine de
@@ -305,11 +308,39 @@ build_vllm_rust_frontend() {
 }
 
 vllm_rust_frontend_version() {
+    local patch_hash
+
+    patch_hash="$("$VENV_DIR/bin/python" - "$VLLM_FABI_PATCH" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
     if [[ -n "$VLLM_MINIJINJA_VERSION" ]]; then
-        printf '%s+minijinja-%s\n' "$VLLM_REF" "$VLLM_MINIJINJA_VERSION"
+        printf '%s+minijinja-%s+fabi-%s\n' \
+            "$VLLM_REF" "$VLLM_MINIJINJA_VERSION" "$patch_hash"
     else
-        printf '%s\n' "$VLLM_REF"
+        printf '%s+fabi-%s\n' "$VLLM_REF" "$patch_hash"
     fi
+}
+
+apply_vllm_fabi_patch() {
+    local clone_root="$1"
+
+    if [[ ! -f "$VLLM_FABI_PATCH" ]]; then
+        echo "Required vLLM Fabi patch is missing: $VLLM_FABI_PATCH" >&2
+        exit 1
+    fi
+
+    echo "Applying Fabi token-exact chat replay patch"
+    if ! git -C "$clone_root" apply --unidiff-zero --check "$VLLM_FABI_PATCH"; then
+        echo "The Fabi replay patch is incompatible with vLLM ref $VLLM_REF." >&2
+        echo "Qualify and update the patch before building this frontend." >&2
+        exit 1
+    fi
+    git -C "$clone_root" apply --unidiff-zero "$VLLM_FABI_PATCH"
 }
 
 update_vllm_minijinja() {

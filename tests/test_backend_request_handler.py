@@ -105,6 +105,8 @@ class RecoveryForwardingSchedulerManage(V3ForwardingSchedulerManage):
             )
         )
         self.journal_calls = []
+        self.committed_output_token_ids = []
+        self.promotions = 0
 
     def preferred_recovery_level(self, request_data):
         assert request_data["temperature"] == 0
@@ -123,9 +125,59 @@ class RecoveryForwardingSchedulerManage(V3ForwardingSchedulerManage):
 
     def commit_generation_tokens(self, request_id, *, epoch, token_ids):
         self.journal_calls.append(("tokens", request_id, epoch, token_ids))
+        self.committed_output_token_ids.extend(token_ids)
 
     def finish_generation_journal(self, request_id, *, epoch, state, failure=None):
         self.journal_calls.append(("finish", request_id, epoch, state, failure))
+
+    def promote_generation_recovery(self, request_id, *, failed_epoch):
+        self.journal_calls.append(("promote", request_id, failed_epoch))
+        self.promotions += 1
+        if self.promotions > 1:
+            raise RecoveryConflict("request has no reserved recovery route")
+        recovering = SimpleNamespace(
+            epoch=8,
+            spec=SimpleNamespace(prompt_token_ids=(10, 20, 30)),
+            committed_output_token_ids=tuple(self.committed_output_token_ids),
+        )
+        promoted = SimpleNamespace(
+            primary_plan=SimpleNamespace(
+                route_id="route-recovery-8",
+                stages=(SimpleNamespace(worker_id="node-b"),),
+            )
+        )
+        return recovering, promoted
+
+    def build_generation_replay_request(
+        self,
+        request_id,
+        *,
+        original_request,
+        model_name,
+    ):
+        self.journal_calls.append(
+            ("build-replay", request_id, tuple(self.committed_output_token_ids))
+        )
+        replay_chat_request = dict(original_request)
+        replay_chat_request["model"] = model_name
+        replay_chat_request["request_id"] = request_id
+        replay_chat_request["return_token_ids"] = True
+        replay_chat_request["include_reasoning"] = True
+        replay_chat_request["vllm_xargs"] = {
+            "parallax_routing_table": ["node-b"],
+            "parallax_scheduler_request_id": request_id,
+            "fabi_route_id": "route-recovery-8",
+            "fabi_route_epoch": 8,
+        }
+        return "node-b", {
+            "authority_request_id": request_id,
+            "request": replay_chat_request,
+            "original_prompt_token_ids": [10, 20, 30],
+            "committed_output_token_ids": list(self.committed_output_token_ids),
+        }
+
+    def complete_generation_replay(self, request_id, *, epoch):
+        self.journal_calls.append(("replay-complete", request_id, epoch))
 
 
 class ImmediateResult:
@@ -139,6 +191,7 @@ class StaticStub:
         self.request = None
         self.response = None
         self.abort_requests = []
+        self.replay_request = None
 
     def chat_completion(self, request):
         self.request = request
@@ -148,6 +201,11 @@ class StaticStub:
     def abort_completion(self, request):
         self.abort_requests.append(request)
         return ImmediateResult()
+
+    def replay_generation(self, request):
+        self.replay_request = request
+        self.response = CancellableResponse(self.chunks)
+        return self.response
 
 
 class CancellableResponse:
@@ -571,6 +629,141 @@ def test_recoverable_stream_commits_official_tokens_before_sanitized_sse():
         ("finish", "recoverable-stream", 7, RecoveryState.COMPLETED, None),
     ]
     assert scheduler_manage.routing_requests[0][-1] == RecoveryLevel.RECOVERABLE
+    assert scheduler_manage.released == ["recoverable-stream"]
+
+
+def test_recoverable_stream_promotes_and_resumes_without_repeating_committed_prefix():
+    handler = RequestHandler()
+    scheduler_manage = RecoveryForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    primary_wire = b"".join(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}],'
+            b'"prompt_token_ids":[10,20,30]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n',
+        ]
+    )
+    replay_wire = b"".join(
+        [
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}],'
+            b'"prompt_token_ids":[10,20,30]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{"content":" continued"},'
+            b'"token_ids":[41],"finish_reason":null}]}\n\n',
+            b'data: {"choices":[{"index":0,"delta":{},"token_ids":[],"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+    primary_stub = StaticStub([primary_wire])
+    recovery_stub = StaticStub([replay_wire[:67], replay_wire[67:]])
+    handler.stubs["node-a"] = primary_stub
+    handler.stubs["node-b"] = recovery_stub
+
+    async def consume_stream():
+        response = await handler.v1_chat_completions(
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "temperature": 0,
+                "include_reasoning": False,
+            },
+            "recoverable-stream",
+            1.0,
+        )
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    body = asyncio.run(consume_stream())
+
+    assert body.count(b'"content":"partial"') == 1
+    assert body.count(b'"content":" continued"') == 1
+    assert b"prompt_token_ids" not in body
+    assert b"token_ids" not in body
+    assert body.endswith(b"data: [DONE]\n\n")
+    assert primary_stub.response.cancelled
+    assert recovery_stub.replay_request["authority_request_id"] == "recoverable-stream"
+    assert recovery_stub.replay_request["original_prompt_token_ids"] == [10, 20, 30]
+    assert recovery_stub.replay_request["committed_output_token_ids"] == [40]
+    assert recovery_stub.replay_request["request"]["vllm_xargs"]["fabi_route_epoch"] == 8
+    assert scheduler_manage.journal_calls == [
+        (
+            "begin",
+            "recoverable-stream",
+            {
+                "engine_prompt_token_ids": (10, 20, 30),
+                "expected_prompt_token_ids": (10, 20, 30),
+                "request_data": {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                    "temperature": 0,
+                    "include_reasoning": False,
+                },
+            },
+        ),
+        ("prefill", "recoverable-stream", 7),
+        ("tokens", "recoverable-stream", 7, (40,)),
+        ("promote", "recoverable-stream", 7),
+        ("build-replay", "recoverable-stream", (40,)),
+        ("replay-complete", "recoverable-stream", 8),
+        ("tokens", "recoverable-stream", 8, (41,)),
+        ("tokens", "recoverable-stream", 8, ()),
+        ("finish", "recoverable-stream", 8, RecoveryState.COMPLETED, None),
+    ]
+    assert scheduler_manage.released == ["recoverable-stream"]
+
+
+def test_second_worker_loss_fails_cleanly_after_reserved_backup_is_consumed():
+    handler = RequestHandler()
+    scheduler_manage = RecoveryForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    primary_stub = StaticStub(
+        [
+            b'data: {"choices":[],"prompt_token_ids":[10,20,30]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n'
+        ]
+    )
+    recovery_stub = StaticStub(
+        [
+            b'data: {"choices":[],"prompt_token_ids":[10,20,30]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":" next"},'
+            b'"token_ids":[41],"finish_reason":null}]}\n\n'
+        ]
+    )
+    handler.stubs["node-a"] = primary_stub
+    handler.stubs["node-b"] = recovery_stub
+
+    async def consume_stream():
+        response = await handler.v1_chat_completions(
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "temperature": 0,
+            },
+            "recoverable-stream",
+            1.0,
+        )
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    body = asyncio.run(consume_stream())
+    payloads = [line.removeprefix(b"data: ") for line in body.splitlines() if line]
+    error = json.loads(payloads[-2])
+
+    assert body.count(b'"content":"partial"') == 1
+    assert body.count(b'"content":" next"') == 1
+    assert error["error"]["code"] == "upstream_worker_lost"
+    assert payloads[-1] == b"[DONE]"
+    assert scheduler_manage.promotions == 2
+    assert scheduler_manage.journal_calls[-1] == (
+        "finish",
+        "recoverable-stream",
+        8,
+        RecoveryState.FAILED,
+        "upstream ended without [DONE]",
+    )
     assert scheduler_manage.released == ["recoverable-stream"]
 
 

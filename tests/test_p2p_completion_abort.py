@@ -6,6 +6,7 @@ import pytest
 
 import parallax.p2p.server as p2p_server
 import parallax.server.vllm_rust_frontend as rust_frontend
+from backend.server.openai_compat import decode_http_response_envelope
 from parallax.p2p.server import TransformerConnectionHandler
 from parallax.server.vllm_rust_frontend import launch_vllm_rust_frontend
 
@@ -28,12 +29,25 @@ class FakeHttpResponse:
         return None
 
 
+class FakeStreamResponse(FakeHttpResponse):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def iter_bytes(self):
+        yield b'data: {"choices":[{"token_ids":[42]}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+
 class FakeHttpClient:
     instances = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.posts = []
+        self.streams = []
         self.instances.append(self)
 
     def __enter__(self):
@@ -45,6 +59,10 @@ class FakeHttpClient:
     def post(self, url, *, json):
         self.posts.append((url, json))
         return FakeHttpResponse()
+
+    def stream(self, method, url, *, json):
+        self.streams.append((method, url, json))
+        return FakeStreamResponse()
 
 
 def make_handler(admission=None):
@@ -101,6 +119,88 @@ def test_abort_completion_fails_closed_without_active_v3():
 
     with pytest.raises(PermissionError, match="active protocol v3"):
         handler.abort_completion({"request_id": "request", "vllm_xargs": {}})
+
+
+def test_generation_replay_is_route_fenced_and_uses_qualified_chat_api(monkeypatch):
+    admission = FakeAdmission()
+    handler = make_handler(admission)
+    FakeHttpClient.instances.clear()
+    monkeypatch.setattr(p2p_server, "authenticated_rpc_peer_id", lambda: "coordinator")
+    monkeypatch.setattr(p2p_server.httpx, "Client", FakeHttpClient)
+    request = {
+        "authority_request_id": "scheduler-request",
+        "request": {
+            "request_id": "scheduler-request",
+            "model": "Qwen/Qwen3-4B",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "max_completion_tokens": 16,
+            "temperature": 0,
+            "vllm_xargs": {
+                "fabi_route_id": "route-8",
+                "fabi_route_epoch": 8,
+                "parallax_routing_table": ["backup-a", "backup-b"],
+            },
+        },
+        "original_prompt_token_ids": [10, 20, 30],
+        "committed_output_token_ids": [40],
+    }
+
+    chunks = list(handler.replay_generation(request))
+
+    assert chunks == [
+        b'data: {"choices":[{"token_ids":[42]}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    assert admission.calls == [
+        {
+            "request_id": "scheduler-request",
+            "route_id": "route-8",
+            "epoch": 8,
+            "routing_table": ("backup-a", "backup-b"),
+            "caller_endpoint_id": "coordinator",
+        }
+    ]
+    assert FakeHttpClient.instances[0].streams == [
+        (
+            "POST",
+            "http://localhost:3000/inference/v1/chat-replay",
+            {key: value for key, value in request.items() if key != "authority_request_id"},
+        )
+    ]
+
+
+def test_generation_replay_rejects_unbounded_or_non_streaming_input(monkeypatch):
+    handler = make_handler(FakeAdmission())
+    monkeypatch.setattr(p2p_server, "authenticated_rpc_peer_id", lambda: "coordinator")
+
+    chunks = list(
+        handler.replay_generation(
+            {
+                "authority_request_id": "request",
+                "request": {
+                    "request_id": "request",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                    "max_completion_tokens": 1,
+                    "vllm_xargs": {
+                        "fabi_route_id": "route",
+                        "fabi_route_epoch": 1,
+                        "parallax_routing_table": ["worker"],
+                    },
+                },
+                "original_prompt_token_ids": [1],
+                "committed_output_token_ids": [],
+            }
+        )
+    )
+
+    assert len(chunks) == 1
+    envelope = decode_http_response_envelope(chunks[0])
+    assert envelope is not None
+    status_code, _, body = envelope
+    assert status_code == 502
+    assert b"generation_replay_failed" in body
 
 
 def test_active_v3_frontend_enables_local_vllm_abort_route(monkeypatch):
