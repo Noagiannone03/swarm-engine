@@ -185,6 +185,28 @@ def test_empty_legacy_response_cannot_demote_autonomous_worker():
     assert values["model_name"] == "Qwen/Qwen3-4B"
 
 
+def test_global_legacy_tier_cannot_resize_autonomous_generation():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.swarm_v3_placement_mode = "autonomous"
+    server.block_start_index = 0
+    server.block_end_index = 5
+    server.planned_context_tokens = 32768
+    server.allocation_epoch = 11
+
+    fenced = server._fence_autonomous_scheduler_allocation(
+        start_layer=0,
+        end_layer=4,
+        planned_context_tokens=16384,
+        allocation_epoch=12,
+    )
+
+    assert fenced == (0, 5, 32768, 11)
+
+
 def test_forward_enqueue_failure_is_not_reported_as_success():
     handler = build_forward_handler(RecordingSocket(error=RuntimeError("enqueue failed")))
     request = forward_pb2.ForwardRequest()

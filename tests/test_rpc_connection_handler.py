@@ -192,6 +192,23 @@ def test_initial_join_acknowledges_registration_before_dp_allocation():
     assert response["planned_context_tokens"] == scheduler.node.max_sequence_length
 
 
+def test_autonomous_join_uses_model_preference_not_legacy_global_tier():
+    scheduler = RecordingScheduler()
+    scheduler.model_info.max_context_length = 40960
+    scheduler.node.max_sequence_length = 65536
+    scheduler.node.swarm_v3 = {"placement_mode": "autonomous"}
+    scheduler.layer_allocator = SimpleNamespace(
+        selected_context_tokens=16384,
+        preferred_context_tokens=32768,
+    )
+    handler = RPCConnectionHandler.__new__(RPCConnectionHandler)
+    handler.scheduler = scheduler
+
+    response = handler.pending_join_response("worker")
+
+    assert response["planned_context_tokens"] == 32768
+
+
 def test_node_join_starts_heartbeat_phase_before_full_dp_pipeline(monkeypatch):
     scheduler = RecordingScheduler()
     scheduler.full_pipeline = False

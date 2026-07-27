@@ -16,10 +16,31 @@ from swarm_protocol import (
     SpanState,
     WorkerOffer,
     WorkerRole,
+    autonomous_context_tiers,
 )
 
 HASHES = tuple(character * 64 for character in "abcdef")
 NOW = 1_000
+
+
+def test_autonomous_context_tiers_are_bounded_and_include_configured_floor():
+    assert autonomous_context_tiers(32_768) == (32_768, 16_384, 8_192, 4_096)
+    assert autonomous_context_tiers(32_768, minimum_tokens=12_000) == (
+        32_768,
+        16_384,
+        12_000,
+    )
+    assert autonomous_context_tiers(2_048) == (2_048,)
+
+
+def test_autonomous_context_tiers_reject_non_positive_contracts():
+    for preferred, minimum in ((0, 4_096), (32_768, 0), (-1, 4_096)):
+        try:
+            autonomous_context_tiers(preferred, minimum_tokens=minimum)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("non-positive context tier contract was accepted")
 
 
 def model() -> ModelManifest:
@@ -236,6 +257,7 @@ def test_cold_worker_announces_building_before_executor_reload():
         )
 
     assert status["phase"] == "building"
+    assert status["context_tokens"] == 10
     assert len(publisher.bootstrap) == 1
     intent = publisher.bootstrap[0]
     assert intent.lease.state is SpanState.BUILDING

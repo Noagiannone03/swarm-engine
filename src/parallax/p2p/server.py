@@ -65,7 +65,10 @@ from swarm_protocol.worker_integration import (
     WorkerProtocolV3Reporter,
     WorkerServingSnapshot,
 )
-from swarm_protocol.worker_placement import AutonomousWorkerPlacement
+from swarm_protocol.worker_placement import (
+    AutonomousWorkerPlacement,
+    autonomous_context_tiers,
+)
 
 logger = get_logger(__name__)
 
@@ -1039,6 +1042,13 @@ class GradientServer:
                 self.swarm_v3_placement_controller = controller
                 offer = None
                 manifest_published = False
+                preferred_context_tokens = int(self.planned_context_tokens)
+                context_tiers = autonomous_context_tiers(
+                    preferred_context_tokens,
+                    minimum_tokens=int(
+                        os.environ.get("FABI_SWARM_V3_MIN_CONTEXT_TOKENS", "4096")
+                    ),
+                )
                 while not self.stop_event.is_set():
                     if not manifest_published:
                         try:
@@ -1062,20 +1072,33 @@ class GradientServer:
                             ),
                             supports_frontend=self.supports_frontend,
                         )
-                    placement = controller.bootstrap(
-                        offer=offer,
-                        manifest=manifest,
-                        context_tokens=int(self.planned_context_tokens),
-                        kv_block_size=self.kv_block_size,
-                        max_sessions=max(1, int(self.max_batch_size or 1)),
-                        # BUILDING binds the signed collection identity without
-                        # expanding a potentially huge shard list into the DHT.
-                        # READY later contains the exact locally verified files.
-                        weight_hashes=(manifest.weight_collection_hash,),
-                        outgoing_links=self._v3_outgoing_link_metrics(),
-                    )
+                    placement = None
+                    for context_tokens in context_tiers:
+                        self.planned_context_tokens = context_tokens
+                        placement = controller.bootstrap(
+                            offer=offer,
+                            manifest=manifest,
+                            context_tokens=context_tokens,
+                            kv_block_size=self.kv_block_size,
+                            max_sessions=max(1, int(self.max_batch_size or 1)),
+                            # BUILDING binds the signed collection identity without
+                            # expanding a potentially huge shard list into the DHT.
+                            # READY later contains the exact locally verified files.
+                            weight_hashes=(manifest.weight_collection_hash,),
+                            outgoing_links=self._v3_outgoing_link_metrics(),
+                        )
+                        if placement["decision"] == "waiting_catalog":
+                            self.planned_context_tokens = preferred_context_tokens
+                            break
+                        if (
+                            placement["decision"]
+                            != "no_exact_span_fits_the_stable_memory_envelope"
+                        ):
+                            break
+                    assert placement is not None
                     if self._shared_state is not None:
                         self._shared_state.update(
+                            planned_context_tokens=self.planned_context_tokens,
                             swarm_v3_placement_generation=placement["generation"],
                             swarm_v3_placement_phase=placement["phase"],
                         )
@@ -2115,12 +2138,17 @@ class GradientServer:
                                 allocation_epoch = response.get("allocation_epoch")
                                 has_model_context = "model_max_sequence_length" in response
                                 negotiated_chunk_size = response.get("chunked_prefill_size")
-                                if self.swarm_v3_placement_mode == "autonomous":
-                                    # The qualified scheduler still supplies model and wire
-                                    # contracts during migration, but layer ownership belongs to
-                                    # the worker-side v3 transaction even before its first span.
-                                    start_layer = self.block_start_index
-                                    end_layer = self.block_end_index
+                                (
+                                    start_layer,
+                                    end_layer,
+                                    planned_context_tokens,
+                                    allocation_epoch,
+                                ) = self._fence_autonomous_scheduler_allocation(
+                                    start_layer=start_layer,
+                                    end_layer=end_layer,
+                                    planned_context_tokens=planned_context_tokens,
+                                    allocation_epoch=allocation_epoch,
+                                )
                                 if start_layer is not None and end_layer is not None:
                                     logger.debug(
                                         f"Heartbeat: Node {self.lattica.peer_id()}... "
@@ -2291,6 +2319,30 @@ class GradientServer:
             "layer allocation was received."
         )
 
+    def _fence_autonomous_scheduler_allocation(
+        self,
+        *,
+        start_layer: int | None,
+        end_layer: int | None,
+        planned_context_tokens: int | None,
+        allocation_epoch: int | None,
+    ) -> tuple[int | None, int | None, int | None, int | None]:
+        """Project legacy responses onto the worker-owned v3 generation."""
+
+        if self.swarm_v3_placement_mode != "autonomous":
+            return (
+                start_layer,
+                end_layer,
+                planned_context_tokens,
+                allocation_epoch,
+            )
+        return (
+            self.block_start_index,
+            self.block_end_index,
+            self.planned_context_tokens,
+            self.allocation_epoch,
+        )
+
     def get_node_info(self, is_update: bool = False):
         # A dedicated topology thread owns network probes. Heartbeats only read
         # its last fail-closed result and therefore cannot be starved by probes.
@@ -2356,6 +2408,8 @@ class GradientServer:
             "manual_layer_assignment": self.manual_layer_assignment,
             "last_refit_time": self.last_refit_time,
         }
+        if self.swarm_v3_reporter is not None:
+            info["swarm_v3_placement_mode"] = self.swarm_v3_placement_mode
         if self.account_token:
             info["account_token"] = self.account_token
         if runtime_kv_capacity is not None and runtime_kv_block_size is not None:
@@ -2401,6 +2455,7 @@ class GradientServer:
                 info["swarm_v3"] = {
                     "mode": "active" if self.swarm_v3_execution_admission is not None else "shadow",
                     "state": "rejected",
+                    "placement_mode": self.swarm_v3_placement_mode,
                     "error": self.swarm_v3_init_error,
                 }
             elif self.swarm_v3_reporter is not None:
@@ -2452,6 +2507,7 @@ class GradientServer:
                             ),
                         )
                     )
+                    report["placement_mode"] = self.swarm_v3_placement_mode
                     if self.swarm_v3_execution_admission is not None and report.get("state") in {
                         "ready",
                         "warming",
@@ -2511,6 +2567,7 @@ class GradientServer:
                     info["swarm_v3"] = {
                         "mode": self.swarm_v3_reporter.mode,
                         "state": "waiting_contract",
+                        "placement_mode": self.swarm_v3_placement_mode,
                     }
 
         return info

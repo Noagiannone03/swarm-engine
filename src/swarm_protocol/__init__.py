@@ -100,7 +100,10 @@ from swarm_protocol.routing import (
     RouteEstimate,
     RoutePlanningError,
 )
-from swarm_protocol.worker_placement import AutonomousWorkerPlacement
+from swarm_protocol.worker_placement import (
+    AutonomousWorkerPlacement,
+    autonomous_context_tiers,
+)
 
 __all__ = [
     "PROTOCOL_VERSION",
@@ -108,6 +111,7 @@ __all__ = [
     "ArtifactRole",
     "AutonomousPlacementPolicy",
     "AutonomousWorkerPlacement",
+    "autonomous_context_tiers",
     "BackendKind",
     "ContributionReceipt",
     "CapacityDemandMap",

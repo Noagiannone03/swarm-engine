@@ -52,6 +52,32 @@ class SpanStatePublisher(Protocol):
     ) -> ModelMemberAdvertisement: ...
 
 
+def autonomous_context_tiers(
+    preferred_tokens: int,
+    *,
+    minimum_tokens: int = 4_096,
+) -> tuple[int, ...]:
+    """Return deterministic per-worker context tiers from preferred to minimum.
+
+    Context is a property of a complete v3 route, not a swarm-wide constant.
+    A constrained contributor may therefore materialize a smaller-context
+    shard without downgrading unrelated routes.  Halving keeps the number of
+    exact placement attempts bounded while the final configured minimum
+    remains reachable even when it is not a power-of-two boundary.
+    """
+
+    if preferred_tokens <= 0 or minimum_tokens <= 0:
+        raise ValueError("autonomous context tiers must be positive")
+    floor = min(preferred_tokens, minimum_tokens)
+    tiers: list[int] = []
+    candidate = preferred_tokens
+    while candidate > floor:
+        tiers.append(candidate)
+        candidate = max(floor, candidate // 2)
+    tiers.append(floor)
+    return tuple(dict.fromkeys(tiers))
+
+
 class AutonomousWorkerPlacement:
     """Compose DHT policy, admission drain and the existing executor reload path."""
 
@@ -81,6 +107,7 @@ class AutonomousWorkerPlacement:
         self._last_moved_at_ms: int | None = None
         self._announced_transition: tuple[object, ...] | None = None
         self._error: dict[str, str] | None = None
+        self._context_tokens: int | None = None
         self._lock = threading.RLock()
 
     def bootstrap(
@@ -105,6 +132,8 @@ class AutonomousWorkerPlacement:
             raise ValueError("bootstrap context, KV block size and sessions must be positive")
         if not weight_hashes:
             raise ValueError("bootstrap intent must bind signed weight identities")
+        with self._lock:
+            self._context_tokens = context_tokens
 
         state = self._materializer.snapshot()
         if state.phase is not MaterializationPhase.STANDBY:
@@ -193,6 +222,8 @@ class AutonomousWorkerPlacement:
             raise ValueError("placement advertisement and trusted manifest disagree")
         if context_tokens <= 0:
             raise ValueError("placement context contract must be positive")
+        with self._lock:
+            self._context_tokens = context_tokens
 
         state = self._materializer.snapshot()
         if (
@@ -309,10 +340,10 @@ class AutonomousWorkerPlacement:
             self._retry_after = time.monotonic() + 2
             self._read_pending = False
 
-    @staticmethod
-    def _status(state, *, decision: str, error) -> dict[str, object]:
+    def _status(self, state, *, decision: str, error) -> dict[str, object]:
         return {
             "mode": "autonomous",
+            "context_tokens": self._context_tokens,
             "phase": state.phase.value,
             "generation": state.generation,
             "current_span": (

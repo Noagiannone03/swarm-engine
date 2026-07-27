@@ -282,16 +282,25 @@ class RPCConnectionHandler(ConnectionHandler):
             return {}
         model = node.model_info
         using_mlx = node.hardware.device == "mlx"
-        selected_context = int(
-            getattr(getattr(self.scheduler, "layer_allocator", None), "selected_context_tokens", 0)
-            or 0
-        )
+        allocator = getattr(self.scheduler, "layer_allocator", None)
+        selected_context = int(getattr(allocator, "selected_context_tokens", 0) or 0)
+        preferred_context = int(getattr(allocator, "preferred_context_tokens", 0) or 0)
         context_limits = [
             int(value)
             for value in (node.max_sequence_length, getattr(model, "max_context_length", None))
             if value is not None and int(value) > 0
         ]
-        planned_context = selected_context or (min(context_limits) if context_limits else 0)
+        autonomous = (
+            isinstance(node.swarm_v3, dict)
+            and node.swarm_v3.get("placement_mode") == "autonomous"
+        )
+        requested_context = preferred_context if autonomous else selected_context
+        if requested_context > 0 and context_limits:
+            planned_context = min(requested_context, *context_limits)
+        else:
+            planned_context = requested_context or (
+                min(context_limits) if context_limits else 0
+            )
         return {
             "node_id": current_node_id,
             "status": "waiting",
@@ -438,9 +447,7 @@ class RPCConnectionHandler(ConnectionHandler):
             ),
             account_hash=account_hash(node_json.get("account_token")),
             memory_contract_failure=node_json.get("memory_contract_failure"),
-            swarm_v3=(
-                dict(node_json["swarm_v3"]) if isinstance(node_json.get("swarm_v3"), dict) else None
-            ),
+            swarm_v3=self._build_swarm_v3_registration(node_json),
         )
         if node_json.get("start_layer", None) is not None:
             node.start_layer = node_json.get("start_layer")
@@ -453,6 +460,18 @@ class RPCConnectionHandler(ConnectionHandler):
         if node_json.get("rtt_to_nodes", None) is not None:
             node.rtt_to_nodes = node_json.get("rtt_to_nodes")
         return node
+
+    @staticmethod
+    def _build_swarm_v3_registration(node_json: dict) -> dict | None:
+        report = (
+            dict(node_json["swarm_v3"])
+            if isinstance(node_json.get("swarm_v3"), dict)
+            else {}
+        )
+        placement_mode = node_json.get("swarm_v3_placement_mode")
+        if placement_mode is not None:
+            report["placement_mode"] = placement_mode
+        return report or None
 
     def build_hardware(self, hardware_json):
         node_id = hardware_json.get("node_id")
