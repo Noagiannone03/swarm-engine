@@ -42,6 +42,10 @@ class ProbeStub:
             raise RuntimeError("link probe is not configured")
         return self.link_future
 
+    def with_timeout(self, timeout):
+        self.timeout = timeout
+        return self
+
 
 class RecordingSocket:
     def __init__(self, error=None):
@@ -939,9 +943,11 @@ def test_worker_qualifies_scheduler_before_reading_connection_telemetry():
     server = GradientServer.__new__(GradientServer)
     server.iroh_transport = transport
     server.scheduler_peer_id = "scheduler-endpoint"
-    server.scheduler_stub = ProbeStub(ProbeFuture({"peer_id": "scheduler-endpoint"}))
+    stub = ProbeStub(ProbeFuture({"peer_id": "scheduler-endpoint"}))
+    server.scheduler_stub = stub
 
     server._qualify_iroh_scheduler()
+    assert stub.timeout == 15.0
 
 
 def test_worker_rejects_wrong_scheduler_health_identity():
@@ -952,6 +958,76 @@ def test_worker_rejects_wrong_scheduler_health_identity():
 
     with pytest.raises(RuntimeError, match="wrong endpoint identity"):
         server._qualify_iroh_scheduler()
+
+
+def test_worker_retries_transient_scheduler_failure_with_capped_native_calls(monkeypatch):
+    responses = iter(
+        [
+            ProbeFuture(error=TimeoutError("relay unavailable")),
+            ProbeFuture({"peer_id": "scheduler-endpoint"}),
+        ]
+    )
+
+    class RetryingProbeStub(ProbeStub):
+        def rpc_health(self, request):
+            assert request == {}
+            return next(responses)
+
+    waits = []
+    server = GradientServer.__new__(GradientServer)
+    server.iroh_transport = SimpleNamespace(selected_path=lambda peer_id: {"kind": "relay"})
+    server.scheduler_peer_id = "scheduler-endpoint"
+    server.scheduler_stub = RetryingProbeStub(None)
+    server.stop_event = SimpleNamespace(
+        wait=lambda delay: waits.append(delay) or False,
+    )
+    monkeypatch.setattr("parallax.p2p.server.random.uniform", lambda lower, upper: upper)
+
+    server._qualify_iroh_scheduler()
+
+    assert server.scheduler_stub.timeout == 15.0
+    assert waits == [1.0]
+
+
+def test_worker_scheduler_retry_is_interruptible_by_shutdown(monkeypatch):
+    server = GradientServer.__new__(GradientServer)
+    server.iroh_transport = SimpleNamespace(selected_path=lambda peer_id: None)
+    server.scheduler_peer_id = "scheduler-endpoint"
+    server.scheduler_stub = ProbeStub(ProbeFuture(error=TimeoutError("relay unavailable")))
+    server.stop_event = SimpleNamespace(wait=lambda delay: True)
+    monkeypatch.setattr("parallax.p2p.server.random.uniform", lambda lower, upper: upper)
+
+    with pytest.raises(RuntimeError, match="stopped during shutdown"):
+        server._qualify_iroh_scheduler()
+
+
+def test_worker_retries_idempotent_join_after_transient_failure(monkeypatch):
+    responses = iter(
+        [
+            ProbeFuture(error=TimeoutError("scheduler deployment")),
+            ProbeFuture({"model_name": "Qwen/Qwen3-4B", "start_layer": None}),
+        ]
+    )
+
+    class JoinStub(ProbeStub):
+        def node_join(self, node_info):
+            assert node_info == {"node_id": "worker"}
+            return next(responses)
+
+    qualifications = []
+    waits = []
+    server = GradientServer.__new__(GradientServer)
+    server.scheduler_stub = JoinStub(None)
+    server.stop_event = SimpleNamespace(wait=lambda delay: waits.append(delay) or False)
+    server._qualify_iroh_scheduler = lambda: qualifications.append(True)
+    monkeypatch.setattr("parallax.p2p.server.random.uniform", lambda lower, upper: upper)
+
+    response = server._join_iroh_scheduler({"node_id": "worker"})
+
+    assert response["model_name"] == "Qwen/Qwen3-4B"
+    assert server.scheduler_stub.timeout == 30.0
+    assert waits == [1.0]
+    assert qualifications == [True]
 
 
 @pytest.mark.parametrize("scheduler_addr", [None, "auto", "/ip4/127.0.0.1/tcp/1"])

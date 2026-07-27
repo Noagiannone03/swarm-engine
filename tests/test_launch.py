@@ -10,11 +10,88 @@ from parallax.launch import (
     _prepare_engine_core_generation,
     _update_args_from_shared_state,
     _wait_executors_check_layer_change,
+    _wait_for_initial_layer_allocation,
     _wait_for_v3_placement_rollback,
 )
 from parallax.p2p.server import ServerState
 from parallax.server.memory_budget import GIB, MemoryPressureController
 from parallax.utils.shared_state import SharedState
+
+
+class _ProcessState:
+    def __init__(self, alive=True):
+        self.alive = alive
+
+    def is_alive(self):
+        return self.alive
+
+
+def test_unassigned_worker_remains_joining_until_complete_span_arrives(monkeypatch):
+    shared_state = SharedState(
+        {
+            "block_start_index": None,
+            "block_end_index": None,
+            "model_name": None,
+        }
+    )
+    polls = []
+
+    def allocate_after_first_poll(delay):
+        polls.append(delay)
+        shared_state.update(
+            block_start_index=4,
+            block_end_index=28,
+            model_name="Qwen/Qwen3-4B",
+        )
+
+    monkeypatch.setattr("parallax.launch.time.sleep", allocate_after_first_poll)
+
+    _wait_for_initial_layer_allocation(
+        shared_state,
+        _ProcessState(),
+        timeout_seconds=0,
+        poll_seconds=0.25,
+    )
+
+    assert polls == [0.25]
+
+
+def test_waiting_worker_fails_if_p2p_controller_exits():
+    shared_state = SharedState(
+        {
+            "block_start_index": None,
+            "block_end_index": None,
+            "model_name": None,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="P2P controller exited"):
+        _wait_for_initial_layer_allocation(
+            shared_state,
+            _ProcessState(alive=False),
+            timeout_seconds=0,
+            poll_seconds=0,
+        )
+
+
+def test_initial_allocation_operator_deadline_is_optional(monkeypatch):
+    shared_state = SharedState(
+        {
+            "block_start_index": None,
+            "block_end_index": None,
+            "model_name": None,
+        }
+    )
+    times = iter([0.0, 2.0])
+    monkeypatch.setattr("parallax.launch.time.monotonic", lambda: next(times))
+
+    with pytest.raises(RuntimeError, match="within 1s"):
+        _wait_for_initial_layer_allocation(
+            shared_state,
+            _ProcessState(),
+            timeout_seconds=1,
+            poll_seconds=0,
+        )
 
 
 def test_scheduler_model_name_is_kept_as_alias_for_local_weights():

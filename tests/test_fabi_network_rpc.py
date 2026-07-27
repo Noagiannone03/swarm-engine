@@ -117,6 +117,35 @@ def test_service_stub_returns_futures_and_cancellable_iterators():
     ]
 
 
+def test_service_stub_per_call_timeout_reaches_native_transport():
+    node = _FakeNode()
+    with ThreadPoolExecutor(max_workers=2) as outbound:
+        runtime = SimpleNamespace(_node=node, _outbound=outbound, timeout_seconds=600.0)
+        stub = RpcServiceStub(runtime, "peer", ExampleService).with_timeout(7.5)
+
+        assert stub.echo("bounded").result(timeout=1) == "bounded"
+        assert list(stub.tokens([b"bounded"])) == [b"bounded"]
+
+    assert node.calls == [
+        ("unary", "peer", "ExampleService.echo", 7.5),
+        ("stream", "peer", "ExampleService.tokens", 7.5),
+    ]
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_service_stub_rejects_non_positive_timeout(timeout):
+    runtime = SimpleNamespace(
+        _node=_FakeNode(),
+        _outbound=ThreadPoolExecutor(max_workers=1),
+        timeout_seconds=600.0,
+    )
+    try:
+        with pytest.raises(ValueError, match="greater than zero"):
+            RpcServiceStub(runtime, "peer", ExampleService, timeout_seconds=timeout)
+    finally:
+        runtime._outbound.shutdown()
+
+
 def test_inbound_handler_receives_authenticated_native_peer_identity():
     responses = []
     request = SimpleNamespace(

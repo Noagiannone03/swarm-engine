@@ -93,6 +93,27 @@ _LINK_REACHABILITY_TTL_MS = int(
     )
     * 1_000
 )
+_SCHEDULER_CONNECT_ATTEMPT_TIMEOUT_SECONDS = 15.0
+_SCHEDULER_CONNECT_INITIAL_BACKOFF_SECONDS = 1.0
+_SCHEDULER_CONNECT_MAX_BACKOFF_SECONDS = 60.0
+
+
+def _configured_nonnegative_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return value
+
+
+def _with_rpc_timeout(stub: object, timeout_seconds: float):
+    """Apply a native deadline when the selected transport supports it."""
+
+    with_timeout = getattr(stub, "with_timeout", None)
+    return with_timeout(timeout_seconds) if callable(with_timeout) else stub
 
 
 def _configured_link_probe_bytes() -> int:
@@ -909,15 +930,125 @@ class GradientServer:
         return True
 
     def _qualify_iroh_scheduler(self) -> None:
-        """Open and authenticate the scheduler connection before reading telemetry."""
+        """Open and authenticate the scheduler connection before reading telemetry.
+
+        A community worker is a long-lived participant, not a one-shot CLI
+        request.  Relay restarts, NAT rebinding and scheduler deployments are
+        therefore retried with capped exponential backoff and full jitter.
+        Each attempt has a deadline in the native Iroh call; an authenticated
+        response from the wrong endpoint remains a fatal configuration error.
+        """
 
         if self.iroh_transport is None:
             return
-        response = self.scheduler_stub.rpc_health({}).result(timeout=30)
-        if not isinstance(response, dict) or response.get("peer_id") != self.scheduler_peer_id:
-            raise RuntimeError("Iroh scheduler health response has the wrong endpoint identity")
-        path = self.iroh_transport.selected_path(self.scheduler_peer_id)
-        logger.info("Qualified Iroh scheduler connection: path=%s", path)
+        attempt_timeout = _configured_nonnegative_float(
+            "FABI_SCHEDULER_CONNECT_ATTEMPT_TIMEOUT_SECONDS",
+            _SCHEDULER_CONNECT_ATTEMPT_TIMEOUT_SECONDS,
+        )
+        if attempt_timeout == 0:
+            raise ValueError(
+                "FABI_SCHEDULER_CONNECT_ATTEMPT_TIMEOUT_SECONDS must be greater than zero"
+            )
+        connect_deadline = _configured_nonnegative_float(
+            "FABI_SCHEDULER_CONNECT_DEADLINE_SECONDS",
+            0,
+        )
+        started_at = time.monotonic()
+        backoff_ceiling = _SCHEDULER_CONNECT_INITIAL_BACKOFF_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
+            elapsed = time.monotonic() - started_at
+            remaining = max(0.0, connect_deadline - elapsed) if connect_deadline else None
+            if connect_deadline and remaining == 0:
+                raise RuntimeError(
+                    "Iroh scheduler could not be reached before the configured "
+                    f"{connect_deadline:g}s connection deadline"
+                )
+            call_timeout = (
+                min(attempt_timeout, remaining) if remaining is not None else attempt_timeout
+            )
+            bounded_stub = _with_rpc_timeout(self.scheduler_stub, call_timeout)
+            try:
+                response = bounded_stub.rpc_health({}).result(
+                    timeout=call_timeout + 1.0
+                )
+            except Exception as exc:
+                elapsed = time.monotonic() - started_at
+                if connect_deadline and elapsed >= connect_deadline:
+                    raise RuntimeError(
+                        "Iroh scheduler could not be reached before the configured "
+                        f"{connect_deadline:g}s connection deadline"
+                    ) from exc
+
+                delay_ceiling = backoff_ceiling
+                if connect_deadline:
+                    delay_ceiling = min(delay_ceiling, max(0.0, connect_deadline - elapsed))
+                delay = random.uniform(0.0, delay_ceiling)
+                logger.warning(
+                    "Iroh scheduler connection attempt %d failed (%s); retrying in %.1fs",
+                    attempt,
+                    type(exc).__name__,
+                    delay,
+                )
+                stop_event = getattr(self, "stop_event", None)
+                if stop_event is not None:
+                    if stop_event.wait(delay):
+                        raise RuntimeError(
+                            "Iroh scheduler connection stopped during shutdown"
+                        ) from exc
+                else:
+                    time.sleep(delay)
+                backoff_ceiling = min(
+                    backoff_ceiling * 2,
+                    _SCHEDULER_CONNECT_MAX_BACKOFF_SECONDS,
+                )
+                continue
+
+            if not isinstance(response, dict) or response.get("peer_id") != self.scheduler_peer_id:
+                raise RuntimeError(
+                    "Iroh scheduler health response has the wrong endpoint identity"
+                )
+            path = self.iroh_transport.selected_path(self.scheduler_peer_id)
+            logger.info(
+                "Qualified Iroh scheduler connection after %d attempt(s): path=%s",
+                attempt,
+                path,
+            )
+            return
+
+    def _join_iroh_scheduler(self, node_info: dict[str, object]) -> dict[str, object]:
+        """Register idempotently and remain available through transient outages."""
+
+        attempt = 0
+        backoff_ceiling = _SCHEDULER_CONNECT_INITIAL_BACKOFF_SECONDS
+        join_timeout = WORKER_HEARTBEAT_RPC_TIMEOUT_SECONDS
+        while True:
+            attempt += 1
+            try:
+                join_stub = _with_rpc_timeout(self.scheduler_stub, join_timeout)
+                response = join_stub.node_join(node_info).result(timeout=join_timeout + 1.0)
+                if not isinstance(response, dict) or not response:
+                    raise RuntimeError("scheduler returned an empty join registration")
+                logger.info("Scheduler accepted worker registration after %d attempt(s)", attempt)
+                return response
+            except Exception as exc:
+                delay = random.uniform(0.0, backoff_ceiling)
+                logger.warning(
+                    "Scheduler registration attempt %d failed (%s); retrying in %.1fs",
+                    attempt,
+                    type(exc).__name__,
+                    delay,
+                )
+                if self.stop_event.wait(delay):
+                    raise RuntimeError(
+                        "scheduler registration stopped during shutdown"
+                    ) from exc
+                self._qualify_iroh_scheduler()
+                backoff_ceiling = min(
+                    backoff_ceiling * 2,
+                    _SCHEDULER_CONNECT_MAX_BACKOFF_SECONDS,
+                )
 
     def run(self):
         if self.build_lattica():
@@ -951,11 +1082,13 @@ class GradientServer:
                 if self.manual_layer_assignment:
                     node_info["manual_layer_assignment"] = True
 
-                response = self.scheduler_stub.node_join(node_info)
-                response = response.result(timeout=300)
-                if response == {}:
-                    logger.error("Failed to join scheduler")
-                    exit(1)
+                if self.iroh_transport is not None:
+                    response = self._join_iroh_scheduler(node_info)
+                else:
+                    response = self.scheduler_stub.node_join(node_info)
+                    response = response.result(timeout=300)
+                    if not isinstance(response, dict) or not response:
+                        raise RuntimeError("scheduler returned an empty join registration")
 
                 logger.info(f"Join scheduler response: {response}")
 
@@ -1089,7 +1222,11 @@ class GradientServer:
             candidates = list(self.outbound_peer_ids)
         for peer_id in candidates:
             try:
-                pending[peer_id] = self.get_stub(peer_id).rpc_health({})
+                stub = _with_rpc_timeout(
+                    self.get_stub(peer_id),
+                    _LINK_HEALTH_RPC_TIMEOUT_SECONDS,
+                )
+                pending[peer_id] = stub.rpc_health({})
             except Exception:
                 logger.debug("Could not start direct-path probe to %s", peer_id, exc_info=True)
 
@@ -1313,7 +1450,8 @@ class GradientServer:
 
         started_ns = time.perf_counter_ns()
         try:
-            response_future = self.get_stub(peer_id).rpc_link_probe(self.link_probe_payload)
+            probe_stub = _with_rpc_timeout(self.get_stub(peer_id), 15.0)
+            response_future = probe_stub.rpc_link_probe(self.link_probe_payload)
             response = (
                 response_future.result(timeout=15)
                 if hasattr(response_future, "result")
@@ -1637,11 +1775,19 @@ class GradientServer:
 
         def _announcer_thread():
             try:
+                scheduler_update_stub = (
+                    _with_rpc_timeout(
+                        self.scheduler_stub,
+                        WORKER_HEARTBEAT_RPC_TIMEOUT_SECONDS,
+                    )
+                    if self.scheduler_peer_id is not None
+                    else None
+                )
                 while not self.stop_event.is_set():
                     # Announce the range ID
                     try:
                         if self.scheduler_peer_id is not None:
-                            response_future = self.scheduler_stub.node_update(
+                            response_future = scheduler_update_stub.node_update(
                                 self.get_node_info(is_update=True)
                             )
                             # Get the response result
@@ -2080,7 +2226,8 @@ class GradientServer:
             if self.scheduler_addr is not None and self.scheduler_stub is not None:
                 peer_id = self.lattica.peer_id() if self.lattica is not None else "unknown"
                 logger.info(f"Leave scheduler: {peer_id}")
-                response = self.scheduler_stub.node_leave(self.get_node_info(is_update=True))
+                leave_stub = _with_rpc_timeout(self.scheduler_stub, 5.0)
+                response = leave_stub.node_leave(self.get_node_info(is_update=True))
                 if hasattr(response, "result"):
                     response.result(timeout=5)
         except Exception:

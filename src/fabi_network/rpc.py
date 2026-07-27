@@ -7,6 +7,7 @@ handlers without inheriting Lattica's transport or its pickle wire format.
 from __future__ import annotations
 
 import inspect
+import math
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
@@ -231,13 +232,39 @@ class RpcServiceStub:
         runtime: IrohRpcRuntime,
         peer_id: str,
         service: object | type[object],
+        *,
+        timeout_seconds: float | None = None,
     ):
         self._runtime = runtime
         self._peer_id = peer_id
         service_type = service if inspect.isclass(service) else type(service)
+        self._service_type = service_type
         self._service_name = service_type.__name__
+        selected_timeout = (
+            runtime.timeout_seconds if timeout_seconds is None else float(timeout_seconds)
+        )
+        if not math.isfinite(selected_timeout) or selected_timeout <= 0:
+            raise ValueError("RPC timeout_seconds must be finite and greater than zero")
+        self._timeout_seconds = selected_timeout
         self._method_cache: dict[str, Callable[..., object]] = {}
         self._methods = _service_methods_from_type(service_type)
+
+    def with_timeout(self, timeout_seconds: float) -> RpcServiceStub:
+        """Return an equivalent stub with a real native per-call deadline.
+
+        Calling ``Future.result(timeout=...)`` only bounds how long Python waits
+        for a future; it does not cancel the underlying QUIC request.  Startup
+        probes and heartbeats need their deadline enforced by Iroh itself so a
+        failed dial cannot occupy an outbound worker for the runtime-wide
+        default (ten minutes).
+        """
+
+        return type(self)(
+            self._runtime,
+            self._peer_id,
+            self._service_type,
+            timeout_seconds=timeout_seconds,
+        )
 
     def __getattr__(self, name: str) -> Callable[..., object]:
         cached = self._method_cache.get(name)
@@ -254,7 +281,7 @@ class RpcServiceStub:
                     self._peer_id,
                     method.full_name,
                     body,
-                    self._runtime.timeout_seconds,
+                    self._timeout_seconds,
                 )
                 return _DecodedRpcStream(native_stream, method.response_protobuf)
 
@@ -263,7 +290,7 @@ class RpcServiceStub:
                     self._peer_id,
                     method.full_name,
                     body,
-                    self._runtime.timeout_seconds,
+                    self._timeout_seconds,
                 )
                 return _decode_value(response, method.response_protobuf)
 

@@ -17,6 +17,7 @@ python src/parallax/launch.py \
 """
 
 import argparse
+import math
 import multiprocessing
 import os
 import time
@@ -402,6 +403,74 @@ def _wait_for_contract_replan(
         )
 
 
+def _configured_initial_allocation_timeout_seconds() -> float:
+    raw = os.environ.get("FABI_INITIAL_ALLOCATION_TIMEOUT_SECONDS", "0").strip()
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ValueError("FABI_INITIAL_ALLOCATION_TIMEOUT_SECONDS must be a number") from exc
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError(
+            "FABI_INITIAL_ALLOCATION_TIMEOUT_SECONDS must be finite and non-negative"
+        )
+    return timeout
+
+
+def _wait_for_initial_layer_allocation(
+    shared_state: SharedState,
+    p2p_server_process,
+    *,
+    timeout_seconds: float | None = None,
+    poll_seconds: float = 1.0,
+) -> None:
+    """Keep an unassigned community worker in JOINING until a span is ready.
+
+    Petals servers may remain visible as JOINING while the swarm is choosing or
+    loading a contiguous block range.  Exiting after an arbitrary five minutes
+    made scarce workers disappear precisely when a later peer could complete a
+    route.  Zero means no operator deadline; process death and shutdown remain
+    independently observable.
+    """
+
+    timeout = (
+        _configured_initial_allocation_timeout_seconds()
+        if timeout_seconds is None
+        else float(timeout_seconds)
+    )
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("initial allocation timeout must be finite and non-negative")
+    if not math.isfinite(poll_seconds) or poll_seconds < 0:
+        raise ValueError("allocation poll interval must be finite and non-negative")
+    started_at = time.monotonic()
+    next_status_log = started_at + 60.0
+    while True:
+        model_info = shared_state.get_model_info()
+        if (
+            model_info["block_start_index"] is not None
+            and model_info["block_end_index"] is not None
+            and model_info["model_name"] is not None
+        ):
+            return
+        if p2p_server_process is not None and not p2p_server_process.is_alive():
+            raise RuntimeError("P2P controller exited while waiting for layer allocation")
+
+        now = time.monotonic()
+        elapsed = now - started_at
+        if timeout and elapsed >= timeout:
+            raise RuntimeError(
+                "Scheduler did not provide a complete layer allocation within "
+                f"{timeout:g}s"
+            )
+        if now >= next_status_log:
+            logger.info(
+                "Worker remains JOINING after %.0fs; waiting for enough compatible "
+                "capacity to form a complete route",
+                elapsed,
+            )
+            next_status_log = now + 60.0
+        time.sleep(poll_seconds)
+
+
 def _build_memory_pressure_guards():
     """Create host-RAM and CUDA-VRAM guards from maintained OS/runtime APIs."""
 
@@ -589,22 +658,11 @@ if __name__ == "__main__":
                 conn=conn_main,
             )
 
-            # Wait for layer allocation from scheduler (via shared state)
-            logger.debug("Waiting for layer allocation from scheduler...")
-            max_wait_time = 300  # 5 minutes
-            wait_start = time.time()
-            while True:
-                model_info = shared_state.get_model_info()
-                if (
-                    model_info["block_start_index"] is not None
-                    and model_info["block_end_index"] is not None
-                    and model_info["model_name"] is not None
-                ):
-                    break
-                if time.time() - wait_start > max_wait_time:
-                    logger.error("Timeout waiting for layer allocation from scheduler")
-                    raise RuntimeError("Failed to get layer allocation from scheduler")
-                time.sleep(1)
+            # Stay discoverable as JOINING until compatible peers complete a
+            # route. Operators may set a finite timeout, but community workers
+            # no longer disappear after an arbitrary five-minute window.
+            logger.info("Waiting in JOINING for a complete layer allocation...")
+            _wait_for_initial_layer_allocation(shared_state, p2p_server_process)
 
             # Get layer allocation from shared state
             _update_args_from_shared_state(args, shared_state, force_update=False)
