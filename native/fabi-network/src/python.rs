@@ -583,6 +583,7 @@ impl PyNetworkNode {
         bootstrap_addresses=Vec::new(),
         query_timeout_seconds=15,
         max_records=25_000,
+        bootstrap_interval_seconds=30,
     ))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn start_catalog_dht(
@@ -594,11 +595,12 @@ impl PyNetworkNode {
         bootstrap_addresses: Vec<String>,
         query_timeout_seconds: u64,
         max_records: usize,
+        bootstrap_interval_seconds: u64,
     ) -> PyResult<(String, String)> {
         self.ensure_open()?;
-        if query_timeout_seconds == 0 || max_records == 0 {
+        if query_timeout_seconds == 0 || max_records == 0 || bootstrap_interval_seconds == 0 {
             return Err(PyRuntimeError::new_err(
-                "query_timeout_seconds and max_records must be positive",
+                "query_timeout_seconds, max_records and bootstrap_interval_seconds must be positive",
             ));
         }
         if self
@@ -627,6 +629,7 @@ impl PyNetworkNode {
             config.bootstrap_peers = bootstrap_peers;
         }
         config.query_timeout = Duration::from_secs(query_timeout_seconds);
+        config.bootstrap_interval = Duration::from_secs(bootstrap_interval_seconds);
         config.max_records = max_records;
 
         let runtime = Arc::clone(&self.runtime);

@@ -21,6 +21,7 @@ class FakeNode:
         bootstraps,
         replication_factor,
         query_timeout_ms,
+        bootstrap_interval_seconds,
     ):
         self.started = {
             "identity_path": identity_path,
@@ -29,6 +30,7 @@ class FakeNode:
             "bootstraps": bootstraps,
             "replication_factor": replication_factor,
             "query_timeout_ms": query_timeout_ms,
+            "bootstrap_interval_seconds": bootstrap_interval_seconds,
         }
         return "catalog-peer", "/ip4/127.0.0.1/tcp/4242"
 
@@ -96,9 +98,28 @@ def test_catalogue_server_starts_embedded_dht_and_closes_it(monkeypatch):
         assert runtime._node.started["server_mode"] is True
         assert runtime._node.started["replication_factor"] == 15
         assert runtime._node.started["query_timeout_ms"] == 25_000
+        assert runtime._node.started["bootstrap_interval_seconds"] == 30
         assert runtime._node.bootstrapped
     finally:
         transport.close()
 
     assert runtime._node.stopped
     assert runtime.closed
+
+
+def test_catalogue_bootstrap_interval_is_configurable_and_positive(monkeypatch):
+    base_environment(monkeypatch)
+    monkeypatch.setenv("FABI_CATALOG_DHT_MODE", "client")
+    monkeypatch.setenv("FABI_CATALOG_DHT_BOOTSTRAPS", "/dns/bootstrap/tcp/4242")
+    monkeypatch.setenv("FABI_CATALOG_DHT_BOOTSTRAP_INTERVAL_SECONDS", "45")
+
+    transport = IrohTransport.from_environment("worker")
+    try:
+        assert FakeRuntime.instances[0]._node.started["bootstrap_interval_seconds"] == 45
+    finally:
+        transport.close()
+
+    monkeypatch.setenv("FABI_CATALOG_DHT_BOOTSTRAP_INTERVAL_SECONDS", "0")
+    with pytest.raises(ValueError, match="positive integer"):
+        IrohTransport.from_environment("worker")
+    assert FakeRuntime.instances[-1].closed

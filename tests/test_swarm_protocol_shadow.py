@@ -151,7 +151,7 @@ def _observe_until_resolved(shadow, nodes):
         planning_context_tokens=512,
         epoch=1,
     )
-    while result["state"] == "verifying_registry" and time.monotonic() < deadline:
+    while result["state"] in {"verifying_registry", "waiting_catalog"} and time.monotonic() < deadline:
         time.sleep(0.01)
         result = shadow.observe(
             nodes,
@@ -219,7 +219,10 @@ def test_active_planning_uses_dht_membership_not_legacy_scheduler_nodes():
     )
     planner = SchedulerProtocolV3Shadow(_Registry(bundle), mode="active")
     planner.attach_catalog(_Catalog(catalog_snapshot))
-    _observe_until_resolved(planner, nodes)
+    status = _observe_until_resolved(planner, nodes)
+    assert status["state"] == "route_ready"
+    assert status["v3_route"] == ("mac", "rtx")
+    assert "legacy_routes" not in status
     deadline = time.monotonic() + 2
     while not planner.live_worker_ids() and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -246,3 +249,25 @@ def test_active_planning_uses_dht_membership_not_legacy_scheduler_nodes():
     assert planner.ready_model_swarm_id(nodes) == bundle.model_swarm_id
     assert planner.live_worker_ids() == frozenset({"mac", "rtx", "building"})
     assert planner.ready_worker_ids() == frozenset({"mac", "rtx"})
+
+
+def test_active_status_fails_closed_when_rpc_workers_are_absent_from_dht():
+    bundle = _bundle()
+    planner = SchedulerProtocolV3Shadow(_Registry(bundle), mode="active")
+    planner.attach_catalog(
+        _Catalog(
+            DiscoverySnapshot(
+                captured_at_ms=time.time_ns() // 1_000_000,
+                manifests=(bundle.manifest,),
+                offers=(),
+                leases=(),
+                links=(),
+            )
+        )
+    )
+
+    status = _observe_until_resolved(planner, _nodes(bundle))
+
+    assert status["state"] == "no_feasible_route"
+    assert status["accepted_workers"] == 0
+    assert "v3_route" not in status

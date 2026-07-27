@@ -164,6 +164,32 @@ class SchedulerProtocolV3Shadow:
         self._publish_manifest_async(bundle)
         self._refresh_catalog_async(model_swarm_id)
 
+        planning_advertisements = advertisements
+        with self._lock:
+            catalog = self._catalog
+            catalog_snapshot = self._catalog_snapshots.get(model_swarm_id)
+        if self.mode == "active" and catalog is not None:
+            if catalog_snapshot is None:
+                return self._store(
+                    {
+                        "mode": self.mode,
+                        "state": "waiting_catalog",
+                        "model_swarm_id": model_swarm_id,
+                        "accepted_workers": 0,
+                        "rejected_workers": rejected_workers,
+                    }
+                )
+            if catalog_snapshot.manifest(model_swarm_id) != bundle.manifest:
+                return self._store(
+                    {
+                        "mode": self.mode,
+                        "state": "catalog_rejected",
+                        "model_swarm_id": model_swarm_id,
+                        "accepted_workers": 0,
+                        "rejected_workers": rejected_workers,
+                    }
+                )
+
         prompt_tokens = max(1, planning_context_tokens - min(4096, planning_context_tokens - 1))
         output_tokens = planning_context_tokens - prompt_tokens
         request = RequestContract(
@@ -173,11 +199,18 @@ class SchedulerProtocolV3Shadow:
             reserved_output_tokens=output_tokens,
             recovery_level=RecoveryLevel.RESTARTABLE,
         )
-        offers = tuple(advertisement.offer for advertisement in advertisements)
-        leases = tuple(advertisement.lease for advertisement in advertisements)
-        links = tuple(
-            link for advertisement in advertisements for link in advertisement.outgoing_links
-        )
+        if self.mode == "active" and catalog_snapshot is not None:
+            offers = catalog_snapshot.offers
+            leases = catalog_snapshot.leases
+            links = catalog_snapshot.links
+        else:
+            offers = tuple(advertisement.offer for advertisement in planning_advertisements)
+            leases = tuple(advertisement.lease for advertisement in planning_advertisements)
+            links = tuple(
+                link
+                for advertisement in planning_advertisements
+                for link in advertisement.outgoing_links
+            )
         blockers = []
         if len(leases) > 1 and not links:
             blockers.append("missing_link_goodput")
@@ -201,31 +234,41 @@ class SchedulerProtocolV3Shadow:
                     "state": "no_feasible_route",
                     "model_swarm_id": model_swarm_id,
                     "required_context_tokens": planning_context_tokens,
-                    "accepted_workers": len(advertisements),
+                    "accepted_workers": len(offers),
                     "blockers": blockers or [str(exc)],
                     "rejected_workers": rejected_workers,
                 }
             )
 
         v3_route = tuple(stage.worker_id for stage in planned.plan.stages)
+        route_status = {
+            "mode": self.mode,
+            "model_swarm_id": model_swarm_id,
+            "required_context_tokens": planning_context_tokens,
+            "accepted_workers": len(offers),
+            "v3_route": v3_route,
+            "projected_ttft_ms": (
+                planned.estimate.ttft_ms if planned.estimate.complete else None
+            ),
+            "projected_inter_token_ms": (
+                planned.estimate.inter_token_ms if planned.estimate.complete else None
+            ),
+            "performance_telemetry_complete": planned.estimate.complete,
+            "rejected_workers": rejected_workers,
+        }
+        if self.mode == "active":
+            # Active v3 placement is worker-owned and DHT-authoritative.  A
+            # legacy scheduler route is neither an input nor a useful health
+            # comparison once this mode is selected.
+            return self._store({"state": "route_ready", **route_status})
+
         legacy_routes = self._legacy_complete_routes(nodes, model_num_layers)
         agrees = v3_route in legacy_routes
         return self._store(
             {
-                "mode": self.mode,
                 "state": "agreement" if agrees else "divergence",
-                "model_swarm_id": model_swarm_id,
-                "required_context_tokens": planning_context_tokens,
-                "v3_route": v3_route,
+                **route_status,
                 "legacy_routes": legacy_routes,
-                "projected_ttft_ms": (
-                    planned.estimate.ttft_ms if planned.estimate.complete else None
-                ),
-                "projected_inter_token_ms": (
-                    planned.estimate.inter_token_ms if planned.estimate.complete else None
-                ),
-                "performance_telemetry_complete": planned.estimate.complete,
-                "rejected_workers": rejected_workers,
             }
         )
 

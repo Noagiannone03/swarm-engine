@@ -39,6 +39,7 @@ const DHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/fabi/swarm/kad/3");
 const IDENTIFY_PROTOCOL: &str = "/fabi/swarm/identify/3";
 const COMMAND_BUFFER: usize = 256;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_RECORD_TTL: Duration = Duration::from_mins(5);
 const DEFAULT_REPLICATION_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RECORDS: usize = 25_000;
@@ -71,6 +72,7 @@ pub struct CatalogDhtConfig {
     pub listen_address: Multiaddr,
     pub bootstrap_peers: Vec<BootstrapPeer>,
     pub query_timeout: Duration,
+    pub bootstrap_interval: Duration,
     pub max_clock_skew: Duration,
     pub max_records: usize,
 }
@@ -151,6 +153,7 @@ impl CatalogDhtConfig {
             listen_address,
             bootstrap_peers,
             query_timeout: DEFAULT_QUERY_TIMEOUT,
+            bootstrap_interval: DEFAULT_BOOTSTRAP_INTERVAL,
             max_clock_skew: DEFAULT_MAX_CLOCK_SKEW,
             max_records: DEFAULT_MAX_RECORDS,
         }
@@ -164,6 +167,7 @@ impl CatalogDhtConfig {
             listen_address,
             bootstrap_peers: Vec::new(),
             query_timeout: DEFAULT_QUERY_TIMEOUT,
+            bootstrap_interval: DEFAULT_BOOTSTRAP_INTERVAL,
             max_clock_skew: DEFAULT_MAX_CLOCK_SKEW,
             max_records: DEFAULT_MAX_RECORDS,
         }
@@ -503,6 +507,10 @@ fn choose_best(
 /// Returns an error when transport construction, behaviour construction, or listening fails.
 pub async fn spawn_catalog_dht(config: CatalogDhtConfig) -> Result<CatalogDhtHandle> {
     ensure!(config.max_records > 0, "max_records must be positive");
+    ensure!(
+        !config.bootstrap_interval.is_zero(),
+        "bootstrap_interval must be positive"
+    );
     let local_peer_id = config.keypair.public().to_peer_id();
     let mode = config.mode;
     let query_timeout = config.query_timeout;
@@ -522,6 +530,7 @@ pub async fn spawn_catalog_dht(config: CatalogDhtConfig) -> Result<CatalogDhtHan
             let mut kad_config = kad::Config::new(DHT_PROTOCOL);
             kad_config
                 .set_query_timeout(query_timeout)
+                .set_periodic_bootstrap_interval(Some(config.bootstrap_interval))
                 .set_record_ttl(Some(DEFAULT_RECORD_TTL))
                 .set_replication_interval(Some(DEFAULT_REPLICATION_INTERVAL))
                 .set_publication_interval(None)
@@ -1014,6 +1023,99 @@ mod tests {
         reader.shutdown().await?;
         writer.shutdown().await?;
         server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_reconnects_after_bootstrap_server_restart() -> Result<()> {
+        let server_key = Keypair::generate_ed25519();
+        let server = spawn_catalog_dht(CatalogDhtConfig::server(
+            server_key.clone(),
+            "/ip4/127.0.0.1/tcp/0".parse()?,
+        ))
+        .await?;
+        let mut server_address = server.listen_address().clone();
+        let peer_suffix = server_address.pop();
+        ensure!(
+            matches!(peer_suffix, Some(libp2p::multiaddr::Protocol::P2p(_))),
+            "server address has no /p2p component"
+        );
+        let bootstrap = BootstrapPeer {
+            peer_id: server.peer_id(),
+            address: server_address.clone(),
+        };
+        let mut writer_config =
+            CatalogDhtConfig::client(Keypair::generate_ed25519(), vec![bootstrap]);
+        writer_config.bootstrap_interval = Duration::from_millis(250);
+        writer_config.query_timeout = Duration::from_secs(1);
+        let writer = spawn_catalog_dht(writer_config).await?;
+        writer.bootstrap().await?;
+
+        server.shutdown().await?;
+        let publisher = SecretKey::generate();
+        let logical_key = keys::worker_offer(&publisher.public());
+        let disconnected_at_ms = now_ms()?;
+        let disconnected_record = sign_catalog_record(
+            &publisher,
+            CatalogRecordParams {
+                kind: CatalogRecordKind::WorkerOffer,
+                logical_key: &logical_key,
+                discovery_peer_id: &writer.peer_id().to_string(),
+                sequence: 1,
+                issued_at_ms: disconnected_at_ms,
+                expires_at_ms: disconnected_at_ms + 60_000,
+                payload: br#"{"worker":"disconnected"}"#,
+            },
+        )?;
+        writer
+            .put(
+                &logical_key,
+                disconnected_record,
+                NonZeroUsize::new(1).expect("one"),
+            )
+            .await
+            .expect_err("publication must fail while the only routing server is down");
+
+        let replacement =
+            spawn_catalog_dht(CatalogDhtConfig::server(server_key, server_address)).await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut sequence = 2;
+        loop {
+            let issued_at_ms = now_ms()?;
+            let signed = sign_catalog_record(
+                &publisher,
+                CatalogRecordParams {
+                    kind: CatalogRecordKind::WorkerOffer,
+                    logical_key: &logical_key,
+                    discovery_peer_id: &writer.peer_id().to_string(),
+                    sequence,
+                    issued_at_ms,
+                    expires_at_ms: issued_at_ms + 60_000,
+                    payload: br#"{"worker":"reconnected"}"#,
+                },
+            )?;
+            if writer
+                .put(&logical_key, signed, NonZeroUsize::new(1).expect("one"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "client did not reconnect through periodic Kademlia bootstrap"
+            );
+            sequence += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let found = replacement.get(&logical_key).await?;
+        assert_eq!(found.sequence, sequence);
+        assert_eq!(found.payload, br#"{"worker":"reconnected"}"#);
+
+        writer.shutdown().await?;
+        replacement.shutdown().await?;
         Ok(())
     }
 

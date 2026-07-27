@@ -75,6 +75,17 @@ def _catalog_bootstrap_addresses() -> list[str]:
     return [address.strip() for address in decoded]
 
 
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 class IrohTransport:
     """Authenticated RPC plus an optional native peer-discovery catalogue.
 
@@ -137,6 +148,7 @@ class IrohTransport:
             bootstraps,
             15,
             25_000,
+            _positive_env_int("FABI_CATALOG_DHT_BOOTSTRAP_INTERVAL_SECONDS", 30),
         )
         if bootstraps:
             self.runtime._node.catalog_bootstrap()
