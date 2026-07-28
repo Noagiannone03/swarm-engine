@@ -120,6 +120,7 @@ class ActiveRouteRuntime:
         self._failures: deque[dict[str, object]] = deque(maxlen=64)
         self._recovery_degradations: deque[dict[str, object]] = deque(maxlen=64)
         self._readiness_cache: dict[int, tuple[int, bool]] = {}
+        self._structural_readiness_cache: dict[int, tuple[int, bool]] = {}
         self._lock = threading.RLock()
         self._capacity_changed = threading.Condition(self._lock)
         self._stop_event = threading.Event()
@@ -234,12 +235,21 @@ class ActiveRouteRuntime:
     def route_available(self, required_context_tokens: int) -> bool:
         """Probe one complete DHT route without reserving capacity or burning an epoch."""
 
+        return self._route_available(required_context_tokens, structural=False)
+
+    def structural_route_available(self, required_context_tokens: int) -> bool:
+        """Probe loaded coverage independently from live request reservations."""
+
+        return self._route_available(required_context_tokens, structural=True)
+
+    def _route_available(self, required_context_tokens: int, *, structural: bool) -> bool:
         required = int(required_context_tokens)
         if required < 2:
             raise ValueError("readiness probe requires at least two context tokens")
         now_steady_ms = self._steady_now_ms()
+        cache = self._structural_readiness_cache if structural else self._readiness_cache
         with self._lock:
-            cached = self._readiness_cache.get(required)
+            cached = cache.get(required)
             if cached is not None and now_steady_ms - cached[0] <= 1_000:
                 return cached[1]
 
@@ -263,38 +273,44 @@ class ActiveRouteRuntime:
                 epoch=self.epoch_allocator.current(),
                 reservation_deadline_ms=now_ms + self.prepare_ttl_ms,
                 plan_expires_at_ms=now_ms + self.plan_ttl_ms,
+                structural=structural,
             )
         except RoutePlanningError:
             available = False
         else:
             available = True
         with self._lock:
-            self._readiness_cache[required] = (now_steady_ms, available)
+            cache[required] = (now_steady_ms, available)
         return available
 
     def max_supported_context_tokens(self, upper_bound: int) -> int:
-        """Return the exact largest context admitted by a complete live route.
+        """Return the exact largest context supported by loaded route coverage.
 
         Route feasibility is monotonic with respect to the requested KV token
         budget: a route that cannot hold ``n`` tokens cannot hold more than
         ``n`` with the same immutable leases. Binary search therefore avoids a
-        configured tier or hardware estimate and asks the same verified planner
-        used for real requests.
+        configured tier or hardware estimate and asks the same verified
+        planner used for real requests.
+
+        Unlike admission, this deliberately uses each worker's measured
+        allocatable KV geometry instead of its instantaneous free snapshot.
+        This mirrors Petals' ONLINE span plus `cache_tokens_left`: a request can
+        saturate a loaded route without making the model disappear.
         """
 
         maximum = int(upper_bound)
         if maximum < 2:
             return 0
-        if not self.route_available(2):
+        if not self.structural_route_available(2):
             return 0
-        if self.route_available(maximum):
+        if self.structural_route_available(maximum):
             return maximum
 
         supported = 2
         rejected = maximum
         while supported + 1 < rejected:
             candidate = (supported + rejected) // 2
-            if self.route_available(candidate):
+            if self.structural_route_available(candidate):
                 supported = candidate
             else:
                 rejected = candidate

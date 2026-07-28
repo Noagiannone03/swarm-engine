@@ -2,6 +2,8 @@ import hashlib
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from swarm_protocol import (
     ArtifactDescriptor,
     ArtifactRole,
@@ -24,6 +26,7 @@ from swarm_protocol import (
     artifact_collection_hash,
 )
 from swarm_protocol.discovery import DiscoverySnapshot
+from swarm_protocol.routing import NoFeasibleRoute
 from swarm_protocol.shadow import SchedulerProtocolV3Shadow
 
 
@@ -249,6 +252,50 @@ def test_active_planning_uses_dht_membership_not_legacy_scheduler_nodes():
     assert planner.ready_model_swarm_id(nodes) == bundle.model_swarm_id
     assert planner.live_worker_ids() == frozenset({"mac", "rtx", "building"})
     assert planner.ready_worker_ids() == frozenset({"mac", "rtx"})
+
+
+def test_structural_planning_keeps_online_spans_visible_when_live_kv_is_busy():
+    bundle = _bundle()
+    nodes = _nodes(bundle)
+    advertisements = [
+        ModelMemberAdvertisement.model_validate(node.swarm_v3["advertisement"])
+        for node in nodes
+    ]
+    busy_leases = tuple(
+        item.lease.model_copy(update={"available_kv_bytes_snapshot": 0})
+        for item in advertisements
+    )
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=time.time_ns() // 1_000_000,
+        manifests=(bundle.manifest,),
+        offers=tuple(item.offer for item in advertisements),
+        leases=busy_leases,
+        links=tuple(link for item in advertisements for link in item.outgoing_links),
+    )
+    planner = SchedulerProtocolV3Shadow(_Registry(bundle), mode="active")
+    planner.attach_catalog(_Catalog(snapshot))
+    _observe_until_resolved(planner, nodes)
+    now_ms = time.time_ns() // 1_000_000
+    request = RequestContract(
+        request_id="busy-kv",
+        model_swarm_id=bundle.model_swarm_id,
+        prompt_tokens=400,
+        reserved_output_tokens=112,
+        recovery_level=RecoveryLevel.RESTARTABLE,
+    )
+    kwargs = {
+        "nodes": nodes,
+        "request": request,
+        "coordinator_id": "coordinator",
+        "epoch": 1,
+        "reservation_deadline_ms": now_ms + 5_000,
+        "plan_expires_at_ms": now_ms + 10_000,
+    }
+
+    with pytest.raises(NoFeasibleRoute):
+        planner.plan_request(**kwargs)
+    planned = planner.plan_request(**kwargs, structural=True)
+    assert tuple(stage.worker_id for stage in planned.plan.stages) == ("mac", "rtx")
 
 
 def test_active_status_fails_closed_when_rpc_workers_are_absent_from_dht():

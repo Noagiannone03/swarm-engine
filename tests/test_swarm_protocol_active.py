@@ -71,9 +71,10 @@ class FakePlanner:
         epoch,
         reservation_deadline_ms,
         plan_expires_at_ms,
+        structural=False,
     ):
         del nodes
-        if self.fail_planning:
+        if self.fail_planning and not structural:
             raise NoFeasibleRoute("no complete route")
         if (
             self.max_context_tokens is not None
@@ -182,7 +183,7 @@ class FakeCoordinator:
         self.fenced.append((route, epoch))
 
 
-def runtime(now, *, nodes=None, wall_clock=None):
+def runtime(now, *, nodes=None, wall_clock=None, session_ttl_ms=600):
     planner = FakePlanner()
     coordinator = FakeCoordinator(now)
     current_nodes = [SimpleNamespace(node_id="worker", is_active=True)] if nodes is None else nodes
@@ -194,7 +195,7 @@ def runtime(now, *, nodes=None, wall_clock=None):
         steady_clock_ms=lambda: now[0],
         prepare_ttl_ms=100,
         plan_ttl_ms=300,
-        session_ttl_ms=600,
+        session_ttl_ms=session_ttl_ms,
         renew_interval_ms=200,
         renew_retry_interval_ms=50,
         lease_expiry_guard_ms=25,
@@ -260,6 +261,33 @@ def test_max_supported_context_uses_exact_route_planner_capacity():
         assert active.max_supported_context_tokens(40_960) == 32_896
         assert coordinator.reserved == []
         assert set(planner.epochs) == {0}
+    finally:
+        active.close()
+
+
+def test_structural_context_stays_ready_while_the_route_is_reserved():
+    now = [1_000]
+    active, planner, _, _ = runtime(now, session_ttl_ms=5_000)
+    planner.max_context_tokens = 16_384
+    try:
+        assert active.max_supported_context_tokens(40_960) == 16_384
+        assert active.reserve(
+            request_id="request",
+            prompt_tokens=13_548,
+            reserved_output_tokens=2_048,
+        ) == ("worker",)
+
+        # Simulate live admission seeing no second free route while the
+        # structural planner still sees the executor-measured KV envelope.
+        planner.fail_planning = True
+        now[0] += 1_001
+        assert not active.route_available(16_384)
+        assert active.max_supported_context_tokens(40_960) == 16_384
+
+        assert active.release("request")
+        planner.max_context_tokens = 8_192
+        now[0] += 1_001
+        assert active.max_supported_context_tokens(40_960) == 8_192
     finally:
         active.close()
 

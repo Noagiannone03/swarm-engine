@@ -311,8 +311,15 @@ class SchedulerProtocolV3Shadow:
         epoch: int,
         reservation_deadline_ms: int,
         plan_expires_at_ms: int,
+        structural: bool = False,
     ):
-        """Plan from the same verified snapshot used by comparison mode."""
+        """Plan from the same verified snapshot used by comparison mode.
+
+        Structural probes replace only the instantaneous free-KV snapshot with
+        the executor-measured allocatable envelope. Offers, signed spans,
+        liveness, links and every exact KV calculation remain identical to a
+        real request plan.
+        """
 
         advertisements, rejected_workers = self._advertisements(nodes)
         matching = [
@@ -348,6 +355,15 @@ class SchedulerProtocolV3Shadow:
             offers = tuple(item.offer for item in matching)
             leases = tuple(item.lease for item in matching)
             links = tuple(link for item in matching for link in item.outgoing_links)
+        if structural:
+            leases = tuple(
+                lease.model_copy(
+                    update={
+                        "available_kv_bytes_snapshot": lease.kv_geometry.allocatable_bytes,
+                    }
+                )
+                for lease in leases
+            )
         return self.planner.plan(
             manifest=bundle.manifest,
             request=request,

@@ -216,10 +216,20 @@ class SchedulerManage:
         return self.scheduler.need_more_nodes() if self.scheduler else False
 
     def get_cluster_status(self):
+        max_supported_context_tokens = self.max_supported_context_tokens()
+        routing_ready = self.get_schedule_status() == NODE_STATUS_AVAILABLE
+        planning_context_tokens = (
+            int(self.scheduler.layer_allocator.planning_context_tokens)
+            if self.scheduler is not None
+            else 0
+        )
+        pipeline_ready = (
+            max_supported_context_tokens >= planning_context_tokens > 0
+        )
         return {
             "type": "cluster_status",
             "data": {
-                "status": self.get_schedule_status(),
+                "status": NODE_STATUS_AVAILABLE if routing_ready else NODE_STATUS_WAITING,
                 "model_name": self.model_name,
                 "init_nodes_num": self.init_nodes_num,
                 "allocation_strategy": self.allocation_strategy,
@@ -239,15 +249,20 @@ class SchedulerManage:
                 ),
                 "runtime_memory_contract_ready": (
                     (
-                        self.max_supported_context_tokens()
-                        >= int(self.scheduler.layer_allocator.planning_context_tokens)
+                        max_supported_context_tokens >= planning_context_tokens
                     )
                     if self.scheduler is not None and self.swarm_v3_mode == "active"
                     else (
                         self.scheduler.runtime_memory_contract_ready() if self.scheduler else False
                     )
                 ),
-                "max_supported_context_tokens": self.max_supported_context_tokens(),
+                # Structural model/KV readiness and instantaneous admission
+                # capacity are separate contracts. A fully loaded route may be
+                # temporarily saturated by a generation without bootstrapping
+                # the model again.
+                "structural_pipeline_ready": pipeline_ready,
+                "admission_ready": routing_ready,
+                "max_supported_context_tokens": max_supported_context_tokens,
                 # Machine-readable connection identity for registries and
                 # clients.  Parsing a one-shot startup log is not a reliable
                 # discovery protocol, especially after switching from libp2p
