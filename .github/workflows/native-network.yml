@@ -85,6 +85,7 @@ jobs:
         run: >-
           python -c "import fabi_network_native as n;
           assert hasattr(n, 'CatalogRecord');
+          assert hasattr(n, 'create_relay_enrollment_proof');
           assert hasattr(n.NetworkNode, 'start_catalog_dht');
           assert hasattr(n.NetworkNode, 'catalog_put');
           assert hasattr(n.NetworkNode, 'catalog_get');

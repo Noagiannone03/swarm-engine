@@ -38,13 +38,30 @@ use crate::{
     },
     control,
     endpoint::{EndpointConfig, bind},
-    identity,
+    enrollment, identity,
     protocol::{
         DEFAULT_MAX_PAYLOAD, Header, MessageKind, decode_rpc_request, encode_rpc_request,
         read_and_verify_payload, read_header, write_header,
     },
     telemetry,
 };
+
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+fn create_relay_enrollment_proof(
+    identity_path: PathBuf,
+    account_id: &str,
+    issued_at_ms: u64,
+    nonce: &str,
+) -> PyResult<(String, String)> {
+    let secret_key = identity::load_or_create(&identity_path).map_err(py_error)?;
+    let signature =
+        enrollment::sign(&secret_key, account_id, issued_at_ms, nonce).map_err(py_error)?;
+    Ok((
+        secret_key.public().to_string(),
+        data_encoding::HEXLOWER.encode(&signature),
+    ))
+}
 
 const INBOUND_QUEUE_CAPACITY: usize = 1024;
 const STREAM_QUEUE_CAPACITY: usize = 16;
@@ -1450,6 +1467,7 @@ async fn get_connection(
 
 #[pymodule(gil_used = false)]
 fn fabi_network_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(create_relay_enrollment_proof, module)?)?;
     module.add_class::<PyNetworkNode>()?;
     module.add_class::<PyCatalogRecord>()?;
     module.add_class::<PyRpcRequest>()?;

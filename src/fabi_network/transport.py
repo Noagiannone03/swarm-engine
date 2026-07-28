@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .rpc import IrohRpcRuntime, RpcServiceStub
+from .relay_enrollment import RelayEnrollmentClient
 from swarm_protocol.dht_discovery import DhtDiscoveryStore
 
 IROH_TRANSPORT = "iroh"
@@ -38,7 +39,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be a boolean value")
 
 
-def _relay_token() -> str:
+def _relay_token(*, required: bool = True) -> str | None:
     token = os.environ.get("FABI_RELAY_TOKEN", "").strip()
     token_file = os.environ.get("FABI_RELAY_TOKEN_FILE", "").strip()
     if token and token_file:
@@ -46,9 +47,11 @@ def _relay_token() -> str:
     if token:
         return token
     if not token_file:
-        raise ValueError(
-            "FABI_RELAY_TOKEN or FABI_RELAY_TOKEN_FILE is required for the authenticated relay"
-        )
+        if required:
+            raise ValueError(
+                "FABI_RELAY_TOKEN or FABI_RELAY_TOKEN_FILE is required when automatic enrollment is disabled"
+            )
+        return None
     path = Path(token_file).expanduser()
     if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) & 0o077:
         raise PermissionError(f"relay token file {path} must not be accessible by group or others")
@@ -93,8 +96,13 @@ class IrohTransport:
     carries only bounded signed manifests and short-lived membership records.
     """
 
-    def __init__(self, runtime: IrohRpcRuntime):
+    def __init__(
+        self,
+        runtime: IrohRpcRuntime,
+        relay_enrollment: RelayEnrollmentClient | None = None,
+    ):
         self.runtime = runtime
+        self.relay_enrollment = relay_enrollment
         self.catalog_discovery: DhtDiscoveryStore | None = None
         self.catalog_peer_id: str | None = None
         self.catalog_listen_address: str | None = None
@@ -104,19 +112,30 @@ class IrohTransport:
         relay_url = os.environ.get("FABI_RELAY_URL", "").strip()
         if not relay_url:
             raise ValueError("FABI_RELAY_URL is required for the Iroh transport")
-        relay_token = _relay_token()
         configured_identity = os.environ.get("FABI_NETWORK_IDENTITY_PATH", "").strip()
         identity_path = Path(configured_identity or f"~/.fabi/network/{role}.key").expanduser()
-        runtime = IrohRpcRuntime(
-            identity_path,
-            relay_url,
-            relay_token,
-            force_relay=_env_bool("FABI_FORCE_RELAY"),
-        )
-        transport = cls(runtime)
+        enrollment = RelayEnrollmentClient.from_environment(identity_path)
+        relay_token = _relay_token(required=enrollment is None)
+        initial_lease = enrollment.enroll() if enrollment is not None else None
         try:
+            runtime = IrohRpcRuntime(
+                identity_path,
+                relay_url,
+                relay_token,
+                force_relay=_env_bool("FABI_FORCE_RELAY"),
+            )
+        except BaseException:
+            if enrollment is not None:
+                enrollment.close()
+            raise
+        transport = cls(runtime, enrollment)
+        try:
+            if enrollment is not None and initial_lease is not None:
+                enrollment.start_refresh(initial_lease)
             transport._start_catalog_from_environment(role)
         except BaseException:
+            if enrollment is not None:
+                enrollment.close()
             runtime.close()
             raise
         return transport
@@ -202,6 +221,8 @@ class IrohTransport:
         self.runtime._node.verify_control_payload(signer_endpoint_id, payload, signature)
 
     def close(self) -> None:
+        if self.relay_enrollment is not None:
+            self.relay_enrollment.close()
         if self.catalog_discovery is not None:
             self.runtime._node.stop_catalog_dht()
             self.catalog_discovery = None

@@ -123,3 +123,39 @@ def test_catalogue_bootstrap_interval_is_configurable_and_positive(monkeypatch):
     with pytest.raises(ValueError, match="positive integer"):
         IrohTransport.from_environment("worker")
     assert FakeRuntime.instances[-1].closed
+
+
+def test_automatic_relay_enrollment_removes_client_relay_token(monkeypatch):
+    base_environment(monkeypatch)
+    monkeypatch.delenv("FABI_RELAY_TOKEN", raising=False)
+    monkeypatch.delenv("FABI_RELAY_TOKEN_FILE", raising=False)
+    monkeypatch.setenv("FABI_CATALOG_DHT_MODE", "off")
+
+    class FakeEnrollment:
+        def __init__(self):
+            self.enrolled = False
+            self.started_with = None
+            self.closed = False
+
+        def enroll(self):
+            self.enrolled = True
+            return object()
+
+        def start_refresh(self, lease):
+            self.started_with = lease
+
+        def close(self):
+            self.closed = True
+
+    enrollment = FakeEnrollment()
+    monkeypatch.setattr(
+        "fabi_network.transport.RelayEnrollmentClient.from_environment",
+        lambda identity_path: enrollment,
+    )
+
+    transport = IrohTransport.from_environment("worker")
+    assert enrollment.enrolled
+    assert enrollment.started_with is not None
+    assert FakeRuntime.instances[-1].relay_token is None
+    transport.close()
+    assert enrollment.closed

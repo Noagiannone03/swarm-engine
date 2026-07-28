@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod catalog_dht;
 pub mod control;
 pub mod endpoint;
+pub mod enrollment;
 pub mod identity;
 pub mod protocol;
 pub mod telemetry;
