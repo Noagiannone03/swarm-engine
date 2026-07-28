@@ -22,8 +22,12 @@ fabi-swarm-registry generate-passphrase \
   --output /private/operator/secrets/registry.passphrase
 ```
 
-Build a bundle from an exact Hub commit. The command downloads small runtime metadata files, but
-uses the Hub's official LFS size and SHA-256 metadata instead of downloading weight blobs:
+Build a bundle from an exact Hub commit. In addition to the small runtime files and official LFS
+metadata, the publishing authority streams every immutable SafeTensors data section once through
+Hugging Face Xet. It does not persist a second full checkpoint: it computes and signs each tensor
+SHA-256, absolute byte range, dtype and shape, together with the Xet Merkle file identity. This is
+an operator-side, once-per-model-revision cost; it is what lets every worker later verify a partial
+checkpoint without first downloading the complete source files:
 
 ```console
 fabi-swarm-registry build-hub-bundle \
@@ -33,6 +37,26 @@ fabi-swarm-registry build-hub-bundle \
   --dtype bfloat16 \
   --output /private/operator/bundles/qwen3-4b.json
 ```
+
+The command retries only transient Hub transport failures with bounded exponential backoff. A
+metadata mismatch, invalid SafeTensors layout, missing Xet identity, short reconstruction, or
+digest mismatch fails closed and no bundle is published.
+
+## Selective worker materialization
+
+For a bundle carrying the signed tensor index, a worker materializes deterministic
+`model-fabi-layer-NNNNN.safetensors` packs for its exact span. Input embeddings and output
+norm/head tensors use separate endpoint packs. The maintained `hf-xet` client reconstructs only
+the signed byte ranges; an existing complete Hub shard is reused only after its legacy size and
+SHA-256 pass verification. A generated SafeTensors weight map makes those packs consumable by the
+existing MLX, vLLM and SGLang loaders.
+
+Packs live in the shared content-specific cache selected by `FABI_MODEL_ARTIFACT_CACHE` (default
+`~/.cache/fabi/models`). Reallocation is incremental: already verified packs are reused and only
+new layers are fetched. Every READY admission rechecks the deterministic weight map, pack digest,
+tensor metadata and each signed tensor SHA-256. A locally altered pack and receipt are therefore
+rejected even while offline. Bundles published before the tensor index remain compatible and use
+the older whole-shard path.
 
 Initialize a new staging repository. Existing keys, bootstrap roots, and non-empty repositories
 are never overwritten:

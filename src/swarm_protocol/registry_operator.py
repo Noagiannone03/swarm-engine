@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import os
 import secrets
 import stat
@@ -218,6 +219,7 @@ def build_hub_bundle_file(
         dtype=dtype,
         token=token,
         include_weight_profile=True,
+        include_selective_weight_index=True,
     )
     bundle = ModelRegistryBundle(
         manifest=resolved.manifest,
@@ -284,6 +286,8 @@ def _bundle_summary(bundle: ModelRegistryBundle) -> dict[str, object]:
         "model_swarm_id": bundle.model_swarm_id,
         "num_layers": bundle.manifest.num_layers,
         "artifacts": len(bundle.artifact_index.artifacts),
+        "tensors": len(bundle.artifact_index.tensors),
+        "signed_tensor_bytes": sum(tensor.length for tensor in bundle.artifact_index.tensors),
     }
 
 
@@ -339,6 +343,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the operator CLI and emit only non-secret JSON summaries."""
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _parser().parse_args(argv)
     if args.command == "generate-passphrase":
         generate_passphrase_file(args.output)

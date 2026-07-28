@@ -10,6 +10,11 @@ class Tensor:
     data_offsets: tuple[int, int]
 
 
+@dataclass(frozen=True)
+class SignedTensor:
+    length: int
+
+
 def _tensor(size: int) -> Tensor:
     return Tensor((100, 100 + size))
 
@@ -48,3 +53,20 @@ def test_exact_profile_rejects_incomplete_layer_metadata():
             num_layers=2,
             tie_word_embeddings=False,
         )
+
+
+def test_exact_profile_reuses_signed_tensor_lengths_without_refetching_headers():
+    profile = build_weight_profile_from_tensors(
+        {
+            "model.embed_tokens.weight": SignedTensor(1_000),
+            "model.layers.0.self_attn.q_proj.weight": SignedTensor(200),
+            "model.norm.weight": SignedTensor(10),
+        },
+        num_layers=1,
+        tie_word_embeddings=False,
+        source_revision="immutable",
+    )
+
+    assert profile.layer_bytes == (200,)
+    assert profile.input_endpoint_bytes == 1_000
+    assert profile.output_endpoint_bytes == 10

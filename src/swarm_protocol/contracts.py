@@ -75,6 +75,11 @@ class ArtifactDescriptor(ContractModel):
     sha256: HashHex
     media_type: Annotated[str, Field(min_length=1, max_length=255)]
     role: ArtifactRole
+    # Hugging Face Xet identifies the complete file with a cryptographic
+    # BLAKE3/Merkle hash.  When present in the signed TUF bundle, workers can
+    # authenticate byte-range reconstruction without downloading the rest of
+    # the file merely to recompute its legacy LFS SHA-256.
+    xet_file_hash: HashHex | None = None
 
     @model_validator(mode="after")
     def validate_path(self) -> Self:
@@ -88,6 +93,29 @@ class ArtifactDescriptor(ContractModel):
         return self
 
 
+class TensorArtifactDescriptor(ContractModel):
+    """Signed location and shape of one tensor inside a SafeTensors source file."""
+
+    name: Annotated[str, Field(min_length=1, max_length=4096)]
+    source_path: Annotated[str, Field(min_length=1, max_length=1024)]
+    offset: NonNegativeInt
+    length: NonNegativeInt
+    sha256: HashHex
+    dtype: Annotated[str, Field(min_length=1, max_length=64)]
+    shape: Annotated[tuple[NonNegativeInt, ...], Field(max_length=32)]
+
+    @model_validator(mode="after")
+    def validate_tensor(self) -> Self:
+        parts = self.source_path.split("/")
+        if (
+            self.source_path.startswith("/")
+            or "\\" in self.source_path
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("tensor source path must be a normalized relative POSIX path")
+        return self
+
+
 class ModelArtifactIndex(ContractModel):
     """Persistent artifact index referenced by the compact DHT model manifest."""
 
@@ -95,6 +123,7 @@ class ModelArtifactIndex(ContractModel):
     model_id: NonEmpty
     immutable_revision: NonEmpty
     artifacts: Annotated[tuple[ArtifactDescriptor, ...], Field(min_length=1, max_length=100_000)]
+    tensors: Annotated[tuple[TensorArtifactDescriptor, ...], Field(max_length=1_000_000)] = ()
 
     @model_validator(mode="after")
     def validate_index(self) -> Self:
@@ -107,6 +136,20 @@ class ModelArtifactIndex(ContractModel):
             raise ValueError("model artifacts must be sorted by path")
         if len(paths) != len(set(paths)):
             raise ValueError("model artifact paths must be unique")
+        tensor_names = [tensor.name for tensor in self.tensors]
+        if tensor_names != sorted(tensor_names):
+            raise ValueError("tensor artifacts must be sorted by name")
+        if len(tensor_names) != len(set(tensor_names)):
+            raise ValueError("tensor artifact names must be unique")
+        artifacts = {artifact.path: artifact for artifact in self.artifacts}
+        for tensor in self.tensors:
+            source = artifacts.get(tensor.source_path)
+            if source is None or source.role is not ArtifactRole.WEIGHT:
+                raise ValueError("tensor source must reference a signed weight artifact")
+            if source.xet_file_hash is None:
+                raise ValueError("selective tensor source must have a signed Xet file hash")
+            if tensor.offset + tensor.length > source.size:
+                raise ValueError("tensor byte range exceeds its signed source artifact")
         return self
 
 
@@ -135,10 +178,7 @@ class LinkMetric(ContractModel):
             raise ValueError("network link must connect two different workers")
         if self.expires_at_ms <= self.measured_at_ms:
             raise ValueError("link metric must expire after it was measured")
-        if (
-            self.throughput_measured_at_ms is not None
-            and self.throughput_bytes_per_second is None
-        ):
+        if self.throughput_measured_at_ms is not None and self.throughput_bytes_per_second is None:
             raise ValueError("throughput timestamp requires a throughput measurement")
         # Reachability and goodput are independent observations.  A successful
         # RPC health check establishes the edge, then the bounded payload probe

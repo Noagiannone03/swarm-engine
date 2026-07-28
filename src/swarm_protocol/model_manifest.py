@@ -10,13 +10,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from huggingface_hub import HfApi, hf_hub_download
+import httpx
+from huggingface_hub import HfApi, get_hf_file_metadata, hf_hub_download, hf_hub_url
+from huggingface_hub.utils import build_hf_headers
+from huggingface_hub.utils._xet import get_xet_session, xet_headers_without_auth
 
 from parallax.utils.model_config import normalize_model_config
 from swarm_protocol.contracts import (
@@ -24,13 +29,23 @@ from swarm_protocol.contracts import (
     ArtifactRole,
     ModelArtifactIndex,
     ModelManifest,
+    TensorArtifactDescriptor,
 )
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_HASHED_GIT_FILE_BYTES = 64 * 1024 * 1024
+_HASH_PROGRESS_BYTES = 512 * 1024 * 1024
+
+logger = logging.getLogger(__name__)
 
 ArtifactReader = Callable[[str, str, str, bool | str | None], bytes]
+_HUB_NETWORK_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+)
+_HUB_METADATA_RETRIES = 5
 
 _TOKENIZER_NAMES = {
     "added_tokens.json",
@@ -104,8 +119,13 @@ def _canonical_hash(domain: str, payload: object) -> str:
 def artifact_collection_hash(index: ModelArtifactIndex, role: ArtifactRole) -> str:
     """Hash one ordered artifact collection with an explicit domain separator."""
 
+    # ``exclude_none`` preserves the v1 identity of bundles published before
+    # optional transport identities were added. Existing swarms must not fork
+    # merely because a newer parser supplies ``xet_file_hash=None``.
     descriptors = [
-        artifact.model_dump(mode="json") for artifact in index.artifacts if artifact.role is role
+        artifact.model_dump(mode="json", exclude_none=True)
+        for artifact in index.artifacts
+        if artifact.role is role
     ]
     if not descriptors:
         raise ValueError(f"model artifact index has no {role.value} artifacts")
@@ -174,6 +194,237 @@ def _default_reader(
         token=token,
     )
     return Path(path).read_bytes()
+
+
+def _attach_selective_safetensors_metadata(
+    *,
+    client: HfApi,
+    repo_id: str,
+    immutable_revision: str,
+    token: bool | str | None,
+    descriptors: list[ArtifactDescriptor],
+) -> tuple[list[ArtifactDescriptor], tuple[TensorArtifactDescriptor, ...]]:
+    """Bind official Xet identities and exact tensor ranges into the signed index.
+
+    SafeTensors offsets are relative to the tensor-data section.  The Hub file
+    metadata gives the immutable full file size, so the absolute range begins
+    at ``file_size - max_tensor_end``.  We deliberately sign the Xet file hash
+    as well as the legacy LFS SHA-256: Xet can then authenticate a reconstructed
+    sub-range without forcing each worker to download the rest of the file.
+    The publishing authority streams each immutable data section once and
+    signs every tensor SHA-256, allowing workers to detect local pack damage
+    later without another network read.
+    """
+
+    metadata = _get_safetensors_metadata_with_backoff(
+        client=client,
+        repo_id=repo_id,
+        immutable_revision=immutable_revision,
+        token=token,
+    )
+    files_metadata = _field(metadata, "files_metadata")
+    if not isinstance(files_metadata, Mapping) or not files_metadata:
+        raise ValueError("Hub returned no SafeTensors file metadata")
+
+    descriptor_by_path = {descriptor.path: descriptor for descriptor in descriptors}
+    tensor_descriptors: list[TensorArtifactDescriptor] = []
+
+    for source_path, file_metadata in sorted(files_metadata.items()):
+        source_path = str(source_path)
+        source = descriptor_by_path.get(source_path)
+        if source is None or source.role is not ArtifactRole.WEIGHT:
+            raise ValueError(
+                f"SafeTensors metadata references an unsigned weight file: {source_path!r}"
+            )
+        headers = build_hf_headers(token=token)
+        remote = get_hf_file_metadata(
+            hf_hub_url(repo_id, source_path, revision=immutable_revision),
+            token=token,
+            headers=headers,
+            retry_on_errors=True,
+        )
+        if remote.size != source.size:
+            raise ValueError(f"Xet metadata size mismatch for {source_path!r}")
+        if str(remote.etag or "").strip('"').lower() != source.sha256:
+            raise ValueError(f"Xet metadata digest mismatch for {source_path!r}")
+        xet = remote.xet_file_data
+        xet_file_hash = str(_field(xet, "file_hash") or "").lower()
+        if not _SHA256_RE.fullmatch(xet_file_hash):
+            raise ValueError(f"Hub returned no valid Xet file hash for {source_path!r}")
+        descriptor_by_path[source_path] = source.model_copy(update={"xet_file_hash": xet_file_hash})
+
+        tensors = _field(file_metadata, "tensors")
+        if not isinstance(tensors, Mapping) or not tensors:
+            raise ValueError(f"SafeTensors file has no tensor metadata: {source_path!r}")
+        relative_ranges: list[tuple[str, int, int, object]] = []
+        for raw_name, tensor in tensors.items():
+            name = str(raw_name)
+            offsets = _field(tensor, "data_offsets")
+            if offsets is None or len(offsets) != 2:
+                raise ValueError(f"tensor has invalid offsets: {name!r}")
+            start, end = int(offsets[0]), int(offsets[1])
+            if start < 0 or end < start:
+                raise ValueError(f"tensor has invalid byte range: {name!r}")
+            relative_ranges.append((name, start, end, tensor))
+
+        relative_ranges.sort(key=lambda item: (item[1], item[2], item[0]))
+        previous_end = 0
+        for name, start, end, _ in relative_ranges:
+            if start != previous_end:
+                raise ValueError(
+                    f"SafeTensors data section is not contiguous before tensor {name!r}"
+                )
+            previous_end = end
+        data_section_offset = source.size - previous_end
+        if data_section_offset < 8:
+            raise ValueError(f"SafeTensors header is invalid for {source_path!r}")
+
+        tensor_hashes = _hash_xet_tensor_ranges(
+            source=source,
+            xet_file_hash=xet_file_hash,
+            refresh_route=str(_field(xet, "refresh_route") or ""),
+            headers=headers,
+            data_section_offset=data_section_offset,
+            relative_ranges=relative_ranges,
+        )
+
+        for name, start, end, tensor in relative_ranges:
+            dtype = str(_field(tensor, "dtype") or "")
+            shape_value = _field(tensor, "shape")
+            if not dtype or shape_value is None:
+                raise ValueError(f"tensor has incomplete type metadata: {name!r}")
+            shape = tuple(int(dimension) for dimension in shape_value)
+            if any(dimension < 0 for dimension in shape):
+                raise ValueError(f"tensor has a negative dimension: {name!r}")
+            tensor_descriptors.append(
+                TensorArtifactDescriptor(
+                    name=name,
+                    source_path=source_path,
+                    offset=data_section_offset + start,
+                    length=end - start,
+                    sha256=tensor_hashes[name],
+                    dtype=dtype,
+                    shape=shape,
+                )
+            )
+
+    updated_descriptors = [descriptor_by_path[descriptor.path] for descriptor in descriptors]
+    return updated_descriptors, tuple(
+        sorted(tensor_descriptors, key=lambda descriptor: descriptor.name)
+    )
+
+
+def _get_safetensors_metadata_with_backoff(
+    *,
+    client: HfApi,
+    repo_id: str,
+    immutable_revision: str,
+    token: bool | str | None,
+) -> object:
+    """Retry the official parallel header parser on transient transport failures.
+
+    Hugging Face's maintained parser fetches a small range from each shard in a
+    thread pool, but unlike ``get_hf_file_metadata(retry_on_errors=True)`` it
+    currently exposes no retry option.  Keep its parser and exception semantics;
+    only retry the same network exception family used by Hub ``http_backoff``.
+    """
+
+    for attempt in range(_HUB_METADATA_RETRIES + 1):
+        try:
+            return client.get_safetensors_metadata(
+                repo_id,
+                revision=immutable_revision,
+                token=token,
+            )
+        except _HUB_NETWORK_ERRORS as exc:
+            if attempt == _HUB_METADATA_RETRIES:
+                raise
+            delay = min(2**attempt, 8)
+            logger.warning(
+                "SafeTensors header fetch failed for %s (%s); retrying in %ds",
+                repo_id,
+                type(exc).__name__,
+                delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable SafeTensors metadata retry state")
+
+
+def _hash_xet_tensor_ranges(
+    *,
+    source: ArtifactDescriptor,
+    xet_file_hash: str,
+    refresh_route: str,
+    headers: dict[str, str],
+    data_section_offset: int,
+    relative_ranges: list[tuple[str, int, int, object]],
+) -> dict[str, str]:
+    """Hash one contiguous SafeTensors data section from one verified Xet stream."""
+
+    if not refresh_route:
+        raise ValueError(f"Hub returned no Xet refresh route for {source.path!r}")
+    from hf_xet import XetFileInfo
+
+    group = get_xet_session().new_download_stream_group(
+        token_refresh_url=refresh_route,
+        token_refresh_headers=headers,
+        custom_headers=xet_headers_without_auth(headers),
+    )
+    stream = group.download_stream(
+        XetFileInfo(xet_file_hash, source.size),
+        start=data_section_offset,
+        end=source.size,
+    )
+    digests = [hashlib.sha256() for _ in relative_ranges]
+    tensor_index = 0
+    tensor_bytes = 0
+    total_bytes = 0
+    expected_bytes = source.size - data_section_offset
+    next_progress = _HASH_PROGRESS_BYTES
+    logger.info("Hashing signed tensor ranges from %s (%d bytes)", source.path, expected_bytes)
+
+    for chunk in stream:
+        view = memoryview(chunk)
+        total_bytes += len(view)
+        if total_bytes >= next_progress:
+            logger.info(
+                "Hashed %d/%d bytes from %s",
+                total_bytes,
+                expected_bytes,
+                source.path,
+            )
+            next_progress = ((total_bytes // _HASH_PROGRESS_BYTES) + 1) * _HASH_PROGRESS_BYTES
+        while view:
+            while (
+                tensor_index < len(relative_ranges)
+                and relative_ranges[tensor_index][2] == relative_ranges[tensor_index][1]
+            ):
+                tensor_index += 1
+                tensor_bytes = 0
+            if tensor_index >= len(relative_ranges):
+                raise OSError(f"Xet returned excess bytes for {source.path!r}")
+            _, start, end, _ = relative_ranges[tensor_index]
+            remaining = end - start - tensor_bytes
+            consumed = min(len(view), remaining)
+            digests[tensor_index].update(view[:consumed])
+            view = view[consumed:]
+            tensor_bytes += consumed
+            if tensor_bytes == end - start:
+                tensor_index += 1
+                tensor_bytes = 0
+
+    while (
+        tensor_index < len(relative_ranges)
+        and relative_ranges[tensor_index][2] == relative_ranges[tensor_index][1]
+    ):
+        tensor_index += 1
+    if total_bytes != expected_bytes or tensor_index != len(relative_ranges) or tensor_bytes:
+        raise OSError(
+            f"Xet reconstructed an incomplete SafeTensors data section for {source.path!r}: "
+            f"expected {expected_bytes} bytes, got {total_bytes}"
+        )
+    logger.info("Hashed all %d tensor bytes from %s", total_bytes, source.path)
+    return {relative_ranges[index][0]: digest.hexdigest() for index, digest in enumerate(digests)}
 
 
 def _runtime_contract(config: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -252,6 +503,7 @@ def build_hub_model_bundle(
     api: HfApi | None = None,
     artifact_reader: ArtifactReader | None = None,
     include_weight_profile: bool = False,
+    include_selective_weight_index: bool = False,
 ) -> ResolvedModelBundle:
     """Resolve a mutable Hub reference into one reproducible Fabi model bundle.
 
@@ -365,10 +617,23 @@ def build_hub_model_bundle(
                 f"{configured_dtype_key}"
             )
 
+    tensor_descriptors: tuple[TensorArtifactDescriptor, ...] = ()
+    if include_selective_weight_index:
+        if weight_format != "safetensors":
+            raise ValueError("selective tensor artifacts require SafeTensors weights")
+        descriptors, tensor_descriptors = _attach_selective_safetensors_metadata(
+            client=client,
+            repo_id=canonical_model_id,
+            immutable_revision=immutable_revision,
+            token=token,
+            descriptors=descriptors,
+        )
+
     index = ModelArtifactIndex(
         model_id=canonical_model_id,
         immutable_revision=immutable_revision,
         artifacts=tuple(sorted(descriptors, key=lambda descriptor: descriptor.path)),
+        tensors=tensor_descriptors,
     )
     architecture_hash = artifact_collection_hash(index, ArtifactRole.ARCHITECTURE)
     tokenizer_hash = artifact_collection_hash(index, ArtifactRole.TOKENIZER)
@@ -424,16 +689,27 @@ def build_hub_model_bundle(
     }
     weight_profile = None
     if include_weight_profile:
-        from backend.server.model_weight_metadata import load_hub_weight_profile
-
-        weight_profile = load_hub_weight_profile(
-            canonical_model_id,
-            num_layers=num_layers,
-            tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
-            revision=immutable_revision,
-            token=token,
-            api=client,
+        from backend.server.model_weight_metadata import (
+            build_weight_profile_from_tensors,
+            load_hub_weight_profile,
         )
+
+        if tensor_descriptors:
+            weight_profile = build_weight_profile_from_tensors(
+                {tensor.name: tensor for tensor in tensor_descriptors},
+                num_layers=num_layers,
+                tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
+                source_revision=immutable_revision,
+            )
+        else:
+            weight_profile = load_hub_weight_profile(
+                canonical_model_id,
+                num_layers=num_layers,
+                tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
+                revision=immutable_revision,
+                token=token,
+                api=client,
+            )
 
     manifest = ModelManifest(
         model_id=canonical_model_id,

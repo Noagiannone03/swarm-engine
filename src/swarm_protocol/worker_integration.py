@@ -22,6 +22,7 @@ from swarm_protocol.contracts import (
     KvGeometry,
     LayerSpan,
     LinkMetric,
+    ModelArtifactIndex,
     ModelMemberAdvertisement,
     SpanLease,
     SpanState,
@@ -91,6 +92,7 @@ def _local_model_root(
     model_id: str,
     immutable_revision: str,
     span: LayerSpan,
+    artifact_index: ModelArtifactIndex | None = None,
 ) -> Path:
     # Keep the protocol contracts importable in registry/control-plane-only
     # environments that intentionally do not install model executors.
@@ -102,6 +104,7 @@ def _local_model_root(
         end_layer=span.end,
         local_files_only=True,
         revision=immutable_revision,
+        artifact_index=artifact_index,
     )
 
 
@@ -376,6 +379,7 @@ class WorkerProtocolV3Reporter:
                 serving.model_id,
                 serving.immutable_revision,
                 serving.span,
+                bundle.artifact_index,
             )
             artifacts = verify_worker_span(
                 model_root,

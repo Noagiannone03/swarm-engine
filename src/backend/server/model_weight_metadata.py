@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Mapping
 
+from huggingface_hub import HfApi
+
 from parallax.utils.weight_filter_utils import normalize_language_model_weight_key
 from scheduling.model_info import ModelWeightProfile
-
-from huggingface_hub import HfApi
 
 
 def resolve_hub_revision(repo_id: str, *, api: HfApi | None = None) -> str:
@@ -23,6 +23,12 @@ def resolve_hub_revision(repo_id: str, *, api: HfApi | None = None) -> str:
 
 
 def _tensor_bytes(tensor_info: object) -> int:
+    signed_length = getattr(tensor_info, "length", None)
+    if signed_length is not None:
+        length = int(signed_length)
+        if length < 0:
+            raise ValueError(f"Invalid signed tensor length: {signed_length!r}")
+        return length
     offsets = getattr(tensor_info, "data_offsets", None)
     if offsets is None or len(offsets) != 2:
         raise ValueError("Safetensors metadata is missing data offsets")

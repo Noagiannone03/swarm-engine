@@ -28,6 +28,7 @@ from swarm_protocol.contracts import (
     RouteStage,
     SpanLease,
     SpanState,
+    TensorArtifactDescriptor,
     WorkerOffer,
     WorkerRole,
 )
@@ -55,16 +56,6 @@ from swarm_protocol.placement import (
     PlacementMaterializer,
     PlacementScore,
 )
-from swarm_protocol.registry import (
-    ModelCatalogEntry,
-    ModelRegistryBundle,
-    ModelRegistryCatalog,
-    RegistryExpiryPolicy,
-    RegistryRoleSigners,
-    TrustedModelRegistry,
-    TufRegistryPublisher,
-    model_target_path,
-)
 from swarm_protocol.recovery import (
     InMemoryRecoveryJournal,
     RecoveryConflict,
@@ -81,6 +72,16 @@ from swarm_protocol.recovery import (
     replay_sequence_checksum,
     sampling_replay_contract,
     token_sequence_checksum,
+)
+from swarm_protocol.registry import (
+    ModelCatalogEntry,
+    ModelRegistryBundle,
+    ModelRegistryCatalog,
+    RegistryExpiryPolicy,
+    RegistryRoleSigners,
+    TrustedModelRegistry,
+    TufRegistryPublisher,
+    model_target_path,
 )
 from swarm_protocol.reservations import (
     CapacityUnavailable,
@@ -103,8 +104,8 @@ from swarm_protocol.routing import (
 from swarm_protocol.worker_placement import (
     AutonomousPeerTopology,
     AutonomousWorkerPlacement,
-    autonomous_peer_topology,
     autonomous_context_tiers,
+    autonomous_peer_topology,
 )
 
 __all__ = [
@@ -156,6 +157,7 @@ __all__ = [
     "RouteStage",
     "SpanLease",
     "SpanState",
+    "TensorArtifactDescriptor",
     "WorkerOffer",
     "WorkerRole",
     "CatalogRecordConflict",

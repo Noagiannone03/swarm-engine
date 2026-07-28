@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 from huggingface_hub import hf_hub_download as _hf_hub_download
 from huggingface_hub import snapshot_download as _snapshot_download
@@ -16,6 +16,10 @@ from parallax.utils.weight_filter_utils import (
 
 logger = logging.getLogger(__name__)
 _USE_MODELSCOPE_ENV = "USE_MODELSCOPE"
+_MAX_CACHED_BUNDLE_BYTES = 32 * 1024 * 1024
+
+if TYPE_CHECKING:
+    from swarm_protocol.contracts import ModelArtifactIndex
 
 __all__ = [
     "download_model_file",
@@ -88,6 +92,8 @@ def selective_model_download(
     end_layer: Optional[int] = None,
     local_files_only: bool = False,
     revision: Optional[str] = None,
+    artifact_index: "ModelArtifactIndex | None" = None,
+    token: bool | str | None = None,
 ) -> Path:
     local_path = Path(repo_id)
     if local_path.exists():
@@ -130,6 +136,34 @@ def selective_model_download(
             revision=revision,
         )
     logger.debug(f"Downloaded model metadata to {model_path}")
+
+    trusted_index = artifact_index or _cached_v3_artifact_index(repo_id, revision)
+    if (
+        trusted_index is not None
+        and trusted_index.tensors
+        and start_layer is not None
+        and end_layer is not None
+        and not _use_modelscope()
+    ):
+        if revision is None:
+            raise ValueError("signed selective downloads require an immutable model revision")
+        from parallax.utils.selective_safetensors import materialize_tensor_span
+
+        logger.info(
+            "Materializing signed tensor ranges for layers [%d, %d)",
+            start_layer,
+            end_layer,
+        )
+        return materialize_tensor_span(
+            repo_id=repo_id,
+            immutable_revision=str(revision),
+            metadata_root=model_path,
+            artifact_index=trusted_index,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            local_files_only=local_files_only,
+            token=token,
+        )
 
     if start_layer is not None and end_layer is not None:
         logger.debug(f"Determining required weight files for layers [{start_layer}, {end_layer})")
@@ -327,3 +361,77 @@ def _determine_needed_weight_files_for_download(
 
 def _use_modelscope() -> bool:
     return _USE_MODELSCOPE_ENV in os.environ
+
+
+def _cached_v3_artifact_index(
+    repo_id: str,
+    revision: Optional[str],
+) -> "ModelArtifactIndex | None":
+    """Read only a bundle already authenticated into the worker's TUF cache.
+
+    The P2P process resolves the bundle before autonomous materialization.  The
+    executor process shares the same registry state directory and can consume
+    that verified target without racing a second python-tuf updater against it.
+    """
+
+    if not revision or os.environ.get("FABI_SWARM_V3_MODE", "off").strip().lower() in {
+        "",
+        "off",
+        "disabled",
+    }:
+        return None
+    state_dir = Path(
+        os.environ.get(
+            "FABI_SWARM_V3_STATE_DIR",
+            str(Path.home() / ".fabi" / "swarm-v3" / "registry"),
+        )
+    )
+    target_dir = state_dir / "targets"
+    if not target_dir.is_dir():
+        return None
+
+    from swarm_protocol.registry import ModelRegistryBundle, ModelRegistryCatalog
+
+    catalog_path = target_dir / "catalog.json"
+    if not catalog_path.is_file():
+        if os.environ.get("FABI_SWARM_V3_PLACEMENT", "legacy").strip().lower() == "autonomous":
+            raise RuntimeError("autonomous executor has no authenticated registry catalog cache")
+        return None
+    try:
+        catalog = ModelRegistryCatalog.model_validate_json(catalog_path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("authenticated registry catalog cache is invalid") from exc
+    requested_swarm_id = os.environ.get("FABI_MODEL_SWARM_ID")
+    entries = [
+        entry
+        for entry in catalog.models
+        if entry.model_id == repo_id
+        and entry.immutable_revision == revision
+        and (requested_swarm_id is None or entry.model_swarm_id == requested_swarm_id)
+    ]
+    if not entries:
+        return None
+    if len(entries) != 1:
+        raise RuntimeError(
+            "current registry catalog has ambiguous execution variants; "
+            "set FABI_MODEL_SWARM_ID to the trusted variant"
+        )
+    current_swarm_id = entries[0].model_swarm_id
+
+    matches = []
+    for candidate in sorted(path for path in target_dir.rglob("*") if path.is_file()):
+        try:
+            if candidate.stat().st_size > _MAX_CACHED_BUNDLE_BYTES:
+                continue
+            bundle = ModelRegistryBundle.model_validate_json(candidate.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if bundle.model_swarm_id == current_swarm_id:
+            matches.append(bundle.artifact_index)
+    if len(matches) > 1:
+        identities = {index.model_dump_json() for index in matches}
+        if len(identities) != 1:
+            raise RuntimeError("trusted registry cache contains conflicting current model targets")
+    if not matches:
+        raise RuntimeError("current authenticated model target is missing from the registry cache")
+    return matches[0]

@@ -2,9 +2,15 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from swarm_protocol import ArtifactRole, build_hub_model_bundle
+from swarm_protocol.contracts import ArtifactDescriptor
+from swarm_protocol.model_manifest import (
+    _get_safetensors_metadata_with_backoff,
+    _hash_xet_tensor_ranges,
+)
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
 
@@ -246,3 +252,143 @@ def test_builder_rejects_dtype_that_cuda_loaders_would_ignore():
             api=FakeApi(siblings),
             artifact_reader=reader,
         )
+
+
+def test_xet_stream_hashes_each_tensor_across_transport_chunk_boundaries(monkeypatch):
+    payload = b"abcdefghijkl"
+    ranges = [
+        ("tensor.a", 0, 3, object()),
+        ("tensor.empty", 3, 3, object()),
+        ("tensor.b", 3, 8, object()),
+        ("tensor.c", 8, 12, object()),
+    ]
+
+    class Group:
+        def download_stream(self, file_info, *, start, end):
+            assert (start, end) == (8, 20)
+            yield payload[:2]
+            yield payload[2:7]
+            yield payload[7:]
+
+    class Session:
+        def new_download_stream_group(self, **kwargs):
+            assert kwargs["token_refresh_url"] == "https://xet.example/refresh"
+            return Group()
+
+    monkeypatch.setattr("swarm_protocol.model_manifest.get_xet_session", lambda: Session())
+    source = ArtifactDescriptor(
+        path="model.safetensors",
+        size=20,
+        sha256="10" * 32,
+        media_type="application/vnd.safetensors",
+        role=ArtifactRole.WEIGHT,
+    )
+
+    hashes = _hash_xet_tensor_ranges(
+        source=source,
+        xet_file_hash="20" * 32,
+        refresh_route="https://xet.example/refresh",
+        headers={},
+        data_section_offset=8,
+        relative_ranges=ranges,
+    )
+
+    assert hashes == {
+        "tensor.a": hashlib.sha256(b"abc").hexdigest(),
+        "tensor.empty": hashlib.sha256(b"").hexdigest(),
+        "tensor.b": hashlib.sha256(b"defgh").hexdigest(),
+        "tensor.c": hashlib.sha256(b"ijkl").hexdigest(),
+    }
+
+
+def test_safetensors_metadata_retries_only_transient_hub_network_errors(monkeypatch):
+    calls = 0
+    sleeps = []
+
+    class Api:
+        def get_safetensors_metadata(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise httpx.ConnectError("temporary TLS disconnect")
+            return "metadata"
+
+    monkeypatch.setattr("swarm_protocol.model_manifest.time.sleep", sleeps.append)
+    result = _get_safetensors_metadata_with_backoff(
+        client=Api(),
+        repo_id="test/model",
+        immutable_revision=REVISION,
+        token=None,
+    )
+
+    assert result == "metadata"
+    assert calls == 3
+    assert sleeps == [1, 2]
+
+
+def test_builder_signs_absolute_tensor_ranges_and_xet_identity(monkeypatch):
+    files, siblings, _, reader = _fixture()
+    source = next(item for item in siblings if item.rfilename == "model.safetensors")
+    source.size = 128
+    source.lfs.size = 128
+    source.lfs.sha256 = "30" * 32
+
+    class SelectiveApi(FakeApi):
+        def get_safetensors_metadata(self, repo_id, **kwargs):
+            return SimpleNamespace(
+                files_metadata={
+                    "model.safetensors": SimpleNamespace(
+                        tensors={
+                            "model.layers.0.weight": SimpleNamespace(
+                                data_offsets=(0, 16), dtype="F32", shape=(2, 2)
+                            ),
+                            "model.layers.1.weight": SimpleNamespace(
+                                data_offsets=(16, 32), dtype="F32", shape=(2, 2)
+                            ),
+                        }
+                    )
+                }
+            )
+
+    monkeypatch.setattr(
+        "swarm_protocol.model_manifest.get_hf_file_metadata",
+        lambda *args, **kwargs: SimpleNamespace(
+            size=128,
+            etag='"' + "30" * 32 + '"',
+            xet_file_data=SimpleNamespace(
+                file_hash="40" * 32,
+                refresh_route="https://xet.example/refresh",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "swarm_protocol.model_manifest._hash_xet_tensor_ranges",
+        lambda **kwargs: {
+            "model.layers.0.weight": "50" * 32,
+            "model.layers.1.weight": "60" * 32,
+        },
+    )
+
+    bundle = build_hub_model_bundle(
+        "Qwen/Qwen3-1.7B",
+        revision=REVISION,
+        quantization="bf16",
+        dtype="bfloat16",
+        api=SelectiveApi(siblings),
+        artifact_reader=reader,
+        include_selective_weight_index=True,
+    )
+
+    signed_source = next(
+        artifact
+        for artifact in bundle.artifact_index.artifacts
+        if artifact.path == "model.safetensors"
+    )
+    assert signed_source.xet_file_hash == "40" * 32
+    assert [
+        (tensor.name, tensor.offset, tensor.length, tensor.sha256)
+        for tensor in bundle.artifact_index.tensors
+    ] == [
+        ("model.layers.0.weight", 96, 16, "50" * 32),
+        ("model.layers.1.weight", 112, 16, "60" * 32),
+    ]

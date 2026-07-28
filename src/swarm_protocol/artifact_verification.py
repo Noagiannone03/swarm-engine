@@ -204,8 +204,40 @@ def verify_worker_span(
         if artifact.role is ArtifactRole.ARCHITECTURE
         or (include_tokenizer and artifact.role is ArtifactRole.TOKENIZER)
     )
-    weight_descriptors = required_weight_descriptors(root, artifact_index, manifest, span)
     runtime_paths = tuple(verify_artifact(root, artifact) for artifact in runtime_descriptors)
+    if artifact_index.tensors:
+        from parallax.utils.selective_safetensors import (
+            selective_receipt_path,
+            verify_selective_projection,
+        )
+
+        if selective_receipt_path(root).is_file():
+            config_descriptor = next(
+                (
+                    artifact
+                    for artifact in artifact_index.artifacts
+                    if artifact.path == "config.json" and artifact.role is ArtifactRole.ARCHITECTURE
+                ),
+                None,
+            )
+            if config_descriptor is None:
+                raise ValueError("signed artifact index has no architecture config.json")
+            config = _load_verified_json(root, config_descriptor)
+            weight_paths, weight_hashes = verify_selective_projection(
+                model_root=root,
+                artifact_index=artifact_index,
+                start_layer=span.start,
+                end_layer=span.end,
+                num_layers=manifest.num_layers,
+                tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
+            )
+            return VerifiedSpanArtifacts(
+                runtime_paths=runtime_paths,
+                weight_paths=weight_paths,
+                weight_hashes=weight_hashes,
+            )
+
+    weight_descriptors = required_weight_descriptors(root, artifact_index, manifest, span)
     weight_paths = tuple(verify_artifact(root, artifact) for artifact in weight_descriptors)
     return VerifiedSpanArtifacts(
         runtime_paths=runtime_paths,
