@@ -78,9 +78,7 @@ class PlacementMaterializer:
         self._drain = drain
         self._reload_target = reload_target
         self._phase = (
-            MaterializationPhase.READY
-            if current_span is not None
-            else MaterializationPhase.STANDBY
+            MaterializationPhase.READY if current_span is not None else MaterializationPhase.STANDBY
         )
         self._generation = 0
         self._current_span = current_span
@@ -112,20 +110,16 @@ class PlacementMaterializer:
                 return self.snapshot()
             if decision.action is PlacementAction.STANDBY:
                 if self._current_span is not None:
-                    raise RuntimeError("a serving worker cannot enter standby without a safe target")
+                    raise RuntimeError(
+                        "a serving worker cannot enter standby without a safe target"
+                    )
                 self._phase = MaterializationPhase.STANDBY
                 return self.snapshot()
             if decision.span is None:
                 raise ValueError("join and move decisions require a target span")
-            if (
-                decision.action is PlacementAction.JOIN
-                and self._current_span is not None
-            ):
+            if decision.action is PlacementAction.JOIN and self._current_span is not None:
                 raise RuntimeError("a serving worker cannot execute a join decision")
-            if (
-                decision.action is PlacementAction.MOVE
-                and self._current_span is None
-            ):
+            if decision.action is PlacementAction.MOVE and self._current_span is None:
                 raise RuntimeError("a standby worker cannot execute a move decision")
 
             self._target_span = decision.span
@@ -236,6 +230,7 @@ class CapacityDemandMap(BaseModel):
 @dataclass(frozen=True)
 class PlacementScore:
     completes_fixed_route: int
+    establishes_missing_frontend: int
     fixed_route_progress: int
     minimum_ready_coverage: int
     weighted_deficit_filled: float
@@ -243,9 +238,10 @@ class PlacementScore:
     span_length: int
     deterministic_tiebreaker: int
 
-    def rank(self) -> tuple[int, int, int, float, float, int, int]:
+    def rank(self) -> tuple[int, int, int, int, float, float, int, int]:
         return (
             self.completes_fixed_route,
+            self.establishes_missing_frontend,
             self.fixed_route_progress,
             self.minimum_ready_coverage,
             self.weighted_deficit_filled,
@@ -379,6 +375,7 @@ class AutonomousPlacementPolicy:
         prefix_boundaries: frozenset[int],
         suffix_boundaries: frozenset[int],
         model_num_layers: int,
+        can_host_frontend: bool,
     ) -> PlacementScore:
         after = [
             count + int(span.start <= layer < span.end) for layer, count in enumerate(base_coverage)
@@ -402,6 +399,9 @@ class AutonomousPlacementPolicy:
         )
         return PlacementScore(
             completes_fixed_route=completes_fixed_route,
+            establishes_missing_frontend=int(
+                can_host_frontend and span.start == 0 and base_coverage[0] == 0
+            ),
             fixed_route_progress=fixed_route_progress,
             minimum_ready_coverage=min(after),
             weighted_deficit_filled=deficit_filled,
@@ -520,6 +520,7 @@ class AutonomousPlacementPolicy:
                     prefix_boundaries=prefix_boundaries,
                     suffix_boundaries=suffix_boundaries,
                     model_num_layers=manifest.num_layers,
+                    can_host_frontend=WorkerRole.FRONTEND in offer.supported_roles,
                 ),
             )
             for span, required in feasible
@@ -549,6 +550,7 @@ class AutonomousPlacementPolicy:
                         prefix_boundaries=prefix_boundaries,
                         suffix_boundaries=suffix_boundaries,
                         model_num_layers=manifest.num_layers,
+                        can_host_frontend=WorkerRole.FRONTEND in offer.supported_roles,
                     ),
                     reason="movement_would_remove_the_last_ready_coverage",
                 )
@@ -591,6 +593,7 @@ class AutonomousPlacementPolicy:
                 prefix_boundaries=prefix_boundaries,
                 suffix_boundaries=suffix_boundaries,
                 model_num_layers=manifest.num_layers,
+                can_host_frontend=WorkerRole.FRONTEND in offer.supported_roles,
             )
         else:
             _, current_required, current_score = current

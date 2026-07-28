@@ -175,6 +175,42 @@ def test_fixed_cold_workers_form_a_complete_route_when_tail_arrives_first():
     assert head.score.completes_fixed_route == 1
 
 
+def test_first_frontend_worker_establishes_ingress_when_catalogue_is_empty():
+    model = manifest()
+
+    decision = AutonomousPlacementPolicy().choose(
+        offer=offer("frontend-first", memory_bytes=500, frontend=True),
+        manifest=model,
+        leases=(),
+        demand=CapacityDemandMap.uniform(4, desired_replicas=2),
+        context_tokens=10,
+        kv_block_size=1,
+        now_ms=SWARM_NOW,
+    )
+
+    assert decision.action is PlacementAction.JOIN
+    assert decision.span == LayerSpan(start=0, end=2)
+    assert decision.score is not None
+    assert decision.score.establishes_missing_frontend == 1
+
+
+def test_cold_join_never_counts_its_own_historical_lease_as_replica():
+    model = manifest()
+
+    decision = AutonomousPlacementPolicy().choose(
+        offer=offer("persistent-worker", memory_bytes=500, frontend=True),
+        manifest=model,
+        leases=(lease(model, "persistent-worker", 0, 2),),
+        demand=CapacityDemandMap.uniform(4, desired_replicas=2),
+        context_tokens=10,
+        kv_block_size=1,
+        now_ms=SWARM_NOW,
+    )
+
+    assert decision.action is PlacementAction.JOIN
+    assert decision.span == LayerSpan(start=0, end=2)
+
+
 def test_executor_without_http_frontend_can_fill_the_model_tail():
     model = manifest()
     policy = AutonomousPlacementPolicy()
