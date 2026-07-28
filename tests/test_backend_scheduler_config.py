@@ -367,6 +367,14 @@ def test_scheduler_starts_and_reuses_iroh_rpc_handler(monkeypatch):
     assert registered[0].scheduler is second_scheduler
 
 
+def test_scheduler_peer_id_prefers_explicit_iroh_transport():
+    manager = SchedulerManage()
+    manager.iroh_transport = SimpleNamespace(peer_id=lambda: "iroh-endpoint")
+    manager.lattica = None
+
+    assert manager.get_peer_id() == "iroh-endpoint"
+
+
 def test_active_v3_mode_fails_closed_without_verified_planner(monkeypatch):
     monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
     manager = SchedulerManage()

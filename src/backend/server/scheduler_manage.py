@@ -191,9 +191,13 @@ class SchedulerManage:
         return self.is_local_network
 
     def get_peer_id(self):
-        if self.lattica is None:
+        # Iroh is the product control plane in v3.  Keep the legacy Lattica
+        # fallback for old deployments, but never make public discovery depend
+        # on the compatibility alias being populated as a side effect.
+        transport = self.iroh_transport or self.lattica
+        if transport is None:
             return None
-        return self.lattica.peer_id()
+        return transport.peer_id()
 
     def weight_refit(self, request_data):
         """
@@ -244,6 +248,14 @@ class SchedulerManage:
                     )
                 ),
                 "max_supported_context_tokens": self.max_supported_context_tokens(),
+                # Machine-readable connection identity for registries and
+                # clients.  Parsing a one-shot startup log is not a reliable
+                # discovery protocol, especially after switching from libp2p
+                # peer IDs to authenticated Iroh EndpointIds.
+                "scheduler_endpoint_id": self.get_peer_id(),
+                "network_transport": (
+                    "iroh" if self.iroh_transport is not None else "lattica"
+                ),
                 "node_join_command": get_node_join_command(
                     self.get_peer_id(), self.is_local_network
                 ),
