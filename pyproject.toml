@@ -13,12 +13,10 @@ requires-python = ">=3.10,<3.14"
 dependencies = [
   "msgpack>=1.0.7",
   "safetensors>=0.5.1",
-  # 1.24 exposes the maintained Xet byte-range stream used by Fabi's
-  # per-layer SafeTensors materializer. hf-xet publishes native wheels for
-  # Windows, macOS and Linux.
-  # The selective transport uses the 1.24 Xet session integration. Keep its
-  # internal session contract reproducible across Windows, macOS and Linux.
-  "huggingface-hub>=1.24.0,<1.25.0",
+  # Hub 0.36 is Xet-aware and remains compatible with Transformers 4.x.
+  # Range streaming itself uses hf-xet's public API, so workers can also run
+  # with the Hub 1.x line selected by newer Transformers installations.
+  "huggingface-hub>=0.36.2,<2.0.0",
   "hf-xet>=1.5.2,<1.6.0",
   "filelock>=3.12",
   "modelscope",

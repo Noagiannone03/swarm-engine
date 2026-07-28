@@ -19,9 +19,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import httpx
-from huggingface_hub import HfApi, get_hf_file_metadata, hf_hub_download, hf_hub_url
+import requests
+from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
 from huggingface_hub.utils import build_hf_headers
-from huggingface_hub.utils._xet import get_xet_session, xet_headers_without_auth
 
 from parallax.utils.model_config import normalize_model_config
 from swarm_protocol.contracts import (
@@ -30,6 +30,11 @@ from swarm_protocol.contracts import (
     ModelArtifactIndex,
     ModelManifest,
     TensorArtifactDescriptor,
+)
+from swarm_protocol.xet_transport import (
+    get_hf_file_metadata_with_backoff,
+    get_xet_session,
+    xet_headers_without_auth,
 )
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -44,6 +49,9 @@ _HUB_NETWORK_ERRORS = (
     httpx.TimeoutException,
     httpx.NetworkError,
     httpx.RemoteProtocolError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
 )
 _HUB_METADATA_RETRIES = 5
 
@@ -237,11 +245,10 @@ def _attach_selective_safetensors_metadata(
                 f"SafeTensors metadata references an unsigned weight file: {source_path!r}"
             )
         headers = build_hf_headers(token=token)
-        remote = get_hf_file_metadata(
+        remote = get_hf_file_metadata_with_backoff(
             hf_hub_url(repo_id, source_path, revision=immutable_revision),
             token=token,
             headers=headers,
-            retry_on_errors=True,
         )
         if remote.size != source.size:
             raise ValueError(f"Xet metadata size mismatch for {source_path!r}")

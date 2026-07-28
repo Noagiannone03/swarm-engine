@@ -27,9 +27,8 @@ from pathlib import Path
 from typing import BinaryIO
 
 from filelock import FileLock
-from huggingface_hub import get_hf_file_metadata, hf_hub_url
+from huggingface_hub import hf_hub_url
 from huggingface_hub.utils import build_hf_headers
-from huggingface_hub.utils._xet import get_xet_session, xet_headers_without_auth
 
 from parallax.utils.weight_filter_utils import (
     normalize_language_model_weight_key,
@@ -40,6 +39,11 @@ from swarm_protocol.contracts import (
     ArtifactRole,
     ModelArtifactIndex,
     TensorArtifactDescriptor,
+)
+from swarm_protocol.xet_transport import (
+    get_hf_file_metadata_with_backoff,
+    get_xet_session,
+    xet_headers_without_auth,
 )
 
 _HASH_CHUNK_BYTES = 8 * 1024 * 1024
@@ -278,11 +282,10 @@ class _RangeSources:
         if source.xet_file_hash is None:
             raise ValueError(f"signed artifact has no Xet identity: {source_path!r}")
         headers = build_hf_headers(token=self.token)
-        remote = get_hf_file_metadata(
+        remote = get_hf_file_metadata_with_backoff(
             hf_hub_url(self.repo_id, source_path, revision=self.immutable_revision),
             token=self.token,
             headers=headers,
-            retry_on_errors=True,
         )
         remote_xet = remote.xet_file_data
         if remote.size != source.size or str(remote.etag or "").strip('"').lower() != source.sha256:

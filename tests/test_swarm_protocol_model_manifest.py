@@ -351,7 +351,7 @@ def test_builder_signs_absolute_tensor_ranges_and_xet_identity(monkeypatch):
             )
 
     monkeypatch.setattr(
-        "swarm_protocol.model_manifest.get_hf_file_metadata",
+        "swarm_protocol.model_manifest.get_hf_file_metadata_with_backoff",
         lambda *args, **kwargs: SimpleNamespace(
             size=128,
             etag='"' + "30" * 32 + '"',
