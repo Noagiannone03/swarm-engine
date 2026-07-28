@@ -381,12 +381,24 @@ def _wait_for_contract_replan(
     p2p_server_process,
     *,
     timeout_seconds: float = 300.0,
+    require_newer_scheduler_epoch: bool = True,
 ) -> None:
-    """Wait for a new scheduler epoch while the heartbeat process stays alive."""
+    """Wait for a fenced serving-contract replacement while P2P stays alive.
+
+    Scheduler-owned placement requires a newer scheduler epoch.  Active v3
+    workers instead reconcile their own BUILDING lease and signal a local
+    reload without involving the legacy allocator.
+    """
 
     failed_epoch = shared_state.get("allocation_epoch")
     started_at = time.monotonic()
     while not shared_state.get_layer_allocation_changed():
+        terminal_failure = shared_state.get("swarm_v3_context_failure")
+        if terminal_failure is not None:
+            raise RuntimeError(
+                "Autonomous v3 memory contract has no supported context tier: "
+                f"{terminal_failure.get('detail', terminal_failure)}"
+            )
         if p2p_server_process is not None and not p2p_server_process.is_alive():
             raise RuntimeError("P2P heartbeat exited while waiting for memory-contract replan")
         if time.monotonic() - started_at >= timeout_seconds:
@@ -396,6 +408,14 @@ def _wait_for_contract_replan(
             )
         time.sleep(0.25)
 
+    terminal_failure = shared_state.get("swarm_v3_context_failure")
+    if terminal_failure is not None:
+        raise RuntimeError(
+            "Autonomous v3 memory contract has no supported context tier: "
+            f"{terminal_failure.get('detail', terminal_failure)}"
+        )
+    if not require_newer_scheduler_epoch:
+        return
     new_epoch = shared_state.get("allocation_epoch")
     if failed_epoch is not None and new_epoch is not None and int(new_epoch) <= int(failed_epoch):
         raise RuntimeError(
@@ -410,9 +430,7 @@ def _configured_initial_allocation_timeout_seconds() -> float:
     except ValueError as exc:
         raise ValueError("FABI_INITIAL_ALLOCATION_TIMEOUT_SECONDS must be a number") from exc
     if not math.isfinite(timeout) or timeout < 0:
-        raise ValueError(
-            "FABI_INITIAL_ALLOCATION_TIMEOUT_SECONDS must be finite and non-negative"
-        )
+        raise ValueError("FABI_INITIAL_ALLOCATION_TIMEOUT_SECONDS must be finite and non-negative")
     return timeout
 
 
@@ -458,8 +476,7 @@ def _wait_for_initial_layer_allocation(
         elapsed = now - started_at
         if timeout and elapsed >= timeout:
             raise RuntimeError(
-                "Scheduler did not provide a complete layer allocation within "
-                f"{timeout:g}s"
+                "Scheduler did not provide a complete layer allocation within " f"{timeout:g}s"
             )
         if now >= next_status_log:
             logger.info(
@@ -747,6 +764,10 @@ if __name__ == "__main__":
                             _wait_for_contract_replan(
                                 shared_state,
                                 p2p_server_process,
+                                require_newer_scheduler_epoch=(
+                                    os.environ.get("FABI_SWARM_V3_MODE", "off").strip().lower()
+                                    != "active"
+                                ),
                             )
                         logger.warning("Serving contract changed; stopping executors to reload")
                         # Reset flag and set status to INITIALIZING

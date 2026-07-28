@@ -75,6 +75,34 @@ def test_disabled_notification_does_not_require_an_assigned_span():
     assert send_notify(None, None, None, request, "started") is None
 
 
+def test_active_v3_worker_refuses_legacy_placement_fallback(monkeypatch):
+    monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
+    monkeypatch.setenv("FABI_SWARM_V3_PLACEMENT", "legacy")
+
+    with pytest.raises(ValueError, match="not a product fallback"):
+        GradientServer(
+            recv_from_peer_addr="",
+            send_to_peer_addr="",
+            scheduler_addr="scheduler-peer",
+        )
+
+
+def test_active_v3_worker_fails_closed_when_trust_cannot_initialize(monkeypatch):
+    monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
+    monkeypatch.delenv("FABI_SWARM_V3_PLACEMENT", raising=False)
+    monkeypatch.setattr(
+        "parallax.p2p.server.WorkerProtocolV3Reporter.from_environment",
+        lambda: (_ for _ in ()).throw(ValueError("missing pinned root")),
+    )
+
+    with pytest.raises(RuntimeError, match="trust initialization failed"):
+        GradientServer(
+            recv_from_peer_addr="",
+            send_to_peer_addr="",
+            scheduler_addr="scheduler-peer",
+        )
+
+
 def test_dynamic_span_handler_enqueues_after_standby_assignment():
     socket = RecordingSocket()
     handler = build_forward_handler(socket)
@@ -207,6 +235,50 @@ def test_global_legacy_tier_cannot_resize_autonomous_generation():
     assert fenced == (0, 5, 32768, 11)
 
 
+def test_autonomous_worker_reconciles_live_kv_limit_without_scheduler(monkeypatch):
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    values = {"memory_contract_failure": {"stale": True}}
+
+    class State:
+        def get(self, key, default=None):
+            return values.get(key, default)
+
+        def update(self, **changes):
+            values.update(changes)
+
+    calls = []
+    server._shared_state = State()
+    server.swarm_v3_placement_mode = "autonomous"
+    server.swarm_v3_placement_controller = SimpleNamespace(
+        downgrade_building_context=lambda value: (
+            calls.append(value) or {"generation": 7, "phase": "building"}
+        )
+    )
+    server.planned_context_tokens = 32_768
+    monkeypatch.setenv("FABI_SWARM_V3_MIN_CONTEXT_TOKENS", "4096")
+
+    reconciled = server._reconcile_autonomous_memory_contract_failure(
+        {
+            "kind": "kv_materialization",
+            "requested_tokens": 32_768,
+            "supported_tokens": 30_752,
+        }
+    )
+
+    assert reconciled is True
+    assert calls == [16_384]
+    assert server.planned_context_tokens == 16_384
+    assert server.status is ServerState.INITIALIZING
+    assert values["memory_contract_failure"] is None
+    assert values["planned_context_tokens"] == 16_384
+    assert values["_layer_allocation_changed"] is True
+    assert values["swarm_v3_placement_generation"] == 7
+
+
 def test_empty_legacy_topology_cannot_erase_autonomous_dht_peers():
     server = GradientServer(
         recv_from_peer_addr="",
@@ -217,9 +289,7 @@ def test_empty_legacy_topology_cannot_erase_autonomous_dht_peers():
     server.outbound_peer_ids = ["dht-successor"]
     server.authorized_link_peer_ids = ["dht-predecessor"]
 
-    server._update_outbound_peers(
-        {"outbound_peer_ids": [], "authorized_link_peer_ids": []}
-    )
+    server._update_outbound_peers({"outbound_peer_ids": [], "authorized_link_peer_ids": []})
 
     assert server.outbound_peer_ids == ["dht-successor"]
     assert server.authorized_link_peer_ids == ["dht-predecessor"]

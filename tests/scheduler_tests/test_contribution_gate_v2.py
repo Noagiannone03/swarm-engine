@@ -15,7 +15,6 @@ from swarm_protocol import (
     WorkerRole,
 )
 
-
 CREDENTIAL = "ab" * 32
 
 
@@ -170,6 +169,22 @@ def test_autonomous_contributor_must_publish_verified_ready_lease(monkeypatch):
         external_ready_worker_ids=lambda: frozenset({node.node_id}),
         product_serving_ready=lambda: True,
         serving_ready=lambda: False,
+    )
+
+    assert gate.status(CREDENTIAL, sched).reason == "no_eligible_worker"
+
+
+def test_v3_membership_authority_never_accepts_legacy_scheduler_worker(monkeypatch):
+    monkeypatch.setenv("FABI_GATE", "on")
+    gate = ContributionGate()
+    node = worker()
+    node.node_id = "stale-scheduler-worker"
+    sched = SimpleNamespace(
+        node_manager=SimpleNamespace(nodes=[node], active_nodes=[node]),
+        heartbeat_timeout=30,
+        external_ready_worker_ids=lambda: frozenset({node.node_id}),
+        product_serving_ready=lambda: True,
+        serving_ready=lambda: True,
     )
 
     assert gate.status(CREDENTIAL, sched).reason == "no_eligible_worker"

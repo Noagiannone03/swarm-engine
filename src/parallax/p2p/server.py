@@ -67,8 +67,9 @@ from swarm_protocol.worker_integration import (
 )
 from swarm_protocol.worker_placement import (
     AutonomousWorkerPlacement,
-    autonomous_peer_topology,
     autonomous_context_tiers,
+    autonomous_peer_topology,
+    next_autonomous_context_tier,
 )
 
 logger = get_logger(__name__)
@@ -458,8 +459,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "request_id": request_id,
                 "status_code": 400,
                 "error": (
-                    "this qualified Rust frontend supports tool_choice only as "
-                    "'auto' or 'none'"
+                    "this qualified Rust frontend supports tool_choice only as " "'auto' or 'none'"
                 ),
             }
 
@@ -890,21 +890,31 @@ class GradientServer:
         self.swarm_v3_execution_admission = None
         self.swarm_v3_placement_controller = None
         self.swarm_v3_bootstrap_thread = None
+        configured_swarm_v3_mode = os.environ.get("FABI_SWARM_V3_MODE", "off").strip().lower()
+        default_placement_mode = "autonomous" if configured_swarm_v3_mode == "active" else "legacy"
         self.swarm_v3_placement_mode = (
             os.environ.get(
                 "FABI_SWARM_V3_PLACEMENT",
-                "legacy",
+                default_placement_mode,
             )
             .strip()
             .lower()
         )
         if self.swarm_v3_placement_mode not in {"legacy", "autonomous"}:
             raise ValueError("FABI_SWARM_V3_PLACEMENT supports only legacy or autonomous")
+        if configured_swarm_v3_mode == "active" and self.swarm_v3_placement_mode != "autonomous":
+            raise ValueError(
+                "active protocol-v3 workers require autonomous DHT placement; "
+                "the legacy scheduler placement path is not a product fallback"
+            )
         self.swarm_v3_init_error = None
         try:
             self.swarm_v3_reporter = WorkerProtocolV3Reporter.from_environment()
         except Exception as exc:
-            # Shadow telemetry must never take the qualified v2 heartbeat or serving path down.
+            if configured_swarm_v3_mode == "active":
+                raise RuntimeError("active protocol-v3 worker trust initialization failed") from exc
+            # Optional shadow telemetry remains observational when v3 is not
+            # the product serving authority.
             self.swarm_v3_init_error = {
                 "code": type(exc).__name__,
                 "detail": str(exc)[:256],
@@ -1028,11 +1038,7 @@ class GradientServer:
                 backend = (
                     BackendKind.MLX
                     if hardware.get("device") == "mlx"
-                    else (
-                        BackendKind.VLLM
-                        if self.gpu_backend == "vllm"
-                        else BackendKind.SGLANG
-                    )
+                    else (BackendKind.VLLM if self.gpu_backend == "vllm" else BackendKind.SGLANG)
                 )
                 controller = AutonomousWorkerPlacement(
                     catalog=self.iroh_transport.catalog_discovery,
@@ -1048,9 +1054,7 @@ class GradientServer:
                 preferred_context_tokens = int(self.planned_context_tokens)
                 context_tiers = autonomous_context_tiers(
                     preferred_context_tokens,
-                    minimum_tokens=int(
-                        os.environ.get("FABI_SWARM_V3_MIN_CONTEXT_TOKENS", "4096")
-                    ),
+                    minimum_tokens=int(os.environ.get("FABI_SWARM_V3_MIN_CONTEXT_TOKENS", "4096")),
                 )
                 while not self.stop_event.is_set():
                     if not manifest_published:
@@ -1070,9 +1074,7 @@ class GradientServer:
                             worker_id=self.iroh_transport.peer_id(),
                             endpoint_id=self.iroh_transport.peer_id(),
                             backend=backend,
-                            stable_memory_envelope_bytes=int(
-                                hardware["usable_memory_bytes"]
-                            ),
+                            stable_memory_envelope_bytes=int(hardware["usable_memory_bytes"]),
                             supports_frontend=self.supports_frontend,
                         )
                     placement = None
@@ -1093,10 +1095,7 @@ class GradientServer:
                         if placement["decision"] == "waiting_catalog":
                             self.planned_context_tokens = preferred_context_tokens
                             break
-                        if (
-                            placement["decision"]
-                            != "no_exact_span_fits_the_stable_memory_envelope"
-                        ):
+                        if placement["decision"] != "no_exact_span_fits_the_stable_memory_envelope":
                             break
                     assert placement is not None
                     if self._shared_state is not None:
@@ -1455,8 +1454,7 @@ class GradientServer:
             notify_url=self.notify_url,
             iroh_transport=self.iroh_transport,
             execution_admission=self.swarm_v3_execution_admission,
-            link_probe_authorizer=lambda peer_id: peer_id
-            in self._authorized_link_peer_id_set,
+            link_probe_authorizer=lambda peer_id: peer_id in self._authorized_link_peer_id_set,
             link_probe_idle=self._link_probe_idle,
         )  # thread
         if self.iroh_transport is not None:
@@ -2062,9 +2060,9 @@ class GradientServer:
                     for req in forward_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert self.block_start_index == 0, (
-                                "Request routing table is not set for non-head rank"
-                            )
+                            assert (
+                                self.block_start_index == 0
+                            ), "Request routing table is not set for non-head rank"
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -2120,9 +2118,9 @@ class GradientServer:
                     for req in abort_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert self.block_start_index == 0, (
-                                "Request routing table is not set for non-head rank"
-                            )
+                            assert (
+                                self.block_start_index == 0
+                            ), "Request routing table is not set for non-head rank"
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -2400,6 +2398,77 @@ class GradientServer:
             self.allocation_epoch,
         )
 
+    def _reconcile_autonomous_memory_contract_failure(
+        self,
+        failure: dict[str, object],
+    ) -> bool:
+        """Reconcile measured KV capacity without consulting the v2 allocator.
+
+        The initialized executor is the authority for its live KV ceiling.  In
+        active v3 mode, a failed cold join replaces its own non-routable
+        BUILDING lease with a lower sequenced context tier and asks the local
+        launcher to retry the same layer generation.
+        """
+
+        if self.swarm_v3_placement_mode != "autonomous":
+            return False
+        try:
+            kind = str(failure["kind"])
+            requested_tokens = int(failure["requested_tokens"])
+            supported_tokens = int(failure["supported_tokens"])
+        except (KeyError, TypeError, ValueError):
+            logger.error("Autonomous executor returned a malformed memory contract: %s", failure)
+            return False
+        if kind != "kv_materialization" or requested_tokens != self.planned_context_tokens:
+            return False
+
+        minimum_tokens = int(os.environ.get("FABI_SWARM_V3_MIN_CONTEXT_TOKENS", "4096"))
+        next_tier = next_autonomous_context_tier(
+            requested_tokens,
+            supported_tokens,
+            minimum_tokens=minimum_tokens,
+        )
+        if next_tier is None:
+            detail = (
+                f"measured KV ceiling {supported_tokens} is below every configured "
+                f"context tier after {requested_tokens} (minimum={minimum_tokens})"
+            )
+            logger.error("Autonomous v3 context reconciliation failed: %s", detail)
+            if self._shared_state is not None:
+                self._shared_state.update(
+                    status=ServerState.INITIALIZING.value,
+                    frontend_alive=False,
+                    memory_contract_failure=None,
+                    swarm_v3_context_failure={"code": "NoSupportedContextTier", "detail": detail},
+                )
+            return True
+        if self.swarm_v3_placement_controller is None:
+            raise RuntimeError("autonomous memory reconciliation has no placement controller")
+
+        placement = self.swarm_v3_placement_controller.downgrade_building_context(next_tier)
+        self.planned_context_tokens = next_tier
+        self.status = ServerState.INITIALIZING
+        self._layer_allocation_changed = True
+        if self._shared_state is not None:
+            self._shared_state.update(
+                planned_context_tokens=next_tier,
+                status=ServerState.INITIALIZING.value,
+                frontend_alive=False,
+                memory_contract_failure=None,
+                swarm_v3_context_failure=None,
+                _layer_allocation_changed=True,
+                swarm_v3_placement_generation=placement["generation"],
+                swarm_v3_placement_phase=placement["phase"],
+            )
+        logger.warning(
+            "Autonomous v3 worker reconciled measured KV capacity: %d -> %d tokens "
+            "(measured ceiling=%d); retrying the same layer generation",
+            requested_tokens,
+            next_tier,
+            supported_tokens,
+        )
+        return True
+
     def get_node_info(self, is_update: bool = False):
         # A dedicated topology thread owns network probes. Heartbeats only read
         # its last fail-closed result and therefore cannot be starved by probes.
@@ -2433,6 +2502,13 @@ class GradientServer:
             runtime_kv_capacity = self._shared_state.get("kv_cache_token_capacity")
             runtime_kv_block_size = self._shared_state.get("kv_cache_block_size")
             memory_contract_failure = self._shared_state.get("memory_contract_failure")
+            if (
+                memory_contract_failure is not None
+                and self._reconcile_autonomous_memory_contract_failure(
+                    dict(memory_contract_failure)
+                )
+            ):
+                memory_contract_failure = self._shared_state.get("memory_contract_failure")
             placement_error = self._shared_state.get("swarm_v3_placement_error")
             if placement_error is not None and self.swarm_v3_placement_controller is not None:
                 try:

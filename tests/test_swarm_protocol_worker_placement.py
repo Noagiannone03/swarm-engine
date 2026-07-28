@@ -16,8 +16,9 @@ from swarm_protocol import (
     SpanState,
     WorkerOffer,
     WorkerRole,
-    autonomous_peer_topology,
     autonomous_context_tiers,
+    autonomous_peer_topology,
+    next_autonomous_context_tier,
 )
 
 HASHES = tuple(character * 64 for character in "abcdef")
@@ -42,6 +43,12 @@ def test_autonomous_context_tiers_reject_non_positive_contracts():
             pass
         else:
             raise AssertionError("non-positive context tier contract was accepted")
+
+
+def test_measured_context_limit_selects_highest_strictly_lower_tier():
+    assert next_autonomous_context_tier(32_768, 30_752) == 16_384
+    assert next_autonomous_context_tier(32_768, 8_192) == 8_192
+    assert next_autonomous_context_tier(4_096, 4_095) is None
 
 
 def test_autonomous_topology_forms_sparse_forward_edges_and_decode_closure():
@@ -204,12 +211,14 @@ class FakePublisher:
     def __init__(self) -> None:
         self.states = []
         self.bootstrap = []
+        self.publications = []
 
     def publish_bootstrap_state(self, value):
         self.bootstrap.append(value)
 
     def publish_span_state(self, value, state):
         self.states.append(state)
+        self.publications.append(value)
         return value.model_copy(update={"lease": value.lease.model_copy(update={"state": state})})
 
 
@@ -404,6 +413,60 @@ def test_cold_worker_announces_building_before_executor_reload():
     assert intent.lease.state is SpanState.BUILDING
     assert intent.lease.available_kv_bytes_snapshot == 0
     assert events == [("reload", intent.lease.hosted_span, 1)]
+
+
+def test_cold_worker_republishes_measured_lower_context_without_moving_layers():
+    manifest = model()
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(),
+        leases=(),
+        links=(),
+    )
+    publisher = FakePublisher()
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot),
+        admission=FakeAdmission(),
+        state_publisher=publisher,
+        reload_target=lambda span, generation: None,
+    )
+    joining = advertisement(manifest, "cold-context", 0, 1)
+
+    status = controller.bootstrap(
+        offer=joining.offer,
+        manifest=manifest,
+        context_tokens=10,
+        kv_block_size=1,
+        max_sessions=1,
+        weight_hashes=(HASHES[0],),
+    )
+    deadline = time.monotonic() + 1
+    while status["phase"] != "building" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = controller.bootstrap(
+            offer=joining.offer,
+            manifest=manifest,
+            context_tokens=10,
+            kv_block_size=1,
+            max_sessions=1,
+            weight_hashes=(HASHES[0],),
+        )
+
+    original = publisher.bootstrap[0]
+    downgraded = controller.downgrade_building_context(4)
+
+    assert downgraded["decision"] == "measured_context_downgrade"
+    assert downgraded["context_tokens"] == 4
+    assert downgraded["generation"] == status["generation"]
+    replacement = publisher.publications[-1]
+    assert replacement.lease.hosted_span == original.lease.hosted_span
+    assert replacement.lease.kv_geometry.allocatable_bytes == (
+        replacement.lease.kv_geometry.required_bytes(
+            replacement.lease.hosted_span,
+            4,
+        )
+    )
 
 
 def test_cold_worker_renews_building_intent_until_executor_is_ready():

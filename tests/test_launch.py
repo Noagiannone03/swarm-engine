@@ -1,6 +1,6 @@
-from argparse import Namespace
 import threading
 import time
+from argparse import Namespace
 
 import pytest
 
@@ -11,6 +11,7 @@ from parallax.launch import (
     _prepare_engine_core_generation,
     _update_args_from_shared_state,
     _wait_executors_check_layer_change,
+    _wait_for_contract_replan,
     _wait_for_initial_layer_allocation,
     _wait_for_v3_placement_rollback,
 )
@@ -433,6 +434,41 @@ def test_memory_contract_failure_keeps_heartbeat_generation_alive_for_replan():
 
     assert _wait_executors_check_layer_change(shared_state, [FailedExecutor()]) is True
     assert shared_state.get_status() == ServerState.INITIALIZING.value
+
+
+def test_autonomous_contract_replan_does_not_require_scheduler_epoch_change():
+    shared_state = SharedState(
+        {
+            "_layer_allocation_changed": True,
+            "allocation_epoch": 76,
+            "swarm_v3_context_failure": None,
+        }
+    )
+
+    _wait_for_contract_replan(
+        shared_state,
+        _ProcessState(),
+        require_newer_scheduler_epoch=False,
+    )
+
+
+def test_autonomous_contract_replan_surfaces_terminal_local_capacity_failure():
+    shared_state = SharedState(
+        {
+            "_layer_allocation_changed": False,
+            "swarm_v3_context_failure": {
+                "code": "NoSupportedContextTier",
+                "detail": "measured ceiling below 4096",
+            },
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="below 4096"):
+        _wait_for_contract_replan(
+            shared_state,
+            _ProcessState(),
+            require_newer_scheduler_epoch=False,
+        )
 
 
 def test_v3_load_failure_waits_for_a_new_fenced_rollback_generation():

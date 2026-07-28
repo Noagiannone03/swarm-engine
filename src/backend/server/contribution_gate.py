@@ -2,9 +2,9 @@
 
 This is deliberately not a credit ledger.  The scheduler derives a short-lived
 capability from authenticated live membership on every admission: an account
-may start inference only while it owns at least one initialized worker. During
-the v3 migration, a legacy worker must have a scheduler allocation; an
-autonomous worker must have both a verified READY lease and a live DHT offer.
+may start inference only while it owns at least one initialized worker.  In
+active v3 mode, that means both a verified READY lease and a live DHT offer;
+scheduler-allocated workers are never a product fallback.
 
 Only a SHA-256 account identifier is retained on ``Node`` objects.  The account
 credential itself is accepted from the encrypted worker RPC and the HTTPS
@@ -137,11 +137,13 @@ class ContributionGate:
             report = getattr(node, "swarm_v3", None)
             autonomous = bool(
                 getattr(node, "uses_autonomous_placement", False)
-                or (
-                    isinstance(report, dict)
-                    and report.get("placement_mode") == "autonomous"
-                )
+                or (isinstance(report, dict) and report.get("placement_mode") == "autonomous")
             )
+            if external_workers is not None and not autonomous:
+                # The presence of an authoritative DHT membership provider
+                # means the product is running v3-only.  A stale scheduler
+                # allocation must not unlock consumption.
+                continue
             if autonomous:
                 if external_workers is None or str(node.node_id) not in external_workers:
                     continue
@@ -192,11 +194,7 @@ class ContributionGate:
         product_ready = getattr(scheduler, "product_serving_ready", None)
         serving_ready = bool(
             scheduler is not None
-            and (
-                product_ready()
-                if callable(product_ready)
-                else scheduler.serving_ready()
-            )
+            and (product_ready() if callable(product_ready) else scheduler.serving_ready())
         )
         eligible = self._eligible_workers(scheduler, identity, time.time())
         with self._lock:

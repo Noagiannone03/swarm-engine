@@ -22,8 +22,8 @@ from parallax_utils.logging_config import get_logger
 from scheduling.node import RequestSignal, node_is_routable
 from scheduling.scheduler import Scheduler
 from swarm_protocol.active import ActiveRouteContext, ActiveRouteRuntime
-from swarm_protocol.coordinator import RouteReservationError
 from swarm_protocol.contracts import RecoveryLevel
+from swarm_protocol.coordinator import RouteReservationError
 from swarm_protocol.epochs import InMemoryEpochAllocator, SqliteEpochAllocator
 from swarm_protocol.recovery import (
     InMemoryRecoveryJournal,
@@ -240,9 +240,7 @@ class SchedulerManage:
                     )
                     if self.scheduler is not None and self.swarm_v3_mode == "active"
                     else (
-                        self.scheduler.runtime_memory_contract_ready()
-                        if self.scheduler
-                        else False
+                        self.scheduler.runtime_memory_contract_ready() if self.scheduler else False
                     )
                 ),
                 "max_supported_context_tokens": self.max_supported_context_tokens(),
@@ -385,9 +383,7 @@ class SchedulerManage:
             ),
             require_exact_weight_metadata=True,
             epoch_allocator=self.epoch_allocator,
-            placement_authority=(
-                "worker_dht" if self.swarm_v3_mode == "active" else "scheduler"
-            ),
+            placement_authority=("worker_dht" if self.swarm_v3_mode == "active" else "scheduler"),
         )
 
         # Run the scheduler's event/dispatch loops in background so the process
@@ -527,9 +523,7 @@ class SchedulerManage:
         )
         self.scheduler.external_routes_active = self.active_v3_routes.has_active_routes
         self.scheduler.external_ready_worker_ids = planner.ready_worker_ids
-        planning_context_tokens = int(
-            self.scheduler.layer_allocator.planning_context_tokens
-        )
+        planning_context_tokens = int(self.scheduler.layer_allocator.planning_context_tokens)
         self.scheduler.external_serving_ready = (
             lambda: self.active_v3_routes is not None
             and self.active_v3_routes.route_available(planning_context_tokens)
@@ -680,16 +674,21 @@ class SchedulerManage:
         """Release scheduler capacity as soon as the forwarded HTTP request ends."""
         if self.scheduler is None:
             return False
-        if self.active_v3_routes is not None:
-            return self.active_v3_routes.release(str(request_id))
+        if self.swarm_v3_mode == "active":
+            return bool(
+                self.active_v3_routes is not None and self.active_v3_routes.release(str(request_id))
+            )
         return self.scheduler.release_request(str(request_id))
 
     def is_routing_table_active(self, request_id: str) -> bool:
         """Return whether a dispatched request still owns a live worker route."""
         if self.scheduler is None:
             return False
-        if self.active_v3_routes is not None:
-            return self.active_v3_routes.is_active(str(request_id))
+        if self.swarm_v3_mode == "active":
+            return bool(
+                self.active_v3_routes is not None
+                and self.active_v3_routes.is_active(str(request_id))
+            )
         return self.scheduler.is_request_route_active(str(request_id))
 
     def get_route_authority(self, request_id: str) -> dict[str, object] | None:
@@ -959,8 +958,11 @@ class SchedulerManage:
         """Block until a route can be admitted or the bounded wait expires."""
         if self.scheduler is None:
             return False
-        if self.active_v3_routes is not None:
-            return self.active_v3_routes.wait_for_capacity(timeout)
+        if self.swarm_v3_mode == "active":
+            return bool(
+                self.active_v3_routes is not None
+                and self.active_v3_routes.wait_for_capacity(timeout)
+            )
         return self.scheduler.wait_for_routing_capacity(timeout)
 
     def get_schedule_status(self):
@@ -973,9 +975,7 @@ class SchedulerManage:
 
         # todo rebalance status
         status = (
-            NODE_STATUS_AVAILABLE
-            if self.scheduler.product_serving_ready()
-            else NODE_STATUS_WAITING
+            NODE_STATUS_AVAILABLE if self.scheduler.product_serving_ready() else NODE_STATUS_WAITING
         )
         logger.debug(f"SchedulerManage status queried: {status}")
         return status

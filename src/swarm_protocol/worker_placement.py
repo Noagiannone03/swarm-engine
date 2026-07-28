@@ -205,6 +205,36 @@ def autonomous_context_tiers(
     return tuple(dict.fromkeys(tiers))
 
 
+def next_autonomous_context_tier(
+    requested_tokens: int,
+    supported_tokens: int,
+    *,
+    minimum_tokens: int = 4_096,
+) -> int | None:
+    """Choose the highest bounded tier proved to fit by the live executor.
+
+    Static placement uses the stable pre-load memory envelope, but only the
+    initialized backend can measure its final workspace and KV footprint.  A
+    failed cold join therefore reconciles the worker's own context claim from
+    the measured limit instead of asking the legacy scheduler to resize an
+    autonomous DHT generation.
+    """
+
+    if supported_tokens < 0:
+        raise ValueError("supported context tokens cannot be negative")
+    return next(
+        (
+            tier
+            for tier in autonomous_context_tiers(
+                requested_tokens,
+                minimum_tokens=minimum_tokens,
+            )
+            if tier < requested_tokens and tier <= supported_tokens
+        ),
+        None,
+    )
+
+
 class AutonomousWorkerPlacement:
     """Compose DHT policy, admission drain and the existing executor reload path."""
 
@@ -434,6 +464,58 @@ class AutonomousWorkerPlacement:
                 state = self._materializer.reconcile(decision)
                 self._announce_transition_once(advertisement, state)
         return self._status(state, decision=decision.reason, error=read_error)
+
+    def downgrade_building_context(self, context_tokens: int) -> dict[str, object]:
+        """Republish one non-routable cold join with a measured lower KV tier.
+
+        The layer span and materialization generation remain unchanged: only
+        the worker-local KV claim changes.  ``publish_span_state`` sequences
+        the replacement lease, so concurrent readers cannot mistake it for
+        the previous, larger BUILDING contract.
+        """
+
+        if context_tokens <= 0:
+            raise ValueError("placement context contract must be positive")
+        with self._transition_publish_lock:
+            state = self._materializer.snapshot()
+            if state.phase is not MaterializationPhase.BUILDING:
+                raise RuntimeError("context downgrade requires a BUILDING placement")
+            with self._lock:
+                previous_context = self._context_tokens
+                advertisement = self._transition_advertisement
+            if previous_context is None or context_tokens >= previous_context:
+                raise ValueError("context downgrade must reduce the current contract")
+            if advertisement is None:
+                raise RuntimeError("BUILDING placement has no renewable advertisement")
+
+            geometry = advertisement.lease.kv_geometry
+            adjusted_geometry = geometry.model_copy(
+                update={
+                    "allocatable_bytes": geometry.required_bytes(
+                        advertisement.lease.hosted_span,
+                        context_tokens,
+                    )
+                }
+            )
+            adjusted = advertisement.model_copy(
+                update={
+                    "lease": advertisement.lease.model_copy(
+                        update={"kv_geometry": adjusted_geometry}
+                    )
+                }
+            )
+            transitioned = self._state_publisher.publish_span_state(
+                adjusted,
+                SpanState.BUILDING,
+            )
+            with self._lock:
+                self._context_tokens = context_tokens
+            self._track_transition(transitioned, state)
+        return self._status(
+            state,
+            decision="measured_context_downgrade",
+            error=None,
+        )
 
     @staticmethod
     def _route_survives_without_worker(

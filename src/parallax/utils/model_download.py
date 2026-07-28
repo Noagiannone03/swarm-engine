@@ -394,7 +394,14 @@ def _cached_v3_artifact_index(
 
     catalog_path = target_dir / "catalog.json"
     if not catalog_path.is_file():
-        if os.environ.get("FABI_SWARM_V3_PLACEMENT", "legacy").strip().lower() == "autonomous":
+        placement_mode = os.environ.get("FABI_SWARM_V3_PLACEMENT")
+        if placement_mode is None:
+            placement_mode = (
+                "autonomous"
+                if os.environ.get("FABI_SWARM_V3_MODE", "off").strip().lower() == "active"
+                else "legacy"
+            )
+        if placement_mode.strip().lower() == "autonomous":
             raise RuntimeError("autonomous executor has no authenticated registry catalog cache")
         return None
     try:

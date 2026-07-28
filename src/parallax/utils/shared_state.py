@@ -191,6 +191,7 @@ class SharedState:
         shared_dict["memory_pressure"] = "normal"
         shared_dict["memory_pressure_resources"] = {}
         shared_dict["memory_contract_failure"] = None
+        shared_dict["swarm_v3_context_failure"] = None
         shared_dict["status"] = None
 
         # Create nested shared dict for metrics
