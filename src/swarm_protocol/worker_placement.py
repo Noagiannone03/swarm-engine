@@ -37,6 +37,8 @@ from swarm_protocol.routing import ExactRoutePlanner, RoutePlanningError
 
 logger = logging.getLogger(__name__)
 
+_TRANSITION_REFRESH_INTERVAL_SECONDS = 15.0
+
 
 class PlacementCatalog(Protocol):
     def snapshot(
@@ -127,8 +129,7 @@ def autonomous_peer_topology(
     leases = {
         lease.worker_id: lease
         for lease in snapshot.leases
-        if lease.state in {SpanState.BUILDING, SpanState.READY}
-        and lease.worker_id in offers
+        if lease.state in {SpanState.BUILDING, SpanState.READY} and lease.worker_id in offers
     }
     current = leases.get(worker_id)
     if current is None:
@@ -148,9 +149,7 @@ def autonomous_peer_topology(
         (lease for lease in others if _can_transition(current, lease)),
         key=_rank,
     )
-    predecessors = {
-        lease.worker_id for lease in others if _can_transition(lease, current)
-    }
+    predecessors = {lease.worker_id for lease in others if _can_transition(lease, current)}
 
     # Decode returns sampled tokens from a tail stage to a frontend-capable
     # head.  This closure is a real directed edge in Fabi's cyclic request
@@ -164,11 +163,7 @@ def autonomous_peer_topology(
         ),
         key=_rank,
     )
-    tails = {
-        lease.worker_id
-        for lease in others
-        if lease.hosted_span.end == model_num_layers
-    }
+    tails = {lease.worker_id for lease in others if lease.hosted_span.end == model_num_layers}
     if current.hosted_span.end == model_num_layers:
         successors = heads + [
             lease for lease in successors if lease.worker_id not in {x.worker_id for x in heads}
@@ -176,9 +171,7 @@ def autonomous_peer_topology(
     if current.hosted_span.start == 0 and WorkerRole.FRONTEND in offers[worker_id].supported_roles:
         predecessors.update(tails)
 
-    outbound = tuple(
-        dict.fromkeys(lease.worker_id for lease in successors)
-    )[:max_outbound_peers]
+    outbound = tuple(dict.fromkeys(lease.worker_id for lease in successors))[:max_outbound_peers]
     # Authorizing a signed current model member is cheap and passive.  Do not
     # cap this set with the active probe budget: otherwise a valid predecessor
     # could select us while being rejected solely because of local ordering.
@@ -225,7 +218,10 @@ class AutonomousWorkerPlacement:
         current_span: LayerSpan | None = None,
         policy: AutonomousPlacementPolicy | None = None,
         topology_observer: Callable[[DiscoverySnapshot], None] | None = None,
+        transition_refresh_interval_s: float = _TRANSITION_REFRESH_INTERVAL_SECONDS,
     ) -> None:
+        if transition_refresh_interval_s <= 0:
+            raise ValueError("transition refresh interval must be positive")
         self._catalog = catalog
         self._admission = admission
         self._state_publisher = state_publisher
@@ -246,6 +242,10 @@ class AutonomousWorkerPlacement:
             time.time_ns() // 1_000_000 if current_span is not None else None
         )
         self._announced_transition: tuple[object, ...] | None = None
+        self._transition_advertisement: ModelMemberAdvertisement | None = None
+        self._transition_renewal_thread: threading.Thread | None = None
+        self._transition_refresh_interval_s = transition_refresh_interval_s
+        self._transition_publish_lock = threading.RLock()
         self._error: dict[str, str] | None = None
         self._context_tokens: int | None = None
         self._lock = threading.RLock()
@@ -282,9 +282,7 @@ class AutonomousWorkerPlacement:
         self._refresh_async(manifest.model_swarm_id)
         with self._lock:
             snapshot = (
-                self._snapshot
-                if self._snapshot_model_id == manifest.model_swarm_id
-                else None
+                self._snapshot if self._snapshot_model_id == manifest.model_swarm_id else None
             )
             read_error = self._error
         if snapshot is None:
@@ -313,9 +311,7 @@ class AutonomousWorkerPlacement:
             raise RuntimeError("cold placement policy returned an invalid transition")
 
         span = decision.span
-        rounded_tokens = (
-            (context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
-        )
+        rounded_tokens = (context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
         allocatable_kv_bytes = rounded_tokens * sum(
             manifest.kv_bytes_per_token_by_layer[span.start : span.end]
         )
@@ -346,7 +342,7 @@ class AutonomousWorkerPlacement:
         # across deficits instead of stampeding the same layers.
         self._state_publisher.publish_bootstrap_state(building)
         state = self._materializer.reconcile(decision)
-        self._announced_transition = (state.phase, state.generation, state.target_span)
+        self._track_transition(building, state)
         return self._status(state, decision=decision.reason, error=read_error)
 
     def observe(
@@ -371,24 +367,27 @@ class AutonomousWorkerPlacement:
             and advertisement.lease.state is SpanState.READY
             and advertisement.lease.hosted_span == state.target_span
         ):
-            self._admission.configure(advertisement)
-            state = self._materializer.mark_ready(
-                span=advertisement.lease.hosted_span,
-                generation=state.generation,
-            )
-            self._last_moved_at_ms = time.time_ns() // 1_000_000
-            self._announced_transition = None
+            with self._transition_publish_lock:
+                self._admission.configure(advertisement)
+                state = self._materializer.mark_ready(
+                    span=advertisement.lease.hosted_span,
+                    generation=state.generation,
+                )
+                self._last_moved_at_ms = time.time_ns() // 1_000_000
+                with self._lock:
+                    self._announced_transition = None
+                    self._transition_advertisement = None
         elif state.phase is MaterializationPhase.DRAINING:
-            state = self._materializer.continue_after_drain()
+            with self._transition_publish_lock:
+                state = self._materializer.continue_after_drain()
+                self._announce_transition_once(advertisement, state)
         elif state.phase is MaterializationPhase.READY:
             self._admission.configure(advertisement)
 
         self._refresh_async(manifest.model_swarm_id)
         with self._lock:
             snapshot = (
-                self._snapshot
-                if self._snapshot_model_id == manifest.model_swarm_id
-                else None
+                self._snapshot if self._snapshot_model_id == manifest.model_swarm_id else None
             )
             read_error = self._error
 
@@ -431,8 +430,9 @@ class AutonomousWorkerPlacement:
             now_ms=time.time_ns() // 1_000_000,
         )
         if decision.action in {PlacementAction.JOIN, PlacementAction.MOVE}:
-            state = self._materializer.reconcile(decision)
-            self._announce_transition_once(advertisement, state)
+            with self._transition_publish_lock:
+                state = self._materializer.reconcile(decision)
+                self._announce_transition_once(advertisement, state)
         return self._status(state, decision=decision.reason, error=read_error)
 
     @staticmethod
@@ -457,12 +457,8 @@ class AutonomousWorkerPlacement:
             ExactRoutePlanner().plan(
                 manifest=manifest,
                 request=request,
-                offers=tuple(
-                    offer for offer in snapshot.offers if offer.worker_id != worker_id
-                ),
-                leases=tuple(
-                    lease for lease in snapshot.leases if lease.worker_id != worker_id
-                ),
+                offers=tuple(offer for offer in snapshot.offers if offer.worker_id != worker_id),
+                leases=tuple(lease for lease in snapshot.leases if lease.worker_id != worker_id),
                 links=snapshot.links,
                 snapshot_time_ms=snapshot.captured_at_ms,
                 coordinator_id=worker_id,
@@ -489,10 +485,82 @@ class AutonomousWorkerPlacement:
         state,
     ) -> None:
         key = (state.phase, state.generation, state.target_span)
-        if self._announced_transition == key:
-            return
-        self._state_publisher.publish_span_state(advertisement, SpanState.DRAINING)
-        self._announced_transition = key
+        with self._transition_publish_lock:
+            with self._lock:
+                if self._announced_transition == key:
+                    return
+            span_state = self._span_state_for_phase(state.phase)
+            transitioned = self._state_publisher.publish_span_state(advertisement, span_state)
+            self._track_transition(transitioned, state)
+
+    @staticmethod
+    def _span_state_for_phase(phase: MaterializationPhase) -> SpanState:
+        if phase is MaterializationPhase.DRAINING:
+            return SpanState.DRAINING
+        if phase is MaterializationPhase.BUILDING:
+            return SpanState.BUILDING
+        raise ValueError(f"{phase.value} is not a renewable placement transition")
+
+    def _track_transition(self, advertisement, state) -> None:
+        """Keep non-routable placement intent alive during slow materialization.
+
+        Model downloads and backend initialization can legitimately take much
+        longer than one DHT TTL.  As in Petals' ModuleAnnouncerThread, renewal
+        is therefore owned by a small independent daemon rather than by an
+        executor heartbeat or a guessed loading deadline.
+        """
+
+        key = (state.phase, state.generation, state.target_span)
+        with self._lock:
+            self._announced_transition = key
+            self._transition_advertisement = advertisement
+            if (
+                self._transition_renewal_thread is not None
+                and self._transition_renewal_thread.is_alive()
+            ):
+                return
+            thread = threading.Thread(
+                target=self._renew_transition,
+                name="SwarmV3PlacementAnnouncer",
+                daemon=True,
+            )
+            self._transition_renewal_thread = thread
+            thread.start()
+
+    def _renew_transition(self) -> None:
+        while True:
+            time.sleep(self._transition_refresh_interval_s)
+            with self._transition_publish_lock:
+                state = self._materializer.snapshot()
+                if state.phase not in {
+                    MaterializationPhase.DRAINING,
+                    MaterializationPhase.BUILDING,
+                }:
+                    with self._lock:
+                        self._transition_advertisement = None
+                    continue
+                key = (state.phase, state.generation, state.target_span)
+                with self._lock:
+                    advertisement = self._transition_advertisement
+                    announced = self._announced_transition
+                if advertisement is None:
+                    continue
+                # A phase/generation change must first publish its own exact
+                # transition. Never renew a stale DRAINING value as BUILDING.
+                if announced != key:
+                    continue
+                span_state = self._span_state_for_phase(state.phase)
+                try:
+                    refreshed = self._state_publisher.publish_span_state(
+                        advertisement,
+                        span_state,
+                    )
+                except Exception:  # noqa: BLE001 - asynchronous DHT publication boundary
+                    logger.warning("Autonomous transition renewal failed", exc_info=True)
+                    continue
+                with self._lock:
+                    if self._announced_transition == key:
+                        self._transition_advertisement = refreshed
 
     def _refresh_async(self, model_swarm_id: str) -> None:
         with self._lock:

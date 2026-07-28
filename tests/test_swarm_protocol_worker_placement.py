@@ -93,9 +93,7 @@ def test_autonomous_topology_forms_sparse_forward_edges_and_decode_closure():
 def test_autonomous_topology_never_probes_every_non_adjacent_member():
     manifest = model()
     current = advertisement(manifest, "current", 0, 1)
-    non_adjacent = [
-        advertisement(manifest, f"peer-{index}", 2, 4) for index in range(20)
-    ]
+    non_adjacent = [advertisement(manifest, f"peer-{index}", 2, 4) for index in range(20)]
     snapshot = DiscoverySnapshot(
         captured_at_ms=NOW,
         manifests=(manifest,),
@@ -111,9 +109,7 @@ def test_autonomous_topology_never_probes_every_non_adjacent_member():
     )
 
     assert topology.outbound_worker_ids == ()
-    assert set(topology.authorized_worker_ids) == {
-        item.offer.worker_id for item in non_adjacent
-    }
+    assert set(topology.authorized_worker_ids) == {item.offer.worker_id for item in non_adjacent}
 
 
 def model() -> ModelManifest:
@@ -214,7 +210,7 @@ class FakePublisher:
 
     def publish_span_state(self, value, state):
         self.states.append(state)
-        return value
+        return value.model_copy(update={"lease": value.lease.model_copy(update={"state": state})})
 
 
 class FakeCatalog:
@@ -278,7 +274,7 @@ def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():
         )
 
     assert reloads == [(LayerSpan(start=2, end=4), 1)]
-    assert publisher.states == [SpanState.DRAINING]
+    assert publisher.states == [SpanState.BUILDING]
     assert admission.draining
 
     ready = controller.observe(
@@ -408,3 +404,58 @@ def test_cold_worker_announces_building_before_executor_reload():
     assert intent.lease.state is SpanState.BUILDING
     assert intent.lease.available_kv_bytes_snapshot == 0
     assert events == [("reload", intent.lease.hosted_span, 1)]
+
+
+def test_cold_worker_renews_building_intent_until_executor_is_ready():
+    manifest = model()
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(),
+        leases=(),
+        links=(),
+    )
+    publisher = FakePublisher()
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot),
+        admission=FakeAdmission(),
+        state_publisher=publisher,
+        reload_target=lambda span, generation: None,
+        transition_refresh_interval_s=0.01,
+    )
+    joining = advertisement(manifest, "cold-renewed", 0, 1)
+
+    status = controller.bootstrap(
+        offer=joining.offer,
+        manifest=manifest,
+        context_tokens=10,
+        kv_block_size=1,
+        max_sessions=1,
+        weight_hashes=(HASHES[0],),
+    )
+    deadline = time.monotonic() + 1
+    while status["phase"] != "building" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = controller.bootstrap(
+            offer=joining.offer,
+            manifest=manifest,
+            context_tokens=10,
+            kv_block_size=1,
+            max_sessions=1,
+            weight_hashes=(HASHES[0],),
+        )
+    while len(publisher.states) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert publisher.states[:2] == [SpanState.BUILDING, SpanState.BUILDING]
+    target = publisher.bootstrap[0].lease.hosted_span
+    ready = advertisement(manifest, "cold-renewed", target.start, target.end)
+    result = controller.observe(
+        advertisement=ready,
+        manifest=manifest,
+        context_tokens=10,
+    )
+    assert result["phase"] == "ready"
+    publications_at_ready = len(publisher.states)
+    time.sleep(0.04)
+    assert len(publisher.states) == publications_at_ready

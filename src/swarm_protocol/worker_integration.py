@@ -200,9 +200,17 @@ class WorkerProtocolV3Reporter:
             raise ValueError("READY must come from a freshly verified serving snapshot")
         now_ms = time.time_ns() // 1_000_000
         with self._lock:
+            self._offer_seq = max(self._offer_seq, advertisement.offer.offer_seq) + 1
             self._lease_seq = max(self._lease_seq, advertisement.lease.lease_seq) + 1
             transitioned = advertisement.model_copy(
                 update={
+                    "offer": advertisement.offer.model_copy(
+                        update={
+                            "offer_seq": self._offer_seq,
+                            "issued_at_ms": now_ms,
+                            "expires_at_ms": now_ms + _REPORT_TTL_MS,
+                        }
+                    ),
                     "lease": advertisement.lease.model_copy(
                         update={
                             "state": state,
@@ -211,7 +219,7 @@ class WorkerProtocolV3Reporter:
                             "issued_at_ms": now_ms,
                             "expires_at_ms": now_ms + _REPORT_TTL_MS,
                         }
-                    )
+                    ),
                 }
             )
         self._queue_catalog_publish(transitioned)

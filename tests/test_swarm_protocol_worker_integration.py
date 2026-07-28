@@ -10,8 +10,10 @@ from swarm_protocol import (
     LayerSpan,
     ModelArtifactIndex,
     ModelManifest,
+    ModelMemberAdvertisement,
     ModelRegistryBundle,
     artifact_collection_hash,
+    SpanState,
 )
 from swarm_protocol.worker_integration import (
     WorkerProtocolV3Reporter,
@@ -152,6 +154,28 @@ def test_single_session_worker_advertises_measured_executor_throughput(monkeypat
     lease = ready["advertisement"]["lease"]
     assert lease["measured_prefill_tokens_per_second"] == 1000
     assert lease["measured_decode_tokens_per_second"] == 50
+
+
+def test_transition_refreshes_offer_and_lease_together(monkeypatch, tmp_path):
+    bundle = _bundle(tmp_path)
+    monkeypatch.setattr(
+        "swarm_protocol.worker_integration._local_model_root",
+        lambda *args: tmp_path,
+    )
+    reporter = WorkerProtocolV3Reporter(_Registry(bundle))
+    ready = _wait_report(reporter, _serving())
+    advertisement = ModelMemberAdvertisement.model_validate(ready["advertisement"])
+
+    transitioned = reporter.publish_span_state(advertisement, SpanState.BUILDING)
+
+    assert transitioned.offer.offer_seq > advertisement.offer.offer_seq
+    assert transitioned.offer.issued_at_ms >= advertisement.offer.issued_at_ms
+    assert transitioned.offer.expires_at_ms >= advertisement.offer.expires_at_ms
+    assert transitioned.lease.lease_seq > advertisement.lease.lease_seq
+    assert transitioned.lease.issued_at_ms >= advertisement.lease.issued_at_ms
+    assert transitioned.lease.expires_at_ms >= advertisement.lease.expires_at_ms
+    assert transitioned.lease.state is SpanState.BUILDING
+    assert transitioned.lease.available_kv_bytes_snapshot == 0
 
 
 def test_reallocation_never_starts_concurrent_checkpoint_hashers(monkeypatch, tmp_path):
