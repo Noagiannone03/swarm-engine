@@ -31,6 +31,12 @@ from swarm_protocol.control import (
 )
 from swarm_protocol.epochs import InMemoryRequestEpochFence, RequestEpochFence
 from swarm_protocol.reservations import LocalReservationTable
+from swarm_protocol.route_authority import (
+    AuthorizedRoutePlan,
+    FixedCoordinatorRouteAuthority,
+    RouteAdmissionEnvelope,
+    RoutePlanAuthority,
+)
 
 
 class ExecutionAdmissionError(RuntimeError):
@@ -57,25 +63,33 @@ class WorkerExecutionAdmission:
         *,
         worker_id: str,
         endpoint_id: str,
-        coordinator_endpoint_id: str,
+        coordinator_endpoint_id: str | None = None,
+        route_authority: RoutePlanAuthority | None = None,
         crypto: ControlCrypto,
         clock_ms: Callable[[], int] = _system_clock_ms,
         request_epoch_fence: RequestEpochFence | None = None,
     ) -> None:
-        if not worker_id or not endpoint_id or not coordinator_endpoint_id:
-            raise ValueError("worker, endpoint, and coordinator identities are required")
+        if not worker_id or not endpoint_id:
+            raise ValueError("worker and endpoint identities are required")
+        if route_authority is None:
+            if not coordinator_endpoint_id:
+                raise ValueError("a route authority or coordinator identity is required")
+            route_authority = FixedCoordinatorRouteAuthority(coordinator_endpoint_id)
+        elif coordinator_endpoint_id is not None:
+            raise ValueError("configure either route_authority or coordinator_endpoint_id")
         if crypto.peer_id() != endpoint_id:
             raise ValueError("execution crypto identity does not match the worker endpoint")
         self.worker_id = worker_id
         self.endpoint_id = endpoint_id
         self.coordinator_endpoint_id = coordinator_endpoint_id
+        self.route_authority = route_authority
         self.crypto = crypto
         self._clock_ms = clock_ms
         self._request_epoch_fence = request_epoch_fence or InMemoryRequestEpochFence()
         self._advertisement: ModelMemberAdvertisement | None = None
         self._reservations: LocalReservationTable | None = None
         self._contract_key: tuple[object, ...] | None = None
-        self._plans_by_route_id: dict[str, RoutePlan] = {}
+        self._routes_by_route_id: dict[str, AuthorizedRoutePlan] = {}
         self._highest_epoch_by_request: dict[str, int] = {}
         self._draining = False
         self._lock = threading.RLock()
@@ -132,11 +146,7 @@ class WorkerExecutionAdmission:
             )
             self._advertisement = member
             self._contract_key = contract_key
-            self._plans_by_route_id.clear()
-
-    def _require_caller(self, caller_endpoint_id: str) -> None:
-        if caller_endpoint_id != self.coordinator_endpoint_id:
-            raise PermissionError("only the configured route coordinator may control reservations")
+            self._routes_by_route_id.clear()
 
     def _ready_contract(
         self, now_ms: int
@@ -232,28 +242,27 @@ class WorkerExecutionAdmission:
 
     def prepare(
         self,
-        signed_plan: SignedControlMessage | dict[str, object],
+        signed_plan: SignedControlMessage | RouteAdmissionEnvelope | dict[str, object],
         *,
         caller_endpoint_id: str,
     ) -> SignedControlMessage:
-        self._require_caller(caller_endpoint_id)
         with self._lock:
             now_ms = self._now_ms()
             member, table = self._ready_contract(now_ms)
-            plan = verify_control_contract(
+            authorized_route = self.route_authority.authorize_route(
                 signed_plan,
-                expected_kind=ControlMessageKind.ROUTE_PLAN,
-                expected_signer_endpoint_id=self.coordinator_endpoint_id,
-                contract_type=RoutePlan,
+                caller_endpoint_id=caller_endpoint_id,
                 crypto=self.crypto,
+                now_ms=now_ms,
             )
+            plan = authorized_route.plan
             if plan.reservation_deadline_ms <= now_ms or plan.plan_expires_at_ms <= now_ms:
                 raise ExecutionAdmissionError("route plan reservation window has expired")
             if plan.plan_expires_at_ms > now_ms + _MAX_PLAN_FUTURE_MS:
                 raise ExecutionAdmissionError("route plan expiry exceeds the worker replay bound")
             stage = self._local_stage(plan, member)
             self._request_epoch_fence.advance(
-                coordinator_id=self.coordinator_endpoint_id,
+                coordinator_id=authorized_route.coordinator_endpoint_id,
                 request_id=plan.request_id,
                 epoch=plan.epoch,
                 retain_until_ms=plan.plan_expires_at_ms + _FENCE_CLOCK_SKEW_MS,
@@ -270,13 +279,13 @@ class WorkerExecutionAdmission:
             )
             highest = self._highest_epoch_by_request.get(plan.request_id, -1)
             if plan.epoch > highest:
-                self._plans_by_route_id = {
+                self._routes_by_route_id = {
                     route_id: existing
-                    for route_id, existing in self._plans_by_route_id.items()
-                    if existing.request_id != plan.request_id
+                    for route_id, existing in self._routes_by_route_id.items()
+                    if existing.plan.request_id != plan.request_id
                 }
                 self._highest_epoch_by_request[plan.request_id] = plan.epoch
-            self._plans_by_route_id[plan.route_id] = plan
+            self._routes_by_route_id[plan.route_id] = authorized_route
         return sign_control_contract(
             reservation,
             kind=ControlMessageKind.RESERVATION_LEASE,
@@ -289,20 +298,38 @@ class WorkerExecutionAdmission:
         *,
         caller_endpoint_id: str,
     ) -> SignedControlMessage | None:
-        self._require_caller(caller_endpoint_id)
         now_ms = self._now_ms()
         table = self._configured_table()
+        envelope = (
+            signed_command
+            if isinstance(signed_command, SignedControlMessage)
+            else SignedControlMessage.model_validate(signed_command)
+        )
+        unsigned_command = ReservationCommand.model_validate_json(envelope.payload)
+        with self._lock:
+            route = self._routes_by_route_id.get(unsigned_command.route_id)
+        expected_coordinator = (
+            route.coordinator_endpoint_id if route is not None else caller_endpoint_id
+        )
+        if caller_endpoint_id != expected_coordinator:
+            raise PermissionError("reservation command did not come from the route coordinator")
+        if route is None and not self.route_authority.authorize_unbound_control(caller_endpoint_id):
+            raise PermissionError("reservation command references no authorized route")
         command = verify_control_contract(
-            signed_command,
+            envelope,
             expected_kind=ControlMessageKind.RESERVATION_COMMAND,
-            expected_signer_endpoint_id=self.coordinator_endpoint_id,
+            expected_signer_endpoint_id=expected_coordinator,
             contract_type=ReservationCommand,
             crypto=self.crypto,
         )
+        if route is not None and command.request_id != route.plan.request_id:
+            raise ExecutionAdmissionError(
+                "reservation command request does not match its authorized route"
+            )
         if command.expires_at_ms <= now_ms or command.issued_at_ms > now_ms + 30_000:
             raise ExecutionAdmissionError("reservation command is expired or issued in the future")
         self._request_epoch_fence.advance(
-            coordinator_id=self.coordinator_endpoint_id,
+            coordinator_id=expected_coordinator,
             request_id=command.request_id,
             epoch=command.epoch,
             retain_until_ms=command.expires_at_ms + _FENCE_CLOCK_SKEW_MS,
@@ -316,10 +343,10 @@ class WorkerExecutionAdmission:
                 highest = self._highest_epoch_by_request.get(command.request_id, -1)
                 if command.epoch > highest:
                     self._highest_epoch_by_request[command.request_id] = command.epoch
-                    self._plans_by_route_id = {
-                        route_id: plan
-                        for route_id, plan in self._plans_by_route_id.items()
-                        if plan.request_id != command.request_id
+                    self._routes_by_route_id = {
+                        route_id: authorized
+                        for route_id, authorized in self._routes_by_route_id.items()
+                        if authorized.plan.request_id != command.request_id
                     }
             return None
         assert command.reservation_id is not None
@@ -350,19 +377,20 @@ class WorkerExecutionAdmission:
         with self._lock:
             return () if self._reservations is None else self._reservations.snapshot()
 
-    def _lookup_plan(
+    def _lookup_authorized_route(
         self,
         *,
         request_id: str,
         route_id: str,
         epoch: int,
         routing_table: tuple[str, ...],
-    ) -> RoutePlan:
+    ) -> AuthorizedRoutePlan:
         with self._lock:
-            plan = self._plans_by_route_id.get(route_id)
+            authorized = self._routes_by_route_id.get(route_id)
             highest_epoch = self._highest_epoch_by_request.get(request_id)
-        if plan is None:
+        if authorized is None:
             raise ExecutionAdmissionError("data plane references an unknown route")
+        plan = authorized.plan
         if (
             plan.request_id != request_id
             or plan.epoch != epoch
@@ -370,7 +398,7 @@ class WorkerExecutionAdmission:
             or tuple(stage.worker_id for stage in plan.stages) != routing_table
         ):
             raise ExecutionAdmissionError("data-plane route fence does not match its signed plan")
-        return plan
+        return authorized
 
     def _authorize_plan(
         self,
@@ -382,12 +410,13 @@ class WorkerExecutionAdmission:
     ) -> RoutePlan:
         now_ms = self._now_ms()
         _, table = self._ready_contract(now_ms)
-        plan = self._lookup_plan(
+        authorized = self._lookup_authorized_route(
             request_id=request_id,
             route_id=route_id,
             epoch=epoch,
             routing_table=routing_table,
         )
+        plan = authorized.plan
         reservation = table.get(f"{route_id}:{self.worker_id}")
         if (
             reservation is None
@@ -409,13 +438,20 @@ class WorkerExecutionAdmission:
     ) -> None:
         """Authorize the coordinator's initial request at the route head."""
 
-        self._require_caller(caller_endpoint_id)
         plan = self._authorize_plan(
             request_id=request_id,
             route_id=route_id,
             epoch=epoch,
             routing_table=routing_table,
         )
+        authorized = self._lookup_authorized_route(
+            request_id=request_id,
+            route_id=route_id,
+            epoch=epoch,
+            routing_table=routing_table,
+        )
+        if caller_endpoint_id != authorized.coordinator_endpoint_id:
+            raise PermissionError("frontend request did not come from the route coordinator")
         if plan.stages[0].worker_id != self.worker_id:
             raise ExecutionAdmissionError("frontend request did not reach the route head")
 
@@ -454,11 +490,11 @@ class WorkerExecutionAdmission:
     ) -> None:
         """Authorize route-scoped control emitted by any signed route member."""
 
-        plan = self._lookup_plan(
+        authorized = self._lookup_authorized_route(
             request_id=request_id,
             route_id=route_id,
             epoch=epoch,
             routing_table=routing_table,
         )
-        if caller_endpoint_id not in {stage.endpoint_id for stage in plan.stages}:
+        if caller_endpoint_id not in {stage.endpoint_id for stage in authorized.plan.stages}:
             raise PermissionError("route control did not come from a signed route member")

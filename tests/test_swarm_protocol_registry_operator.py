@@ -15,6 +15,8 @@ from swarm_protocol import (
     ModelArtifactIndex,
     ModelManifest,
     ModelRegistryBundle,
+    RouteAuthorityKey,
+    RouteAuthorityKeyset,
     TrustedModelRegistry,
     artifact_collection_hash,
 )
@@ -168,6 +170,22 @@ def test_staging_registry_initializes_publishes_and_verifies(tmp_path):
     repository = tmp_path / "repository"
     key_dir = tmp_path / "keys"
     bootstrap = tmp_path / "bootstrap-root.json"
+    authority_public_key = "aa" * 32
+    authorities = RouteAuthorityKeyset(
+        generation=1,
+        issued_at_ms=1_000,
+        expires_at_ms=100_000,
+        keys=(
+            RouteAuthorityKey(
+                key_id=hashlib.sha256(bytes.fromhex(authority_public_key)).hexdigest(),
+                public_key=authority_public_key,
+                not_before_ms=1_000,
+                not_after_ms=100_000,
+            ),
+        ),
+    )
+    authorities_path = tmp_path / "route-authorities.json"
+    authorities_path.write_bytes(authorities.canonical_bytes())
 
     assert initialize_staging_registry(
         repository,
@@ -175,6 +193,7 @@ def test_staging_registry_initializes_publishes_and_verifies(tmp_path):
         (bundle_path,),
         PASSPHRASE,
         bootstrap_root_output=bootstrap,
+        route_authority_path=authorities_path,
     ) == (bundle,)
     assert bootstrap.read_bytes() == (repository / "metadata" / "1.root.json").read_bytes()
     if os.name != "nt":
@@ -189,6 +208,7 @@ def test_staging_registry_initializes_publishes_and_verifies(tmp_path):
         key_dir,
         (bundle_path,),
         PASSPHRASE,
+        route_authority_path=authorities_path,
     )
     assert version == 2
     assert published == (bundle,)
@@ -201,6 +221,7 @@ def test_staging_registry_initializes_publishes_and_verifies(tmp_path):
             bootstrap_root=bootstrap.read_bytes(),
         )
         assert client.fetch(bundle.model_swarm_id) == bundle
+        assert client.route_authorities() == authorities
 
 
 def test_staging_registry_refuses_nonempty_repository_before_key_generation(tmp_path):

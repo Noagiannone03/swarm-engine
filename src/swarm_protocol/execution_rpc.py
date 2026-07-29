@@ -7,6 +7,7 @@ from lattica import rpc_method
 from fabi_network.rpc import authenticated_rpc_peer_id
 from swarm_protocol.control import SignedControlMessage
 from swarm_protocol.execution import WorkerExecutionAdmission
+from swarm_protocol.route_authority import RouteAdmissionEnvelope
 
 
 def control_message_to_wire(message: SignedControlMessage) -> dict[str, object]:
@@ -15,6 +16,17 @@ def control_message_to_wire(message: SignedControlMessage) -> dict[str, object]:
         "signer_endpoint_id": message.signer_endpoint_id,
         "payload": message.payload,
         "signature": message.signature,
+    }
+
+
+def route_admission_to_wire(envelope: RouteAdmissionEnvelope) -> dict[str, object]:
+    return {
+        "signed_plan": control_message_to_wire(envelope.signed_plan),
+        "authority_key_id": envelope.authority_key_id,
+        "capability_token": envelope.capability_token,
+        "permit_id": envelope.permit_id,
+        "account_id": envelope.account_id,
+        "recovery_policy": envelope.recovery_policy.value,
     }
 
 

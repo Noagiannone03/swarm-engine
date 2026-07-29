@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from securesystemslib.signer import Signer
 from tuf.api.metadata import (
     Metadata,
@@ -45,6 +47,8 @@ _SERIALIZER = JSONSerializer(compact=True, validate=True)
 _MAX_BUNDLE_BYTES = 32 * 1024 * 1024
 _TOP_LEVEL_ROLES = ("root", "targets", "snapshot", "timestamp")
 _CATALOG_TARGET_PATH = "catalog.json"
+_ROUTE_AUTHORITIES_TARGET_PATH = "route-authorities.json"
+RevocationIdentifierHex = Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
 
 
 class ModelCatalogEntry(ContractModel):
@@ -76,6 +80,71 @@ class ModelRegistryCatalog(ContractModel):
         if len(keys) != len(set(keys)):
             raise ValueError("model catalog contains a duplicate execution identity")
         return self
+
+    def canonical_bytes(self) -> bytes:
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+
+class RouteAuthorityKey(ContractModel):
+    """One Biscuit root key accepted for a bounded wall-clock interval."""
+
+    key_id: HashHex
+    public_key: HashHex
+    not_before_ms: int
+    not_after_ms: int
+
+    @model_validator(mode="after")
+    def validate_key(self) -> "RouteAuthorityKey":
+        expected_key_id = hashlib.sha256(bytes.fromhex(self.public_key)).hexdigest()
+        if self.key_id != expected_key_id:
+            raise ValueError("route authority key ID does not match its public key")
+        if self.not_before_ms < 0 or self.not_after_ms <= self.not_before_ms:
+            raise ValueError("route authority key has an invalid validity interval")
+        return self
+
+
+class RouteAuthorityKeyset(ContractModel):
+    """TUF-authenticated capability keys and emergency revocations."""
+
+    protocol_version: int = PROTOCOL_VERSION
+    generation: int
+    issued_at_ms: int
+    expires_at_ms: int
+    keys: tuple[RouteAuthorityKey, ...]
+    revoked_identifiers: tuple[RevocationIdentifierHex, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_keyset(self) -> "RouteAuthorityKeyset":
+        if self.protocol_version != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version: {self.protocol_version}")
+        if self.generation <= 0:
+            raise ValueError("route authority generation must be positive")
+        if self.issued_at_ms < 0 or self.expires_at_ms <= self.issued_at_ms:
+            raise ValueError("route authority keyset has an invalid validity interval")
+        key_ids = [key.key_id for key in self.keys]
+        if not key_ids:
+            raise ValueError("route authority keyset must contain at least one key")
+        if key_ids != sorted(key_ids) or len(key_ids) != len(set(key_ids)):
+            raise ValueError("route authority keys must be unique and canonically ordered")
+        if tuple(sorted(self.revoked_identifiers)) != self.revoked_identifiers:
+            raise ValueError("route revocations must use canonical ordering")
+        if len(set(self.revoked_identifiers)) != len(self.revoked_identifiers):
+            raise ValueError("route authority keyset contains duplicate revocations")
+        return self
+
+    def active_public_keys(self, now_ms: int) -> dict[str, str]:
+        if now_ms < self.issued_at_ms or now_ms >= self.expires_at_ms:
+            raise ValueError("route authority keyset is not currently valid")
+        return {
+            key.key_id: key.public_key
+            for key in self.keys
+            if key.not_before_ms <= now_ms < key.not_after_ms
+        }
 
     def canonical_bytes(self) -> bytes:
         return json.dumps(
@@ -225,6 +294,7 @@ def _build_root(
 
 def _target_payloads(
     bundles: tuple[ModelRegistryBundle, ...],
+    route_authorities: RouteAuthorityKeyset | None = None,
 ) -> dict[str, bytes]:
     entries = tuple(
         sorted(
@@ -248,6 +318,8 @@ def _target_payloads(
     )
     catalog = ModelRegistryCatalog(models=entries)
     payloads: dict[str, bytes] = {_CATALOG_TARGET_PATH: catalog.canonical_bytes()}
+    if route_authorities is not None:
+        payloads[_ROUTE_AUTHORITIES_TARGET_PATH] = route_authorities.canonical_bytes()
     for bundle in bundles:
         target_path = model_target_path(bundle.model_swarm_id)
         if target_path in payloads:
@@ -282,6 +354,7 @@ class TufRegistryPublisher:
         self,
         bundles: tuple[ModelRegistryBundle, ...],
         *,
+        route_authorities: RouteAuthorityKeyset | None = None,
         now: datetime | None = None,
     ) -> bytes:
         """Create version one and return root bytes to embed out-of-band in clients."""
@@ -297,13 +370,20 @@ class TufRegistryPublisher:
         root_bytes = _sign(root, self.signers.root)
         root.signed.verify_delegate("root", root.signed_bytes, root.signatures)
         _atomic_write(self.metadata_dir / "1.root.json", root_bytes)
-        self._publish_generation(bundles, version=1, root=root, now=current)
+        self._publish_generation(
+            bundles,
+            version=1,
+            root=root,
+            now=current,
+            route_authorities=route_authorities,
+        )
         return root_bytes
 
     def publish(
         self,
         bundles: tuple[ModelRegistryBundle, ...],
         *,
+        route_authorities: RouteAuthorityKeyset | None = None,
         now: datetime | None = None,
     ) -> int:
         """Atomically expose a new complete targets/snapshot/timestamp generation."""
@@ -311,7 +391,13 @@ class TufRegistryPublisher:
         root = self._load_latest_root()
         current_version = self._latest_role_version("targets")
         version = current_version + 1
-        self._publish_generation(bundles, version=version, root=root, now=_utc_now(now))
+        self._publish_generation(
+            bundles,
+            version=version,
+            root=root,
+            now=_utc_now(now),
+            route_authorities=route_authorities,
+        )
         return version
 
     def _publish_generation(
@@ -321,8 +407,9 @@ class TufRegistryPublisher:
         version: int,
         root: Metadata[Root],
         now: datetime,
+        route_authorities: RouteAuthorityKeyset | None,
     ) -> None:
-        payloads = _target_payloads(bundles)
+        payloads = _target_payloads(bundles, route_authorities)
         targets = Metadata(
             Targets(
                 version=version,
@@ -482,6 +569,13 @@ class TrustedModelRegistry:
         """Return the current authenticated human-name to swarm-id catalog."""
 
         return ModelRegistryCatalog.model_validate_json(self._fetch_target(_CATALOG_TARGET_PATH))
+
+    def route_authorities(self) -> RouteAuthorityKeyset:
+        """Return the current TUF-authenticated capability authority keyset."""
+
+        return RouteAuthorityKeyset.model_validate_json(
+            self._fetch_target(_ROUTE_AUTHORITIES_TARGET_PATH)
+        )
 
     def resolve(
         self,

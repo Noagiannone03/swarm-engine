@@ -4,6 +4,7 @@
 //! byte streams. Scheduler membership, routing and model semantics stay in the
 //! Python control plane.
 
+pub mod capability;
 pub mod catalog;
 pub mod catalog_dht;
 pub mod control;

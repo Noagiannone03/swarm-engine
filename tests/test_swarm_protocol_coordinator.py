@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import secrets
 from concurrent.futures import Future
 
 import pytest
@@ -28,6 +29,8 @@ from swarm_protocol.coordinator import (
 )
 from swarm_protocol.execution import WorkerExecutionAdmission
 from swarm_protocol.execution_rpc import control_message_to_wire
+from swarm_protocol.registry import RouteAuthorityKey, RouteAuthorityKeyset
+from swarm_protocol.route_authority import CapabilityRouteAuthority
 
 COORDINATOR = "10" * 32
 HEAD_ENDPOINT = "20" * 32
@@ -264,6 +267,110 @@ def test_coordinator_commits_and_releases_every_stage():
     assert transport.stubs[TAIL_ENDPOINT].native_timeouts == [5.0, 5.0, 5.0, 5.0]
     assert head.snapshot()[0].state == ReservationState.RELEASED
     assert tail.snapshot()[0].state == ReservationState.RELEASED
+
+
+def test_client_coordinator_reserves_a_complete_route_with_one_bounded_capability():
+    pytest.importorskip("fabi_network_native")
+    from backend.server.route_capabilities import (
+        AuthorizedContributionPermit,
+        RouteCapabilityIssuer,
+    )
+    from fabi_network.capability import (
+        RouteRecoveryPolicy,
+        capability_public_key,
+    )
+
+    now = [1_000]
+    private_key = secrets.token_hex(32)
+    public_key = capability_public_key(private_key)
+    authority_key_id = hashlib.sha256(bytes.fromhex(public_key)).hexdigest()
+    route_authority = CapabilityRouteAuthority(authority_public_keys={authority_key_id: public_key})
+    head = WorkerExecutionAdmission(
+        worker_id="head",
+        endpoint_id=HEAD_ENDPOINT,
+        route_authority=route_authority,
+        crypto=SharedCrypto(HEAD_ENDPOINT),
+        clock_ms=lambda: now[0],
+    )
+    tail = WorkerExecutionAdmission(
+        worker_id="tail",
+        endpoint_id=TAIL_ENDPOINT,
+        route_authority=route_authority,
+        crypto=SharedCrypto(TAIL_ENDPOINT),
+        clock_ms=lambda: now[0],
+    )
+    head.configure(
+        ready_member(
+            worker_id="head",
+            endpoint_id=HEAD_ENDPOINT,
+            span=LayerSpan(start=0, end=2),
+            now=now[0],
+        )
+    )
+    tail.configure(
+        ready_member(
+            worker_id="tail",
+            endpoint_id=TAIL_ENDPOINT,
+            span=LayerSpan(start=2, end=4),
+            now=now[0],
+        )
+    )
+    transport = InProcessTransport(
+        {
+            HEAD_ENDPOINT: AdmissionStub(head),
+            TAIL_ENDPOINT: AdmissionStub(tail),
+        }
+    )
+    keyset = RouteAuthorityKeyset(
+        generation=1,
+        issued_at_ms=0,
+        expires_at_ms=100_000,
+        keys=(
+            RouteAuthorityKey(
+                key_id=authority_key_id,
+                public_key=public_key,
+                not_before_ms=0,
+                not_after_ms=100_000,
+            ),
+        ),
+    )
+    issuer = RouteCapabilityIssuer(
+        private_key_hex=private_key,
+        crypto=transport,
+        trusted_keyset=lambda: keyset,
+        clock_ms=lambda: now[0],
+    )
+    permit = AuthorizedContributionPermit(
+        permit_id="60" * 32,
+        account_id="70" * 32,
+        model_swarm_id=SWARM_ID,
+        max_context_tokens=2_000,
+        recovery_policies=frozenset({RouteRecoveryPolicy.REPLAN_COLD}),
+        expires_at_ms=20_000,
+    )
+    coordinator = RouteReservationCoordinator(
+        transport,
+        clock_ms=lambda: now[0],
+        admission_authorizer=lambda signed: issuer.issue(
+            signed,
+            caller_endpoint_id=COORDINATOR,
+            permit=permit,
+            recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+        ).admission,
+    )
+
+    committed = coordinator.reserve(route(now[0]))
+
+    assert [lease.state for lease in committed.leases] == [
+        ReservationState.COMMITTED,
+        ReservationState.COMMITTED,
+    ]
+    coordinator.release(committed)
+    assert all(
+        lease.state == ReservationState.RELEASED
+        for admission in (head, tail)
+        for lease in admission.snapshot()
+    )
 
 
 def test_coordinator_fences_every_superseded_stage_with_newer_epoch():

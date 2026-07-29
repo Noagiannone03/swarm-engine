@@ -32,6 +32,7 @@ from swarm_protocol.model_manifest import build_hub_model_bundle
 from swarm_protocol.registry import (
     ModelRegistryBundle,
     RegistryRoleSigners,
+    RouteAuthorityKeyset,
     TrustedModelRegistry,
     TufRegistryPublisher,
 )
@@ -39,6 +40,7 @@ from swarm_protocol.registry import (
 _KEY_ROLES = ("root", "targets", "snapshot", "timestamp")
 _MAX_SECRET_BYTES = 4096
 _MAX_BUNDLE_BYTES = 32 * 1024 * 1024
+_MAX_ROUTE_AUTHORITY_BYTES = 1024 * 1024
 
 
 def _assert_private_path(path: Path, *, description: str) -> None:
@@ -183,6 +185,16 @@ def load_bundles(paths: Sequence[Path]) -> tuple[ModelRegistryBundle, ...]:
     return tuple(bundles)
 
 
+def load_route_authorities(path: Path | None) -> RouteAuthorityKeyset | None:
+    """Load a bounded public keyset; the TUF targets role signs it on publish."""
+
+    if path is None:
+        return None
+    if path.stat().st_size > _MAX_ROUTE_AUTHORITY_BYTES:
+        raise ValueError("route authority keyset exceeds 1 MiB")
+    return RouteAuthorityKeyset.model_validate_json(path.read_bytes())
+
+
 def _atomic_write_public(path: Path, payload: bytes) -> None:
     """Write a non-secret operator artifact atomically."""
 
@@ -236,6 +248,7 @@ def initialize_staging_registry(
     passphrase: bytes,
     *,
     bootstrap_root_output: Path,
+    route_authority_path: Path | None = None,
 ) -> tuple[ModelRegistryBundle, ...]:
     """Create a fresh 1-of-1 staging authority and its first signed snapshot."""
 
@@ -244,9 +257,13 @@ def initialize_staging_registry(
     if bootstrap_root_output.exists():
         raise FileExistsError(f"refusing to overwrite bootstrap root: {bootstrap_root_output}")
     bundles = load_bundles(bundle_paths)
+    route_authorities = load_route_authorities(route_authority_path)
     signers = generate_staging_keys(key_dir, passphrase)
     try:
-        root = TufRegistryPublisher(repository_dir, signers).initialize(bundles)
+        root = TufRegistryPublisher(repository_dir, signers).initialize(
+            bundles,
+            route_authorities=route_authorities,
+        )
         _atomic_write_public(bootstrap_root_output, root)
     except BaseException:
         # Key deletion is intentionally not automatic here: once an authority has been created,
@@ -260,14 +277,17 @@ def publish_staging_registry(
     key_dir: Path,
     bundle_paths: Sequence[Path],
     passphrase: bytes,
+    *,
+    route_authority_path: Path | None = None,
 ) -> tuple[int, tuple[ModelRegistryBundle, ...]]:
     """Publish a complete new staging snapshot with already-created keys."""
 
     bundles = load_bundles(bundle_paths)
+    route_authorities = load_route_authorities(route_authority_path)
     version = TufRegistryPublisher(
         repository_dir,
         load_staging_keys(key_dir, passphrase),
-    ).publish(bundles)
+    ).publish(bundles, route_authorities=route_authorities)
     return version, bundles
 
 
@@ -318,12 +338,14 @@ def _parser() -> argparse.ArgumentParser:
     initialize.add_argument("--key-dir", type=Path, required=True)
     initialize.add_argument("--bundle", type=Path, action="append", required=True)
     initialize.add_argument("--bootstrap-root-output", type=Path, required=True)
+    initialize.add_argument("--route-authorities", type=Path)
     initialize.add_argument("--passphrase-file", type=Path)
 
     publish = commands.add_parser("publish")
     publish.add_argument("--repository-dir", type=Path, required=True)
     publish.add_argument("--key-dir", type=Path, required=True)
     publish.add_argument("--bundle", type=Path, action="append", required=True)
+    publish.add_argument("--route-authorities", type=Path)
     publish.add_argument("--passphrase-file", type=Path)
 
     verify = commands.add_parser("verify-remote")
@@ -365,6 +387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.bundle,
             _passphrase(args, confirm=True),
             bootstrap_root_output=args.bootstrap_root_output,
+            route_authority_path=args.route_authorities,
         )
         result = {
             "status": "initialized_staging_1_of_1",
@@ -378,6 +401,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.key_dir,
             args.bundle,
             _passphrase(args, confirm=False),
+            route_authority_path=args.route_authorities,
         )
         result = {
             "status": "published",

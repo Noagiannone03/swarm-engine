@@ -22,7 +22,12 @@ from swarm_protocol.control import (
     sign_control_contract,
     verify_control_contract,
 )
-from swarm_protocol.execution_rpc import WorkerExecutionControlService, control_message_to_wire
+from swarm_protocol.execution_rpc import (
+    WorkerExecutionControlService,
+    control_message_to_wire,
+    route_admission_to_wire,
+)
+from swarm_protocol.route_authority import RouteAdmissionEnvelope
 
 
 class RouteReservationError(RuntimeError):
@@ -31,6 +36,9 @@ class RouteReservationError(RuntimeError):
 
 class ControlTransport(ControlCrypto):
     def stub(self, peer_id: str, service: type[object]) -> object: ...
+
+
+RouteAdmissionAuthorizer = Callable[[SignedControlMessage], RouteAdmissionEnvelope]
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,7 @@ class RouteReservationCoordinator:
         clock_ms: Callable[[], int] = _system_clock_ms,
         command_ttl_ms: int = 5_000,
         session_ttl_ms: int = 60_000,
+        admission_authorizer: RouteAdmissionAuthorizer | None = None,
     ) -> None:
         if command_ttl_ms <= 0:
             raise ValueError("command TTL must be positive")
@@ -63,6 +72,7 @@ class RouteReservationCoordinator:
         self._clock_ms = clock_ms
         self.command_ttl_ms = command_ttl_ms
         self.session_ttl_ms = session_ttl_ms
+        self.admission_authorizer = admission_authorizer
 
     def _now_ms(self) -> int:
         now = int(self._clock_ms())
@@ -205,10 +215,15 @@ class RouteReservationCoordinator:
             crypto=self.transport,
         )
         try:
+            prepare_message = (
+                control_message_to_wire(signed_plan)
+                if self.admission_authorizer is None
+                else route_admission_to_wire(self.admission_authorizer(signed_plan))
+            )
             pending = [
                 (
                     stage,
-                    self._stub(stage).prepare(control_message_to_wire(signed_plan)),
+                    self._stub(stage).prepare(prepare_message),
                 )
                 for stage in plan.stages
             ]

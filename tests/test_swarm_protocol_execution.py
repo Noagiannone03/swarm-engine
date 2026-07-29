@@ -35,11 +35,19 @@ from swarm_protocol.execution import (
 )
 from swarm_protocol.epochs import SqliteRequestEpochFence
 from swarm_protocol.reservations import CapacityUnavailable, StaleEpoch
+from swarm_protocol.route_authority import (
+    CapabilityRouteAuthority,
+    RouteAdmissionEnvelope,
+    route_plan_digest,
+)
 
 WORKER_ENDPOINT = "11" * 32
 COORDINATOR_ENDPOINT = "22" * 32
 ATTACKER_ENDPOINT = "33" * 32
 SWARM_ID = "44" * 32
+AUTHORITY_KEY_ID = "77" * 32
+ACCOUNT_ID = "88" * 32
+PERMIT_ID = "99" * 32
 
 
 class FakeCrypto:
@@ -105,7 +113,13 @@ def member(*, now: int, allocatable_bytes: int = 100_000) -> ModelMemberAdvertis
     )
 
 
-def plan(*, now: int, epoch: int = 1, context_tokens: int = 1000) -> RoutePlan:
+def plan(
+    *,
+    now: int,
+    epoch: int = 1,
+    context_tokens: int = 1000,
+    coordinator_endpoint_id: str = COORDINATOR_ENDPOINT,
+) -> RoutePlan:
     rounded = ((context_tokens + 15) // 16) * 16
     return RoutePlan(
         request_id="request",
@@ -127,7 +141,7 @@ def plan(*, now: int, epoch: int = 1, context_tokens: int = 1000) -> RoutePlan:
             ),
         ),
         recovery_level=RecoveryLevel.RESTARTABLE,
-        coordinator_id=COORDINATOR_ENDPOINT,
+        coordinator_id=coordinator_endpoint_id,
         reservation_deadline_ms=now + 5_000,
         plan_expires_at_ms=now + 10_000,
     )
@@ -171,6 +185,22 @@ def signed_plan(route: RoutePlan) -> SignedControlMessage:
         route,
         kind=ControlMessageKind.ROUTE_PLAN,
         crypto=FakeCrypto(COORDINATOR_ENDPOINT),
+    )
+
+
+def capability_envelope(
+    route: RoutePlan,
+    *,
+    capability_token: str = "signed-biscuit",
+) -> RouteAdmissionEnvelope:
+    signed = signed_plan(route)
+    return RouteAdmissionEnvelope(
+        signed_plan=signed,
+        authority_key_id=AUTHORITY_KEY_ID,
+        capability_token=capability_token,
+        permit_id=PERMIT_ID,
+        account_id=ACCOUNT_ID,
+        recovery_policy="replan_cold",
     )
 
 
@@ -437,3 +467,96 @@ def test_drain_atomically_rejects_new_routes_but_allows_existing_release():
         signed_plan(plan(now=now[0], epoch=2)),
         caller_endpoint_id=COORDINATOR_ENDPOINT,
     )
+
+
+def test_capability_authority_binds_dynamic_coordinator_to_exact_plan_and_context():
+    now = [1_000]
+    verified = []
+
+    def verifier(public_key, token, context, revoked):
+        verified.append((public_key, token, context, revoked))
+        return "ab" * 32
+
+    admission = WorkerExecutionAdmission(
+        worker_id="worker",
+        endpoint_id=WORKER_ENDPOINT,
+        route_authority=CapabilityRouteAuthority(
+            authority_public_keys={AUTHORITY_KEY_ID: "authority-public-key"},
+            revoked_identifiers=lambda: ("cd" * 64,),
+            verifier=verifier,
+        ),
+        crypto=FakeCrypto(WORKER_ENDPOINT),
+        clock_ms=lambda: now[0],
+    )
+    admission.configure(member(now=now[0]))
+    route = plan(now=now[0])
+    envelope = capability_envelope(route)
+
+    admission.prepare(envelope, caller_endpoint_id=COORDINATOR_ENDPOINT)
+
+    assert len(verified) == 1
+    public_key, token, context, revoked = verified[0]
+    assert public_key == "authority-public-key"
+    assert token == "signed-biscuit"
+    assert revoked == ("cd" * 64,)
+    assert context.route_plan_digest == route_plan_digest(envelope.signed_plan)
+    assert context.coordinator_endpoint_id == COORDINATOR_ENDPOINT
+    assert context.required_context_tokens == route.required_context_tokens
+    assert context.epoch == route.epoch
+    assert context.account_id == ACCOUNT_ID
+    assert context.permit_id == PERMIT_ID
+
+
+def test_dynamic_admission_rejects_bare_plans_wrong_callers_and_unbound_fences():
+    now = [1_000]
+    authority = CapabilityRouteAuthority(
+        authority_public_keys={AUTHORITY_KEY_ID: "authority-public-key"},
+        verifier=lambda *_: "ab" * 32,
+    )
+    admission = WorkerExecutionAdmission(
+        worker_id="worker",
+        endpoint_id=WORKER_ENDPOINT,
+        route_authority=authority,
+        crypto=FakeCrypto(WORKER_ENDPOINT),
+        clock_ms=lambda: now[0],
+    )
+    admission.configure(member(now=now[0]))
+    route = plan(now=now[0])
+    envelope = capability_envelope(route)
+
+    with pytest.raises(PermissionError, match="requires an authority capability"):
+        admission.prepare(
+            envelope.signed_plan,
+            caller_endpoint_id=COORDINATOR_ENDPOINT,
+        )
+    with pytest.raises(PermissionError, match="caller"):
+        admission.prepare(envelope, caller_endpoint_id=ATTACKER_ENDPOINT)
+
+    admission.prepare(envelope, caller_endpoint_id=COORDINATOR_ENDPOINT)
+    with pytest.raises(PermissionError, match="no authorized route"):
+        admission.apply_command(
+            signed_command(
+                command(
+                    now=now[0],
+                    action=ReservationAction.FENCE,
+                    route_id="unknown-route",
+                    epoch=2,
+                )
+            ),
+            caller_endpoint_id=COORDINATOR_ENDPOINT,
+        )
+
+
+def test_fixed_authority_rejects_a_signed_plan_claiming_another_coordinator():
+    now = [1_000]
+    admission = controller(now)
+    route = plan(
+        now=now[0],
+        coordinator_endpoint_id=ATTACKER_ENDPOINT,
+    )
+
+    with pytest.raises(PermissionError, match="does not match"):
+        admission.prepare(
+            signed_plan(route),
+            caller_endpoint_id=COORDINATOR_ENDPOINT,
+        )

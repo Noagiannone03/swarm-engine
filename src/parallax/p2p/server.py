@@ -1223,6 +1223,7 @@ class GradientServer:
             and self.swarm_v3_reporter.mode == "active"
         ):
             from swarm_protocol.epochs import SqliteRequestEpochFence
+            from swarm_protocol.route_authority import CapabilityRouteAuthority
 
             fence_path = os.environ.get("FABI_SWARM_V3_FENCE_DB")
             if not fence_path:
@@ -1233,12 +1234,32 @@ class GradientServer:
                     )
                 )
                 fence_path = str(state_dir / "request-fences.sqlite3")
+            coordination_mode = (
+                os.environ.get(
+                    "FABI_SWARM_V3_COORDINATION_MODE",
+                    "fixed",
+                )
+                .strip()
+                .lower()
+            )
+            admission_kwargs = {
+                "worker_id": self.iroh_transport.peer_id(),
+                "endpoint_id": self.iroh_transport.peer_id(),
+                "crypto": self.iroh_transport,
+                "request_epoch_fence": SqliteRequestEpochFence(fence_path),
+            }
+            if coordination_mode == "client":
+                admission_kwargs["route_authority"] = (
+                    CapabilityRouteAuthority.from_trusted_registry(self.swarm_v3_reporter.registry)
+                )
+            elif coordination_mode == "fixed":
+                admission_kwargs["coordinator_endpoint_id"] = self.scheduler_peer_id
+            else:
+                raise ValueError(
+                    "FABI_SWARM_V3_COORDINATION_MODE supports only 'fixed' or 'client'"
+                )
             self.swarm_v3_execution_admission = WorkerExecutionAdmission(
-                worker_id=self.iroh_transport.peer_id(),
-                endpoint_id=self.iroh_transport.peer_id(),
-                coordinator_endpoint_id=self.scheduler_peer_id,
-                crypto=self.iroh_transport,
-                request_epoch_fence=SqliteRequestEpochFence(fence_path),
+                **admission_kwargs,
             )
         if getattr(self, "swarm_v3_placement_mode", "legacy") == "autonomous" and (
             getattr(self, "swarm_v3_execution_admission", None) is None

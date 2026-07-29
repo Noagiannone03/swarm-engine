@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -28,6 +28,7 @@ use tracing::{debug, warn};
 
 use crate::{
     ALPN,
+    capability::{self, RouteCapabilityClaims, RouteCapabilityContext},
     catalog::{
         self, CatalogRecordKind, CatalogRecordParams, ValidatedCatalogRecord, sign_catalog_record,
         verify_catalog_record,
@@ -45,6 +46,44 @@ use crate::{
     },
     telemetry,
 };
+
+#[pyfunction(name = "capability_public_key")]
+fn py_capability_public_key(private_key_hex: &str) -> PyResult<String> {
+    capability::capability_public_key(private_key_hex).map_err(py_error)
+}
+
+#[pyfunction(name = "issue_route_capability")]
+fn py_issue_route_capability(private_key_hex: &str, claims_json: &str) -> PyResult<String> {
+    let claims: RouteCapabilityClaims = serde_json::from_str(claims_json)
+        .context("invalid route capability claims")
+        .map_err(py_error)?;
+    capability::issue_route_capability(private_key_hex, &claims).map_err(py_error)
+}
+
+#[pyfunction(name = "verify_route_capability")]
+fn py_verify_route_capability(
+    public_key_hex: &str,
+    token: &str,
+    context_json: &str,
+    revoked_identifiers_hex: Vec<String>,
+) -> PyResult<String> {
+    let context: RouteCapabilityContext = serde_json::from_str(context_json)
+        .context("invalid route capability verification context")
+        .map_err(py_error)?;
+    let revoked_identifiers = revoked_identifiers_hex
+        .into_iter()
+        .map(|identifier| {
+            data_encoding::HEXLOWER
+                .decode(identifier.as_bytes())
+                .context("revocation identifier must be lowercase hexadecimal")
+        })
+        .collect::<Result<BTreeSet<_>>>()
+        .map_err(py_error)?;
+    let verified =
+        capability::verify_route_capability(public_key_hex, token, &context, &revoked_identifiers)
+            .map_err(py_error)?;
+    Ok(data_encoding::HEXLOWER.encode(&verified.root_revocation_id))
+}
 
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
@@ -1467,6 +1506,9 @@ async fn get_connection(
 
 #[pymodule(gil_used = false)]
 fn fabi_network_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(py_capability_public_key, module)?)?;
+    module.add_function(wrap_pyfunction!(py_issue_route_capability, module)?)?;
+    module.add_function(wrap_pyfunction!(py_verify_route_capability, module)?)?;
     module.add_function(wrap_pyfunction!(create_relay_enrollment_proof, module)?)?;
     module.add_class::<PyNetworkNode>()?;
     module.add_class::<PyCatalogRecord>()?;

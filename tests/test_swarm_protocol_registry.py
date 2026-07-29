@@ -21,6 +21,8 @@ from swarm_protocol import (
     ModelRegistryBundle,
     RegistryExpiryPolicy,
     RegistryRoleSigners,
+    RouteAuthorityKey,
+    RouteAuthorityKeyset,
     TrustedModelRegistry,
     TufRegistryPublisher,
     artifact_collection_hash,
@@ -67,6 +69,24 @@ def _bundle(*, tokenizer_bytes: bytes = b"tokenizer") -> ModelRegistryBundle:
         wire_protocol_version=1,
     )
     return ModelRegistryBundle(manifest=manifest, artifact_index=index)
+
+
+def _route_authorities() -> RouteAuthorityKeyset:
+    public_key = "aa" * 32
+    return RouteAuthorityKeyset(
+        generation=3,
+        issued_at_ms=1_000,
+        expires_at_ms=100_000,
+        keys=(
+            RouteAuthorityKey(
+                key_id=hashlib.sha256(bytes.fromhex(public_key)).hexdigest(),
+                public_key=public_key,
+                not_before_ms=500,
+                not_after_ms=90_000,
+            ),
+        ),
+        revoked_identifiers=("bb" * 64,),
+    )
 
 
 def _signers(*, root_threshold: int = 1) -> RegistryRoleSigners:
@@ -133,9 +153,56 @@ def test_tuf_registry_authenticates_bundle_and_survives_root_rotation(tmp_path):
         # The original embedded root follows the dual-signed chain and accepts the new roles.
         assert client.fetch(bundle.model_swarm_id) == bundle
         assert not projected_root.is_symlink()
-        assert projected_root.read_bytes() == (
-            repository / "metadata" / "2.root.json"
-        ).read_bytes()
+        assert projected_root.read_bytes() == (repository / "metadata" / "2.root.json").read_bytes()
+
+
+def test_tuf_registry_authenticates_route_authority_rotation_and_revocations(tmp_path):
+    repository = tmp_path / "repository"
+    publisher = TufRegistryPublisher(repository, _signers())
+    bundle = _bundle()
+    keyset = _route_authorities()
+    root_bytes = publisher.initialize((bundle,), route_authorities=keyset)
+
+    with _serve(repository) as base_url:
+        client = _client(tmp_path / "client", base_url, root_bytes)
+        trusted = client.route_authorities()
+        assert trusted == keyset
+        assert trusted.active_public_keys(50_000) == {
+            keyset.keys[0].key_id: keyset.keys[0].public_key
+        }
+        assert trusted.revoked_identifiers == ("bb" * 64,)
+
+        rotated_key = "cc" * 32
+        rotated = RouteAuthorityKeyset(
+            generation=4,
+            issued_at_ms=50_000,
+            expires_at_ms=150_000,
+            keys=(
+                RouteAuthorityKey(
+                    key_id=hashlib.sha256(bytes.fromhex(rotated_key)).hexdigest(),
+                    public_key=rotated_key,
+                    not_before_ms=50_000,
+                    not_after_ms=140_000,
+                ),
+            ),
+            revoked_identifiers=("bb" * 64, "dd" * 64),
+        )
+        assert publisher.publish((bundle,), route_authorities=rotated) == 2
+        assert client.route_authorities() == rotated
+
+
+def test_route_authority_keyset_rejects_substituted_key_ids_and_stale_windows():
+    with pytest.raises(ValueError, match="key ID"):
+        RouteAuthorityKey(
+            key_id="00" * 32,
+            public_key="aa" * 32,
+            not_before_ms=1,
+            not_after_ms=2,
+        )
+
+    keyset = _route_authorities()
+    with pytest.raises(ValueError, match="not currently valid"):
+        keyset.active_public_keys(keyset.expires_at_ms)
 
 
 def test_tuf_registry_rejects_target_tampering(tmp_path):
