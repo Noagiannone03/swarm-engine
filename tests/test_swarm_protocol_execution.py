@@ -192,6 +192,8 @@ def capability_envelope(
     route: RoutePlan,
     *,
     capability_token: str = "signed-biscuit",
+    authorization_generation: int = 0,
+    expires_at_ms: int | None = None,
 ) -> RouteAdmissionEnvelope:
     signed = signed_plan(route)
     return RouteAdmissionEnvelope(
@@ -200,6 +202,8 @@ def capability_envelope(
         capability_token=capability_token,
         permit_id=PERMIT_ID,
         account_id=ACCOUNT_ID,
+        authorization_generation=authorization_generation,
+        expires_at_ms=expires_at_ms or route.plan_expires_at_ms + 60_000,
         recovery_policy="replan_cold",
     )
 
@@ -543,6 +547,73 @@ def test_dynamic_admission_rejects_bare_plans_wrong_callers_and_unbound_fences()
                     epoch=2,
                 )
             ),
+            caller_endpoint_id=COORDINATOR_ENDPOINT,
+        )
+
+
+def test_dynamic_route_renewal_requires_current_authority_and_bounds_worker_ttl():
+    now = [1_000]
+    admission = WorkerExecutionAdmission(
+        worker_id="worker",
+        endpoint_id=WORKER_ENDPOINT,
+        route_authority=CapabilityRouteAuthority(
+            authority_public_keys={AUTHORITY_KEY_ID: "authority-public-key"},
+            verifier=lambda *_: "ab" * 32,
+        ),
+        crypto=FakeCrypto(WORKER_ENDPOINT),
+        clock_ms=lambda: now[0],
+    )
+    admission.configure(member(now=now[0]))
+    route = plan(now=now[0])
+    admission.prepare(
+        capability_envelope(route),
+        caller_endpoint_id=COORDINATOR_ENDPOINT,
+    )
+    admission.apply_command(
+        signed_command(command(now=now[0], action=ReservationAction.COMMIT)),
+        caller_endpoint_id=COORDINATOR_ENDPOINT,
+    )
+    renewal = signed_command(command(now=now[0], action=ReservationAction.RENEW, ttl_ms=5_000))
+
+    with pytest.raises(PermissionError, match="fresh authority"):
+        admission.apply_command(
+            renewal,
+            caller_endpoint_id=COORDINATOR_ENDPOINT,
+        )
+
+    refreshed = capability_envelope(
+        route,
+        authorization_generation=1,
+        expires_at_ms=now[0] + 10_000,
+    )
+    admission.apply_command(
+        {
+            "signed_command": renewal.model_dump(mode="python"),
+            "admission": refreshed.model_dump(mode="python"),
+        },
+        caller_endpoint_id=COORDINATOR_ENDPOINT,
+    )
+    assert admission.snapshot()[0].expires_at_ms == now[0] + 5_000
+
+    with pytest.raises(PermissionError, match="moved backwards"):
+        admission.apply_command(
+            {
+                "signed_command": renewal.model_dump(mode="python"),
+                "admission": capability_envelope(route).model_dump(mode="python"),
+            },
+            caller_endpoint_id=COORDINATOR_ENDPOINT,
+        )
+
+    with pytest.raises(PermissionError, match="outlive"):
+        admission.apply_command(
+            {
+                "signed_command": renewal.model_dump(mode="python"),
+                "admission": capability_envelope(
+                    route,
+                    authorization_generation=2,
+                    expires_at_ms=now[0] + 4_999,
+                ).model_dump(mode="python"),
+            },
             caller_endpoint_id=COORDINATOR_ENDPOINT,
         )
 

@@ -26,6 +26,7 @@ from swarm_protocol.execution_rpc import (
     WorkerExecutionControlService,
     control_message_to_wire,
     route_admission_to_wire,
+    route_renewal_to_wire,
 )
 from swarm_protocol.route_authority import RouteAdmissionEnvelope
 
@@ -39,6 +40,7 @@ class ControlTransport(ControlCrypto):
 
 
 RouteAdmissionAuthorizer = Callable[[SignedControlMessage], RouteAdmissionEnvelope]
+RouteRenewalAuthorizer = Callable[[SignedControlMessage], RouteAdmissionEnvelope]
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class RouteReservationCoordinator:
         command_ttl_ms: int = 5_000,
         session_ttl_ms: int = 60_000,
         admission_authorizer: RouteAdmissionAuthorizer | None = None,
+        renewal_authorizer: RouteRenewalAuthorizer | None = None,
     ) -> None:
         if command_ttl_ms <= 0:
             raise ValueError("command TTL must be positive")
@@ -73,6 +76,7 @@ class RouteReservationCoordinator:
         self.command_ttl_ms = command_ttl_ms
         self.session_ttl_ms = session_ttl_ms
         self.admission_authorizer = admission_authorizer
+        self.renewal_authorizer = renewal_authorizer
 
     def _now_ms(self) -> int:
         now = int(self._clock_ms())
@@ -181,23 +185,22 @@ class RouteReservationCoordinator:
         stages: tuple[RouteStage, ...],
         action: ReservationAction,
         ttl_ms: int | None = None,
+        admission: RouteAdmissionEnvelope | None = None,
     ) -> list[tuple[RouteStage, object]]:
-        pending = [
-            (
-                stage,
-                self._stub(stage).command(
-                    control_message_to_wire(
-                        self._command(
-                            plan=plan,
-                            stage=stage,
-                            action=action,
-                            ttl_ms=ttl_ms,
-                        )
-                    )
-                ),
+        pending = []
+        for stage in stages:
+            command = self._command(
+                plan=plan,
+                stage=stage,
+                action=action,
+                ttl_ms=ttl_ms,
             )
-            for stage in stages
-        ]
+            wire = (
+                route_renewal_to_wire(command, admission)
+                if admission is not None
+                else control_message_to_wire(command)
+            )
+            pending.append((stage, self._stub(stage).command(wire)))
         return self._resolve_all(pending, operation=action.value)
 
     def reserve(self, plan: RoutePlan) -> CommittedRoute:
@@ -292,11 +295,20 @@ class RouteReservationCoordinator:
     def renew(self, route: CommittedRoute, *, ttl_ms: int) -> CommittedRoute:
         if ttl_ms <= 0:
             raise ValueError("renew TTL must be positive")
+        admission = None
+        if self.renewal_authorizer is not None:
+            signed_plan = sign_control_contract(
+                route.plan,
+                kind=ControlMessageKind.ROUTE_PLAN,
+                crypto=self.transport,
+            )
+            admission = self.renewal_authorizer(signed_plan)
         renewed = self._send_command(
             plan=route.plan,
             stages=route.plan.stages,
             action=ReservationAction.RENEW,
             ttl_ms=ttl_ms,
+            admission=admission,
         )
         leases = tuple(
             self._verify_lease(

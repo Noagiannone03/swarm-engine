@@ -77,10 +77,11 @@ class FakeAuthority:
         self.permits = []
         self.capabilities = []
         self.released = []
+        self.current_permit = None
 
     def issue_permit(self, **kwargs):
         self.permits.append(kwargs)
-        return RoutePermitGrant(
+        permit = RoutePermitGrant(
             permit_id=PERMIT,
             request_id=kwargs["request_id"],
             coordinator_endpoint_id=kwargs["coordinator_endpoint_id"],
@@ -90,6 +91,21 @@ class FakeAuthority:
             issued_at_ms=1_000,
             expires_at_ms=121_000,
         )
+        self.current_permit = permit
+        return permit
+
+    def keepalive_permit(self, permit_id, *, ttl_ms, idempotency_key):
+        assert permit_id == PERMIT
+        assert ttl_ms > 0
+        assert idempotency_key
+        assert self.current_permit is not None
+        self.current_permit = self.current_permit.model_copy(
+            update={
+                "authorization_generation": (self.current_permit.authorization_generation + 1),
+                "expires_at_ms": self.current_permit.expires_at_ms + ttl_ms,
+            }
+        )
+        return self.current_permit
 
     def issue_capability(self, *, permit_id, signed_plan, recovery_policy):
         self.capabilities.append((permit_id, signed_plan, recovery_policy))
@@ -100,6 +116,8 @@ class FakeAuthority:
                 capability_token="signed-biscuit",
                 permit_id=permit_id,
                 account_id=ACCOUNT,
+                authorization_generation=self.current_permit.authorization_generation,
+                expires_at_ms=self.current_permit.expires_at_ms,
                 recovery_policy=recovery_policy,
             ),
             expires_at_ms=11_000,
@@ -112,9 +130,10 @@ class FakeAuthority:
 
 
 class FakeCoordinator:
-    def __init__(self, transport, authorizer):
+    def __init__(self, transport, authorizer, renewal_authorizer):
         self.transport = transport
         self.authorizer = authorizer
+        self.renewal_authorizer = renewal_authorizer
         self.released = []
         self.renew_calls = []
         self.renew_errors = []
@@ -131,6 +150,12 @@ class FakeCoordinator:
 
     def renew(self, route, *, ttl_ms):
         assert ttl_ms > 0
+        signed = sign_control_contract(
+            route.plan,
+            kind=ControlMessageKind.ROUTE_PLAN,
+            crypto=self.transport,
+        )
+        self.renewal_authorizer(signed)
         self.renew_calls.append((route.plan.route_id, ttl_ms))
         if self.on_renew is not None:
             self.on_renew()
@@ -187,8 +212,8 @@ def test_request_agent_plans_from_dht_and_coordinates_with_its_own_identity():
     authority = FakeAuthority()
     coordinators = []
 
-    def coordinator_factory(transport, authorizer):
-        coordinator = FakeCoordinator(transport, authorizer)
+    def coordinator_factory(transport, authorizer, renewal_authorizer):
+        coordinator = FakeCoordinator(transport, authorizer, renewal_authorizer)
         coordinators.append(coordinator)
         return coordinator
 
@@ -266,8 +291,8 @@ def lease_runtime():
     coordinators = []
     steady_clock = MutableClock()
 
-    def coordinator_factory(transport, authorizer):
-        coordinator = FakeCoordinator(transport, authorizer)
+    def coordinator_factory(transport, authorizer, renewal_authorizer):
+        coordinator = FakeCoordinator(transport, authorizer, renewal_authorizer)
         coordinators.append(coordinator)
         return coordinator
 
@@ -313,6 +338,22 @@ def test_request_agent_renews_due_lease_from_independent_maintenance_tick():
     route_status = runtime.status()["active_routes"][0]
     assert route_status["lease_expires_in_ms"] == 60
     assert route_status["renewal_failures"] == 0
+
+
+def test_explicit_control_acks_keep_a_silent_generation_alive_past_initial_ttl():
+    runtime, reservation, authority, coordinator, steady_clock = lease_runtime()
+
+    for now_ms in range(20, 221, 20):
+        steady_clock.now_ms = now_ms
+        runtime.maintain_once()
+
+    assert len(coordinator.renew_calls) == 11
+    assert all(
+        call == (reservation.committed.plan.route_id, 60) for call in coordinator.renew_calls
+    )
+    assert authority.current_permit.authorization_generation == 11
+    assert runtime.active_reservation("lease-request") is not None
+    assert runtime.status()["active_routes"][0]["lease_expires_in_ms"] == 60
 
 
 def test_request_agent_retries_transient_renewal_only_inside_safe_window():

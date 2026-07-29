@@ -12,7 +12,7 @@ import threading
 import time
 import unicodedata
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -65,6 +65,8 @@ class AuthorizedContributionPermit:
     recovery_policies: frozenset[RouteRecoveryPolicy]
     issued_at_ms: int
     expires_at_ms: int
+    authorization_generation: int = 0
+    initial_ttl_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,7 @@ class RouteCapabilityIssuance:
     root_revocation_id: str
     recovery_policy: RouteRecoveryPolicy
     expires_at_ms: int
+    authorization_generation: int = 0
 
 
 def _system_clock_ms() -> int:
@@ -146,6 +149,8 @@ class SqliteRoutePermitLedger:
                 recovery_policies_json TEXT NOT NULL,
                 issued_at_ms INTEGER NOT NULL,
                 expires_at_ms INTEGER NOT NULL,
+                authorization_generation INTEGER NOT NULL DEFAULT 0,
+                initial_ttl_ms INTEGER NOT NULL,
                 state TEXT NOT NULL,
                 current_epoch INTEGER NOT NULL DEFAULT 0,
                 current_plan_digest TEXT,
@@ -168,7 +173,48 @@ class SqliteRoutePermitLedger:
             );
             CREATE INDEX IF NOT EXISTS route_capability_revocations
                 ON route_capability_issuances(root_revocation_id);
+            CREATE TABLE IF NOT EXISTS route_capability_refresh_issuances (
+                permit_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL,
+                authorization_generation INTEGER NOT NULL,
+                route_plan_digest TEXT NOT NULL,
+                authority_key_id TEXT NOT NULL,
+                capability_token TEXT NOT NULL,
+                root_revocation_id TEXT NOT NULL,
+                recovery_policy TEXT NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(permit_id, epoch, authorization_generation),
+                FOREIGN KEY(permit_id) REFERENCES route_permits(permit_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS route_capability_refresh_revocations
+                ON route_capability_refresh_issuances(root_revocation_id);
+            CREATE TABLE IF NOT EXISTS route_permit_keepalives (
+                permit_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                ttl_ms INTEGER NOT NULL,
+                authorization_generation INTEGER NOT NULL,
+                expires_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(permit_id, idempotency_key),
+                FOREIGN KEY(permit_id) REFERENCES route_permits(permit_id)
+                    ON DELETE CASCADE
+            );
             """)
+        columns = {
+            str(row["name"]) for row in self._connection.execute("PRAGMA table_info(route_permits)")
+        }
+        if "authorization_generation" not in columns:
+            self._connection.execute(
+                "ALTER TABLE route_permits "
+                "ADD COLUMN authorization_generation INTEGER NOT NULL DEFAULT 0"
+            )
+        if "initial_ttl_ms" not in columns:
+            self._connection.execute("ALTER TABLE route_permits ADD COLUMN initial_ttl_ms INTEGER")
+            self._connection.execute(
+                "UPDATE route_permits "
+                "SET initial_ttl_ms = expires_at_ms - issued_at_ms "
+                "WHERE initial_ttl_ms IS NULL"
+            )
         self._lock = threading.RLock()
 
     def _now_ms(self) -> int:
@@ -202,6 +248,23 @@ class SqliteRoutePermitLedger:
                 now_ms,
             ),
         )
+        self._connection.execute(
+            "DELETE FROM route_capability_issuances WHERE expires_at_ms <= ?",
+            (now_ms,),
+        )
+        self._connection.execute(
+            "DELETE FROM route_capability_refresh_issuances WHERE expires_at_ms <= ?",
+            (now_ms,),
+        )
+        self._connection.execute(
+            """
+            DELETE FROM route_permit_keepalives
+            WHERE permit_id IN (
+                SELECT permit_id FROM route_permits WHERE state != ?
+            )
+            """,
+            (RoutePermitState.ACTIVE.value,),
+        )
 
     @staticmethod
     def _permit(row: sqlite3.Row) -> AuthorizedContributionPermit:
@@ -218,6 +281,8 @@ class SqliteRoutePermitLedger:
             recovery_policies=policies,
             issued_at_ms=int(row["issued_at_ms"]),
             expires_at_ms=int(row["expires_at_ms"]),
+            authorization_generation=int(row["authorization_generation"]),
+            initial_ttl_ms=int(row["initial_ttl_ms"]),
         )
 
     @staticmethod
@@ -231,7 +296,100 @@ class SqliteRoutePermitLedger:
             root_revocation_id=str(row["root_revocation_id"]),
             recovery_policy=RouteRecoveryPolicy(str(row["recovery_policy"])),
             expires_at_ms=int(row["expires_at_ms"]),
+            authorization_generation=int(row["authorization_generation"]),
         )
+
+    def keepalive_owned(
+        self,
+        permit_id: str,
+        account_id: str,
+        *,
+        ttl_ms: int,
+        idempotency_key: str,
+    ) -> AuthorizedContributionPermit:
+        """Extend one live permit exactly once for an idempotent keepalive."""
+
+        _validate_hash(permit_id, "permit ID")
+        _validate_hash(account_id, "account ID")
+        _validate_request_id(idempotency_key)
+        if ttl_ms <= 0 or ttl_ms > 300_000:
+            raise ValueError("route permit keepalive TTL must be between 1 ms and 5 minutes")
+        now_ms = self._now_ms()
+        with self._transaction():
+            self._expire(now_ms)
+            previous = self._connection.execute(
+                """
+                SELECT ttl_ms, authorization_generation, expires_at_ms
+                FROM route_permit_keepalives
+                WHERE permit_id = ? AND idempotency_key = ?
+                """,
+                (permit_id, idempotency_key),
+            ).fetchone()
+            if previous is not None:
+                if int(previous["ttl_ms"]) != ttl_ms:
+                    raise RoutePermitConflict(
+                        "permit keepalive idempotency key was reused with a different TTL"
+                    )
+                row = self._connection.execute(
+                    "SELECT * FROM route_permits WHERE permit_id = ? AND account_id = ?",
+                    (permit_id, account_id),
+                ).fetchone()
+                if row is None:
+                    raise RoutePermitError("unknown route permit")
+                if row["state"] != RoutePermitState.ACTIVE.value:
+                    raise RoutePermitExpired(f"route permit is {row['state']}")
+                return replace(
+                    self._permit(row),
+                    authorization_generation=int(previous["authorization_generation"]),
+                    expires_at_ms=int(previous["expires_at_ms"]),
+                )
+
+            row = self._connection.execute(
+                "SELECT * FROM route_permits WHERE permit_id = ? AND account_id = ?",
+                (permit_id, account_id),
+            ).fetchone()
+            if row is None:
+                raise RoutePermitError("unknown route permit")
+            if row["state"] != RoutePermitState.ACTIVE.value:
+                raise RoutePermitExpired(f"route permit is {row['state']}")
+            generation = int(row["authorization_generation"]) + 1
+            expires_at_ms = now_ms + ttl_ms
+            self._connection.execute(
+                """
+                UPDATE route_permits
+                SET expires_at_ms = ?, authorization_generation = ?
+                WHERE permit_id = ? AND account_id = ? AND state = ?
+                """,
+                (
+                    expires_at_ms,
+                    generation,
+                    permit_id,
+                    account_id,
+                    RoutePermitState.ACTIVE.value,
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO route_permit_keepalives(
+                    permit_id, idempotency_key, ttl_ms,
+                    authorization_generation, expires_at_ms
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (permit_id, idempotency_key, ttl_ms, generation, expires_at_ms),
+            )
+            self._connection.execute(
+                """
+                DELETE FROM route_permit_keepalives
+                WHERE permit_id = ? AND authorization_generation < ?
+                """,
+                (permit_id, max(0, generation - 32)),
+            )
+            renewed = self._connection.execute(
+                "SELECT * FROM route_permits WHERE permit_id = ?",
+                (permit_id,),
+            ).fetchone()
+            assert renewed is not None
+            return self._permit(renewed)
 
     def get_active(self, permit_id: str) -> AuthorizedContributionPermit:
         _validate_hash(permit_id, "permit ID")
@@ -364,8 +522,8 @@ class SqliteRoutePermitLedger:
                 INSERT INTO route_permits(
                     permit_id, account_id, request_id, coordinator_endpoint_id,
                     model_swarm_id, max_context_tokens, recovery_policies_json,
-                    issued_at_ms, expires_at_ms, state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    issued_at_ms, expires_at_ms, initial_ttl_ms, state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     identifier,
@@ -377,6 +535,7 @@ class SqliteRoutePermitLedger:
                     policies_json,
                     now_ms,
                     expires_at_ms,
+                    ttl_ms,
                     RoutePermitState.ACTIVE.value,
                 ),
             )
@@ -487,7 +646,8 @@ class SqliteRoutePermitLedger:
             self._expire(now_ms)
             row = self._connection.execute(
                 """
-                SELECT current_epoch, current_plan_digest, state
+                SELECT current_epoch, current_plan_digest, state,
+                       authorization_generation
                 FROM route_permits WHERE permit_id = ?
                 """,
                 (claim.permit.permit_id,),
@@ -497,41 +657,83 @@ class SqliteRoutePermitLedger:
                 or row["state"] != RoutePermitState.ACTIVE.value
                 or int(row["current_epoch"]) != claim.epoch
                 or row["current_plan_digest"] != claim.route_plan_digest
+                or int(row["authorization_generation"]) != claim.permit.authorization_generation
             ):
                 raise RoutePermitConflict("route permit moved before capability persistence")
             self._connection.execute(
-                """
-                INSERT INTO route_capability_issuances(
-                    permit_id, epoch, route_plan_digest,
-                    authority_key_id, capability_token, root_revocation_id,
-                    recovery_policy, expires_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(permit_id, epoch) DO NOTHING
-                """,
                 (
-                    claim.permit.permit_id,
-                    claim.epoch,
-                    claim.route_plan_digest,
-                    authority_key_id,
-                    capability_token,
-                    root_revocation_id,
-                    recovery_policy.value,
-                    expires_at_ms,
+                    """
+                    INSERT INTO route_capability_issuances(
+                        permit_id, epoch, route_plan_digest,
+                        authority_key_id, capability_token, root_revocation_id,
+                        recovery_policy, expires_at_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(permit_id, epoch) DO NOTHING
+                    """
+                    if claim.permit.authorization_generation == 0
+                    else """
+                    INSERT INTO route_capability_refresh_issuances(
+                        permit_id, epoch, authorization_generation,
+                        route_plan_digest, authority_key_id, capability_token,
+                        root_revocation_id, recovery_policy, expires_at_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(permit_id, epoch, authorization_generation) DO NOTHING
+                    """
+                ),
+                (
+                    (
+                        claim.permit.permit_id,
+                        claim.epoch,
+                        claim.route_plan_digest,
+                        authority_key_id,
+                        capability_token,
+                        root_revocation_id,
+                        recovery_policy.value,
+                        expires_at_ms,
+                    )
+                    if claim.permit.authorization_generation == 0
+                    else (
+                        claim.permit.permit_id,
+                        claim.epoch,
+                        claim.permit.authorization_generation,
+                        claim.route_plan_digest,
+                        authority_key_id,
+                        capability_token,
+                        root_revocation_id,
+                        recovery_policy.value,
+                        expires_at_ms,
+                    )
                 ),
             )
-            persisted_row = self._connection.execute(
-                """
-                SELECT * FROM route_capability_issuances
-                WHERE permit_id = ? AND epoch = ?
-                """,
-                (claim.permit.permit_id, claim.epoch),
-            ).fetchone()
+            if claim.permit.authorization_generation == 0:
+                persisted_row = self._connection.execute(
+                    """
+                    SELECT *, 0 AS authorization_generation
+                    FROM route_capability_issuances
+                    WHERE permit_id = ? AND epoch = ?
+                    """,
+                    (claim.permit.permit_id, claim.epoch),
+                ).fetchone()
+            else:
+                persisted_row = self._connection.execute(
+                    """
+                    SELECT * FROM route_capability_refresh_issuances
+                    WHERE permit_id = ? AND epoch = ?
+                      AND authorization_generation = ?
+                    """,
+                    (
+                        claim.permit.permit_id,
+                        claim.epoch,
+                        claim.permit.authorization_generation,
+                    ),
+                ).fetchone()
             assert persisted_row is not None
             persisted = self._issuance(persisted_row)
             if (
                 persisted.route_plan_digest != claim.route_plan_digest
                 or persisted.recovery_policy != recovery_policy
                 or persisted.expires_at_ms != expires_at_ms
+                or persisted.authorization_generation != claim.permit.authorization_generation
             ):
                 raise RoutePermitConflict(
                     "permit epoch already contains a different capability contract"
@@ -543,18 +745,32 @@ class SqliteRoutePermitLedger:
         *,
         permit_id: str,
         epoch: int,
+        authorization_generation: int = 0,
     ) -> RouteCapabilityIssuance | None:
         _validate_hash(permit_id, "permit ID")
         if epoch <= 0:
             raise ValueError("epoch must be positive")
+        if authorization_generation < 0:
+            raise ValueError("authorization generation must be non-negative")
         with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT * FROM route_capability_issuances
-                WHERE permit_id = ? AND epoch = ?
-                """,
-                (permit_id, epoch),
-            ).fetchone()
+            if authorization_generation == 0:
+                row = self._connection.execute(
+                    """
+                    SELECT *, 0 AS authorization_generation
+                    FROM route_capability_issuances
+                    WHERE permit_id = ? AND epoch = ?
+                    """,
+                    (permit_id, epoch),
+                ).fetchone()
+            else:
+                row = self._connection.execute(
+                    """
+                    SELECT * FROM route_capability_refresh_issuances
+                    WHERE permit_id = ? AND epoch = ?
+                      AND authorization_generation = ?
+                    """,
+                    (permit_id, epoch, authorization_generation),
+                ).fetchone()
         return None if row is None else self._issuance(row)
 
     def release(self, permit_id: str) -> bool:
@@ -609,12 +825,16 @@ class SqliteRoutePermitLedger:
                 str(row["root_revocation_id"])
                 for row in self._connection.execute(
                     """
-                    SELECT root_revocation_id
+                    SELECT root_revocation_id, epoch, 0 AS authorization_generation
                     FROM route_capability_issuances
                     WHERE permit_id = ? AND expires_at_ms > ?
-                    ORDER BY epoch
+                    UNION ALL
+                    SELECT root_revocation_id, epoch, authorization_generation
+                    FROM route_capability_refresh_issuances
+                    WHERE permit_id = ? AND expires_at_ms > ?
+                    ORDER BY epoch, authorization_generation
                     """,
-                    (permit_id, self._now_ms()),
+                    (permit_id, self._now_ms(), permit_id, self._now_ms()),
                 )
             )
 

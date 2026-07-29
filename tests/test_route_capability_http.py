@@ -178,3 +178,67 @@ def test_permit_requires_idempotency_and_capability_rechecks_account(monkeypatch
         assert len(capabilities.calls) == 1
     finally:
         set_request_agent_authority(None)
+
+
+def test_permit_keepalive_rechecks_contribution_and_is_idempotent(monkeypatch, tmp_path):
+    authority, _capabilities = install_authority(monkeypatch, tmp_path)
+    client = TestClient(app)
+    try:
+        permit = client.post(
+            "/v1/swarm/route-permits",
+            headers=auth_headers(),
+            json=permit_payload(),
+        ).json()
+        permit_id = permit["permit_id"]
+        keepalive_headers = {
+            "Authorization": f"Bearer {CREDENTIAL}",
+            "Idempotency-Key": "keepalive-0",
+        }
+        first = client.post(
+            f"/v1/swarm/route-permits/{permit_id}/keepalive",
+            headers=keepalive_headers,
+            json={"ttl_ms": 60_000},
+        )
+        assert first.status_code == 200
+        assert first.json()["authorization_generation"] == 1
+        retry = client.post(
+            f"/v1/swarm/route-permits/{permit_id}/keepalive",
+            headers=keepalive_headers,
+            json={"ttl_ms": 60_000},
+        )
+        assert retry.json() == first.json()
+        original_retry = client.post(
+            "/v1/swarm/route-permits",
+            headers=auth_headers(),
+            json=permit_payload(),
+        )
+        assert original_retry.status_code == 200
+        assert original_retry.json()["authorization_generation"] == 1
+
+        foreign = client.post(
+            f"/v1/swarm/route-permits/{permit_id}/keepalive",
+            headers={
+                "Authorization": f"Bearer {OTHER_CREDENTIAL}",
+                "Idempotency-Key": "foreign",
+            },
+            json={"ttl_ms": 60_000},
+        )
+        assert foreign.status_code == 404
+
+        authority._scheduler_provider = lambda: SimpleNamespace(
+            node_manager=SimpleNamespace(active_nodes=[]),
+            heartbeat_timeout=30,
+            serving_ready=lambda: True,
+        )
+        stopped = client.post(
+            f"/v1/swarm/route-permits/{permit_id}/keepalive",
+            headers={
+                "Authorization": f"Bearer {CREDENTIAL}",
+                "Idempotency-Key": "keepalive-1",
+            },
+            json={"ttl_ms": 60_000},
+        )
+        assert stopped.status_code == 403
+        assert stopped.json()["error"]["code"] == "contribution_required"
+    finally:
+        set_request_agent_authority(None)

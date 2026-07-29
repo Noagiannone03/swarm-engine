@@ -43,6 +43,8 @@ def test_native_biscuit_capability_roundtrip_binding_expiry_and_revocation():
         coordinator_endpoint_id=claims.coordinator_endpoint_id,
         route_plan_digest=claims.route_plan_digest,
         epoch=claims.epoch,
+        authorization_generation=claims.authorization_generation,
+        capability_expires_at_ms=claims.expires_at_ms,
         required_context_tokens=12_220 + 4_096,
         recovery_policy=claims.recovery_policy,
         now_ms=now_ms,
@@ -64,7 +66,7 @@ def test_native_biscuit_capability_roundtrip_binding_expiry_and_revocation():
             context,
             (root_revocation_id,),
         )
-    with pytest.raises(RuntimeError, match="does not authorize"):
+    with pytest.raises(RuntimeError, match="expired"):
         verify_route_capability(
             public_key,
             token,

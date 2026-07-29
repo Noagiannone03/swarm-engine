@@ -68,6 +68,7 @@ class RoutePermitResponse(BaseModel):
     recovery_policies: tuple[RouteRecoveryPolicy, ...]
     issued_at_ms: int
     expires_at_ms: int
+    authorization_generation: int = Field(ge=0)
 
     @classmethod
     def from_permit(cls, permit: AuthorizedContributionPermit) -> "RoutePermitResponse":
@@ -80,7 +81,14 @@ class RoutePermitResponse(BaseModel):
             recovery_policies=tuple(sorted(permit.recovery_policies, key=lambda item: item.value)),
             issued_at_ms=permit.issued_at_ms,
             expires_at_ms=permit.expires_at_ms,
+            authorization_generation=permit.authorization_generation,
         )
+
+
+class RoutePermitKeepaliveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ttl_ms: int = Field(default=120_000, gt=0, le=300_000)
 
 
 class RouteCapabilityRequest(BaseModel):
@@ -172,7 +180,7 @@ class RequestAgentAuthority:
                 existing.model_swarm_id != contract.model_swarm_id
                 or existing.max_context_tokens != contract.max_context_tokens
                 or existing.recovery_policies != frozenset(contract.recovery_policies)
-                or existing.expires_at_ms - existing.issued_at_ms != contract.ttl_ms
+                or existing.initial_ttl_ms != contract.ttl_ms
             ):
                 raise RoutePermitConflict(
                     "request idempotency key was reused with a different permit contract"
@@ -218,6 +226,23 @@ class RequestAgentAuthority:
             caller_endpoint_id=contract.signed_plan.signer_endpoint_id,
             recovery_policy=contract.recovery_policy,
         )
+
+    def keepalive(
+        self,
+        *,
+        credential: object,
+        permit_id: str,
+        idempotency_key: str,
+        contract: RoutePermitKeepaliveRequest,
+    ) -> RoutePermitResponse:
+        permit = self.gate.keepalive_route_permit(
+            credential,
+            self._scheduler_provider(),
+            permit_id=permit_id,
+            ttl_ms=contract.ttl_ms,
+            idempotency_key=idempotency_key,
+        )
+        return RoutePermitResponse.from_permit(permit)
 
     def release(self, *, credential: object, permit_id: str) -> bool:
         identity = account_hash(credential)
@@ -371,6 +396,50 @@ def create_route_capability(contract: RouteCapabilityRequest, raw_request: Reque
         return _error(409, "route_epoch_conflict", str(error))
     except (RoutePermitError, ValueError) as error:
         return _error(422, "invalid_route_capability", str(error))
+    except RuntimeError as error:
+        return _error(503, "route_authority_unavailable", str(error), retry_after=1)
+
+
+@router.post("/route-permits/{permit_id}/keepalive")
+def keepalive_route_permit(
+    permit_id: str,
+    contract: RoutePermitKeepaliveRequest,
+    raw_request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    authority = _required_authority()
+    if isinstance(authority, JSONResponse):
+        return authority
+    if idempotency_key is None:
+        return _error(
+            400,
+            "idempotency_key_required",
+            "Idempotency-Key is required for a route permit keepalive.",
+        )
+    try:
+        return authority.keepalive(
+            credential=_bearer_credential(raw_request),
+            permit_id=permit_id,
+            idempotency_key=idempotency_key,
+            contract=contract,
+        )
+    except ContributionPermitDenied as error:
+        reason = error.status.reason
+        if reason in {"swarm_not_ready", "admission_unavailable"}:
+            return _error(503, reason, str(error), retry_after=1)
+        if reason in {"missing_credential", "invalid_credential"}:
+            return _error(401, reason, str(error))
+        return _error(403, "contribution_required", str(error))
+    except PermissionError as error:
+        return _error(404, "route_permit_not_found", str(error))
+    except RoutePermitExpired as error:
+        return _error(410, "route_permit_expired", str(error))
+    except RoutePermitConflict as error:
+        return _error(409, "route_permit_keepalive_conflict", str(error))
+    except RoutePermitError as error:
+        return _error(404, "route_permit_not_found", str(error))
+    except ValueError as error:
+        return _error(422, "invalid_route_permit_keepalive", str(error))
     except RuntimeError as error:
         return _error(503, "route_authority_unavailable", str(error), retry_after=1)
 

@@ -195,7 +195,9 @@ class RouteCapabilityIssuer:
             raise PermissionError("route context exceeds the contribution permit")
         if recovery_policy not in permit.recovery_policies:
             raise PermissionError("route recovery policy exceeds the contribution permit")
-        if plan.reservation_deadline_ms <= now_ms or plan.plan_expires_at_ms > permit.expires_at_ms:
+        if (
+            permit.authorization_generation == 0 and plan.reservation_deadline_ms <= now_ms
+        ) or plan.plan_expires_at_ms > permit.expires_at_ms:
             raise PermissionError("route lifetime exceeds the contribution permit")
 
         self.validate_active_key(now_ms=now_ms)
@@ -208,10 +210,11 @@ class RouteCapabilityIssuer:
             coordinator_endpoint_id=caller_endpoint_id,
             route_plan_digest=route_plan_digest(envelope),
             epoch=plan.epoch,
+            authorization_generation=permit.authorization_generation,
             max_context_tokens=permit.max_context_tokens,
             recovery_policy=recovery_policy,
             issued_at_ms=now_ms,
-            expires_at_ms=plan.plan_expires_at_ms,
+            expires_at_ms=permit.expires_at_ms,
         )
         return _PreparedRouteCapability(
             envelope=envelope,
@@ -241,6 +244,8 @@ class RouteCapabilityIssuer:
                 capability_token=token,
                 permit_id=prepared.permit.permit_id,
                 account_id=prepared.permit.account_id,
+                authorization_generation=prepared.permit.authorization_generation,
+                expires_at_ms=prepared.claims.expires_at_ms,
                 recovery_policy=prepared.recovery_policy,
             ),
             expires_at_ms=prepared.claims.expires_at_ms,
@@ -291,6 +296,7 @@ class RouteCapabilityService:
             issuance.route_plan_digest != prepared.claims.route_plan_digest
             or issuance.recovery_policy != prepared.recovery_policy
             or issuance.expires_at_ms != prepared.claims.expires_at_ms
+            or issuance.authorization_generation != prepared.permit.authorization_generation
         ):
             raise RoutePermitConflict(
                 "permit epoch already contains a different capability contract"
@@ -302,6 +308,8 @@ class RouteCapabilityService:
                 capability_token=issuance.capability_token,
                 permit_id=prepared.permit.permit_id,
                 account_id=prepared.permit.account_id,
+                authorization_generation=issuance.authorization_generation,
+                expires_at_ms=issuance.expires_at_ms,
                 recovery_policy=issuance.recovery_policy,
             ),
             expires_at_ms=issuance.expires_at_ms,
@@ -340,6 +348,7 @@ class RouteCapabilityService:
         existing = self._ledger.get_issuance(
             permit_id=permit.permit_id,
             epoch=prepared.claims.epoch,
+            authorization_generation=permit.authorization_generation,
         )
         if existing is not None:
             return self._response(prepared, existing)

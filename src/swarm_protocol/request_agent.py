@@ -86,6 +86,7 @@ class RoutePermitGrant(BaseModel):
     recovery_policies: tuple[RouteRecoveryPolicy, ...]
     issued_at_ms: int = Field(ge=0)
     expires_at_ms: int = Field(gt=0)
+    authorization_generation: int = Field(default=0, ge=0)
 
 
 class IssuedAdmission(BaseModel):
@@ -262,6 +263,28 @@ class RequestAgentAuthorityClient:
                 code="invalid_route_authority_response",
             ) from error
 
+    def keepalive_permit(
+        self,
+        permit_id: str,
+        *,
+        ttl_ms: int,
+        idempotency_key: str,
+    ) -> RoutePermitGrant:
+        payload = self._request(
+            "POST",
+            f"/v1/swarm/route-permits/{permit_id}/keepalive",
+            headers={"Idempotency-Key": idempotency_key},
+            json={"ttl_ms": ttl_ms},
+        )
+        assert isinstance(payload, dict)
+        try:
+            return RoutePermitGrant.model_validate(payload)
+        except ValueError as error:
+            raise RequestAgentAuthorityError(
+                "route authority returned an invalid permit keepalive",
+                code="invalid_route_authority_response",
+            ) from error
+
     def release_permit(self, permit_id: str) -> bool:
         payload = self._request(
             "DELETE",
@@ -286,7 +309,11 @@ class ReservationCoordinator(Protocol):
 
 
 CoordinatorFactory = Callable[
-    [ControlTransport, Callable[[SignedControlMessage], RouteAdmissionEnvelope]],
+    [
+        ControlTransport,
+        Callable[[SignedControlMessage], RouteAdmissionEnvelope],
+        Callable[[SignedControlMessage], RouteAdmissionEnvelope],
+    ],
     ReservationCoordinator,
 ]
 
@@ -294,11 +321,47 @@ CoordinatorFactory = Callable[
 def _default_coordinator_factory(
     transport: ControlTransport,
     authorizer: Callable[[SignedControlMessage], RouteAdmissionEnvelope],
+    renewal_authorizer: Callable[[SignedControlMessage], RouteAdmissionEnvelope],
 ) -> RouteReservationCoordinator:
     return RouteReservationCoordinator(
         transport,
         admission_authorizer=authorizer,
+        renewal_authorizer=renewal_authorizer,
     )
+
+
+class _RouteRenewalAuthorizer:
+    """Refresh account authority before any worker KV lease is extended."""
+
+    def __init__(
+        self,
+        *,
+        authority: RequestAgentAuthorityClient,
+        permit: RoutePermitGrant,
+        recovery_policy: RouteRecoveryPolicy,
+        ttl_ms: int,
+    ) -> None:
+        self.authority = authority
+        self.permit = permit
+        self.recovery_policy = recovery_policy
+        self.ttl_ms = ttl_ms
+
+    def __call__(self, signed_plan: SignedControlMessage) -> RouteAdmissionEnvelope:
+        current = self.permit
+        renewed = self.authority.keepalive_permit(
+            current.permit_id,
+            ttl_ms=self.ttl_ms,
+            idempotency_key=(
+                f"{current.request_id}:permit-keepalive:{current.authorization_generation}"
+            ),
+        )
+        issued = self.authority.issue_capability(
+            permit_id=renewed.permit_id,
+            signed_plan=signed_plan,
+            recovery_policy=self.recovery_policy,
+        )
+        self.permit = renewed
+        return issued.admission
 
 
 @dataclass(frozen=True)
@@ -388,10 +451,13 @@ class RequestAgentRouteRuntime:
         self.renew_attempt_budget_ms = renew_attempt_budget_ms
         self.lease_expiry_guard_ms = lease_expiry_guard_ms
         if coordinator_factory is _default_coordinator_factory:
-            self._coordinator_factory = lambda transport, authorizer: RouteReservationCoordinator(
-                transport,
-                admission_authorizer=authorizer,
-                session_ttl_ms=self.session_ttl_ms,
+            self._coordinator_factory = lambda transport, authorizer, renewal_authorizer: (
+                RouteReservationCoordinator(
+                    transport,
+                    admission_authorizer=authorizer,
+                    renewal_authorizer=renewal_authorizer,
+                    session_ttl_ms=self.session_ttl_ms,
+                )
             )
         else:
             self._coordinator_factory = coordinator_factory
@@ -568,7 +634,17 @@ class RequestAgentRouteRuntime:
                         recovery_policy=recovery_policy,
                     ).admission
 
-                coordinator = self._coordinator_factory(self.transport, authorize)
+                renewal_authorizer = _RouteRenewalAuthorizer(
+                    authority=self.authority,
+                    permit=permit,
+                    recovery_policy=recovery_policy,
+                    ttl_ms=self.permit_ttl_ms,
+                )
+                coordinator = self._coordinator_factory(
+                    self.transport,
+                    authorize,
+                    renewal_authorizer,
+                )
                 lease_started_at_ms = self._steady_now_ms()
                 committed = coordinator.reserve(planned.plan)
                 acknowledged_at_ms = self._steady_now_ms()
@@ -581,7 +657,7 @@ class RequestAgentRouteRuntime:
                             "route session lease was acknowledged too close to expiry"
                         )
                 reservation = RequestAgentReservation(
-                    permit=permit,
+                    permit=renewal_authorizer.permit,
                     planned=planned,
                     committed=committed,
                     coordinator=coordinator,
@@ -789,7 +865,11 @@ class RequestAgentRouteRuntime:
         if acknowledged_at_ms >= deadline_ms - self.lease_expiry_guard_ms:
             raise TimeoutError("lease renewal acknowledgement arrived after the safe deadline")
         renewed = RequestAgentReservation(
-            permit=current.permit,
+            permit=getattr(
+                getattr(current.coordinator, "renewal_authorizer", None),
+                "permit",
+                current.permit,
+            ),
             planned=current.planned,
             committed=committed,
             coordinator=current.coordinator,

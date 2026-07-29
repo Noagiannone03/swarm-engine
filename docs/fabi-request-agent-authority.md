@@ -65,8 +65,48 @@ policy granted by that permit. The service verifies:
 - request, model, context, epoch, digest, expiry and recovery policy;
 - the issuer key against the current TUF trust snapshot.
 
-The `(permit, epoch)` emission is durable and idempotent. A retry returns the
-same persisted Biscuit. A different plan on the same epoch is rejected.
+The initial `(permit, epoch, generation 0)` emission is durable and
+idempotent. A retry returns the same persisted Biscuit. A different plan on
+the same epoch is rejected.
+
+### `POST /v1/swarm/route-permits/{permit_id}/keepalive`
+
+Long generations do not receive an unbounded permit. Before extending worker
+KV leases, the Request Agent sends an account-authenticated, idempotent permit
+keepalive. The authority rechecks that the same account still owns a verified
+READY contributor and that the swarm is serving, then atomically advances the
+permit's monotone `authorization_generation` and its bounded expiry.
+
+The Request Agent subsequently asks for a new capability for the same signed
+route. Capability idempotency is scoped by
+`(permit, epoch, authorization_generation)`: retries return the same persisted
+Biscuit, while each accepted keepalive produces a distinct, independently
+revocable authority block. Expired refresh rows and old keepalive keys are
+pruned to keep the ledger bounded.
+
+Every dynamic worker renewal carries that capability. The worker authenticates
+the Iroh caller and signed command, verifies the refreshed Biscuit against the
+TUF keyset, rejects a generation rollback, and refuses a KV lease whose expiry
+would exceed the capability expiry. Token/SSE silence is never interpreted as
+a failure; the last explicitly acknowledged authority and worker leases are
+the only liveness bounds.
+
+This follows established control-plane patterns rather than treating an
+inference timeout as a failure detector:
+
+- etcd leases expire only when the server stops receiving lease keepalives, and
+  each keepalive response carries the newly acknowledged TTL:
+  <https://etcd.io/docs/v3.5/learning/api/#lease-api>;
+- SPIRE rotates short-lived identities while the agent maintains its
+  authenticated server connection:
+  <https://spiffe.io/docs/latest/deploying/configuring/>;
+- Biscuit capabilities are verified offline from a public key, bind request
+  facts in the authorizer, and expose revocation identifiers:
+  <https://doc.biscuitsec.org/reference/specifications>.
+
+Fabi deliberately separates these control acknowledgements from inference
+tokens and SSE. A model may spend minutes in prefill, tool execution or decode
+without jeopardizing the route as long as its control plane remains healthy.
 
 ### `DELETE /v1/swarm/route-permits/{permit_id}`
 

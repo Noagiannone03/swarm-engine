@@ -41,6 +41,8 @@ _PUBLIC_RECOVERY_POLICIES = frozenset(
 
 
 class ContributionRoutePermitLedger(Protocol):
+    def get_active(self, permit_id: str) -> AuthorizedContributionPermit: ...
+
     def active_count(self, account_id: str) -> int: ...
 
     def find_active(
@@ -63,6 +65,15 @@ class ContributionRoutePermitLedger(Protocol):
         ttl_ms: int,
         max_active_per_account: int,
         permit_id: str | None = None,
+    ) -> AuthorizedContributionPermit: ...
+
+    def keepalive_owned(
+        self,
+        permit_id: str,
+        account_id: str,
+        *,
+        ttl_ms: int,
+        idempotency_key: str,
     ) -> AuthorizedContributionPermit: ...
 
 
@@ -122,8 +133,10 @@ class ContributionGate:
     One eligible worker grants one concurrent request by default.  This keeps
     the product free of balances and currencies while preventing a single tiny
     contribution credential from being shared to create unbounded traffic.
-    In-flight generations are never interrupted; eligibility is checked only
-    when a new request is admitted.
+    Admission is checked when a request starts. V3 Request Agents then keep the
+    permit alive with explicit authority acknowledgements; every acknowledgement
+    revalidates that the same account still contributes and that the swarm is
+    serving. A slow generation is therefore not mistaken for a failed one.
     """
 
     def __init__(self) -> None:
@@ -388,7 +401,7 @@ class ContributionGate:
                     existing.model_swarm_id != model_swarm_id
                     or existing.max_context_tokens != max_context_tokens
                     or existing.recovery_policies != recovery_policies
-                    or existing.expires_at_ms - existing.issued_at_ms != ttl_ms
+                    or existing.initial_ttl_ms != ttl_ms
                 ):
                     raise RoutePermitConflict(
                         "request idempotency key was reused with a different permit contract"
@@ -419,6 +432,66 @@ class ContributionGate:
                 recovery_policies=recovery_policies,
                 ttl_ms=ttl_ms,
                 max_active_per_account=permit_capacity,
+            )
+
+    def keepalive_route_permit(
+        self,
+        credential: object,
+        scheduler,
+        *,
+        permit_id: str,
+        ttl_ms: int,
+        idempotency_key: str,
+    ) -> AuthorizedContributionPermit:
+        """Continue one in-flight slot only while its worker still contributes."""
+
+        if not self.enabled:
+            raise RuntimeError("route permit authority requires FABI_GATE=on")
+        if ttl_ms <= 0 or ttl_ms > _MAX_ROUTE_PERMIT_TTL_MS:
+            raise ValueError("route permit TTL must be between 1 ms and 5 minutes")
+        identity = account_hash(credential)
+        if identity is None:
+            reason = "missing_credential" if not credential else "invalid_credential"
+            raise ContributionPermitDenied(ContributionStatus(False, reason))
+        with self._lock:
+            ledger = self._route_permit_ledger
+            if ledger is None:
+                raise RuntimeError("route permit ledger is not configured")
+            permit = ledger.get_active(permit_id)
+            if permit.account_id != identity:
+                raise PermissionError("route permit belongs to a different account")
+            product_ready = getattr(scheduler, "product_serving_ready", None)
+            serving_ready = bool(
+                scheduler is not None
+                and (product_ready() if callable(product_ready) else scheduler.serving_ready())
+            )
+            eligible = self._eligible_workers(scheduler, identity, time.time())
+            maximum = eligible * self.requests_per_worker
+            if eligible == 0:
+                raise ContributionPermitDenied(
+                    ContributionStatus(
+                        False,
+                        "no_eligible_worker",
+                        active_requests=1,
+                        account_id=identity,
+                    )
+                )
+            if not serving_ready:
+                raise ContributionPermitDenied(
+                    ContributionStatus(
+                        False,
+                        "swarm_not_ready",
+                        eligible_workers=eligible,
+                        active_requests=1,
+                        max_concurrent_requests=maximum,
+                        account_id=identity,
+                    )
+                )
+            return ledger.keepalive_owned(
+                permit_id,
+                identity,
+                ttl_ms=ttl_ms,
+                idempotency_key=idempotency_key,
             )
 
     def release(self, admission: ContributionAdmission) -> None:

@@ -9,6 +9,7 @@ import pytest
 from backend.server.route_permits import (
     RoutePermitCapacityReached,
     RoutePermitConflict,
+    RoutePermitError,
     RoutePermitExpired,
     SqliteRoutePermitLedger,
     StalePermitEpoch,
@@ -197,3 +198,133 @@ def test_account_scoped_release_cannot_mutate_another_accounts_permit(tmp_path):
     assert ledger.active_count(ACCOUNT) == 1
     assert ledger.release_owned(permit.permit_id, ACCOUNT) is True
     assert ledger.active_count(ACCOUNT) == 0
+
+
+def test_permit_keepalive_is_owned_monotone_and_idempotent(tmp_path):
+    now = [1_000]
+    ledger = SqliteRoutePermitLedger(
+        tmp_path / "permits.sqlite3",
+        clock_ms=lambda: now[0],
+    )
+    permit = issue(ledger)
+
+    now[0] = 20_000
+    first = ledger.keepalive_owned(
+        permit.permit_id,
+        ACCOUNT,
+        ttl_ms=60_000,
+        idempotency_key="keepalive-0",
+    )
+    assert first.authorization_generation == 1
+    assert first.expires_at_ms == 80_000
+    assert (
+        ledger.keepalive_owned(
+            permit.permit_id,
+            ACCOUNT,
+            ttl_ms=60_000,
+            idempotency_key="keepalive-0",
+        )
+        == first
+    )
+    with pytest.raises(RoutePermitConflict, match="different TTL"):
+        ledger.keepalive_owned(
+            permit.permit_id,
+            ACCOUNT,
+            ttl_ms=30_000,
+            idempotency_key="keepalive-0",
+        )
+    with pytest.raises(RoutePermitError):
+        ledger.keepalive_owned(
+            permit.permit_id,
+            "ff" * 32,
+            ttl_ms=60_000,
+            idempotency_key="foreign",
+        )
+
+    now[0] = 30_000
+    second = ledger.keepalive_owned(
+        permit.permit_id,
+        ACCOUNT,
+        ttl_ms=60_000,
+        idempotency_key="keepalive-1",
+    )
+    assert second.authorization_generation == 2
+    assert second.expires_at_ms == 90_000
+
+
+def test_capability_refresh_generation_preserves_initial_issuance(tmp_path):
+    now = [1_000]
+    ledger = SqliteRoutePermitLedger(
+        tmp_path / "permits.sqlite3",
+        clock_ms=lambda: now[0],
+    )
+    permit = issue(ledger)
+    initial_claim = claim(ledger, permit)
+    initial = ledger.record_issuance(
+        initial_claim,
+        authority_key_id="dd" * 32,
+        capability_token="initial-token",
+        root_revocation_id="aa" * 64,
+        recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+        expires_at_ms=20_000,
+    )
+    refreshed_permit = ledger.keepalive_owned(
+        permit.permit_id,
+        ACCOUNT,
+        ttl_ms=60_000,
+        idempotency_key="refresh",
+    )
+    refreshed_claim = claim(ledger, refreshed_permit)
+    refreshed = ledger.record_issuance(
+        refreshed_claim,
+        authority_key_id="dd" * 32,
+        capability_token="refreshed-token",
+        root_revocation_id="bb" * 64,
+        recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+        expires_at_ms=refreshed_permit.expires_at_ms,
+    )
+
+    assert initial.authorization_generation == 0
+    assert refreshed.authorization_generation == 1
+    assert ledger.get_issuance(permit_id=permit.permit_id, epoch=1) == initial
+    assert (
+        ledger.get_issuance(
+            permit_id=permit.permit_id,
+            epoch=1,
+            authorization_generation=1,
+        )
+        == refreshed
+    )
+    assert ledger.revoke(permit.permit_id) == ("aa" * 64, "bb" * 64)
+
+
+def test_two_connections_serialize_permit_keepalive_generations(tmp_path):
+    path = tmp_path / "permits.sqlite3"
+    first = SqliteRoutePermitLedger(path, clock_ms=lambda: 1_000)
+    permit = issue(first)
+    second = SqliteRoutePermitLedger(path, clock_ms=lambda: 1_000)
+    barrier = threading.Barrier(2)
+    generations = []
+
+    def renew(ledger, key):
+        barrier.wait()
+        generations.append(
+            ledger.keepalive_owned(
+                permit.permit_id,
+                ACCOUNT,
+                ttl_ms=60_000,
+                idempotency_key=key,
+            ).authorization_generation
+        )
+
+    threads = (
+        threading.Thread(target=renew, args=(first, "parallel-1")),
+        threading.Thread(target=renew, args=(second, "parallel-2")),
+    )
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert sorted(generations) == [1, 2]
+    assert first.get_active(permit.permit_id).authorization_generation == 2

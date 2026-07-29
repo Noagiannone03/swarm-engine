@@ -300,6 +300,10 @@ class WorkerExecutionAdmission:
     ) -> SignedControlMessage | None:
         now_ms = self._now_ms()
         table = self._configured_table()
+        renewal_admission = None
+        if isinstance(signed_command, dict) and "signed_command" in signed_command:
+            renewal_admission = signed_command.get("admission")
+            signed_command = signed_command["signed_command"]
         envelope = (
             signed_command
             if isinstance(signed_command, SignedControlMessage)
@@ -328,6 +332,43 @@ class WorkerExecutionAdmission:
             )
         if command.expires_at_ms <= now_ms or command.issued_at_ms > now_ms + 30_000:
             raise ExecutionAdmissionError("reservation command is expired or issued in the future")
+        refreshed_route = None
+        if command.action == ReservationAction.RENEW and route is not None:
+            if route.permit_id is not None:
+                if renewal_admission is None:
+                    raise PermissionError(
+                        "dynamic route renewal requires a fresh authority capability"
+                    )
+                refreshed_route = self.route_authority.authorize_route(
+                    renewal_admission,
+                    caller_endpoint_id=caller_endpoint_id,
+                    crypto=self.crypto,
+                    now_ms=now_ms,
+                )
+                if (
+                    refreshed_route.plan != route.plan
+                    or refreshed_route.route_plan_digest != route.route_plan_digest
+                    or refreshed_route.permit_id != route.permit_id
+                    or refreshed_route.account_id != route.account_id
+                    or refreshed_route.recovery_policy != route.recovery_policy
+                ):
+                    raise PermissionError("renewal capability changed the authorized route")
+                previous_generation = route.authorization_generation
+                refreshed_generation = refreshed_route.authorization_generation
+                if (
+                    previous_generation is None
+                    or refreshed_generation is None
+                    or refreshed_generation < previous_generation
+                ):
+                    raise PermissionError("renewal capability generation moved backwards")
+                assert command.ttl_ms is not None
+                capability_expiry = refreshed_route.capability_expires_at_ms
+                if capability_expiry is None or now_ms + command.ttl_ms > capability_expiry:
+                    raise PermissionError("worker lease would outlive the authority capability")
+            elif renewal_admission is not None:
+                raise PermissionError("fixed route renewal does not accept a capability")
+        elif renewal_admission is not None:
+            raise PermissionError("authority capability is only valid on route renewal")
         self._request_epoch_fence.advance(
             coordinator_id=expected_coordinator,
             request_id=command.request_id,
@@ -359,6 +400,9 @@ class WorkerExecutionAdmission:
                 epoch=command.epoch,
                 ttl_ms=command.ttl_ms,
             )
+            if refreshed_route is not None:
+                with self._lock:
+                    self._routes_by_route_id[command.route_id] = refreshed_route
         elif command.action == ReservationAction.RELEASE:
             lease = table.release(command.reservation_id, epoch=command.epoch)
         else:  # pragma: no cover - exhaustive enum defense

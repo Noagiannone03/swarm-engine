@@ -46,6 +46,8 @@ class RouteAdmissionEnvelope(BaseModel):
     capability_token: str = Field(min_length=1, max_length=_MAX_CAPABILITY_BYTES)
     permit_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     account_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    authorization_generation: int = Field(ge=0)
+    expires_at_ms: int = Field(gt=0)
     recovery_policy: RouteRecoveryPolicy
 
 
@@ -59,6 +61,8 @@ class AuthorizedRoutePlan:
     account_id: str | None = None
     recovery_policy: RouteRecoveryPolicy | None = None
     root_revocation_id: str | None = None
+    authorization_generation: int | None = None
+    capability_expires_at_ms: int | None = None
 
 
 class RoutePlanAuthority(Protocol):
@@ -304,6 +308,8 @@ class CapabilityRouteAuthority:
             coordinator_endpoint_id=caller_endpoint_id,
             route_plan_digest=digest,
             epoch=plan.epoch,
+            authorization_generation=envelope.authorization_generation,
+            capability_expires_at_ms=envelope.expires_at_ms,
             required_context_tokens=plan.required_context_tokens,
             recovery_policy=envelope.recovery_policy,
             now_ms=now_ms,
@@ -323,6 +329,8 @@ class CapabilityRouteAuthority:
             account_id=envelope.account_id,
             recovery_policy=envelope.recovery_policy,
             root_revocation_id=root_revocation_id,
+            authorization_generation=envelope.authorization_generation,
+            capability_expires_at_ms=envelope.expires_at_ms,
         )
 
     def authorize_unbound_control(self, caller_endpoint_id: str) -> bool:

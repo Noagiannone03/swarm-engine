@@ -34,6 +34,7 @@ class RouteCapabilityClaims(BaseModel):
     coordinator_endpoint_id: HashHex = Field(pattern=r"^[0-9a-f]{64}$")
     route_plan_digest: HashHex = Field(pattern=r"^[0-9a-f]{64}$")
     epoch: int = Field(gt=0)
+    authorization_generation: int = Field(default=0, ge=0)
     max_context_tokens: int = Field(gt=0)
     recovery_policy: RouteRecoveryPolicy
     issued_at_ms: int = Field(ge=0)
@@ -50,6 +51,8 @@ class RouteCapabilityContext(BaseModel):
     coordinator_endpoint_id: HashHex = Field(pattern=r"^[0-9a-f]{64}$")
     route_plan_digest: HashHex = Field(pattern=r"^[0-9a-f]{64}$")
     epoch: int = Field(gt=0)
+    authorization_generation: int = Field(default=0, ge=0)
+    capability_expires_at_ms: int = Field(gt=0)
     required_context_tokens: int = Field(gt=0)
     recovery_policy: RouteRecoveryPolicy
     now_ms: int = Field(ge=0)

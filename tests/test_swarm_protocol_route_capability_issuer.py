@@ -140,6 +140,8 @@ def test_issuer_binds_contribution_plan_and_tuf_key_before_native_verification()
         coordinator_endpoint_id=COORDINATOR,
         route_plan_digest=route_plan_digest(signed),
         epoch=plan.epoch,
+        authorization_generation=issued.admission.authorization_generation,
+        capability_expires_at_ms=issued.expires_at_ms,
         required_context_tokens=plan.required_context_tokens,
         recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
         now_ms=now[0],
@@ -239,7 +241,27 @@ def test_service_persists_one_biscuit_for_an_exact_retry(tmp_path):
     )
 
     assert retry == first
-    assert ledger.revoke(PERMIT) == (first.root_revocation_id,)
+    now[0] = 12_000
+    refreshed_permit = ledger.keepalive_owned(
+        PERMIT,
+        ACCOUNT,
+        ttl_ms=20_000,
+        idempotency_key="long-generation-1",
+    )
+    refreshed = service.issue(
+        signed,
+        permit_id=PERMIT,
+        account_id=ACCOUNT,
+        caller_endpoint_id=COORDINATOR,
+        recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+    )
+    assert refreshed.admission.authorization_generation == 1
+    assert refreshed.expires_at_ms == refreshed_permit.expires_at_ms
+    assert refreshed.admission.capability_token != first.admission.capability_token
+    assert ledger.revoke(PERMIT) == (
+        first.root_revocation_id,
+        refreshed.root_revocation_id,
+    )
     context = RouteCapabilityContext(
         permit_id=PERMIT,
         account_id=ACCOUNT,
@@ -248,6 +270,8 @@ def test_service_persists_one_biscuit_for_an_exact_retry(tmp_path):
         coordinator_endpoint_id=COORDINATOR,
         route_plan_digest=route_plan_digest(signed),
         epoch=1,
+        authorization_generation=refreshed.admission.authorization_generation,
+        capability_expires_at_ms=refreshed.expires_at_ms,
         required_context_tokens=1_000,
         recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
         now_ms=now[0],
@@ -255,7 +279,7 @@ def test_service_persists_one_biscuit_for_an_exact_retry(tmp_path):
     with pytest.raises(RuntimeError, match="revoked"):
         verify_route_capability(
             public_key,
-            first.admission.capability_token,
+            refreshed.admission.capability_token,
             context,
             ledger.revoke(PERMIT),
         )

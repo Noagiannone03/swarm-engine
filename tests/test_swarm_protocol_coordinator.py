@@ -351,15 +351,22 @@ def test_client_coordinator_reserves_a_complete_route_with_one_bounded_capabilit
         issued_at_ms=now[0],
         expires_at_ms=20_000,
     )
-    coordinator = RouteReservationCoordinator(
-        transport,
-        clock_ms=lambda: now[0],
-        admission_authorizer=lambda signed: issuer.issue(
+
+    def authorize(signed):
+        return issuer.issue(
             signed,
             caller_endpoint_id=COORDINATOR,
             permit=permit,
             recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
-        ).admission,
+        ).admission
+
+    coordinator = RouteReservationCoordinator(
+        transport,
+        clock_ms=lambda: now[0],
+        command_ttl_ms=1_000,
+        session_ttl_ms=5_000,
+        admission_authorizer=authorize,
+        renewal_authorizer=authorize,
     )
 
     committed = coordinator.reserve(route(now[0]))

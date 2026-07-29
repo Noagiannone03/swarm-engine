@@ -26,7 +26,19 @@ def route_admission_to_wire(envelope: RouteAdmissionEnvelope) -> dict[str, objec
         "capability_token": envelope.capability_token,
         "permit_id": envelope.permit_id,
         "account_id": envelope.account_id,
+        "authorization_generation": envelope.authorization_generation,
+        "expires_at_ms": envelope.expires_at_ms,
         "recovery_policy": envelope.recovery_policy.value,
+    }
+
+
+def route_renewal_to_wire(
+    command: SignedControlMessage,
+    admission: RouteAdmissionEnvelope,
+) -> dict[str, object]:
+    return {
+        "signed_command": control_message_to_wire(command),
+        "admission": route_admission_to_wire(admission),
     }
 
 

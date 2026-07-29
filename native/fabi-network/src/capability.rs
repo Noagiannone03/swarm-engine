@@ -59,6 +59,8 @@ pub struct RouteCapabilityClaims {
     pub coordinator_endpoint_id: String,
     pub route_plan_digest: String,
     pub epoch: u64,
+    #[serde(default)]
+    pub authorization_generation: u64,
     pub max_context_tokens: u64,
     pub recovery_policy: RouteRecoveryPolicy,
     pub issued_at_ms: u64,
@@ -76,6 +78,9 @@ pub struct RouteCapabilityContext {
     pub coordinator_endpoint_id: String,
     pub route_plan_digest: String,
     pub epoch: u64,
+    #[serde(default)]
+    pub authorization_generation: u64,
+    pub capability_expires_at_ms: u64,
     pub required_context_tokens: u64,
     pub recovery_policy: RouteRecoveryPolicy,
     pub now_ms: u64,
@@ -143,7 +148,9 @@ fn validate_claims(claims: &RouteCapabilityClaims) -> Result<()> {
         "route capability lifetime exceeds {MAX_CAPABILITY_LIFETIME_MS} ms"
     );
     checked_i64(claims.epoch, "epoch")?;
+    checked_i64(claims.authorization_generation, "authorization generation")?;
     checked_i64(claims.max_context_tokens, "context budget")?;
+    checked_i64(claims.expires_at_ms, "capability expiry")?;
     Ok(())
 }
 
@@ -156,10 +163,16 @@ fn validate_context(context: &RouteCapabilityContext) -> Result<()> {
     validate_hash(&context.route_plan_digest, "route plan digest")?;
     ensure!(context.epoch > 0, "route capability epoch must be positive");
     ensure!(
+        context.capability_expires_at_ms > context.now_ms,
+        "route capability has expired"
+    );
+    ensure!(
         context.required_context_tokens > 0,
         "required context tokens must be positive"
     );
     checked_i64(context.epoch, "epoch")?;
+    checked_i64(context.authorization_generation, "authorization generation")?;
+    checked_i64(context.capability_expires_at_ms, "capability expiry")?;
     checked_i64(context.required_context_tokens, "required context tokens")?;
     Ok(())
 }
@@ -196,7 +209,10 @@ pub fn issue_route_capability(
     validate_claims(claims)?;
     let root = ed25519_keypair(private_key_hex)?;
     let epoch = checked_i64(claims.epoch, "epoch")?;
+    let authorization_generation =
+        checked_i64(claims.authorization_generation, "authorization generation")?;
     let max_context_tokens = checked_i64(claims.max_context_tokens, "context budget")?;
+    let expires_at_ms = checked_i64(claims.expires_at_ms, "capability expiry")?;
     let not_before = system_time(
         claims.issued_at_ms.saturating_sub(MAX_CLOCK_SKEW_MS),
         "capability not-before time",
@@ -213,6 +229,8 @@ pub fn issue_route_capability(
             {coordinator_endpoint_id},
             {route_plan_digest},
             {epoch},
+            {authorization_generation},
+            {expires_at_ms},
             {max_context_tokens},
             {recovery_policy}
         );
@@ -224,6 +242,8 @@ pub fn issue_route_capability(
         model_swarm_id = claims.model_swarm_id.as_str(),
         coordinator_endpoint_id = claims.coordinator_endpoint_id.as_str(),
         route_plan_digest = claims.route_plan_digest.as_str(),
+        authorization_generation = authorization_generation,
+        expires_at_ms = expires_at_ms,
         recovery_policy = claims.recovery_policy.as_str(),
     )
     .build(&root)
@@ -262,6 +282,10 @@ pub fn verify_route_capability(
     );
 
     let epoch = checked_i64(context.epoch, "epoch")?;
+    let authorization_generation =
+        checked_i64(context.authorization_generation, "authorization generation")?;
+    let capability_expires_at_ms =
+        checked_i64(context.capability_expires_at_ms, "capability expiry")?;
     let required_context_tokens =
         checked_i64(context.required_context_tokens, "required context tokens")?;
     let now = system_time(context.now_ms, "verification time")?;
@@ -276,6 +300,8 @@ pub fn verify_route_capability(
             {coordinator_endpoint_id},
             {route_plan_digest},
             {epoch},
+            {authorization_generation},
+            {capability_expires_at_ms},
             {required_context_tokens},
             {recovery_policy}
         );
@@ -288,6 +314,8 @@ pub fn verify_route_capability(
                 $coordinator_endpoint_id,
                 $route_plan_digest,
                 $epoch,
+                $authorization_generation,
+                $capability_expires_at_ms,
                 $max_context_tokens,
                 $recovery_policy
             ),
@@ -299,6 +327,8 @@ pub fn verify_route_capability(
                 $coordinator_endpoint_id,
                 $route_plan_digest,
                 $epoch,
+                $authorization_generation,
+                $capability_expires_at_ms,
                 $required_context_tokens,
                 $recovery_policy
             ),
@@ -311,6 +341,8 @@ pub fn verify_route_capability(
         model_swarm_id = context.model_swarm_id.as_str(),
         coordinator_endpoint_id = context.coordinator_endpoint_id.as_str(),
         route_plan_digest = context.route_plan_digest.as_str(),
+        authorization_generation = authorization_generation,
+        capability_expires_at_ms = capability_expires_at_ms,
         recovery_policy = context.recovery_policy.as_str(),
     )
     .build(&biscuit)
@@ -369,6 +401,7 @@ mod tests {
             coordinator_endpoint_id: "44".repeat(32),
             route_plan_digest: "55".repeat(32),
             epoch: 7,
+            authorization_generation: 0,
             max_context_tokens: 16_384,
             recovery_policy: RouteRecoveryPolicy::ReplanCold,
             issued_at_ms: now_ms,
@@ -385,6 +418,8 @@ mod tests {
             coordinator_endpoint_id: claims.coordinator_endpoint_id.clone(),
             route_plan_digest: claims.route_plan_digest.clone(),
             epoch: claims.epoch,
+            authorization_generation: claims.authorization_generation,
+            capability_expires_at_ms: claims.expires_at_ms,
             required_context_tokens: 12_000,
             recovery_policy: claims.recovery_policy,
             now_ms,
@@ -422,6 +457,14 @@ mod tests {
             },
             RouteCapabilityContext {
                 epoch: expected.epoch + 1,
+                ..expected.clone()
+            },
+            RouteCapabilityContext {
+                authorization_generation: expected.authorization_generation + 1,
+                ..expected.clone()
+            },
+            RouteCapabilityContext {
+                capability_expires_at_ms: expected.capability_expires_at_ms + 1,
                 ..expected.clone()
             },
             RouteCapabilityContext {
