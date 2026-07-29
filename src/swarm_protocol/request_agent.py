@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlparse
@@ -30,6 +33,16 @@ from swarm_protocol.route_authority import RouteAdmissionEnvelope
 from swarm_protocol.routing import ExactRoutePlanner, PlannedRoute
 
 _MAX_AUTHORITY_RESPONSE_BYTES = 1024 * 1024
+
+logger = logging.getLogger(__name__)
+
+
+def _system_clock_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def _steady_clock_ms() -> int:
+    return time.monotonic_ns() // 1_000_000
 
 
 def _account_credential_from_environment() -> str:
@@ -297,8 +310,29 @@ class RequestAgentReservation:
     recovery_policy: RouteRecoveryPolicy
 
 
+@dataclass
+class _ManagedReservation:
+    request: RequestContract
+    reservation: RequestAgentReservation
+    next_renew_at_ms: int
+    lease_deadline_ms: int
+    consecutive_renewal_failures: int = 0
+    last_renewal_error: str | None = None
+
+
+@dataclass
+class _RequestLockEntry:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    users: int = 0
+
+
 class RequestAgentRouteRuntime:
-    """Plan from local DHT state and coordinate one exact route from the client."""
+    """Plan and maintain exact routes from the local Request Agent.
+
+    Reservation keepalives run independently from token generation and SSE
+    publication. A long prefill, a slow tool or a quiet stream therefore
+    cannot starve worker leases.
+    """
 
     def __init__(
         self,
@@ -310,34 +344,71 @@ class RequestAgentRouteRuntime:
         epoch_allocator: EpochAllocator,
         planner: ExactRoutePlanner | None = None,
         coordinator_factory: CoordinatorFactory = _default_coordinator_factory,
-        clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
+        clock_ms: Callable[[], int] = _system_clock_ms,
+        steady_clock_ms: Callable[[], int] = _steady_clock_ms,
         prepare_ttl_ms: int = 5_000,
         plan_ttl_ms: int = 10_000,
         permit_ttl_ms: int = 120_000,
+        session_ttl_ms: int = 60_000,
+        renew_interval_ms: int = 20_000,
+        renew_retry_interval_ms: int = 2_000,
+        renew_attempt_budget_ms: int = 5_000,
+        lease_expiry_guard_ms: int = 1_000,
+        start_maintenance_thread: bool = True,
         close_transport: bool = False,
     ) -> None:
         if prepare_ttl_ms <= 0 or plan_ttl_ms <= prepare_ttl_ms:
             raise ValueError("plan TTL must exceed the positive prepare TTL")
         if permit_ttl_ms < plan_ttl_ms or permit_ttl_ms > 300_000:
             raise ValueError("permit TTL must cover the plan and remain below five minutes")
+        if renew_interval_ms <= 0 or session_ttl_ms <= renew_interval_ms * 2:
+            raise ValueError("session TTL must exceed two renewal intervals")
+        if renew_retry_interval_ms <= 0 or renew_retry_interval_ms >= renew_interval_ms:
+            raise ValueError("renew retry interval must be positive and below renew interval")
+        if renew_attempt_budget_ms <= 0:
+            raise ValueError("renew attempt budget must be positive")
+        if lease_expiry_guard_ms <= 0:
+            raise ValueError("lease expiry guard must be positive")
+        if session_ttl_ms <= renew_attempt_budget_ms + lease_expiry_guard_ms:
+            raise ValueError("session TTL leaves no safe renewal retry window")
         self.transport = transport
         self.discovery = discovery
         self.registry = registry
         self.authority = authority
         self.epoch_allocator = epoch_allocator
         self.planner = planner or ExactRoutePlanner()
-        self._coordinator_factory = coordinator_factory
         self._clock_ms = clock_ms
+        self._steady_clock_ms = steady_clock_ms
         self.prepare_ttl_ms = prepare_ttl_ms
         self.plan_ttl_ms = plan_ttl_ms
         self.permit_ttl_ms = permit_ttl_ms
+        self.session_ttl_ms = session_ttl_ms
+        self.renew_interval_ms = renew_interval_ms
+        self.renew_retry_interval_ms = renew_retry_interval_ms
+        self.renew_attempt_budget_ms = renew_attempt_budget_ms
+        self.lease_expiry_guard_ms = lease_expiry_guard_ms
+        if coordinator_factory is _default_coordinator_factory:
+            self._coordinator_factory = lambda transport, authorizer: RouteReservationCoordinator(
+                transport,
+                admission_authorizer=authorizer,
+                session_ttl_ms=self.session_ttl_ms,
+            )
+        else:
+            self._coordinator_factory = coordinator_factory
         self._close_transport = close_transport
-        self._request_locks: dict[str, threading.Lock] = {}
-        self._reservations: dict[
-            str,
-            tuple[RequestContract, RequestAgentReservation],
-        ] = {}
+        self._request_locks: dict[str, _RequestLockEntry] = {}
+        self._reservations: dict[str, _ManagedReservation] = {}
+        self._failures: deque[dict[str, object]] = deque(maxlen=64)
         self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._maintenance_thread: threading.Thread | None = None
+        if start_maintenance_thread:
+            self._maintenance_thread = threading.Thread(
+                target=self._maintenance_loop,
+                name="FabiRequestAgentRouteLeases",
+                daemon=True,
+            )
+            self._maintenance_thread.start()
 
     @classmethod
     def from_environment(cls) -> "RequestAgentRouteRuntime":
@@ -397,6 +468,45 @@ class RequestAgentRouteRuntime:
             raise RuntimeError("Request Agent clock returned a negative timestamp")
         return now_ms
 
+    def _steady_now_ms(self) -> int:
+        now_ms = int(self._steady_clock_ms())
+        if now_ms < 0:
+            raise RuntimeError("Request Agent steady clock returned a negative timestamp")
+        return now_ms
+
+    @contextmanager
+    def _request_operation(
+        self,
+        request_id: str,
+        *,
+        create: bool,
+    ) -> Iterator[threading.Lock | None]:
+        """Serialize one request without deleting a lock underneath waiters."""
+
+        with self._lock:
+            entry = self._request_locks.get(request_id)
+            if entry is None and create:
+                entry = _RequestLockEntry()
+                self._request_locks[request_id] = entry
+            if entry is not None:
+                entry.users += 1
+        if entry is None:
+            yield None
+            return
+        entry.lock.acquire()
+        try:
+            yield entry.lock
+        finally:
+            entry.lock.release()
+            with self._lock:
+                entry.users -= 1
+                if (
+                    entry.users == 0
+                    and request_id not in self._reservations
+                    and self._request_locks.get(request_id) is entry
+                ):
+                    self._request_locks.pop(request_id, None)
+
     def reserve(
         self,
         request: RequestContract,
@@ -408,18 +518,20 @@ class RequestAgentRouteRuntime:
             RouteRecoveryPolicy.REPLAN_COLD,
         }:
             raise ValueError("Request Agent recovery policy is not implemented")
-        with self._lock:
-            request_lock = self._request_locks.setdefault(request.request_id, threading.Lock())
-        with request_lock:
+        with self._request_operation(request.request_id, create=True):
             with self._lock:
                 existing = self._reservations.get(request.request_id)
             if existing is not None:
-                existing_request, reservation = existing
-                if existing_request != request or reservation.recovery_policy != recovery_policy:
+                if (
+                    existing.request != request
+                    or existing.reservation.recovery_policy != recovery_policy
+                ):
                     raise ValueError(
                         "request id is already reserved with a different route contract"
                     )
-                return reservation
+                if self._steady_now_ms() >= existing.lease_deadline_ms:
+                    raise RuntimeError("request route lease is no longer active")
+                return existing.reservation
             bundle = self.registry.fetch(request.model_swarm_id)
             snapshot = self.discovery.snapshot(model_swarm_id=request.model_swarm_id)
             manifest = snapshot.manifest(request.model_swarm_id)
@@ -457,7 +569,17 @@ class RequestAgentRouteRuntime:
                     ).admission
 
                 coordinator = self._coordinator_factory(self.transport, authorize)
+                lease_started_at_ms = self._steady_now_ms()
                 committed = coordinator.reserve(planned.plan)
+                acknowledged_at_ms = self._steady_now_ms()
+                lease_deadline_ms = lease_started_at_ms + self.session_ttl_ms
+                if acknowledged_at_ms >= lease_deadline_ms - self.lease_expiry_guard_ms:
+                    try:
+                        coordinator.release(committed)
+                    finally:
+                        raise RuntimeError(
+                            "route session lease was acknowledged too close to expiry"
+                        )
                 reservation = RequestAgentReservation(
                     permit=permit,
                     planned=planned,
@@ -466,7 +588,12 @@ class RequestAgentRouteRuntime:
                     recovery_policy=recovery_policy,
                 )
                 with self._lock:
-                    self._reservations[request.request_id] = (request, reservation)
+                    self._reservations[request.request_id] = _ManagedReservation(
+                        request=request,
+                        reservation=reservation,
+                        next_renew_at_ms=acknowledged_at_ms + self.renew_interval_ms,
+                        lease_deadline_ms=lease_deadline_ms,
+                    )
                 return reservation
             except BaseException:
                 self.authority.release_permit(permit.permit_id)
@@ -478,51 +605,79 @@ class RequestAgentRouteRuntime:
         *,
         ttl_ms: int,
     ) -> RequestAgentReservation:
-        with self._lock:
-            request_lock = self._request_locks.get(reservation.committed.plan.request_id)
-        if request_lock is None:
-            raise RuntimeError("cannot renew an inactive Request Agent reservation")
-        with request_lock:
-            committed = reservation.coordinator.renew(
-                reservation.committed,
-                ttl_ms=ttl_ms,
-            )
-            renewed = RequestAgentReservation(
-                permit=reservation.permit,
-                planned=reservation.planned,
-                committed=committed,
-                coordinator=reservation.coordinator,
-                recovery_policy=reservation.recovery_policy,
-            )
-            request_id = committed.plan.request_id
+        request_id = reservation.committed.plan.request_id
+        with self._request_operation(request_id, create=False) as request_lock:
+            if request_lock is None:
+                raise RuntimeError("cannot renew an inactive Request Agent reservation")
             with self._lock:
-                current = self._reservations.get(request_id)
-                if current is None or current[1] != reservation:
+                managed = self._reservations.get(request_id)
+                if (
+                    managed is None
+                    or managed.reservation.permit.permit_id != reservation.permit.permit_id
+                ):
                     raise RuntimeError("cannot renew an inactive Request Agent reservation")
-                self._reservations[request_id] = (current[0], renewed)
-            return renewed
+            return self._renew_locked(request_id, managed, ttl_ms=ttl_ms)
 
     def release(self, reservation: RequestAgentReservation) -> None:
         request_id = reservation.committed.plan.request_id
-        with self._lock:
-            request_lock = self._request_locks.get(request_id)
-        if request_lock is None:
-            return
-        with request_lock:
+        with self._request_operation(request_id, create=False) as request_lock:
+            if request_lock is None:
+                return
             with self._lock:
                 current = self._reservations.pop(request_id, None)
-                self._request_locks.pop(request_id, None)
             if current is None:
                 return
-            active = current[1]
+            active = current.reservation
             try:
                 active.coordinator.release(active.committed)
             finally:
                 self.authority.release_permit(active.permit.permit_id)
 
-    def close(self) -> None:
+    def active_reservation(self, request_id: str) -> RequestAgentReservation | None:
+        """Return the latest acknowledged reservation while its lease is safe."""
+
         with self._lock:
-            reservations = tuple(item[1] for item in self._reservations.values())
+            managed = self._reservations.get(str(request_id))
+            if managed is None or self._steady_now_ms() >= managed.lease_deadline_ms:
+                return None
+            return managed.reservation
+
+    def status(self) -> dict[str, object]:
+        """Expose route health without leaking permits or capabilities."""
+
+        steady_now_ms = self._steady_now_ms()
+        with self._lock:
+            routes = [
+                {
+                    "request_id": request_id,
+                    "route_id": managed.reservation.committed.plan.route_id,
+                    "epoch": managed.reservation.committed.plan.epoch,
+                    "model_swarm_id": managed.request.model_swarm_id,
+                    "required_context_tokens": managed.request.required_context_tokens,
+                    "recovery_policy": managed.reservation.recovery_policy.value,
+                    "lease_expires_in_ms": max(0, managed.lease_deadline_ms - steady_now_ms),
+                    "renewal_failures": managed.consecutive_renewal_failures,
+                    "last_renewal_error": managed.last_renewal_error,
+                }
+                for request_id, managed in sorted(self._reservations.items())
+            ]
+            return {
+                "mode": "request_agent",
+                "active_routes": routes,
+                "recent_failures": list(self._failures),
+                "session_ttl_ms": self.session_ttl_ms,
+                "renew_interval_ms": self.renew_interval_ms,
+                "renew_retry_interval_ms": self.renew_retry_interval_ms,
+                "lease_expiry_guard_ms": self.lease_expiry_guard_ms,
+            }
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._maintenance_thread is not None:
+            self._maintenance_thread.join(timeout=2.0)
+            self._maintenance_thread = None
+        with self._lock:
+            reservations = tuple(item.reservation for item in self._reservations.values())
         first_error: BaseException | None = None
         for reservation in reservations:
             try:
@@ -537,3 +692,157 @@ class RequestAgentRouteRuntime:
             self._close_transport = False
         if first_error is not None:
             raise first_error
+
+    def _maintenance_loop(self) -> None:
+        interval_seconds = min(2.0, self.renew_interval_ms / 1000)
+        while not self._stop_event.wait(interval_seconds):
+            try:
+                self.maintain_once()
+            except Exception:
+                logger.exception("Unexpected Request Agent lease maintenance failure")
+
+    def maintain_once(self) -> None:
+        """Renew every due route once; public to support deterministic tests."""
+
+        now_ms = self._steady_now_ms()
+        with self._lock:
+            due = [
+                (request_id, managed)
+                for request_id, managed in self._reservations.items()
+                if managed.next_renew_at_ms <= now_ms
+            ]
+        for request_id, managed in due:
+            self._renew_managed(request_id, managed)
+
+    def _renew_managed(self, request_id: str, managed: _ManagedReservation) -> None:
+        with self._request_operation(request_id, create=False) as request_lock:
+            if request_lock is None:
+                return
+            with self._lock:
+                if self._reservations.get(request_id) is not managed:
+                    return
+                attempt_started_at_ms = self._steady_now_ms()
+                safe_retry_deadline_ms = (
+                    managed.lease_deadline_ms
+                    - self.renew_attempt_budget_ms
+                    - self.lease_expiry_guard_ms
+                )
+                unsafe_to_attempt = attempt_started_at_ms >= safe_retry_deadline_ms
+            if unsafe_to_attempt:
+                self._invalidate_under_request_lock(
+                    request_id,
+                    managed,
+                    TimeoutError("no safe lease window remains for another renewal attempt"),
+                )
+                return
+            try:
+                self._renew_locked(
+                    request_id,
+                    managed,
+                    ttl_ms=self.session_ttl_ms,
+                    attempt_started_at_ms=attempt_started_at_ms,
+                )
+            except Exception as error:
+                now_ms = self._steady_now_ms()
+                with self._lock:
+                    if self._reservations.get(request_id) is not managed:
+                        return
+                    managed.consecutive_renewal_failures += 1
+                    managed.last_renewal_error = f"{type(error).__name__}: {error}"[:256]
+                    safe_retry_deadline_ms = (
+                        managed.lease_deadline_ms
+                        - self.renew_attempt_budget_ms
+                        - self.lease_expiry_guard_ms
+                    )
+                    can_retry = now_ms + self.renew_retry_interval_ms < safe_retry_deadline_ms
+                    if can_retry:
+                        managed.next_renew_at_ms = now_ms + self.renew_retry_interval_ms
+                if can_retry:
+                    logger.warning(
+                        "Request Agent route %s lease renewal failed "
+                        "(attempt %d); retrying before acknowledged expiry: %s",
+                        request_id,
+                        managed.consecutive_renewal_failures,
+                        error,
+                    )
+                    return
+                self._invalidate_under_request_lock(request_id, managed, error)
+
+    def _renew_locked(
+        self,
+        request_id: str,
+        managed: _ManagedReservation,
+        *,
+        ttl_ms: int,
+        attempt_started_at_ms: int | None = None,
+    ) -> RequestAgentReservation:
+        """Renew while the caller serializes this request against release."""
+
+        if ttl_ms <= self.lease_expiry_guard_ms:
+            raise ValueError("renew TTL must exceed the lease expiry guard")
+        if attempt_started_at_ms is None:
+            attempt_started_at_ms = self._steady_now_ms()
+        current = managed.reservation
+        committed = current.coordinator.renew(current.committed, ttl_ms=ttl_ms)
+        acknowledged_at_ms = self._steady_now_ms()
+        deadline_ms = attempt_started_at_ms + ttl_ms
+        if acknowledged_at_ms >= deadline_ms - self.lease_expiry_guard_ms:
+            raise TimeoutError("lease renewal acknowledgement arrived after the safe deadline")
+        renewed = RequestAgentReservation(
+            permit=current.permit,
+            planned=current.planned,
+            committed=committed,
+            coordinator=current.coordinator,
+            recovery_policy=current.recovery_policy,
+        )
+        with self._lock:
+            if self._reservations.get(request_id) is not managed:
+                raise RuntimeError("cannot renew an inactive Request Agent reservation")
+            managed.reservation = renewed
+            managed.lease_deadline_ms = deadline_ms
+            managed.next_renew_at_ms = acknowledged_at_ms + min(
+                self.renew_interval_ms,
+                max(1, (ttl_ms - self.lease_expiry_guard_ms) // 3),
+            )
+            managed.consecutive_renewal_failures = 0
+            managed.last_renewal_error = None
+        return renewed
+
+    def _invalidate_under_request_lock(
+        self,
+        request_id: str,
+        managed: _ManagedReservation,
+        error: Exception,
+    ) -> None:
+        """Fence locally first, then clean up the remote route best-effort."""
+
+        with self._lock:
+            if self._reservations.get(request_id) is not managed:
+                return
+            self._reservations.pop(request_id, None)
+            self._failures.append(
+                {
+                    "request_id": request_id,
+                    "route_id": managed.reservation.committed.plan.route_id,
+                    "epoch": managed.reservation.committed.plan.epoch,
+                    "error": f"{type(error).__name__}: {error}"[:256],
+                    "failed_at_ms": self._now_ms(),
+                }
+            )
+        try:
+            managed.reservation.coordinator.release(managed.reservation.committed)
+        except Exception:
+            logger.warning(
+                "Failed to release expired Request Agent route %s",
+                request_id,
+                exc_info=True,
+            )
+        finally:
+            try:
+                self.authority.release_permit(managed.reservation.permit.permit_id)
+            except Exception:
+                logger.warning(
+                    "Failed to release expired Request Agent permit %s",
+                    request_id,
+                    exc_info=True,
+                )

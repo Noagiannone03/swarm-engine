@@ -116,6 +116,9 @@ class FakeCoordinator:
         self.transport = transport
         self.authorizer = authorizer
         self.released = []
+        self.renew_calls = []
+        self.renew_errors = []
+        self.on_renew = None
 
     def reserve(self, plan):
         signed = sign_control_contract(
@@ -128,6 +131,11 @@ class FakeCoordinator:
 
     def renew(self, route, *, ttl_ms):
         assert ttl_ms > 0
+        self.renew_calls.append((route.plan.route_id, ttl_ms))
+        if self.on_renew is not None:
+            self.on_renew()
+        if self.renew_errors:
+            raise self.renew_errors.pop(0)
         return route
 
     def release(self, route):
@@ -192,6 +200,7 @@ def test_request_agent_plans_from_dht_and_coordinates_with_its_own_identity():
         epoch_allocator=InMemoryEpochAllocator(),
         coordinator_factory=coordinator_factory,
         clock_ms=lambda: 1_000,
+        start_maintenance_thread=False,
     )
     request = RequestContract(
         request_id="request",
@@ -228,6 +237,7 @@ def test_request_agent_refuses_dht_manifest_not_authenticated_by_tuf():
         authority=authority,
         epoch_allocator=InMemoryEpochAllocator(),
         clock_ms=lambda: 1_000,
+        start_maintenance_thread=False,
     )
     request = RequestContract(
         request_id="request",
@@ -240,6 +250,123 @@ def test_request_agent_refuses_dht_manifest_not_authenticated_by_tuf():
     with pytest.raises(PermissionError, match="TUF-authenticated"):
         runtime.reserve(request)
     assert authority.permits == []
+
+
+class MutableClock:
+    def __init__(self, now_ms=0):
+        self.now_ms = now_ms
+
+    def __call__(self):
+        return self.now_ms
+
+
+def lease_runtime():
+    model = manifest()
+    authority = FakeAuthority()
+    coordinators = []
+    steady_clock = MutableClock()
+
+    def coordinator_factory(transport, authorizer):
+        coordinator = FakeCoordinator(transport, authorizer)
+        coordinators.append(coordinator)
+        return coordinator
+
+    runtime = RequestAgentRouteRuntime(
+        transport=CryptoTransport(),
+        discovery=discovery(model),
+        registry=SimpleNamespace(fetch=lambda _model_id: SimpleNamespace(manifest=model)),
+        authority=authority,
+        epoch_allocator=InMemoryEpochAllocator(),
+        coordinator_factory=coordinator_factory,
+        clock_ms=lambda: 1_000,
+        steady_clock_ms=steady_clock,
+        session_ttl_ms=60,
+        renew_interval_ms=20,
+        renew_retry_interval_ms=5,
+        renew_attempt_budget_ms=10,
+        lease_expiry_guard_ms=1,
+        start_maintenance_thread=False,
+    )
+    request = RequestContract(
+        request_id="lease-request",
+        model_swarm_id=model.model_swarm_id,
+        prompt_tokens=100,
+        reserved_output_tokens=20,
+        recovery_level=RecoveryLevel.RESTARTABLE,
+    )
+    reservation = runtime.reserve(request)
+    return runtime, reservation, authority, coordinators[0], steady_clock
+
+
+def test_request_agent_renews_due_lease_from_independent_maintenance_tick():
+    runtime, reservation, _authority, coordinator, steady_clock = lease_runtime()
+
+    steady_clock.now_ms = 19
+    runtime.maintain_once()
+    assert coordinator.renew_calls == []
+
+    steady_clock.now_ms = 20
+    runtime.maintain_once()
+
+    assert coordinator.renew_calls == [(reservation.committed.plan.route_id, 60)]
+    assert runtime.active_reservation("lease-request") is not None
+    route_status = runtime.status()["active_routes"][0]
+    assert route_status["lease_expires_in_ms"] == 60
+    assert route_status["renewal_failures"] == 0
+
+
+def test_request_agent_retries_transient_renewal_only_inside_safe_window():
+    runtime, _reservation, _authority, coordinator, steady_clock = lease_runtime()
+    coordinator.renew_errors.append(RuntimeError("temporary network failure"))
+
+    steady_clock.now_ms = 20
+    runtime.maintain_once()
+    route_status = runtime.status()["active_routes"][0]
+    assert route_status["renewal_failures"] == 1
+    assert "temporary network failure" in route_status["last_renewal_error"]
+
+    steady_clock.now_ms = 24
+    runtime.maintain_once()
+    assert len(coordinator.renew_calls) == 1
+
+    steady_clock.now_ms = 25
+    runtime.maintain_once()
+    assert len(coordinator.renew_calls) == 2
+    route_status = runtime.status()["active_routes"][0]
+    assert route_status["lease_expires_in_ms"] == 60
+    assert route_status["renewal_failures"] == 0
+
+
+def test_request_agent_fails_closed_before_lease_retry_can_cross_expiry():
+    runtime, reservation, authority, coordinator, steady_clock = lease_runtime()
+
+    steady_clock.now_ms = 49
+    runtime.maintain_once()
+
+    assert runtime.active_reservation("lease-request") is None
+    assert coordinator.renew_calls == []
+    assert coordinator.released == [reservation.committed.plan.route_id]
+    assert authority.released == [PERMIT]
+    failure = runtime.status()["recent_failures"][0]
+    assert "no safe lease window" in failure["error"]
+
+
+def test_request_agent_rejects_renewal_acknowledged_after_safe_deadline():
+    runtime, reservation, authority, coordinator, steady_clock = lease_runtime()
+
+    def delay_acknowledgement():
+        steady_clock.now_ms += 59
+
+    coordinator.on_renew = delay_acknowledgement
+    steady_clock.now_ms = 20
+    runtime.maintain_once()
+
+    assert runtime.active_reservation("lease-request") is None
+    assert coordinator.renew_calls == [(reservation.committed.plan.route_id, 60)]
+    assert coordinator.released == [reservation.committed.plan.route_id]
+    assert authority.released == [PERMIT]
+    failure = runtime.status()["recent_failures"][0]
+    assert "acknowledgement arrived after the safe deadline" in failure["error"]
 
 
 class FakeResponse:
