@@ -12,6 +12,10 @@ from fastapi.staticfiles import StaticFiles
 from backend.server.contribution_gate import ContributionAdmission, get_gate
 from backend.server.openai_compat import openai_error_response, openai_models_payload
 from backend.server.request_handler import RequestHandler
+from backend.server.route_capability_api import (
+    configure_request_agent_authority,
+    router as request_agent_authority_router,
+)
 from backend.server.scheduler_manage import SchedulerManage
 from backend.server.server_args import parse_args
 from backend.server.static_config import (
@@ -33,6 +37,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(request_agent_authority_router)
 
 logger = get_logger(__name__)
 
@@ -157,6 +162,7 @@ async def scheduler_init(raw_request: Request):
             f"Initializing scheduler with model: {model_name}, init_nodes_num: {init_nodes_num}"
         )
         scheduler_manage.run(model_name, init_nodes_num, is_local_network)
+        configure_request_agent_authority(scheduler_manage, get_gate())
 
         return JSONResponse(
             content={
@@ -338,6 +344,7 @@ if __name__ == "__main__":
     is_local_network = args.is_local_network
     if model_name is not None and init_nodes_num is not None:
         scheduler_manage.run(model_name, init_nodes_num, is_local_network)
+        configure_request_agent_authority(scheduler_manage, get_gate())
 
     host = args.host
     port = args.port

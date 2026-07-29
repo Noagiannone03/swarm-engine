@@ -248,6 +248,50 @@ class SqliteRoutePermitLedger:
                 raise RoutePermitExpired(f"route permit is {row['state']}")
             return self._permit(row)
 
+    def active_count(self, account_id: str) -> int:
+        _validate_hash(account_id, "account ID")
+        now_ms = self._now_ms()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM route_permits
+                WHERE account_id = ? AND state = ? AND expires_at_ms > ?
+                """,
+                (account_id, RoutePermitState.ACTIVE.value, now_ms),
+            ).fetchone()
+            assert row is not None
+            return int(row["count"])
+
+    def find_active(
+        self,
+        *,
+        account_id: str,
+        request_id: str,
+        coordinator_endpoint_id: str,
+    ) -> AuthorizedContributionPermit | None:
+        _validate_hash(account_id, "account ID")
+        _validate_request_id(request_id)
+        _validate_hash(coordinator_endpoint_id, "coordinator EndpointId")
+        now_ms = self._now_ms()
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM route_permits
+                WHERE account_id = ? AND request_id = ?
+                  AND coordinator_endpoint_id = ? AND state = ?
+                  AND expires_at_ms > ?
+                """,
+                (
+                    account_id,
+                    request_id,
+                    coordinator_endpoint_id,
+                    RoutePermitState.ACTIVE.value,
+                    now_ms,
+                ),
+            ).fetchone()
+            return None if row is None else self._permit(row)
+
     def issue(
         self,
         *,
@@ -524,6 +568,24 @@ class SqliteRoutePermitLedger:
                 (
                     RoutePermitState.RELEASED.value,
                     permit_id,
+                    RoutePermitState.ACTIVE.value,
+                ),
+            ).rowcount
+            return changed > 0
+
+    def release_owned(self, permit_id: str, account_id: str) -> bool:
+        _validate_hash(permit_id, "permit ID")
+        _validate_hash(account_id, "account ID")
+        with self._transaction():
+            changed = self._connection.execute(
+                """
+                UPDATE route_permits SET state = ?
+                WHERE permit_id = ? AND account_id = ? AND state = ?
+                """,
+                (
+                    RoutePermitState.RELEASED.value,
+                    permit_id,
+                    account_id,
                     RoutePermitState.ACTIVE.value,
                 ),
             ).rowcount

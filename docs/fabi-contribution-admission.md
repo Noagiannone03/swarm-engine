@@ -18,6 +18,10 @@ The IDE does not expose the credential. It asks the account-scoped
 `GET /v1/contribution/status` endpoint and only reveals the prompt when both the
 pipeline and the account are admitted.
 
+Local Request Agent route permits and gateway generations consume the same
+account counter. See `docs/fabi-request-agent-authority.md` for the V3 permit,
+idempotency and Biscuit API.
+
 ## Why this design
 
 BitTorrent's deployed choking algorithm reciprocates observed service, caps the

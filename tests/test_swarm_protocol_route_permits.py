@@ -186,3 +186,14 @@ def test_expiration_releases_capacity_and_ledger_is_private(tmp_path):
     assert replacement.request_id == "replacement"
     if os.name != "nt":
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_account_scoped_release_cannot_mutate_another_accounts_permit(tmp_path):
+    ledger = SqliteRoutePermitLedger(tmp_path / "permits.sqlite3", clock_ms=lambda: 1_000)
+    permit = issue(ledger)
+
+    assert ledger.active_count(ACCOUNT) == 1
+    assert ledger.release_owned(permit.permit_id, "ff" * 32) is False
+    assert ledger.active_count(ACCOUNT) == 1
+    assert ledger.release_owned(permit.permit_id, ACCOUNT) is True
+    assert ledger.active_count(ACCOUNT) == 0

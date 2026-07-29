@@ -1,8 +1,16 @@
 import time
 from types import SimpleNamespace
 
-from backend.server.contribution_gate import ContributionGate, account_hash
+import pytest
+
+from backend.server.contribution_gate import (
+    ContributionGate,
+    ContributionPermitDenied,
+    account_hash,
+)
+from backend.server.route_permits import RoutePermitConflict, SqliteRoutePermitLedger
 from backend.server.rpc_connection_handler import node_log_summary
+from fabi_network.capability import RouteRecoveryPolicy
 from swarm_protocol import (
     BackendKind,
     EffectiveSpanMode,
@@ -16,6 +24,8 @@ from swarm_protocol import (
 )
 
 CREDENTIAL = "ab" * 32
+COORDINATOR = "12" * 32
+MODEL = "34" * 32
 
 
 def worker(
@@ -204,6 +214,66 @@ def test_one_concurrent_request_per_ready_worker(monkeypatch):
     gate.release(first)
     live.serving_ready = lambda: True
     assert gate.admit(CREDENTIAL, live).allowed is True
+
+
+def test_route_permit_and_gateway_share_one_contribution_slot(monkeypatch, tmp_path):
+    monkeypatch.setenv("FABI_GATE", "on")
+    gate = ContributionGate()
+    ledger = SqliteRoutePermitLedger(tmp_path / "permits.sqlite3")
+    gate.bind_route_permit_ledger(ledger)
+    live = scheduler(worker())
+    policies = frozenset({RouteRecoveryPolicy.REPLAN_COLD})
+
+    permit = gate.issue_route_permit(
+        CREDENTIAL,
+        live,
+        request_id="request",
+        coordinator_endpoint_id=COORDINATOR,
+        model_swarm_id=MODEL,
+        max_context_tokens=16_384,
+        recovery_policies=policies,
+        ttl_ms=60_000,
+    )
+    assert gate.status(CREDENTIAL, live).reason == "capacity_reached"
+    assert gate.admit(CREDENTIAL, live).status.reason == "capacity_reached"
+
+    retry = gate.issue_route_permit(
+        CREDENTIAL,
+        live,
+        request_id="request",
+        coordinator_endpoint_id=COORDINATOR,
+        model_swarm_id=MODEL,
+        max_context_tokens=16_384,
+        recovery_policies=policies,
+        ttl_ms=60_000,
+    )
+    assert retry == permit
+    with pytest.raises(RoutePermitConflict):
+        gate.issue_route_permit(
+            CREDENTIAL,
+            live,
+            request_id="request",
+            coordinator_endpoint_id=COORDINATOR,
+            model_swarm_id=MODEL,
+            max_context_tokens=32_768,
+            recovery_policies=policies,
+            ttl_ms=60_000,
+        )
+
+    assert ledger.release_owned(permit.permit_id, account_hash(CREDENTIAL))
+    gateway = gate.admit(CREDENTIAL, live)
+    assert gateway.allowed is True
+    with pytest.raises(ContributionPermitDenied, match="capacity_reached"):
+        gate.issue_route_permit(
+            CREDENTIAL,
+            live,
+            request_id="other",
+            coordinator_endpoint_id=COORDINATOR,
+            model_swarm_id=MODEL,
+            max_context_tokens=16_384,
+            recovery_policies=policies,
+            ttl_ms=60_000,
+        )
 
 
 def test_worker_rpc_log_summary_never_contains_account_credential():

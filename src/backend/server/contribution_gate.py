@@ -19,8 +19,10 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol
 
+from backend.server.route_permits import AuthorizedContributionPermit, RoutePermitConflict
+from fabi_network.capability import RouteRecoveryPolicy
 from parallax_utils.logging_config import get_logger
 from scheduling.node import node_is_routable
 from swarm_protocol.contracts import ModelMemberAdvertisement, SpanState
@@ -29,6 +31,45 @@ logger = get_logger(__name__)
 
 _ACCOUNT_CREDENTIAL = re.compile(r"^[0-9a-fA-F]{64}$")
 _ENABLED = {"1", "true", "yes", "on", "strict"}
+_MAX_ROUTE_PERMIT_TTL_MS = 5 * 60 * 1_000
+_PUBLIC_RECOVERY_POLICIES = frozenset(
+    {
+        RouteRecoveryPolicy.BEST_EFFORT,
+        RouteRecoveryPolicy.REPLAN_COLD,
+    }
+)
+
+
+class ContributionRoutePermitLedger(Protocol):
+    def active_count(self, account_id: str) -> int: ...
+
+    def find_active(
+        self,
+        *,
+        account_id: str,
+        request_id: str,
+        coordinator_endpoint_id: str,
+    ) -> AuthorizedContributionPermit | None: ...
+
+    def issue(
+        self,
+        *,
+        account_id: str,
+        request_id: str,
+        coordinator_endpoint_id: str,
+        model_swarm_id: str,
+        max_context_tokens: int,
+        recovery_policies: frozenset[RouteRecoveryPolicy],
+        ttl_ms: int,
+        max_active_per_account: int,
+        permit_id: str | None = None,
+    ) -> AuthorizedContributionPermit: ...
+
+
+class ContributionPermitDenied(PermissionError):
+    def __init__(self, status: "ContributionStatus") -> None:
+        super().__init__(f"contribution permit denied: {status.reason}")
+        self.status = status
 
 
 def account_hash(credential: object) -> Optional[str]:
@@ -97,13 +138,22 @@ class ContributionGate:
                 "Ignoring invalid FABI_GATE_REQUESTS_PER_WORKER=%r; using 1",
                 raw_limit,
             )
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._active_requests: dict[str, int] = {}
+        self._route_permit_ledger: ContributionRoutePermitLedger | None = None
         logger.info(
             "Contribution gate %s (requests_per_worker=%d)",
             "enabled" if self.enabled else "disabled",
             self.requests_per_worker,
         )
+
+    def bind_route_permit_ledger(self, ledger: ContributionRoutePermitLedger) -> None:
+        """Share one capacity counter between gateway and Request Agent traffic."""
+
+        with self._lock:
+            if self._route_permit_ledger is not None and self._route_permit_ledger is not ledger:
+                raise RuntimeError("contribution gate already has a route permit ledger")
+            self._route_permit_ledger = ledger
 
     @staticmethod
     def _external_ready_worker_ids(scheduler) -> frozenset[str] | None:
@@ -198,7 +248,24 @@ class ContributionGate:
         )
         eligible = self._eligible_workers(scheduler, identity, time.time())
         with self._lock:
-            active = self._active_requests.get(identity, 0)
+            gateway_active = self._active_requests.get(identity, 0)
+            try:
+                permit_active = (
+                    0
+                    if self._route_permit_ledger is None
+                    else self._route_permit_ledger.active_count(identity)
+                )
+            except Exception:
+                logger.exception("Unable to read the route permit capacity ledger")
+                return ContributionStatus(
+                    False,
+                    "admission_unavailable",
+                    eligible_workers=eligible,
+                    active_requests=gateway_active,
+                    max_concurrent_requests=eligible * self.requests_per_worker,
+                    account_id=identity,
+                )
+            active = gateway_active + permit_active
         maximum = eligible * self.requests_per_worker
 
         if eligible == 0:
@@ -240,7 +307,26 @@ class ContributionGate:
         if not status.allowed or not self.enabled or status.account_id is None:
             return ContributionAdmission(status)
         with self._lock:
-            active = self._active_requests.get(status.account_id, 0)
+            gateway_active = self._active_requests.get(status.account_id, 0)
+            try:
+                permit_active = (
+                    0
+                    if self._route_permit_ledger is None
+                    else self._route_permit_ledger.active_count(status.account_id)
+                )
+            except Exception:
+                logger.exception("Unable to read the route permit capacity ledger")
+                return ContributionAdmission(
+                    ContributionStatus(
+                        False,
+                        "admission_unavailable",
+                        eligible_workers=status.eligible_workers,
+                        active_requests=gateway_active,
+                        max_concurrent_requests=status.max_concurrent_requests,
+                        account_id=status.account_id,
+                    )
+                )
+            active = gateway_active + permit_active
             if active >= status.max_concurrent_requests:
                 return ContributionAdmission(
                     ContributionStatus(
@@ -252,7 +338,7 @@ class ContributionGate:
                         account_id=status.account_id,
                     )
                 )
-            self._active_requests[status.account_id] = active + 1
+            self._active_requests[status.account_id] = gateway_active + 1
             return ContributionAdmission(
                 ContributionStatus(
                     True,
@@ -262,6 +348,77 @@ class ContributionGate:
                     max_concurrent_requests=status.max_concurrent_requests,
                     account_id=status.account_id,
                 )
+            )
+
+    def issue_route_permit(
+        self,
+        credential: object,
+        scheduler,
+        *,
+        request_id: str,
+        coordinator_endpoint_id: str,
+        model_swarm_id: str,
+        max_context_tokens: int,
+        recovery_policies: frozenset[RouteRecoveryPolicy],
+        ttl_ms: int,
+    ) -> AuthorizedContributionPermit:
+        """Atomically exchange one live contribution slot for a route permit."""
+
+        if not self.enabled:
+            raise RuntimeError("route permit authority requires FABI_GATE=on")
+        if ttl_ms <= 0 or ttl_ms > _MAX_ROUTE_PERMIT_TTL_MS:
+            raise ValueError("route permit TTL must be between 1 ms and 5 minutes")
+        if not recovery_policies or not recovery_policies <= _PUBLIC_RECOVERY_POLICIES:
+            raise ValueError("route permit requests an unsupported public recovery policy")
+        with self._lock:
+            ledger = self._route_permit_ledger
+            if ledger is None:
+                raise RuntimeError("route permit ledger is not configured")
+            identity = account_hash(credential)
+            if identity is None:
+                reason = "missing_credential" if not credential else "invalid_credential"
+                raise ContributionPermitDenied(ContributionStatus(False, reason))
+            existing = ledger.find_active(
+                account_id=identity,
+                request_id=request_id,
+                coordinator_endpoint_id=coordinator_endpoint_id,
+            )
+            if existing is not None:
+                if (
+                    existing.model_swarm_id != model_swarm_id
+                    or existing.max_context_tokens != max_context_tokens
+                    or existing.recovery_policies != recovery_policies
+                    or existing.expires_at_ms - existing.issued_at_ms != ttl_ms
+                ):
+                    raise RoutePermitConflict(
+                        "request idempotency key was reused with a different permit contract"
+                    )
+                return existing
+            status = self.status(credential, scheduler)
+            if not status.allowed or status.account_id is None:
+                raise ContributionPermitDenied(status)
+            gateway_active = self._active_requests.get(status.account_id, 0)
+            permit_capacity = status.max_concurrent_requests - gateway_active
+            if permit_capacity <= 0:
+                raise ContributionPermitDenied(
+                    ContributionStatus(
+                        False,
+                        "capacity_reached",
+                        eligible_workers=status.eligible_workers,
+                        active_requests=status.active_requests,
+                        max_concurrent_requests=status.max_concurrent_requests,
+                        account_id=status.account_id,
+                    )
+                )
+            return ledger.issue(
+                account_id=status.account_id,
+                request_id=request_id,
+                coordinator_endpoint_id=coordinator_endpoint_id,
+                model_swarm_id=model_swarm_id,
+                max_context_tokens=max_context_tokens,
+                recovery_policies=recovery_policies,
+                ttl_ms=ttl_ms,
+                max_active_per_account=permit_capacity,
             )
 
     def release(self, admission: ContributionAdmission) -> None:

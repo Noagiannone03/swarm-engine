@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Mapping, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -33,7 +33,6 @@ from swarm_protocol.control import (
     SignedControlMessage,
     verify_control_contract,
 )
-from swarm_protocol.registry import RouteAuthorityKeyset
 from swarm_protocol.route_authority import RouteAdmissionEnvelope, route_plan_digest
 
 _MAX_PRIVATE_KEY_FILE_BYTES = 256
@@ -94,6 +93,10 @@ class RoutePermitLedger(Protocol):
     ) -> RouteCapabilityIssuance: ...
 
 
+class ActiveRouteAuthorityKeys(Protocol):
+    def active_public_keys(self, now_ms: int) -> Mapping[str, str]: ...
+
+
 def _system_clock_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -127,7 +130,7 @@ class RouteCapabilityIssuer:
         *,
         private_key_hex: str,
         crypto: ControlCrypto,
-        trusted_keyset: Callable[[], RouteAuthorityKeyset],
+        trusted_keyset: Callable[[], ActiveRouteAuthorityKeys],
         clock_ms: Callable[[], int] = _system_clock_ms,
     ) -> None:
         self._private_key_hex = private_key_hex
@@ -143,7 +146,7 @@ class RouteCapabilityIssuer:
         path: Path,
         *,
         crypto: ControlCrypto,
-        trusted_keyset: Callable[[], RouteAuthorityKeyset],
+        trusted_keyset: Callable[[], ActiveRouteAuthorityKeys],
         clock_ms: Callable[[], int] = _system_clock_ms,
     ) -> "RouteCapabilityIssuer":
         return cls(
@@ -195,10 +198,7 @@ class RouteCapabilityIssuer:
         if plan.reservation_deadline_ms <= now_ms or plan.plan_expires_at_ms > permit.expires_at_ms:
             raise PermissionError("route lifetime exceeds the contribution permit")
 
-        trusted = self._trusted_keyset()
-        active_keys = trusted.active_public_keys(now_ms)
-        if active_keys.get(self.authority_key_id) != self._public_key_hex:
-            raise PermissionError("route capability signing key is not active in the TUF registry")
+        self.validate_active_key(now_ms=now_ms)
 
         claims = RouteCapabilityClaims(
             permit_id=permit.permit_id,
@@ -220,6 +220,15 @@ class RouteCapabilityIssuer:
             recovery_policy=recovery_policy,
             claims=claims,
         )
+
+    def validate_active_key(self, *, now_ms: int | None = None) -> None:
+        current_ms = int(self._clock_ms()) if now_ms is None else int(now_ms)
+        if current_ms < 0:
+            raise RuntimeError("route capability issuer clock returned a negative timestamp")
+        trusted = self._trusted_keyset()
+        active_keys = trusted.active_public_keys(current_ms)
+        if active_keys.get(self.authority_key_id) != self._public_key_hex:
+            raise PermissionError("route capability signing key is not active in the TUF registry")
 
     def _mint(self, prepared: _PreparedRouteCapability) -> IssuedRouteCapability:
         """Mint one validated capability; callers must persist it before returning."""

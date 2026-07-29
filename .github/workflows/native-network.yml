@@ -105,13 +105,18 @@ jobs:
             "tuf==7.0.0" \
             "cryptography>=40.0.0" \
             "requests>=2.31" \
+            "fastapi>=0.115" \
+            "httpx>=0.27" \
             "lattica==1.0.21" \
             "msgpack>=1.0.7" \
             "protobuf>=7.35.1,<8" \
             "pytest>=8.2"
           python -m pip install --no-deps -e ../..
           cd ../..
-          python -m pytest -q --noconftest tests/test_swarm_protocol_*.py
+          python -m pytest -q --noconftest \
+            tests/test_swarm_protocol_*.py \
+            tests/test_route_capability_http.py \
+            tests/scheduler_tests/test_contribution_gate_v2.py
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
