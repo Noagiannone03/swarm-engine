@@ -55,15 +55,51 @@ fabi-request-agent --host 127.0.0.1 --port 7778
 
 The CLI rejects a non-loopback bind.
 
-## Current recovery boundary
+## Exact recovery without an immobilized backup
 
-The local frontend already inherits explicit engine abort and exact route
-fencing. Its first committed version intentionally leaves token capture
-disabled until the durable local journal and `replan_cold` transaction are
-connected. Until that next milestone, loss of an executing route returns an
-OpenAI upstream error and never silently duplicates output.
+Deterministic streaming requests use `replan_cold`; they never reserve a second
+complete pipeline:
 
-The next milestone reuses `OpenAIRecoveryStream`, the exact replay sampling
-contract and the worker `/inference/v1/chat-replay` endpoint already qualified
-in the gateway runtime. It will replace the old pre-reserved backup model with
-a fresh DHT plan and a new fencing epoch.
+1. before prefill, the authenticated route-head tokenization is committed to a
+   local SQLite journal;
+2. every output-token ID is committed in a `BEGIN IMMEDIATE` transaction
+   before the corresponding SSE event is published;
+3. the journal uses SQLite WAL with `synchronous=FULL`, owner-only file
+   permissions, bounded prompt/output counts and checksum verification;
+4. when a route disappears, its workers are excluded from the next decision,
+   its worker leases are released best-effort and its old epoch is fenced;
+5. the Request Agent refreshes the same contribution permit, reads one fresh
+   TUF-matched DHT snapshot and reserves a new complete route at a higher
+   epoch;
+6. `/inference/v1/chat-replay` receives the exact original prompt IDs and
+   committed output prefix, rebuilds KV and parser/tool state, and proves the
+   replay boundary before any new event is published;
+7. replayed SSE events are suppressed, so OpenCode observes every committed
+   token exactly once.
+
+The same mechanism works when the primary dies before its first generation
+chunk: the qualified tokenize RPC is journalled before prefill. A replacement
+that dies while replaying can itself be replaced at a still newer epoch.
+Without another feasible DHT route, the stream ends with a typed OpenAI error;
+Fabi never invents a continuation.
+
+Exact replay is currently admitted only for greedy sampling and the bounded
+parameter subset implemented in `swarm_protocol.recovery`. Portable RNG state
+between MLX, vLLM and SGLang is not yet a wire contract, so sampled requests
+remain restartable.
+
+This follows Petals' proven failure rule: ban the failed peer, reconstruct a
+path from current discovery state and replay the session history into the
+replacement. Petals keeps per-span input activations; Fabi's portable baseline
+keeps token IDs and recomputes the complete route. A future negotiated fast
+path may keep bounded boundary activations or use vLLM's official external KV
+connector interface when model revision, layer span, dtype, KV layout and
+backend match exactly. Cross-backend RTX/MLX recovery always retains token
+replay as the correctness fallback.
+
+Primary references:
+
+- [Petals inference session recovery](https://github.com/bigscience-workshop/petals/blob/main/src/petals/client/inference_session.py)
+- [SQLite write-ahead logging](https://www.sqlite.org/wal.html)
+- [SQLite transaction semantics](https://www.sqlite.org/lang_transaction.html)
+- [vLLM KV connector base](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/kv_transfer/kv_connector/v1/base.py)

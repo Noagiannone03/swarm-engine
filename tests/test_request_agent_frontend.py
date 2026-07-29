@@ -16,6 +16,8 @@ from backend.server.request_agent_frontend import (
 )
 from swarm_protocol.contracts import ArtifactRole
 from fabi_network.capability import RouteRecoveryPolicy
+from swarm_protocol.recovery import RecoveryState
+from swarm_protocol.recovery_sqlite import SqliteRecoveryJournal
 
 MODEL_SWARM_ID = "11" * 32
 ENDPOINT_ID = "22" * 32
@@ -98,6 +100,31 @@ class FakeTransport:
         return self.stub_instance
 
 
+class FailoverTransport:
+    def __init__(self, stubs):
+        self.stubs = dict(stubs)
+
+    def stub(self, endpoint_id, service_type):
+        del service_type
+        return self.stubs[endpoint_id]
+
+
+class FailoverStub(FakeCompletionStub):
+    def __init__(self, *, chat_chunks=(), replay_chunks=()):
+        super().__init__()
+        self.chat_chunks = tuple(chat_chunks)
+        self.replay_chunks = tuple(replay_chunks)
+        self.replay_requests = []
+
+    def chat_completion(self, request):
+        self.requests.append(request)
+        return FakeResponse(self.chat_chunks)
+
+    def replay_generation(self, request):
+        self.replay_requests.append(request)
+        return FakeResponse(self.replay_chunks)
+
+
 class FakeRuntime:
     def __init__(self):
         manifest = SimpleNamespace(
@@ -146,6 +173,101 @@ class FakeRuntime:
 
     def close(self):
         self.closed = True
+
+
+class FailoverRuntime:
+    def __init__(self, primary_stub, replacement_stub):
+        self.manifest = SimpleNamespace(
+            model_swarm_id=MODEL_SWARM_ID,
+            model_id="fabi/test-model",
+            immutable_revision="model-commit",
+            tokenizer_hash="44" * 32,
+            dtype="bfloat16",
+            prefill_contract_hash="55" * 32,
+            attention_kv_contract_hash="66" * 32,
+        )
+        self.registry = SimpleNamespace(
+            fetch=lambda model_swarm_id: SimpleNamespace(manifest=self.manifest)
+        )
+        self.transport = FailoverTransport(
+            {
+                ENDPOINT_ID: primary_stub,
+                "77" * 32: replacement_stub,
+            }
+        )
+        self.active = {}
+        self.replans = []
+        self.released = []
+
+    @staticmethod
+    def _plan(request, *, worker_id, endpoint_id, route_id, epoch):
+        return SimpleNamespace(
+            request_id=request.request_id,
+            model_swarm_id=request.model_swarm_id,
+            route_id=route_id,
+            epoch=epoch,
+            prompt_tokens=request.prompt_tokens,
+            required_context_tokens=request.required_context_tokens,
+            stages=(SimpleNamespace(worker_id=worker_id, endpoint_id=endpoint_id),),
+        )
+
+    def max_supported_context_tokens(self, model_swarm_id, upper_bound):
+        assert model_swarm_id == MODEL_SWARM_ID
+        return min(4096, upper_bound)
+
+    def reserve(self, request):
+        plan = self._plan(
+            request,
+            worker_id="worker-primary",
+            endpoint_id=ENDPOINT_ID,
+            route_id=f"route-primary-{request.request_id}",
+            epoch=1,
+        )
+        reservation = SimpleNamespace(
+            committed=SimpleNamespace(plan=plan),
+            recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+        )
+        self.active[request.request_id] = reservation
+        return reservation
+
+    def replan_cold(self, request_id, *, failed_epoch):
+        current = self.active[request_id]
+        assert failed_epoch == current.committed.plan.epoch
+        request = SimpleNamespace(
+            request_id=request_id,
+            model_swarm_id=current.committed.plan.model_swarm_id,
+            prompt_tokens=current.committed.plan.prompt_tokens,
+            required_context_tokens=current.committed.plan.required_context_tokens,
+        )
+        plan = self._plan(
+            request,
+            worker_id="worker-replacement",
+            endpoint_id="77" * 32,
+            route_id=f"route-replacement-{request_id}",
+            epoch=2,
+        )
+        replacement = SimpleNamespace(
+            committed=SimpleNamespace(plan=plan),
+            recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+        )
+        self.active[request_id] = replacement
+        self.replans.append((request_id, failed_epoch))
+        return replacement
+
+    def active_reservation(self, request_id):
+        return self.active.get(request_id)
+
+    def release_request(self, request_id):
+        if self.active.pop(request_id, None) is None:
+            return False
+        self.released.append(request_id)
+        return True
+
+    def status(self):
+        return {"mode": "request_agent", "active_routes": []}
+
+    def close(self):
+        self.active.clear()
 
 
 def manager_and_runtime():
@@ -251,6 +373,125 @@ def test_local_request_agent_preserves_openai_sse_and_releases_after_done():
     assert b'"content":"ok"' in body
     assert body.endswith(b"data: [DONE]\n\n")
     assert len(runtime.released) == 1
+
+
+def test_local_request_agent_replans_replays_and_resumes_exactly_once(tmp_path):
+    primary = FailoverStub(
+        chat_chunks=(
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}],'
+            b'"prompt_token_ids":[10,20,30]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n',
+        )
+    )
+    replacement = FailoverStub(
+        replay_chunks=(
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}],'
+            b'"prompt_token_ids":[10,20,30]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":" continued"},'
+            b'"token_ids":[41],"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{},"token_ids":[],'
+            b'"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n",
+        )
+    )
+    runtime = FailoverRuntime(primary, replacement)
+    journal = SqliteRecoveryJournal(tmp_path / "recovery.sqlite3")
+    manager = RequestAgentOpenAIManager(
+        runtime,
+        MODEL_SWARM_ID,
+        tokenizer=FakeTokenizer(),
+        model_context_limit=8192,
+        completion_service_type=object,
+        recovery_journal=journal,
+    )
+    app = create_request_agent_app(manager, api_credential=API_CREDENTIAL)
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            headers=AUTH_HEADERS,
+            json={
+                "model": "fabi-swarm",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_completion_tokens": 8,
+                "stream": True,
+                "temperature": 0,
+            },
+        ) as response:
+            body = b"".join(response.iter_bytes())
+
+    request_id = response.headers["x-request-id"]
+    snapshot = journal.get(request_id)
+    assert response.status_code == 200
+    assert body.count(b'"content":"partial"') == 1
+    assert body.count(b'"content":" continued"') == 1
+    assert body.endswith(b"data: [DONE]\n\n")
+    assert runtime.replans == [(request_id, 1)]
+    assert runtime.released == [request_id]
+    assert replacement.replay_requests[0]["original_prompt_token_ids"] == [10, 20, 30]
+    assert replacement.replay_requests[0]["committed_output_token_ids"] == [40]
+    assert snapshot is not None
+    assert snapshot.state == RecoveryState.COMPLETED
+    assert snapshot.route_ids == (
+        f"route-primary-{request_id}",
+        f"route-replacement-{request_id}",
+    )
+    assert snapshot.committed_output_token_ids == (40, 41)
+    journal.close()
+
+
+def test_local_request_agent_recovers_when_primary_dies_during_prefill(tmp_path):
+    primary = FailoverStub(chat_chunks=())
+    replacement = FailoverStub(
+        replay_chunks=(
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}],'
+            b'"prompt_token_ids":[10,20,30]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":"recovered"},'
+            b'"token_ids":[41],"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n",
+        )
+    )
+    runtime = FailoverRuntime(primary, replacement)
+    journal = SqliteRecoveryJournal(tmp_path / "recovery.sqlite3")
+    manager = RequestAgentOpenAIManager(
+        runtime,
+        MODEL_SWARM_ID,
+        tokenizer=FakeTokenizer(),
+        model_context_limit=8192,
+        completion_service_type=object,
+        recovery_journal=journal,
+    )
+    app = create_request_agent_app(manager, api_credential=API_CREDENTIAL)
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            headers=AUTH_HEADERS,
+            json={
+                "model": "fabi-swarm",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_completion_tokens": 8,
+                "stream": True,
+                "temperature": 0,
+            },
+        ) as response:
+            body = b"".join(response.iter_bytes())
+
+    request_id = response.headers["x-request-id"]
+    snapshot = journal.get(request_id)
+    assert body.count(b'"content":"recovered"') == 1
+    assert body.endswith(b"data: [DONE]\n\n")
+    assert runtime.replans == [(request_id, 1)]
+    assert replacement.replay_requests[0]["committed_output_token_ids"] == []
+    assert snapshot is not None
+    assert snapshot.state == RecoveryState.COMPLETED
+    assert snapshot.committed_output_token_ids == (41,)
+    journal.close()
 
 
 def test_local_request_agent_rejects_invalid_json_and_non_loopback_bind():

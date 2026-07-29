@@ -7,9 +7,12 @@ on:
       - '.github/workflows/native-network.yml'
       - 'native/fabi-network/**'
       - 'pyproject.toml'
+      - 'src/backend/server/request_handler.py'
       - 'src/backend/server/request_agent_frontend.py'
       - 'src/parallax/utils/model_config.py'
+      - 'src/parallax/utils/model_download.py'
       - 'src/swarm_protocol/**'
+      - 'tests/test_backend_request_handler.py'
       - 'tests/test_request_agent_frontend.py'
       - 'tests/test_swarm_protocol_*.py'
   push:
@@ -19,9 +22,12 @@ on:
       - '.github/workflows/native-network.yml'
       - 'native/fabi-network/**'
       - 'pyproject.toml'
+      - 'src/backend/server/request_handler.py'
       - 'src/backend/server/request_agent_frontend.py'
       - 'src/parallax/utils/model_config.py'
+      - 'src/parallax/utils/model_download.py'
       - 'src/swarm_protocol/**'
+      - 'tests/test_backend_request_handler.py'
       - 'tests/test_request_agent_frontend.py'
       - 'tests/test_swarm_protocol_*.py'
 
@@ -123,6 +129,7 @@ jobs:
           cd ../..
           python -m pytest -q --noconftest \
             tests/test_swarm_protocol_*.py \
+            tests/test_backend_request_handler.py \
             tests/test_request_agent_frontend.py \
             tests/test_route_capability_http.py \
             tests/scheduler_tests/test_contribution_gate_v2.py

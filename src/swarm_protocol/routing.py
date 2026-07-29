@@ -417,6 +417,7 @@ class ExactRoutePlanner:
         plan_expires_at_ms: int,
         epoch: int = 0,
         route_id: str | None = None,
+        excluded_worker_ids: frozenset[str] = frozenset(),
     ) -> PlannedRoute:
         if request.model_swarm_id != manifest.model_swarm_id:
             raise NoFeasibleRoute("request and model manifest identify different swarms")
@@ -433,6 +434,7 @@ class ExactRoutePlanner:
             request=request,
             candidates=candidates,
             link_map=link_map,
+            excluded_worker_ids=excluded_worker_ids,
         )
 
         if best_complete is None:
@@ -456,7 +458,7 @@ class ExactRoutePlanner:
         recovery_plan: RoutePlan | None = None
         recovery_estimate: RouteEstimate | None = None
         if request.recovery_level == RecoveryLevel.RECOVERABLE:
-            primary_workers = frozenset(
+            primary_workers = excluded_worker_ids | frozenset(
                 segment.candidate.offer.worker_id for segment in best_complete.segments
             )
             recovery_path = self._best_complete_path(

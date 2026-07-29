@@ -6,8 +6,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 from huggingface_hub import hf_hub_download as _hf_hub_download
 from huggingface_hub import snapshot_download as _snapshot_download
-from modelscope import snapshot_download as _ms_snapshot_download
-from modelscope.hub.file_download import model_file_download as _ms_model_file_download
 
 from parallax.utils.weight_filter_utils import (
     normalize_language_model_weight_key,
@@ -38,8 +36,12 @@ def download_model_snapshot(
     max_workers: int = 1,
 ) -> Path:
     if _use_modelscope():
+        try:
+            from modelscope import snapshot_download as ms_snapshot_download
+        except ModuleNotFoundError as error:
+            raise RuntimeError("USE_MODELSCOPE requires the optional modelscope package") from error
         return Path(
-            _ms_snapshot_download(
+            ms_snapshot_download(
                 model_id=repo_id,
                 allow_patterns=allow_patterns,
                 ignore_patterns=ignore_patterns,
@@ -68,8 +70,14 @@ def download_model_file(
     revision: Optional[str] = None,
 ) -> Path:
     if _use_modelscope():
+        try:
+            from modelscope.hub.file_download import (
+                model_file_download as ms_model_file_download,
+            )
+        except ModuleNotFoundError as error:
+            raise RuntimeError("USE_MODELSCOPE requires the optional modelscope package") from error
         return Path(
-            _ms_model_file_download(
+            ms_model_file_download(
                 model_id=repo_id,
                 file_path=filename,
                 local_files_only=local_files_only,
@@ -216,8 +224,7 @@ def selective_model_download(
                         )
                 except Exception as e:
                     logger.error(
-                        f"Failed to download weight files {missing_weight_files} "
-                        f"for {repo_id}: {e}"
+                        f"Failed to download weight files {missing_weight_files} for {repo_id}: {e}"
                     )
                     logger.error(
                         "This node cannot reach the model hub to download weight files. "

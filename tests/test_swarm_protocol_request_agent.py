@@ -207,6 +207,43 @@ def discovery(model):
     return store
 
 
+def publish_complete_worker(store, model, *, worker_id: str, endpoint_id: str) -> None:
+    store.publish_offer(
+        WorkerOffer(
+            worker_id=worker_id,
+            endpoint_id=endpoint_id,
+            runtime_version="test",
+            platform="test",
+            backend=BackendKind.MLX,
+            stable_memory_envelope_bytes=8 * 1024**3,
+            supported_roles=frozenset({WorkerRole.EXECUTOR, WorkerRole.FRONTEND}),
+            offer_seq=1,
+            issued_at_ms=500,
+            expires_at_ms=20_000,
+        )
+    )
+    store.publish_span_lease(
+        SpanLease(
+            model_swarm_id=model.model_swarm_id,
+            worker_id=worker_id,
+            hosted_span=LayerSpan(start=0, end=4),
+            effective_span_mode=EffectiveSpanMode.SUBSPAN,
+            state=SpanState.READY,
+            weight_hashes=(HASHES[0],),
+            kv_geometry=KvGeometry(
+                block_size_tokens=16,
+                bytes_per_token_per_layer=512,
+                allocatable_bytes=1024**3,
+            ),
+            available_kv_bytes_snapshot=1024**3,
+            max_sessions=1,
+            lease_seq=1,
+            issued_at_ms=500,
+            expires_at_ms=20_000,
+        )
+    )
+
+
 def test_request_agent_plans_from_dht_and_coordinates_with_its_own_identity():
     model = manifest()
     authority = FakeAuthority()
@@ -248,6 +285,90 @@ def test_request_agent_plans_from_dht_and_coordinates_with_its_own_identity():
     runtime.release(renewed)
     assert len(authority.permits) == 1
     assert coordinators[0].released == [reservation.committed.plan.route_id]
+    assert authority.released == [PERMIT]
+
+
+def test_request_agent_cold_replan_bans_failed_workers_and_reuses_permit():
+    model = manifest()
+    store = discovery(model)
+    publish_complete_worker(
+        store,
+        model,
+        worker_id="worker-z",
+        endpoint_id="77" * 32,
+    )
+    authority = FakeAuthority()
+    coordinators = []
+
+    def coordinator_factory(transport, authorizer, renewal_authorizer):
+        coordinator = FakeCoordinator(transport, authorizer, renewal_authorizer)
+        coordinators.append(coordinator)
+        return coordinator
+
+    runtime = RequestAgentRouteRuntime(
+        transport=CryptoTransport(),
+        discovery=store,
+        registry=SimpleNamespace(fetch=lambda _model_id: SimpleNamespace(manifest=model)),
+        authority=authority,
+        epoch_allocator=InMemoryEpochAllocator(),
+        coordinator_factory=coordinator_factory,
+        clock_ms=lambda: 1_000,
+        start_maintenance_thread=False,
+    )
+    request = RequestContract(
+        request_id="request",
+        model_swarm_id=model.model_swarm_id,
+        prompt_tokens=1_000,
+        reserved_output_tokens=200,
+        recovery_level=RecoveryLevel.RESTARTABLE,
+    )
+    initial = runtime.reserve(request)
+
+    replacement = runtime.replan_cold("request", failed_epoch=initial.committed.plan.epoch)
+
+    assert [stage.worker_id for stage in initial.committed.plan.stages] == ["worker"]
+    assert [stage.worker_id for stage in replacement.committed.plan.stages] == ["worker-z"]
+    assert replacement.committed.plan.epoch > initial.committed.plan.epoch
+    assert replacement.permit.permit_id == initial.permit.permit_id
+    assert replacement.excluded_worker_ids == frozenset({"worker"})
+    assert len(authority.permits) == 1
+    assert len(authority.capabilities) == 2
+    assert coordinators[0].released == [initial.committed.plan.route_id]
+    assert authority.released == []
+    assert runtime.status()["cold_replans"] == []
+    assert runtime.release_request("request") is True
+    assert authority.released == [PERMIT]
+
+
+def test_request_agent_retains_failed_permit_until_clean_replan_error_is_released():
+    model = manifest()
+    authority = FakeAuthority()
+    runtime = RequestAgentRouteRuntime(
+        transport=CryptoTransport(),
+        discovery=discovery(model),
+        registry=SimpleNamespace(fetch=lambda _model_id: SimpleNamespace(manifest=model)),
+        authority=authority,
+        epoch_allocator=InMemoryEpochAllocator(),
+        coordinator_factory=FakeCoordinator,
+        clock_ms=lambda: 1_000,
+        start_maintenance_thread=False,
+    )
+    request = RequestContract(
+        request_id="request",
+        model_swarm_id=model.model_swarm_id,
+        prompt_tokens=1_000,
+        reserved_output_tokens=200,
+        recovery_level=RecoveryLevel.RESTARTABLE,
+    )
+    initial = runtime.reserve(request)
+
+    with pytest.raises(Exception, match="no complete route"):
+        runtime.replan_cold("request", failed_epoch=initial.committed.plan.epoch)
+
+    assert runtime.active_reservation("request") is None
+    assert runtime.status()["cold_replans"][0]["excluded_worker_count"] == 1
+    assert authority.released == []
+    assert runtime.release_request("request") is True
     assert authority.released == [PERMIT]
 
 
@@ -405,6 +526,9 @@ def test_request_agent_fails_closed_before_lease_retry_can_cross_expiry():
     assert runtime.active_reservation("lease-request") is None
     assert coordinator.renew_calls == []
     assert coordinator.released == [reservation.committed.plan.route_id]
+    assert authority.released == []
+    assert runtime.status()["cold_replans"][0]["failed_epoch"] == 1
+    runtime.release_request("lease-request")
     assert authority.released == [PERMIT]
     failure = runtime.status()["recent_failures"][0]
     assert "no safe lease window" in failure["error"]
@@ -423,6 +547,9 @@ def test_request_agent_rejects_renewal_acknowledged_after_safe_deadline():
     assert runtime.active_reservation("lease-request") is None
     assert coordinator.renew_calls == [(reservation.committed.plan.route_id, 60)]
     assert coordinator.released == [reservation.committed.plan.route_id]
+    assert authority.released == []
+    assert runtime.status()["cold_replans"][0]["failed_epoch"] == 1
+    runtime.release_request("lease-request")
     assert authority.released == [PERMIT]
     failure = runtime.status()["recent_failures"][0]
     assert "acknowledgement arrived after the safe deadline" in failure["error"]

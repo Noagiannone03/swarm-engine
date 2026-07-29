@@ -562,6 +562,7 @@ class InMemoryRecoveryJournal:
         failed_epoch: int,
         new_epoch: int,
         replacement_route_id: str,
+        retain_recovery_level: bool = False,
     ) -> RequestRecoverySnapshot:
         """Fence the failed route and bind replay to a newer route epoch."""
 
@@ -584,7 +585,10 @@ class InMemoryRecoveryJournal:
             self._require_epoch(current, failed_epoch)
             if current.effective_recovery_level != RecoveryLevel.RECOVERABLE:
                 raise RecoveryConflict("request was not admitted as recoverable")
-            if current.state not in {RecoveryState.PREFILLING, RecoveryState.DECODING}:
+            recoverable_states = {RecoveryState.PREFILLING, RecoveryState.DECODING}
+            if retain_recovery_level:
+                recoverable_states.add(RecoveryState.RECOVERING)
+            if current.state not in recoverable_states:
                 raise RecoveryConflict(f"cannot begin recovery while {current.state.value}")
             return self._store_locked(
                 replace(
@@ -592,10 +596,15 @@ class InMemoryRecoveryJournal:
                     state=RecoveryState.RECOVERING,
                     epoch=new_epoch,
                     route_ids=(*current.route_ids, replacement_route_id),
-                    # The one reserved backup is now being consumed. A second
-                    # failure is restartable unless another backup is reserved
-                    # after replay.
-                    effective_recovery_level=RecoveryLevel.RESTARTABLE,
+                    # Reserved-backup callers consume their one hot spare.
+                    # A Request Agent cold-replan has no immobilized spare and
+                    # may retain the exact replay contract for another fresh
+                    # DHT replan.
+                    effective_recovery_level=(
+                        RecoveryLevel.RECOVERABLE
+                        if retain_recovery_level
+                        else RecoveryLevel.RESTARTABLE
+                    ),
                 )
             )
 

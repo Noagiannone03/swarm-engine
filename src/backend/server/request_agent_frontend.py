@@ -10,8 +10,9 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from fabi_network.capability import RouteRecoveryPolicy
 from backend.server.constants import NODE_STATUS_AVAILABLE, NODE_STATUS_WAITING
 from backend.server.context_admission import ContextBudget, build_context_budget
 from backend.server.openai_compat import (
@@ -29,7 +31,23 @@ from backend.server.request_handler import RequestHandler
 from parallax.utils.model_download import download_model_file
 from parallax.utils.model_config import get_model_context_limit, normalize_model_config
 from swarm_protocol.artifact_verification import verify_artifact
-from swarm_protocol.contracts import ArtifactRole, RecoveryLevel, RequestContract
+from swarm_protocol.contracts import (
+    ArtifactRole,
+    ModelManifest,
+    RecoveryLevel,
+    RequestContract,
+    RoutePlan,
+)
+from swarm_protocol.recovery import (
+    InMemoryRecoveryJournal,
+    RecoveryConflict,
+    RecoveryState,
+    RequestRecoverySnapshot,
+    RequestRecoverySpec,
+    exact_replay_sampling_params,
+    sampling_replay_contract,
+)
+from swarm_protocol.recovery_sqlite import SqliteRecoveryJournal
 from swarm_protocol.request_agent import (
     RequestAgentReservation,
     RequestAgentRouteRuntime,
@@ -39,6 +57,12 @@ from swarm_protocol.routing import RoutePlanningError
 
 _MAX_OPENAI_REQUEST_BYTES = 16 * 1024 * 1024
 _READINESS_CACHE_MS = 1_000
+
+
+@dataclass(frozen=True)
+class RequestAgentRouteContext:
+    manifest: ModelManifest
+    primary_plan: RoutePlan
 
 
 def _environment_flag(name: str) -> bool:
@@ -103,6 +127,7 @@ class RequestAgentOpenAIManager:
         model_context_limit: int | None = None,
         local_files_only: bool = False,
         completion_service_type: type | None = None,
+        recovery_journal: InMemoryRecoveryJournal | SqliteRecoveryJournal | None = None,
     ) -> None:
         self.runtime = runtime
         self.model_swarm_id = model_swarm_id
@@ -146,6 +171,17 @@ class RequestAgentOpenAIManager:
         self._tokenizer = tokenizer
         self._model_context_limit = model_context_limit
         self._completion_service_type = completion_service_type
+        self._owns_recovery_journal = recovery_journal is None
+        if recovery_journal is None:
+            state_dir = getattr(runtime, "state_dir", None)
+            if state_dir is None:
+                recovery_journal = InMemoryRecoveryJournal()
+            else:
+                recovery_journal = SqliteRecoveryJournal(Path(state_dir) / "recovery.sqlite3")
+                recovery_journal.abort_unfinished(
+                    "local Request Agent restarted before the client stream completed"
+                )
+        self.recovery_journal = recovery_journal
         self._endpoint_by_worker: dict[str, str] = {}
         self._stub_by_endpoint: dict[str, object] = {}
         self._readiness_cached_at_ms = 0
@@ -190,9 +226,11 @@ class RequestAgentOpenAIManager:
         return NODE_STATUS_AVAILABLE if self._refresh_live_context() >= 2 else NODE_STATUS_WAITING
 
     def preferred_recovery_level(self, request_data) -> RecoveryLevel:
-        del request_data
-        # Route replacement is implemented by the Request Agent's replan_cold
-        # policy, not by pre-reserving an authoritative scheduler backup.
+        if request_data.get("stream", False) and sampling_replay_contract(request_data):
+            # This describes the replay guarantee, not a pre-reserved backup
+            # topology. The route planner still receives RESTARTABLE below so
+            # it never immobilizes a second complete pipeline.
+            return RecoveryLevel.RECOVERABLE
         return RecoveryLevel.RESTARTABLE
 
     def get_routing_table(
@@ -230,6 +268,9 @@ class RequestAgentOpenAIManager:
         return self.runtime.active_reservation(str(request_id))
 
     def release_routing_table(self, request_id: str) -> bool:
+        release_request = getattr(self.runtime, "release_request", None)
+        if release_request is not None:
+            return bool(release_request(str(request_id)))
         reservation = self._active_reservation(str(request_id))
         if reservation is None:
             return False
@@ -270,9 +311,236 @@ class RequestAgentOpenAIManager:
             return stub
 
     def should_capture_generation_tokens(self, request_id: str, request_data) -> bool:
-        del request_id, request_data
-        # Enabled in the next milestone together with the local durable journal.
-        return False
+        reservation = self._active_reservation(str(request_id))
+        return bool(
+            reservation is not None
+            and reservation.recovery_policy == RouteRecoveryPolicy.REPLAN_COLD
+            and sampling_replay_contract(request_data) is not None
+        )
+
+    def begin_generation_journal(
+        self,
+        request_id: str,
+        *,
+        engine_prompt_token_ids: tuple[int, ...],
+        expected_prompt_token_ids: tuple[int, ...],
+        request_data,
+    ) -> RequestRecoverySnapshot:
+        """Bind exact engine tokens to the active local route before decode."""
+
+        reservation = self._active_reservation(str(request_id))
+        if reservation is None:
+            raise RecoveryConflict("request route is no longer active")
+        if engine_prompt_token_ids != expected_prompt_token_ids:
+            raise RecoveryConflict("engine prompt token IDs differ from local context admission")
+        plan = reservation.committed.plan
+        if len(engine_prompt_token_ids) != plan.prompt_tokens:
+            raise RecoveryConflict("engine prompt token count differs from the reserved route")
+        sampling = sampling_replay_contract(request_data)
+        if sampling is None:
+            raise RecoveryConflict("request sampling is not exactly replayable")
+        manifest = self._bundle.manifest
+        if manifest.model_swarm_id != plan.model_swarm_id:
+            raise RecoveryConflict("active route and trusted manifest identify different swarms")
+        return self.recovery_journal.begin(
+            RequestRecoverySpec(
+                request_id=str(request_id),
+                model_swarm_id=manifest.model_swarm_id,
+                immutable_revision=manifest.immutable_revision,
+                tokenizer_hash=manifest.tokenizer_hash,
+                dtype=manifest.dtype,
+                prefill_contract_hash=manifest.prefill_contract_hash,
+                attention_kv_contract_hash=manifest.attention_kv_contract_hash,
+                prompt_token_ids=engine_prompt_token_ids,
+                sampling=sampling,
+                recovery_level=RecoveryLevel.RECOVERABLE,
+                primary_route_id=plan.route_id,
+                epoch=plan.epoch,
+                reserved_context_tokens=plan.required_context_tokens,
+            )
+        )
+
+    def begin_generation_journal_before_prefill(
+        self,
+        request_id: str,
+        *,
+        prompt_token_ids: tuple[int, ...],
+        request_data,
+    ) -> RequestRecoverySnapshot:
+        """Persist the authenticated route-head tokenization before inference."""
+
+        return self.begin_generation_journal(
+            str(request_id),
+            engine_prompt_token_ids=prompt_token_ids,
+            expected_prompt_token_ids=prompt_token_ids,
+            request_data=request_data,
+        )
+
+    def commit_generation_prefill(self, request_id: str, *, epoch: int) -> None:
+        snapshot = self.recovery_journal.get(str(request_id))
+        if snapshot is None:
+            raise RecoveryConflict("request is not present in the recovery journal")
+        self.recovery_journal.commit_prefill(
+            str(request_id),
+            epoch=epoch,
+            prompt_checksum=snapshot.prompt_checksum,
+        )
+
+    def commit_generation_tokens(
+        self,
+        request_id: str,
+        *,
+        epoch: int,
+        token_ids: tuple[int, ...],
+    ) -> None:
+        if not token_ids:
+            return
+        commit_batch = getattr(self.recovery_journal, "commit_tokens", None)
+        if commit_batch is not None:
+            committed_position = self.recovery_journal.committed_position(str(request_id))
+            if committed_position is None:
+                raise RecoveryConflict("request is not present in the recovery journal")
+            commit_batch(
+                str(request_id),
+                epoch=epoch,
+                position=committed_position,
+                token_ids=token_ids,
+            )
+            return
+        for token_id in token_ids:
+            current = self.recovery_journal.get(str(request_id))
+            if current is None:
+                raise RecoveryConflict("request is not present in the recovery journal")
+            self.recovery_journal.commit_token(
+                str(request_id),
+                epoch=epoch,
+                position=current.committed_position,
+                token_id=token_id,
+            )
+
+    def finish_generation_journal(
+        self,
+        request_id: str,
+        *,
+        epoch: int,
+        state: RecoveryState,
+        failure: str | None = None,
+    ) -> None:
+        if self.recovery_journal.get(str(request_id)) is None:
+            return
+        self.recovery_journal.finish(
+            str(request_id),
+            epoch=epoch,
+            state=state,
+            failure=failure,
+        )
+
+    def promote_generation_recovery(
+        self,
+        request_id: str,
+        *,
+        failed_epoch: int,
+    ) -> tuple[RequestRecoverySnapshot, RequestAgentRouteContext]:
+        """Plan a fresh route, then atomically bind the journal to its epoch."""
+
+        snapshot = self.recovery_journal.get(str(request_id))
+        if snapshot is None:
+            raise RecoveryConflict("request is not present in the recovery journal")
+        if snapshot.epoch != failed_epoch:
+            raise RecoveryConflict("failed route epoch differs from the recovery journal")
+        reservation = self.runtime.replan_cold(
+            str(request_id),
+            failed_epoch=failed_epoch,
+        )
+        plan = reservation.committed.plan
+        try:
+            recovering = self.recovery_journal.begin_recovery(
+                str(request_id),
+                failed_epoch=failed_epoch,
+                new_epoch=plan.epoch,
+                replacement_route_id=plan.route_id,
+                retain_recovery_level=True,
+            )
+        except Exception:
+            self.runtime.release_request(str(request_id))
+            raise
+        with self._lock:
+            for stage in plan.stages:
+                self._endpoint_by_worker[stage.worker_id] = stage.endpoint_id
+        return recovering, RequestAgentRouteContext(
+            manifest=self._bundle.manifest,
+            primary_plan=plan,
+        )
+
+    def build_generation_replay_request(
+        self,
+        request_id: str,
+        *,
+        original_request: Mapping[str, object],
+        model_name: str,
+    ) -> tuple[str, dict[str, object]]:
+        """Build the token-exact vLLM chat replay on the newly planned route."""
+
+        if not isinstance(original_request, Mapping):
+            raise TypeError("original replay request must be a mapping")
+        if not isinstance(model_name, str) or not model_name:
+            raise ValueError("replay model_name must not be empty")
+        snapshot = self.recovery_journal.get(str(request_id))
+        if snapshot is None or snapshot.state != RecoveryState.RECOVERING:
+            raise RecoveryConflict("request is not awaiting exact replay")
+        reservation = self._active_reservation(str(request_id))
+        if reservation is None:
+            raise RecoveryConflict("replacement route is no longer active")
+        plan = reservation.committed.plan
+        if (
+            plan.epoch != snapshot.epoch
+            or plan.route_id != snapshot.route_ids[-1]
+            or plan.model_swarm_id != snapshot.spec.model_swarm_id
+        ):
+            raise RecoveryConflict("replacement route differs from the recovery journal fence")
+
+        output_budget = snapshot.spec.reserved_context_tokens - len(snapshot.spec.prompt_token_ids)
+        remaining_output_tokens = output_budget - snapshot.committed_position
+        if remaining_output_tokens <= 0:
+            raise RecoveryConflict("recovered request has no output budget remaining")
+        sampling_params = exact_replay_sampling_params(
+            snapshot.spec.sampling,
+            committed_output_tokens=snapshot.committed_position,
+            remaining_output_tokens=remaining_output_tokens,
+        )
+        routing_table = [stage.worker_id for stage in plan.stages]
+        replay_chat_request = dict(original_request)
+        replay_chat_request.pop("rid", None)
+        replay_chat_request.pop("routing_table", None)
+        replay_chat_request.pop("max_tokens", None)
+        replay_chat_request["request_id"] = str(request_id)
+        replay_chat_request["model"] = model_name
+        replay_chat_request["stream"] = True
+        replay_chat_request["max_completion_tokens"] = sampling_params.pop("max_tokens")
+        replay_chat_request.update(sampling_params)
+        replay_chat_request["vllm_xargs"] = {
+            "parallax_routing_table": routing_table,
+            "parallax_scheduler_request_id": str(request_id),
+            "fabi_route_id": plan.route_id,
+            "fabi_route_epoch": plan.epoch,
+        }
+        return plan.stages[0].worker_id, {
+            "authority_request_id": str(request_id),
+            "request": replay_chat_request,
+            "original_prompt_token_ids": list(snapshot.spec.prompt_token_ids),
+            "committed_output_token_ids": list(snapshot.committed_output_token_ids),
+        }
+
+    def complete_generation_replay(self, request_id: str, *, epoch: int) -> None:
+        snapshot = self.recovery_journal.get(str(request_id))
+        if snapshot is None:
+            raise RecoveryConflict("request is not present in the recovery journal")
+        self.recovery_journal.complete_replay(
+            str(request_id),
+            epoch=epoch,
+            sequence_checksum=snapshot.sequence_checksum,
+            rng_position=snapshot.rng_position,
+        )
 
     def wait_for_routing_capacity(self, timeout: float) -> bool:
         if timeout <= 0:
@@ -291,6 +559,7 @@ class RequestAgentOpenAIManager:
             "model": self.model_name,
             "max_supported_context_tokens": self._refresh_live_context(),
             "frontend": "openai-local",
+            "recovery_journal": self.recovery_journal.status(),
         }
 
     def close(self) -> None:
@@ -298,7 +567,21 @@ class RequestAgentOpenAIManager:
             if self._closed:
                 return
             self._closed = True
-        self.runtime.close()
+        first_error: BaseException | None = None
+        try:
+            self.runtime.close()
+        except BaseException as error:
+            first_error = error
+        if self._owns_recovery_journal:
+            close_journal = getattr(self.recovery_journal, "close", None)
+            if callable(close_journal):
+                try:
+                    close_journal()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 def create_request_agent_app(

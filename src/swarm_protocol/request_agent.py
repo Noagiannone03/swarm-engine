@@ -7,6 +7,7 @@ import os
 import stat
 import threading
 import time
+import hashlib
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -35,6 +36,18 @@ from swarm_protocol.routing import ExactRoutePlanner, PlannedRoute, RoutePlannin
 _MAX_AUTHORITY_RESPONSE_BYTES = 1024 * 1024
 
 logger = logging.getLogger(__name__)
+
+
+def _permit_keepalive_key(*parts: object) -> str:
+    """Build one bounded, non-secret idempotency key from request state."""
+
+    digest = hashlib.sha256()
+    digest.update(b"fabi-request-agent-permit-keepalive\0")
+    for part in parts:
+        encoded = str(part).encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return f"permit-keepalive:{digest.hexdigest()}"
 
 
 def _system_clock_ms() -> int:
@@ -351,8 +364,10 @@ class _RouteRenewalAuthorizer:
         renewed = self.authority.keepalive_permit(
             current.permit_id,
             ttl_ms=self.ttl_ms,
-            idempotency_key=(
-                f"{current.request_id}:permit-keepalive:{current.authorization_generation}"
+            idempotency_key=_permit_keepalive_key(
+                current.request_id,
+                "renew",
+                current.authorization_generation,
             ),
         )
         issued = self.authority.issue_capability(
@@ -371,6 +386,7 @@ class RequestAgentReservation:
     committed: CommittedRoute
     coordinator: ReservationCoordinator
     recovery_policy: RouteRecoveryPolicy
+    excluded_worker_ids: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -381,6 +397,17 @@ class _ManagedReservation:
     lease_deadline_ms: int
     consecutive_renewal_failures: int = 0
     last_renewal_error: str | None = None
+
+
+@dataclass
+class _RecoverableRequest:
+    request: RequestContract
+    permit: RoutePermitGrant
+    recovery_policy: RouteRecoveryPolicy
+    failed_epoch: int
+    failed_route_id: str
+    excluded_worker_ids: frozenset[str]
+    failure: str
 
 
 @dataclass
@@ -419,6 +446,7 @@ class RequestAgentRouteRuntime:
         lease_expiry_guard_ms: int = 1_000,
         start_maintenance_thread: bool = True,
         close_transport: bool = False,
+        state_dir: Path | None = None,
     ) -> None:
         if prepare_ttl_ms <= 0 or plan_ttl_ms <= prepare_ttl_ms:
             raise ValueError("plan TTL must exceed the positive prepare TTL")
@@ -462,8 +490,10 @@ class RequestAgentRouteRuntime:
         else:
             self._coordinator_factory = coordinator_factory
         self._close_transport = close_transport
+        self.state_dir = None if state_dir is None else Path(state_dir)
         self._request_locks: dict[str, _RequestLockEntry] = {}
         self._reservations: dict[str, _ManagedReservation] = {}
+        self._recoverable_requests: dict[str, _RecoverableRequest] = {}
         self._failures: deque[dict[str, object]] = deque(maxlen=64)
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -523,6 +553,7 @@ class RequestAgentRouteRuntime:
                     namespace=f"request-agent:{transport.peer_id()}",
                 ),
                 close_transport=True,
+                state_dir=state_dir,
             )
         except BaseException:
             transport.close()
@@ -569,6 +600,7 @@ class RequestAgentRouteRuntime:
                 if (
                     entry.users == 0
                     and request_id not in self._reservations
+                    and request_id not in self._recoverable_requests
                     and self._request_locks.get(request_id) is entry
                 ):
                     self._request_locks.pop(request_id, None)
@@ -672,6 +704,182 @@ class RequestAgentRouteRuntime:
                 self.authority.release_permit(permit.permit_id)
                 raise
 
+    def replan_cold(
+        self,
+        request_id: str,
+        *,
+        failed_epoch: int,
+    ) -> RequestAgentReservation:
+        """Replace a failed route from a fresh DHT snapshot without a hot spare.
+
+        Failed workers are excluded from the replacement decision, following
+        Petals' client-side peer banning.  The logical request keeps its
+        contribution permit while a strictly newer epoch fences the old data
+        plane.  The caller rebuilds KV from its durable token journal after
+        this method acknowledges the new worker leases.
+        """
+
+        request_id = str(request_id)
+        with self._request_operation(request_id, create=False) as request_lock:
+            if request_lock is None:
+                raise RuntimeError("request has no route authority to replan")
+            with self._lock:
+                managed = self._reservations.get(request_id)
+                recoverable = self._recoverable_requests.get(request_id)
+
+            if managed is not None:
+                active = managed.reservation
+                active_plan = active.committed.plan
+                if active.recovery_policy != RouteRecoveryPolicy.REPLAN_COLD:
+                    raise RuntimeError("active route was not admitted for cold replanning")
+                if active_plan.epoch != failed_epoch:
+                    raise RuntimeError(
+                        f"failed epoch {failed_epoch} differs from active epoch {active_plan.epoch}"
+                    )
+                excluded_worker_ids = active.excluded_worker_ids | frozenset(
+                    stage.worker_id for stage in active_plan.stages
+                )
+                current_permit = getattr(
+                    getattr(active.coordinator, "renewal_authorizer", None),
+                    "permit",
+                    active.permit,
+                )
+                recoverable = _RecoverableRequest(
+                    request=managed.request,
+                    permit=current_permit,
+                    recovery_policy=active.recovery_policy,
+                    failed_epoch=failed_epoch,
+                    failed_route_id=active_plan.route_id,
+                    excluded_worker_ids=excluded_worker_ids,
+                    failure="data-plane route failed",
+                )
+                with self._lock:
+                    if self._reservations.get(request_id) is not managed:
+                        raise RuntimeError("request route changed while replanning")
+                    self._reservations.pop(request_id, None)
+                    self._recoverable_requests[request_id] = recoverable
+                try:
+                    active.coordinator.release(active.committed)
+                except Exception:
+                    logger.warning(
+                        "Failed route %s could not acknowledge fencing release",
+                        active_plan.route_id,
+                        exc_info=True,
+                    )
+            elif recoverable is None:
+                raise RuntimeError("request has no failed route to replan")
+
+            assert recoverable is not None
+            if recoverable.failed_epoch != failed_epoch:
+                raise RuntimeError(
+                    f"failed epoch {failed_epoch} differs from recoverable epoch "
+                    f"{recoverable.failed_epoch}"
+                )
+            if recoverable.recovery_policy != RouteRecoveryPolicy.REPLAN_COLD:
+                raise RuntimeError("failed route was not admitted for cold replanning")
+
+            renewed_permit = recoverable.permit
+            try:
+                bundle, snapshot = self._trusted_planning_snapshot(
+                    recoverable.request.model_swarm_id
+                )
+                epoch = self.epoch_allocator.next_epoch()
+                renewed_permit = self.authority.keepalive_permit(
+                    recoverable.permit.permit_id,
+                    ttl_ms=self.permit_ttl_ms,
+                    idempotency_key=_permit_keepalive_key(
+                        request_id,
+                        "cold-replan",
+                        failed_epoch,
+                        epoch,
+                        recoverable.permit.authorization_generation,
+                    ),
+                )
+                recoverable.permit = renewed_permit
+                now_ms = self._now_ms()
+                planned = self.planner.plan(
+                    manifest=bundle.manifest,
+                    request=recoverable.request,
+                    offers=snapshot.offers,
+                    leases=snapshot.leases,
+                    links=snapshot.links,
+                    snapshot_time_ms=snapshot.captured_at_ms,
+                    coordinator_id=self.transport.peer_id(),
+                    reservation_deadline_ms=now_ms + self.prepare_ttl_ms,
+                    plan_expires_at_ms=now_ms + self.plan_ttl_ms,
+                    epoch=epoch,
+                    excluded_worker_ids=recoverable.excluded_worker_ids,
+                )
+
+                def authorize(signed_plan: SignedControlMessage) -> RouteAdmissionEnvelope:
+                    return self.authority.issue_capability(
+                        permit_id=renewed_permit.permit_id,
+                        signed_plan=signed_plan,
+                        recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+                    ).admission
+
+                renewal_authorizer = _RouteRenewalAuthorizer(
+                    authority=self.authority,
+                    permit=renewed_permit,
+                    recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+                    ttl_ms=self.permit_ttl_ms,
+                )
+                coordinator = self._coordinator_factory(
+                    self.transport,
+                    authorize,
+                    renewal_authorizer,
+                )
+                lease_started_at_ms = self._steady_now_ms()
+                committed = coordinator.reserve(planned.plan)
+                acknowledged_at_ms = self._steady_now_ms()
+                lease_deadline_ms = lease_started_at_ms + self.session_ttl_ms
+                if acknowledged_at_ms >= lease_deadline_ms - self.lease_expiry_guard_ms:
+                    try:
+                        coordinator.release(committed)
+                    finally:
+                        raise RuntimeError(
+                            "replacement route lease was acknowledged too close to expiry"
+                        )
+                reservation = RequestAgentReservation(
+                    permit=renewal_authorizer.permit,
+                    planned=planned,
+                    committed=committed,
+                    coordinator=coordinator,
+                    recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+                    excluded_worker_ids=recoverable.excluded_worker_ids,
+                )
+                with self._lock:
+                    cancelled = self._recoverable_requests.get(request_id) is not recoverable
+                    if not cancelled:
+                        self._recoverable_requests.pop(request_id, None)
+                        self._reservations[request_id] = _ManagedReservation(
+                            request=recoverable.request,
+                            reservation=reservation,
+                            next_renew_at_ms=acknowledged_at_ms + self.renew_interval_ms,
+                            lease_deadline_ms=lease_deadline_ms,
+                        )
+                if cancelled:
+                    try:
+                        coordinator.release(committed)
+                    finally:
+                        raise RuntimeError("request recovery was cancelled while replanning")
+                return reservation
+            except BaseException as error:
+                with self._lock:
+                    if self._recoverable_requests.get(request_id) is recoverable:
+                        recoverable.permit = renewed_permit
+                        recoverable.failure = f"{type(error).__name__}: {error}"[:256]
+                        self._failures.append(
+                            {
+                                "request_id": request_id,
+                                "route_id": recoverable.failed_route_id,
+                                "epoch": failed_epoch,
+                                "error": recoverable.failure,
+                                "failed_at_ms": self._now_ms(),
+                            }
+                        )
+                raise
+
     def _trusted_planning_snapshot(self, model_swarm_id: str):
         """Return one DHT snapshot only after matching it to the TUF contract."""
 
@@ -758,18 +966,37 @@ class RequestAgentRouteRuntime:
 
     def release(self, reservation: RequestAgentReservation) -> None:
         request_id = reservation.committed.plan.request_id
+        with self._lock:
+            current = self._reservations.get(request_id)
+            if (
+                current is None
+                or current.reservation.committed.plan.route_id
+                != reservation.committed.plan.route_id
+            ):
+                return
+        self.release_request(request_id)
+
+    def release_request(self, request_id: str) -> bool:
+        """Release either an active route or a failed request awaiting replan."""
+
+        request_id = str(request_id)
         with self._request_operation(request_id, create=False) as request_lock:
             if request_lock is None:
-                return
+                return False
             with self._lock:
                 current = self._reservations.pop(request_id, None)
-            if current is None:
-                return
-            active = current.reservation
-            try:
-                active.coordinator.release(active.committed)
-            finally:
-                self.authority.release_permit(active.permit.permit_id)
+                recoverable = self._recoverable_requests.pop(request_id, None)
+            if current is not None:
+                active = current.reservation
+                try:
+                    active.coordinator.release(active.committed)
+                finally:
+                    self.authority.release_permit(active.permit.permit_id)
+                return True
+            if recoverable is not None:
+                self.authority.release_permit(recoverable.permit.permit_id)
+                return True
+            return False
 
     def active_reservation(self, request_id: str) -> RequestAgentReservation | None:
         """Return the latest acknowledged reservation while its lease is safe."""
@@ -799,9 +1026,22 @@ class RequestAgentRouteRuntime:
                 }
                 for request_id, managed in sorted(self._reservations.items())
             ]
+            replans = [
+                {
+                    "request_id": request_id,
+                    "failed_route_id": recoverable.failed_route_id,
+                    "failed_epoch": recoverable.failed_epoch,
+                    "model_swarm_id": recoverable.request.model_swarm_id,
+                    "required_context_tokens": (recoverable.request.required_context_tokens),
+                    "excluded_worker_count": len(recoverable.excluded_worker_ids),
+                    "last_error": recoverable.failure,
+                }
+                for request_id, recoverable in sorted(self._recoverable_requests.items())
+            ]
             return {
                 "mode": "request_agent",
                 "active_routes": routes,
+                "cold_replans": replans,
                 "recent_failures": list(self._failures),
                 "session_ttl_ms": self.session_ttl_ms,
                 "renew_interval_ms": self.renew_interval_ms,
@@ -815,11 +1055,11 @@ class RequestAgentRouteRuntime:
             self._maintenance_thread.join(timeout=2.0)
             self._maintenance_thread = None
         with self._lock:
-            reservations = tuple(item.reservation for item in self._reservations.values())
+            request_ids = tuple(set(self._reservations) | set(self._recoverable_requests))
         first_error: BaseException | None = None
-        for reservation in reservations:
+        for request_id in request_ids:
             try:
-                self.release(reservation)
+                self.release_request(request_id)
             except BaseException as error:
                 if first_error is None:
                     first_error = error
@@ -962,6 +1202,24 @@ class RequestAgentRouteRuntime:
             if self._reservations.get(request_id) is not managed:
                 return
             self._reservations.pop(request_id, None)
+            active = managed.reservation
+            current_permit = getattr(
+                getattr(active.coordinator, "renewal_authorizer", None),
+                "permit",
+                active.permit,
+            )
+            retain_for_replan = active.recovery_policy == RouteRecoveryPolicy.REPLAN_COLD
+            if retain_for_replan:
+                self._recoverable_requests[request_id] = _RecoverableRequest(
+                    request=managed.request,
+                    permit=current_permit,
+                    recovery_policy=active.recovery_policy,
+                    failed_epoch=active.committed.plan.epoch,
+                    failed_route_id=active.committed.plan.route_id,
+                    excluded_worker_ids=active.excluded_worker_ids
+                    | frozenset(stage.worker_id for stage in active.committed.plan.stages),
+                    failure=f"{type(error).__name__}: {error}"[:256],
+                )
             self._failures.append(
                 {
                     "request_id": request_id,
@@ -980,11 +1238,12 @@ class RequestAgentRouteRuntime:
                 exc_info=True,
             )
         finally:
-            try:
-                self.authority.release_permit(managed.reservation.permit.permit_id)
-            except Exception:
-                logger.warning(
-                    "Failed to release expired Request Agent permit %s",
-                    request_id,
-                    exc_info=True,
-                )
+            if not retain_for_replan:
+                try:
+                    self.authority.release_permit(current_permit.permit_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to release expired Request Agent permit %s",
+                        request_id,
+                        exc_info=True,
+                    )

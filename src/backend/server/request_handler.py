@@ -74,7 +74,17 @@ class RequestHandler:
     def _release_route(self, request_id: str) -> None:
         release = getattr(self.scheduler_manage, "release_routing_table", None)
         if release is not None:
-            release(str(request_id))
+            try:
+                release(str(request_id))
+            except Exception:
+                # Route/permit cleanup is idempotent and their signed TTLs
+                # still fail closed. A transient authority outage during
+                # cleanup must not corrupt an already committed OpenAI stream.
+                logger.warning(
+                    "Unable to acknowledge route release for request %s",
+                    request_id,
+                    exc_info=True,
+                )
 
     @staticmethod
     def _abort_backend_request(stub, backend_request: Dict) -> None:
@@ -235,7 +245,9 @@ class RequestHandler:
         return backend_request
 
     @staticmethod
-    def _frontend_context_budget(stub, backend_request: Dict, budget: ContextBudget) -> ContextBudget:
+    def _frontend_context_budget(
+        stub, backend_request: Dict, budget: ContextBudget
+    ) -> ContextBudget:
         """Ask the qualified route head for the prompt IDs it will execute."""
 
         for unsupported in ("documents", "reasoning_effort"):
@@ -518,6 +530,7 @@ class RequestHandler:
                 )
                 client_requested_token_ids = bool(request_data.get("return_token_ids", False))
                 client_requested_reasoning = bool(request_data.get("include_reasoning", True))
+                initial_journal_snapshot = None
                 if capture_tokens:
                     # Both maintained vLLM frontends return the exact rendered
                     # prompt once and delta token IDs per update. Force
@@ -526,6 +539,21 @@ class RequestHandler:
                     # client's original visibility choice.
                     backend_request["return_token_ids"] = True
                     backend_request["include_reasoning"] = True
+                    # The route head has already tokenized this exact request
+                    # through the authenticated tokenize RPC. Persist that
+                    # identity before prefill starts so a worker lost before
+                    # its first SSE chunk can still be cold-replanned.
+                    begin_before_prefill = getattr(
+                        self.scheduler_manage,
+                        "begin_generation_journal_before_prefill",
+                        None,
+                    )
+                    if begin_before_prefill is not None:
+                        initial_journal_snapshot = begin_before_prefill(
+                            str(request_id),
+                            prompt_token_ids=budget.prompt_token_ids,
+                            request_data=request_data,
+                        )
                 if is_stream:
 
                     async def stream_generator():
@@ -536,10 +564,14 @@ class RequestHandler:
                         last_chunk = None
                         last_token_time = None
                         stream_finished = False
-                        journal_started = False
+                        journal_started = initial_journal_snapshot is not None
                         journal_terminal = False
                         prefill_committed = False
-                        recovery_epoch = None
+                        recovery_epoch = (
+                            None
+                            if initial_journal_snapshot is None
+                            else initial_journal_snapshot.epoch
+                        )
                         replay_completion_committed = False
                         recovery_stream = (
                             OpenAIRecoveryStream(
@@ -745,14 +777,26 @@ class RequestHandler:
                                         replay_completion_committed = True
                                     for event in events:
                                         if event.prompt_token_ids is not None:
-                                            snapshot = self.scheduler_manage.begin_generation_journal(
-                                                str(request_id),
-                                                engine_prompt_token_ids=event.prompt_token_ids,
-                                                expected_prompt_token_ids=budget.prompt_token_ids,
-                                                request_data=request_data,
-                                            )
-                                            recovery_epoch = snapshot.epoch
-                                            journal_started = True
+                                            if event.prompt_token_ids != budget.prompt_token_ids:
+                                                raise RecoveryConflict(
+                                                    "engine prompt token IDs differ from "
+                                                    "the authenticated tokenize RPC"
+                                                )
+                                            if not journal_started:
+                                                snapshot = (
+                                                    self.scheduler_manage.begin_generation_journal(
+                                                        str(request_id),
+                                                        engine_prompt_token_ids=(
+                                                            event.prompt_token_ids
+                                                        ),
+                                                        expected_prompt_token_ids=(
+                                                            budget.prompt_token_ids
+                                                        ),
+                                                        request_data=request_data,
+                                                    )
+                                                )
+                                                recovery_epoch = snapshot.epoch
+                                                journal_started = True
                                         if (
                                             event.output_token_ids
                                             or event.finish_reason is not None
