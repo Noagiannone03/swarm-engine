@@ -30,7 +30,7 @@ from swarm_protocol.discovery import DiscoveryStore
 from swarm_protocol.epochs import EpochAllocator
 from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
 from swarm_protocol.route_authority import RouteAdmissionEnvelope
-from swarm_protocol.routing import ExactRoutePlanner, PlannedRoute
+from swarm_protocol.routing import ExactRoutePlanner, PlannedRoute, RoutePlanningError
 
 _MAX_AUTHORITY_RESPONSE_BYTES = 1024 * 1024
 
@@ -598,11 +598,8 @@ class RequestAgentRouteRuntime:
                 if self._steady_now_ms() >= existing.lease_deadline_ms:
                     raise RuntimeError("request route lease is no longer active")
                 return existing.reservation
-            bundle = self.registry.fetch(request.model_swarm_id)
-            snapshot = self.discovery.snapshot(model_swarm_id=request.model_swarm_id)
-            manifest = snapshot.manifest(request.model_swarm_id)
-            if manifest is None or manifest != bundle.manifest:
-                raise PermissionError("DHT manifest does not match the TUF-authenticated bundle")
+            bundle, snapshot = self._trusted_planning_snapshot(request.model_swarm_id)
+            manifest = bundle.manifest
             epoch = self.epoch_allocator.next_epoch()
             permit = self.authority.issue_permit(
                 request_id=request.request_id,
@@ -674,6 +671,71 @@ class RequestAgentRouteRuntime:
             except BaseException:
                 self.authority.release_permit(permit.permit_id)
                 raise
+
+    def _trusted_planning_snapshot(self, model_swarm_id: str):
+        """Return one DHT snapshot only after matching it to the TUF contract."""
+
+        bundle = self.registry.fetch(model_swarm_id)
+        snapshot = self.discovery.snapshot(model_swarm_id=model_swarm_id)
+        manifest = snapshot.manifest(model_swarm_id)
+        if manifest is None or manifest != bundle.manifest:
+            raise PermissionError("DHT manifest does not match the TUF-authenticated bundle")
+        return bundle, snapshot
+
+    def max_supported_context_tokens(self, model_swarm_id: str, upper_bound: int) -> int:
+        """Probe the largest live context with the exact planner, without reserving.
+
+        The probe uses one immutable DHT snapshot and never allocates an epoch,
+        a permit or worker KV. Feasibility is monotone for that snapshot, so a
+        binary search returns the exact live boundary without configured tiers
+        or memory estimates.
+        """
+
+        maximum = int(upper_bound)
+        if maximum < 2:
+            return 0
+        bundle, snapshot = self._trusted_planning_snapshot(model_swarm_id)
+        epoch = max(1, int(self.epoch_allocator.current()))
+        now_ms = self._now_ms()
+
+        def feasible(required_tokens: int) -> bool:
+            request = RequestContract(
+                request_id=f"readiness-{model_swarm_id[:12]}-{required_tokens}",
+                model_swarm_id=model_swarm_id,
+                prompt_tokens=required_tokens - 1,
+                reserved_output_tokens=1,
+            )
+            try:
+                self.planner.plan(
+                    manifest=bundle.manifest,
+                    request=request,
+                    offers=snapshot.offers,
+                    leases=snapshot.leases,
+                    links=snapshot.links,
+                    snapshot_time_ms=snapshot.captured_at_ms,
+                    coordinator_id=self.transport.peer_id(),
+                    reservation_deadline_ms=now_ms + self.prepare_ttl_ms,
+                    plan_expires_at_ms=now_ms + self.plan_ttl_ms,
+                    epoch=epoch,
+                    route_id=f"readiness-{model_swarm_id[:12]}-{required_tokens}",
+                )
+            except RoutePlanningError:
+                return False
+            return True
+
+        if not feasible(2):
+            return 0
+        if feasible(maximum):
+            return maximum
+        supported = 2
+        rejected = maximum
+        while supported + 1 < rejected:
+            candidate = (supported + rejected) // 2
+            if feasible(candidate):
+                supported = candidate
+            else:
+                rejected = candidate
+        return supported
 
     def renew(
         self,

@@ -61,6 +61,7 @@ packages = [
 parallax = "parallax.cli:main"
 fabi-swarm-registry = "swarm_protocol.registry_operator:main"
 fabi-catalog-router = "swarm_protocol.catalog_router:main"
+fabi-request-agent = "backend.server.request_agent_frontend:main"
 
 [project.optional-dependencies]
 

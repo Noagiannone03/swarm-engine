@@ -277,6 +277,24 @@ def test_request_agent_refuses_dht_manifest_not_authenticated_by_tuf():
     assert authority.permits == []
 
 
+def test_request_agent_probes_exact_live_context_without_reserving():
+    model = manifest()
+    authority = FakeAuthority()
+    runtime = RequestAgentRouteRuntime(
+        transport=CryptoTransport(),
+        discovery=discovery(model),
+        registry=SimpleNamespace(fetch=lambda _model_id: SimpleNamespace(manifest=model)),
+        authority=authority,
+        epoch_allocator=InMemoryEpochAllocator(),
+        clock_ms=lambda: 1_000,
+        start_maintenance_thread=False,
+    )
+
+    assert runtime.max_supported_context_tokens(model.model_swarm_id, 600_000) == 524_288
+    assert authority.permits == []
+    assert runtime.status()["active_routes"] == []
+
+
 class MutableClock:
     def __init__(self, now_ms=0):
         self.now_ms = now_ms

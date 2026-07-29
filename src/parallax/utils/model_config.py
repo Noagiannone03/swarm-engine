@@ -95,3 +95,32 @@ def normalize_model_config(config: dict) -> dict:
             normalized["quantization"] = normalized["quantization_config"]
         return normalized
     return config
+
+
+def get_model_context_limit(config: dict) -> int | None:
+    """Return the finite total-sequence limit declared by a model config.
+
+    Hugging Face text models usually expose ``max_position_embeddings`` while
+    some tokenizers/models use ``model_max_length``. VLM repositories can put
+    the same fields under ``text_config``. Very large tokenizer sentinels mean
+    "unknown" and are excluded.
+    """
+
+    candidates = [
+        config.get("max_position_embeddings"),
+        config.get("model_max_length"),
+    ]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        candidates.extend(
+            [
+                text_config.get("max_position_embeddings"),
+                text_config.get("model_max_length"),
+            ]
+        )
+    limits = [
+        int(value)
+        for value in candidates
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < 2**63
+    ]
+    return min(limits) if limits else None
