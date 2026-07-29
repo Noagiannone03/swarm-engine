@@ -22,6 +22,7 @@ import multiprocessing
 import os
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable
 
 from parallax.p2p.server import ServerState, launch_p2p_server_process, stop_p2p_server
@@ -59,6 +60,14 @@ class MemoryPressureGuard:
     name: str
     controller: MemoryPressureController
     available_reader: Callable[[], int]
+
+
+class ExecutorSupervisionOutcome(str, Enum):
+    """Reason why one executor generation stopped being supervised."""
+
+    EXITED = "exited"
+    RELOAD_REQUESTED = "reload_requested"
+    MEMORY_SHUTDOWN_REQUESTED = "memory_shutdown_requested"
 
 
 def _update_args_from_shared_state(args, shared_state: SharedState, force_update: bool):
@@ -193,12 +202,12 @@ def _wait_executors_check_layer_change(
     executor_subprocs,
     frontend_process=None,
     memory_pressure_guards=None,
-):
-    """Wait for executor processes and check if layer allocation changed.
+) -> ExecutorSupervisionOutcome:
+    """Supervise one executor generation until one explicit terminal outcome.
 
-    Returns:
-        True if layer allocation changed (need to reload executors),
-        False if all executors exited without a reallocation request.
+    The supervisor never terminates processes itself. Its caller owns the
+    ordered ingress/executor teardown for both a placement reload and a
+    memory-pressure shutdown.
     """
     pressure_paused_admission = False
     last_pressure_poll = 0.0
@@ -222,7 +231,7 @@ def _wait_executors_check_layer_change(
                 raise RuntimeError("vLLM Rust frontend exited while its executor was running")
 
         if shared_state.get_layer_allocation_changed():
-            return True
+            return ExecutorSupervisionOutcome.RELOAD_REQUESTED
 
         failed = [
             (getattr(proc, "pid", None), getattr(proc, "exitcode", None))
@@ -323,9 +332,10 @@ def _wait_executors_check_layer_change(
                     shared_state.set("_memory_shutdown_requested", True)
                     logger.error(
                         "Sustained critical memory pressure: stopping this worker generation "
-                        "after drain (current_requests=%d)",
+                        "after drain or its safety deadline (current_requests=%d)",
                         current_requests,
                     )
+                    return ExecutorSupervisionOutcome.MEMORY_SHUTDOWN_REQUESTED
     failed = [
         (getattr(proc, "pid", None), getattr(proc, "exitcode", None))
         for proc in executor_subprocs
@@ -337,9 +347,11 @@ def _wait_executors_check_layer_change(
             status=ServerState.INITIALIZING.value,
         )
         if shared_state.get("memory_contract_failure") is not None:
-            return True
+            return ExecutorSupervisionOutcome.RELOAD_REQUESTED
         raise RuntimeError(f"Executor subprocess exited unexpectedly: {failed}")
-    return shared_state.get_layer_allocation_changed()
+    if shared_state.get_layer_allocation_changed():
+        return ExecutorSupervisionOutcome.RELOAD_REQUESTED
+    return ExecutorSupervisionOutcome.EXITED
 
 
 def _wait_for_v3_placement_rollback(
@@ -476,7 +488,7 @@ def _wait_for_initial_layer_allocation(
         elapsed = now - started_at
         if timeout and elapsed >= timeout:
             raise RuntimeError(
-                "Scheduler did not provide a complete layer allocation within " f"{timeout:g}s"
+                f"Scheduler did not provide a complete layer allocation within {timeout:g}s"
             )
         if now >= next_status_log:
             logger.info(
@@ -743,13 +755,15 @@ if __name__ == "__main__":
                         proc.start()
                         executor_subprocs.append(proc)
 
-                    # Wait for executors and restart if layer allocation changes
-                    if _wait_executors_check_layer_change(
+                    # Supervision decides why this immutable executor
+                    # generation must end; teardown remains ordered below.
+                    supervision_outcome = _wait_executors_check_layer_change(
                         shared_state,
                         executor_subprocs,
                         frontend_process,
                         memory_pressure_guards,
-                    ):
+                    )
+                    if supervision_outcome is ExecutorSupervisionOutcome.RELOAD_REQUESTED:
                         contract_failure = shared_state.get("memory_contract_failure")
                         if (
                             contract_failure is not None
@@ -790,7 +804,7 @@ if __name__ == "__main__":
                         )
                         continue
 
-                    if shared_state.get("_memory_shutdown_requested", False):
+                    if supervision_outcome is ExecutorSupervisionOutcome.MEMORY_SHUTDOWN_REQUESTED:
                         logger.error(
                             "Worker generation is leaving the swarm to protect the desktop; "
                             "a supervisor may restart it with a smaller live-memory envelope"

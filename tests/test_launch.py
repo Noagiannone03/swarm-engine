@@ -5,6 +5,7 @@ from argparse import Namespace
 import pytest
 
 from parallax.launch import (
+    ExecutorSupervisionOutcome,
     MemoryPressureGuard,
     _build_memory_pressure_guards,
     _consume_initial_autonomous_reload,
@@ -432,7 +433,10 @@ def test_memory_contract_failure_keeps_heartbeat_generation_alive_for_replan():
         },
     )
 
-    assert _wait_executors_check_layer_change(shared_state, [FailedExecutor()]) is True
+    assert (
+        _wait_executors_check_layer_change(shared_state, [FailedExecutor()])
+        is ExecutorSupervisionOutcome.RELOAD_REQUESTED
+    )
     assert shared_state.get_status() == ServerState.INITIALIZING.value
 
 
@@ -533,20 +537,20 @@ def test_memory_warning_pauses_then_resumes_without_layer_reallocation(monkeypat
     shared_state = SharedState.create()
     shared_state.set_status(ServerState.READY.value)
 
-    changed = _wait_executors_check_layer_change(
+    outcome = _wait_executors_check_layer_change(
         shared_state,
         [_FiniteExecutor(iterations=5)],
         memory_pressure_guards=[MemoryPressureGuard("host", controller, lambda: next(samples))],
     )
 
-    assert changed is False
+    assert outcome is ExecutorSupervisionOutcome.EXITED
     assert shared_state.get_status() == ServerState.READY.value
     assert shared_state.get("memory_pressure") == "normal"
     assert shared_state.get_layer_allocation_changed() is False
     assert shared_state.get("_memory_shutdown_requested") is False
 
 
-def test_critical_memory_requests_one_shutdown_after_drain(monkeypatch):
+def test_critical_memory_returns_one_shutdown_outcome_after_drain(monkeypatch, caplog):
     monkeypatch.setattr("parallax.launch.DEFAULT_PRESSURE_POLL_SECONDS", 0)
     controller = MemoryPressureController(
         system_reserve_bytes=6 * GIB,
@@ -555,17 +559,49 @@ def test_critical_memory_requests_one_shutdown_after_drain(monkeypatch):
     shared_state = SharedState.create()
     shared_state.set_status(ServerState.READY.value)
 
-    changed = _wait_executors_check_layer_change(
+    executor = _FiniteExecutor(iterations=10_000)
+    outcome = _wait_executors_check_layer_change(
         shared_state,
-        [_FiniteExecutor(iterations=10)],
+        [executor],
         memory_pressure_guards=[MemoryPressureGuard("host", controller, lambda: GIB)],
     )
 
-    assert changed is False
+    assert outcome is ExecutorSupervisionOutcome.MEMORY_SHUTDOWN_REQUESTED
+    assert executor.is_alive()
     assert shared_state.get_status() == ServerState.INITIALIZING.value
     assert shared_state.get("memory_pressure") == "critical"
     assert shared_state.get("_memory_shutdown_requested") is True
     assert shared_state.get_layer_allocation_changed() is False
+    assert caplog.text.count("Sustained critical memory pressure") == 1
+
+
+def test_critical_memory_waits_for_active_requests_to_drain(monkeypatch):
+    monkeypatch.setattr("parallax.launch.DEFAULT_PRESSURE_POLL_SECONDS", 0)
+    controller = MemoryPressureController(
+        system_reserve_bytes=6 * GIB,
+        critical_samples=1,
+        drain_timeout_seconds=60,
+    )
+    shared_state = SharedState.create()
+    shared_state.update_metrics(current_requests=1)
+    shared_state.set_status(ServerState.READY.value)
+
+    class DrainingExecutor(_FiniteExecutor):
+        def join(self, timeout=None):
+            super().join(timeout)
+            if self.join_count == 3:
+                shared_state.update_metrics(current_requests=0)
+
+    executor = DrainingExecutor(iterations=10_000)
+    outcome = _wait_executors_check_layer_change(
+        shared_state,
+        [executor],
+        memory_pressure_guards=[MemoryPressureGuard("host", controller, lambda: GIB)],
+    )
+
+    assert outcome is ExecutorSupervisionOutcome.MEMORY_SHUTDOWN_REQUESTED
+    assert executor.join_count == 3
+    assert executor.is_alive()
 
 
 def test_worst_resource_controls_admission_until_every_resource_recovers(monkeypatch):
@@ -581,7 +617,7 @@ def test_worst_resource_controls_admission_until_every_resource_recovers(monkeyp
     shared_state = SharedState.create()
     shared_state.set_status(ServerState.READY.value)
 
-    changed = _wait_executors_check_layer_change(
+    outcome = _wait_executors_check_layer_change(
         shared_state,
         [_FiniteExecutor(iterations=5)],
         memory_pressure_guards=[
@@ -590,7 +626,7 @@ def test_worst_resource_controls_admission_until_every_resource_recovers(monkeyp
         ],
     )
 
-    assert changed is False
+    assert outcome is ExecutorSupervisionOutcome.EXITED
     assert shared_state.get_status() == ServerState.READY.value
     assert shared_state.get("memory_pressure") == "normal"
     resources = shared_state.get("memory_pressure_resources")
@@ -607,13 +643,13 @@ def test_transient_sensor_failure_keeps_last_stable_state(monkeypatch):
     def fail_sample():
         raise OSError("temporary counter failure")
 
-    changed = _wait_executors_check_layer_change(
+    outcome = _wait_executors_check_layer_change(
         shared_state,
         [_FiniteExecutor(iterations=1)],
         memory_pressure_guards=[MemoryPressureGuard("host", controller, fail_sample)],
     )
 
-    assert changed is False
+    assert outcome is ExecutorSupervisionOutcome.EXITED
     assert shared_state.get_status() == ServerState.READY.value
     assert shared_state.get("memory_pressure_resources")["host"] == {
         "level": "normal",
