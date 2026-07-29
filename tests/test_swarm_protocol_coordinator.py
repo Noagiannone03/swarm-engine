@@ -343,9 +343,12 @@ def test_client_coordinator_reserves_a_complete_route_with_one_bounded_capabilit
     permit = AuthorizedContributionPermit(
         permit_id="60" * 32,
         account_id="70" * 32,
+        request_id="request",
+        coordinator_endpoint_id=COORDINATOR,
         model_swarm_id=SWARM_ID,
         max_context_tokens=2_000,
         recovery_policies=frozenset({RouteRecoveryPolicy.REPLAN_COLD}),
+        issued_at_ms=now[0],
         expires_at_ms=20_000,
     )
     coordinator = RouteReservationCoordinator(

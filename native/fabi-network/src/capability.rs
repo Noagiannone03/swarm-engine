@@ -329,6 +329,24 @@ pub fn verify_route_capability(
     })
 }
 
+/// Return the authority block revocation identifier of a signed capability.
+///
+/// This authenticates the token before exposing the identifier that the
+/// issuance ledger persists for emergency revocation.
+///
+/// # Errors
+///
+/// Returns an error for an invalid signature or malformed token.
+pub fn route_capability_root_revocation_id(public_key_hex: &str, token: &str) -> Result<Vec<u8>> {
+    let root = ed25519_public_key(public_key_hex)?;
+    let biscuit = Biscuit::from_base64(token, root).context("invalid signed route capability")?;
+    biscuit
+        .revocation_identifiers()
+        .first()
+        .cloned()
+        .context("route capability has no authority revocation identifier")
+}
+
 /// Return the Ed25519 public key for a capability issuer private key.
 ///
 /// # Errors
@@ -468,6 +486,25 @@ mod tests {
     fn public_key_derivation_matches_issuer() -> Result<()> {
         let (private_key, public_key) = issuer();
         assert_eq!(capability_public_key(&private_key)?, public_key);
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_root_revocation_id_matches_verification() -> Result<()> {
+        let now_ms = 1_800_000_000_000;
+        let (private_key, public_key) = issuer();
+        let claims = claims(now_ms);
+        let token = issue_route_capability(&private_key, &claims)?;
+        let verified = verify_route_capability(
+            &public_key,
+            &token,
+            &context(&claims, now_ms + 1_000),
+            &BTreeSet::new(),
+        )?;
+        assert_eq!(
+            route_capability_root_revocation_id(&public_key, &token)?,
+            verified.root_revocation_id
+        );
         Ok(())
     }
 }

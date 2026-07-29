@@ -85,6 +85,13 @@ fn py_verify_route_capability(
     Ok(data_encoding::HEXLOWER.encode(&verified.root_revocation_id))
 }
 
+#[pyfunction(name = "route_capability_root_revocation_id")]
+fn py_route_capability_root_revocation_id(public_key_hex: &str, token: &str) -> PyResult<String> {
+    let identifier =
+        capability::route_capability_root_revocation_id(public_key_hex, token).map_err(py_error)?;
+    Ok(data_encoding::HEXLOWER.encode(&identifier))
+}
+
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
 fn create_relay_enrollment_proof(
@@ -1509,6 +1516,10 @@ fn fabi_network_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(py_capability_public_key, module)?)?;
     module.add_function(wrap_pyfunction!(py_issue_route_capability, module)?)?;
     module.add_function(wrap_pyfunction!(py_verify_route_capability, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        py_route_capability_root_revocation_id,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(create_relay_enrollment_proof, module)?)?;
     module.add_class::<PyNetworkNode>()?;
     module.add_class::<PyCatalogRecord>()?;

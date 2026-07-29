@@ -9,14 +9,22 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from backend.server.route_permits import (
+    AuthorizedContributionPermit,
+    ClaimedRoutePlan,
+    RouteCapabilityIssuance,
+    RoutePermitConflict,
+)
 from fabi_network.capability import (
     RouteCapabilityClaims,
     RouteRecoveryPolicy,
     capability_public_key,
     issue_route_capability,
+    route_capability_root_revocation_id,
 )
 from swarm_protocol.contracts import RoutePlan
 from swarm_protocol.control import (
@@ -31,23 +39,59 @@ from swarm_protocol.route_authority import RouteAdmissionEnvelope, route_plan_di
 _MAX_PRIVATE_KEY_FILE_BYTES = 256
 
 
-@dataclass(frozen=True)
-class AuthorizedContributionPermit:
-    """Atomic contribution/quota decision made before capability issuance."""
-
-    permit_id: str
-    account_id: str
-    model_swarm_id: str
-    max_context_tokens: int
-    recovery_policies: frozenset[RouteRecoveryPolicy]
-    expires_at_ms: int
-
-
 class IssuedRouteCapability(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     admission: RouteAdmissionEnvelope
     expires_at_ms: int
+    root_revocation_id: str
+
+
+@dataclass(frozen=True)
+class _PreparedRouteCapability:
+    envelope: SignedControlMessage
+    plan: RoutePlan
+    permit: AuthorizedContributionPermit
+    recovery_policy: RouteRecoveryPolicy
+    claims: RouteCapabilityClaims
+
+
+class RoutePermitLedger(Protocol):
+    """Storage contract shared by SQLite now and a future PostgreSQL authority."""
+
+    def get_active(self, permit_id: str) -> AuthorizedContributionPermit: ...
+
+    def claim_plan(
+        self,
+        *,
+        permit_id: str,
+        account_id: str,
+        request_id: str,
+        coordinator_endpoint_id: str,
+        model_swarm_id: str,
+        epoch: int,
+        route_plan_digest: str,
+        required_context_tokens: int,
+        recovery_policy: RouteRecoveryPolicy,
+    ) -> ClaimedRoutePlan: ...
+
+    def get_issuance(
+        self,
+        *,
+        permit_id: str,
+        epoch: int,
+    ) -> RouteCapabilityIssuance | None: ...
+
+    def record_issuance(
+        self,
+        claim: ClaimedRoutePlan,
+        *,
+        authority_key_id: str,
+        capability_token: str,
+        root_revocation_id: str,
+        recovery_policy: RouteRecoveryPolicy,
+        expires_at_ms: int,
+    ) -> RouteCapabilityIssuance: ...
 
 
 def _system_clock_ms() -> int:
@@ -109,14 +153,16 @@ class RouteCapabilityIssuer:
             clock_ms=clock_ms,
         )
 
-    def issue(
+    def prepare(
         self,
         signed_plan: SignedControlMessage | dict[str, object],
         *,
         caller_endpoint_id: str,
         permit: AuthorizedContributionPermit,
         recovery_policy: RouteRecoveryPolicy,
-    ) -> IssuedRouteCapability:
+    ) -> _PreparedRouteCapability:
+        """Validate the complete ambient contract before mutating the permit ledger."""
+
         now_ms = int(self._clock_ms())
         if now_ms < 0:
             raise RuntimeError("route capability issuer clock returned a negative timestamp")
@@ -136,6 +182,10 @@ class RouteCapabilityIssuer:
         )
         if plan.coordinator_id != caller_endpoint_id:
             raise PermissionError("route coordinator does not match its plan signer")
+        if plan.request_id != permit.request_id:
+            raise PermissionError("contribution permit targets a different request")
+        if caller_endpoint_id != permit.coordinator_endpoint_id:
+            raise PermissionError("contribution permit targets a different request agent")
         if plan.model_swarm_id != permit.model_swarm_id:
             raise PermissionError("contribution permit targets a different model swarm")
         if plan.required_context_tokens > permit.max_context_tokens:
@@ -163,15 +213,135 @@ class RouteCapabilityIssuer:
             issued_at_ms=now_ms,
             expires_at_ms=plan.plan_expires_at_ms,
         )
-        token = issue_route_capability(self._private_key_hex, claims)
+        return _PreparedRouteCapability(
+            envelope=envelope,
+            plan=plan,
+            permit=permit,
+            recovery_policy=recovery_policy,
+            claims=claims,
+        )
+
+    def _mint(self, prepared: _PreparedRouteCapability) -> IssuedRouteCapability:
+        """Mint one validated capability; callers must persist it before returning."""
+
+        token = issue_route_capability(self._private_key_hex, prepared.claims)
         return IssuedRouteCapability(
             admission=RouteAdmissionEnvelope(
-                signed_plan=envelope,
+                signed_plan=prepared.envelope,
                 authority_key_id=self.authority_key_id,
                 capability_token=token,
-                permit_id=permit.permit_id,
-                account_id=permit.account_id,
-                recovery_policy=recovery_policy,
+                permit_id=prepared.permit.permit_id,
+                account_id=prepared.permit.account_id,
+                recovery_policy=prepared.recovery_policy,
             ),
-            expires_at_ms=claims.expires_at_ms,
+            expires_at_ms=prepared.claims.expires_at_ms,
+            root_revocation_id=route_capability_root_revocation_id(
+                self._public_key_hex,
+                token,
+            ),
         )
+
+    def issue(
+        self,
+        signed_plan: SignedControlMessage | dict[str, object],
+        *,
+        caller_endpoint_id: str,
+        permit: AuthorizedContributionPermit,
+        recovery_policy: RouteRecoveryPolicy,
+    ) -> IssuedRouteCapability:
+        """Compatibility entry point for callers that own persistence themselves."""
+
+        return self._mint(
+            self.prepare(
+                signed_plan,
+                caller_endpoint_id=caller_endpoint_id,
+                permit=permit,
+                recovery_policy=recovery_policy,
+            )
+        )
+
+
+class RouteCapabilityService:
+    """Atomic permit claim plus retry-safe Biscuit issuance."""
+
+    def __init__(
+        self,
+        *,
+        ledger: RoutePermitLedger,
+        issuer: RouteCapabilityIssuer,
+    ) -> None:
+        self._ledger = ledger
+        self._issuer = issuer
+
+    @staticmethod
+    def _response(
+        prepared: _PreparedRouteCapability,
+        issuance: RouteCapabilityIssuance,
+    ) -> IssuedRouteCapability:
+        if (
+            issuance.route_plan_digest != prepared.claims.route_plan_digest
+            or issuance.recovery_policy != prepared.recovery_policy
+            or issuance.expires_at_ms != prepared.claims.expires_at_ms
+        ):
+            raise RoutePermitConflict(
+                "permit epoch already contains a different capability contract"
+            )
+        return IssuedRouteCapability(
+            admission=RouteAdmissionEnvelope(
+                signed_plan=prepared.envelope,
+                authority_key_id=issuance.authority_key_id,
+                capability_token=issuance.capability_token,
+                permit_id=prepared.permit.permit_id,
+                account_id=prepared.permit.account_id,
+                recovery_policy=issuance.recovery_policy,
+            ),
+            expires_at_ms=issuance.expires_at_ms,
+            root_revocation_id=issuance.root_revocation_id,
+        )
+
+    def issue(
+        self,
+        signed_plan: SignedControlMessage | dict[str, object],
+        *,
+        permit_id: str,
+        account_id: str,
+        caller_endpoint_id: str,
+        recovery_policy: RouteRecoveryPolicy,
+    ) -> IssuedRouteCapability:
+        permit = self._ledger.get_active(permit_id)
+        if permit.account_id != account_id:
+            raise PermissionError("route permit belongs to a different account")
+        prepared = self._issuer.prepare(
+            signed_plan,
+            caller_endpoint_id=caller_endpoint_id,
+            permit=permit,
+            recovery_policy=recovery_policy,
+        )
+        claim = self._ledger.claim_plan(
+            permit_id=permit.permit_id,
+            account_id=permit.account_id,
+            request_id=prepared.claims.request_id,
+            coordinator_endpoint_id=prepared.claims.coordinator_endpoint_id,
+            model_swarm_id=prepared.claims.model_swarm_id,
+            epoch=prepared.claims.epoch,
+            route_plan_digest=prepared.claims.route_plan_digest,
+            required_context_tokens=prepared.plan.required_context_tokens,
+            recovery_policy=prepared.recovery_policy,
+        )
+        existing = self._ledger.get_issuance(
+            permit_id=permit.permit_id,
+            epoch=prepared.claims.epoch,
+        )
+        if existing is not None:
+            return self._response(prepared, existing)
+
+        minted = self._issuer._mint(prepared)
+        persisted = self._ledger.record_issuance(
+            claim,
+            authority_key_id=minted.admission.authority_key_id,
+            capability_token=minted.admission.capability_token,
+            root_revocation_id=minted.root_revocation_id,
+            recovery_policy=prepared.recovery_policy,
+            expires_at_ms=minted.expires_at_ms,
+        )
+        return self._response(prepared, persisted)

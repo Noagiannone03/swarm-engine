@@ -99,6 +99,10 @@ def verify_route_capability(
     )
 
 
+def route_capability_root_revocation_id(public_key_hex: str, token: str) -> str:
+    return str(_native_module().route_capability_root_revocation_id(public_key_hex, token))
+
+
 def claims_json(claims: RouteCapabilityClaims) -> str:
     """Canonical JSON helper for non-Python issuers and diagnostic tooling."""
 

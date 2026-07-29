@@ -11,7 +11,9 @@ pytest.importorskip("fabi_network_native")
 from backend.server.route_capabilities import (  # noqa: E402
     AuthorizedContributionPermit,
     RouteCapabilityIssuer,
+    RouteCapabilityService,
 )
+from backend.server.route_permits import SqliteRoutePermitLedger  # noqa: E402
 from fabi_network.capability import (  # noqa: E402
     RouteCapabilityContext,
     RouteRecoveryPolicy,
@@ -115,9 +117,12 @@ def test_issuer_binds_contribution_plan_and_tuf_key_before_native_verification()
     permit = AuthorizedContributionPermit(
         permit_id=PERMIT,
         account_id=ACCOUNT,
+        request_id=plan.request_id,
+        coordinator_endpoint_id=COORDINATOR,
         model_swarm_id=MODEL,
         max_context_tokens=2_000,
         recovery_policies=frozenset({RouteRecoveryPolicy.REPLAN_COLD}),
+        issued_at_ms=now[0],
         expires_at_ms=20_000,
     )
 
@@ -149,6 +154,7 @@ def test_issuer_binds_contribution_plan_and_tuf_key_before_native_verification()
         )
         == 128
     )
+    assert len(issued.root_revocation_id) == 128
 
     with pytest.raises(PermissionError, match="context exceeds"):
         issuer.issue(
@@ -167,4 +173,89 @@ def test_issuer_binds_contribution_plan_and_tuf_key_before_native_verification()
             caller_endpoint_id=COORDINATOR,
             permit=permit,
             recovery_policy=RouteRecoveryPolicy.HOT_REPLICA,
+        )
+
+
+def test_service_persists_one_biscuit_for_an_exact_retry(tmp_path):
+    now = [1_000]
+    private_key = secrets.token_hex(32)
+    from fabi_network.capability import capability_public_key
+
+    public_key = capability_public_key(private_key)
+    key_id = hashlib.sha256(bytes.fromhex(public_key)).hexdigest()
+    issuer = RouteCapabilityIssuer(
+        private_key_hex=private_key,
+        crypto=Crypto(),
+        trusted_keyset=lambda: RouteAuthorityKeyset(
+            generation=1,
+            issued_at_ms=0,
+            expires_at_ms=100_000,
+            keys=(
+                RouteAuthorityKey(
+                    key_id=key_id,
+                    public_key=public_key,
+                    not_before_ms=0,
+                    not_after_ms=100_000,
+                ),
+            ),
+        ),
+        clock_ms=lambda: now[0],
+    )
+    ledger = SqliteRoutePermitLedger(
+        tmp_path / "route-permits.sqlite3",
+        clock_ms=lambda: now[0],
+    )
+    ledger.issue(
+        account_id=ACCOUNT,
+        request_id="request",
+        coordinator_endpoint_id=COORDINATOR,
+        model_swarm_id=MODEL,
+        max_context_tokens=2_000,
+        recovery_policies=frozenset({RouteRecoveryPolicy.REPLAN_COLD}),
+        ttl_ms=20_000,
+        max_active_per_account=1,
+        permit_id=PERMIT,
+    )
+    signed = sign_control_contract(
+        route(now[0]),
+        kind=ControlMessageKind.ROUTE_PLAN,
+        crypto=Crypto(),
+    )
+    service = RouteCapabilityService(ledger=ledger, issuer=issuer)
+
+    first = service.issue(
+        signed,
+        permit_id=PERMIT,
+        account_id=ACCOUNT,
+        caller_endpoint_id=COORDINATOR,
+        recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+    )
+    retry = service.issue(
+        signed,
+        permit_id=PERMIT,
+        account_id=ACCOUNT,
+        caller_endpoint_id=COORDINATOR,
+        recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+    )
+
+    assert retry == first
+    assert ledger.revoke(PERMIT) == (first.root_revocation_id,)
+    context = RouteCapabilityContext(
+        permit_id=PERMIT,
+        account_id=ACCOUNT,
+        request_id="request",
+        model_swarm_id=MODEL,
+        coordinator_endpoint_id=COORDINATOR,
+        route_plan_digest=route_plan_digest(signed),
+        epoch=1,
+        required_context_tokens=1_000,
+        recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+        now_ms=now[0],
+    )
+    with pytest.raises(RuntimeError, match="revoked"):
+        verify_route_capability(
+            public_key,
+            first.admission.capability_token,
+            context,
+            ledger.revoke(PERMIT),
         )
