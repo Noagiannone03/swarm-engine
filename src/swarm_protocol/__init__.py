@@ -73,6 +73,14 @@ from swarm_protocol.recovery import (
     sampling_replay_contract,
     token_sequence_checksum,
 )
+from swarm_protocol.request_agent import (
+    IssuedAdmission,
+    RequestAgentAuthorityClient,
+    RequestAgentAuthorityError,
+    RequestAgentReservation,
+    RequestAgentRouteRuntime,
+    RoutePermitGrant,
+)
 from swarm_protocol.registry import (
     ModelCatalogEntry,
     ModelRegistryBundle,
@@ -155,6 +163,12 @@ __all__ = [
     "sampling_replay_contract",
     "token_sequence_checksum",
     "RequestContract",
+    "RequestAgentAuthorityClient",
+    "RequestAgentAuthorityError",
+    "RequestAgentReservation",
+    "RequestAgentRouteRuntime",
+    "RoutePermitGrant",
+    "IssuedAdmission",
     "ReservationLease",
     "ReservationState",
     "RoutePlan",
