@@ -27,9 +27,18 @@ KV, then calls the authenticated frontend worker directly over Iroh.
    the HTTP response ends or is aborted.
 
 The OpenAI endpoint is loopback-only. `/v1/models`,
-`/v1/request-agent/status` and `/v1/chat/completions` require the same account
-Bearer credential that the Request Agent uses for contribution admission.
-`/health` exposes only `ready` or `waiting`.
+`/v1/request-agent/status`, `/v1/request-agent/events` and
+`/v1/chat/completions` require the same account Bearer credential that the
+Request Agent uses for contribution admission. `/health` exposes only `ready`
+or `waiting`.
+
+`/v1/request-agent/events` is a bounded WHATWG SSE control stream for the IDE.
+Its phases come from actual planner, authority, reservation and durable-journal
+transitions: `planning`, `authorizing`, `reserving`, `prefilling`, `decoding`,
+`recovering`, `replaying` and terminal states. Every event has a monotonic
+`id`; reconnecting clients send `Last-Event-ID`, and receive either retained
+events or a current-state `reset` snapshot after compaction. Quiet-stream
+comments are transport keepalives only and never classify a worker as failed.
 
 ## Environment
 

@@ -496,6 +496,7 @@ class RequestAgentRouteRuntime:
         self._recoverable_requests: dict[str, _RecoverableRequest] = {}
         self._failures: deque[dict[str, object]] = deque(maxlen=64)
         self._lock = threading.RLock()
+        self._phase_observer: Callable[[str, str], None] | None = None
         self._stop_event = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
         if start_maintenance_thread:
@@ -505,6 +506,22 @@ class RequestAgentRouteRuntime:
                 daemon=True,
             )
             self._maintenance_thread.start()
+
+    def set_phase_observer(self, observer: Callable[[str, str], None] | None) -> None:
+        """Attach the local UI observer without making it part of route correctness."""
+
+        with self._lock:
+            self._phase_observer = observer
+
+    def _emit_phase(self, request_id: str, phase: str) -> None:
+        with self._lock:
+            observer = self._phase_observer
+        if observer is None:
+            return
+        try:
+            observer(str(request_id), phase)
+        except Exception:
+            logger.warning("Request Agent phase observer failed", exc_info=True)
 
     @classmethod
     def from_environment(cls) -> "RequestAgentRouteRuntime":
@@ -630,9 +647,11 @@ class RequestAgentRouteRuntime:
                 if self._steady_now_ms() >= existing.lease_deadline_ms:
                     raise RuntimeError("request route lease is no longer active")
                 return existing.reservation
+            self._emit_phase(request.request_id, "planning")
             bundle, snapshot = self._trusted_planning_snapshot(request.model_swarm_id)
             manifest = bundle.manifest
             epoch = self.epoch_allocator.next_epoch()
+            self._emit_phase(request.request_id, "authorizing")
             permit = self.authority.issue_permit(
                 request_id=request.request_id,
                 coordinator_endpoint_id=self.transport.peer_id(),
@@ -674,6 +693,7 @@ class RequestAgentRouteRuntime:
                     authorize,
                     renewal_authorizer,
                 )
+                self._emit_phase(request.request_id, "reserving")
                 lease_started_at_ms = self._steady_now_ms()
                 committed = coordinator.reserve(planned.plan)
                 acknowledged_at_ms = self._steady_now_ms()
@@ -720,6 +740,7 @@ class RequestAgentRouteRuntime:
         """
 
         request_id = str(request_id)
+        self._emit_phase(request_id, "recovering")
         with self._request_operation(request_id, create=False) as request_lock:
             if request_lock is None:
                 raise RuntimeError("request has no route authority to replan")
@@ -780,10 +801,12 @@ class RequestAgentRouteRuntime:
 
             renewed_permit = recoverable.permit
             try:
+                self._emit_phase(request_id, "planning")
                 bundle, snapshot = self._trusted_planning_snapshot(
                     recoverable.request.model_swarm_id
                 )
                 epoch = self.epoch_allocator.next_epoch()
+                self._emit_phase(request_id, "authorizing")
                 renewed_permit = self.authority.keepalive_permit(
                     recoverable.permit.permit_id,
                     ttl_ms=self.permit_ttl_ms,
@@ -829,6 +852,7 @@ class RequestAgentRouteRuntime:
                     authorize,
                     renewal_authorizer,
                 )
+                self._emit_phase(request_id, "reserving")
                 lease_started_at_ms = self._steady_now_ms()
                 committed = coordinator.reserve(planned.plan)
                 acknowledged_at_ms = self._steady_now_ms()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hmac
 import ipaddress
 import json
@@ -53,6 +54,7 @@ from swarm_protocol.request_agent import (
     RequestAgentRouteRuntime,
     _account_credential_from_environment,
 )
+from swarm_protocol.request_status import RequestPhaseFeed
 from swarm_protocol.routing import RoutePlanningError
 
 _MAX_OPENAI_REQUEST_BYTES = 16 * 1024 * 1024
@@ -188,7 +190,15 @@ class RequestAgentOpenAIManager:
         self._readiness_cached_context = 0
         self._closed = False
         self._lock = threading.RLock()
+        self.request_phases = RequestPhaseFeed()
+        set_phase_observer = getattr(runtime, "set_phase_observer", None)
+        self._runtime_emits_phases = callable(set_phase_observer)
+        if self._runtime_emits_phases:
+            set_phase_observer(self._publish_runtime_phase)
         self.completion_handler = _RequestAgentCompletionHandler(self)
+
+    def _publish_runtime_phase(self, request_id: str, phase: str) -> None:
+        self.request_phases.publish(request_id, phase)
 
     def get_model_name(self) -> str:
         return self.model_name
@@ -256,13 +266,30 @@ class RequestAgentOpenAIManager:
             recovery_level=RecoveryLevel.RESTARTABLE,
         )
         try:
+            if not self._runtime_emits_phases:
+                self.request_phases.publish(str(request_id), "planning")
             reservation = self.runtime.reserve(request)
-        except RoutePlanningError:
+        except RoutePlanningError as error:
+            self.request_phases.publish(str(request_id), "failed", detail=str(error))
             return []
+        except BaseException as error:
+            self.request_phases.publish(
+                str(request_id),
+                "failed",
+                detail=f"{type(error).__name__}: {error}",
+            )
+            raise
+        plan = reservation.committed.plan
+        self.request_phases.publish(
+            str(request_id),
+            "prefilling",
+            epoch=plan.epoch,
+            route_id=plan.route_id,
+        )
         with self._lock:
-            for stage in reservation.committed.plan.stages:
+            for stage in plan.stages:
                 self._endpoint_by_worker[stage.worker_id] = stage.endpoint_id
-        return [stage.worker_id for stage in reservation.committed.plan.stages]
+        return [stage.worker_id for stage in plan.stages]
 
     def _active_reservation(self, request_id: str) -> RequestAgentReservation | None:
         return self.runtime.active_reservation(str(request_id))
@@ -270,12 +297,25 @@ class RequestAgentOpenAIManager:
     def release_routing_table(self, request_id: str) -> bool:
         release_request = getattr(self.runtime, "release_request", None)
         if release_request is not None:
-            return bool(release_request(str(request_id)))
+            released = bool(release_request(str(request_id)))
+            if released:
+                self._publish_release_phase(str(request_id))
+            return released
         reservation = self._active_reservation(str(request_id))
         if reservation is None:
             return False
         self.runtime.release(reservation)
+        self._publish_release_phase(str(request_id))
         return True
+
+    def _publish_release_phase(self, request_id: str) -> None:
+        snapshot = self.recovery_journal.get(str(request_id))
+        if snapshot is None or snapshot.state not in {
+            RecoveryState.COMPLETED,
+            RecoveryState.FAILED,
+            RecoveryState.ABORTED,
+        }:
+            self.request_phases.publish(str(request_id), "released")
 
     def is_routing_table_active(self, request_id: str) -> bool:
         return self._active_reservation(str(request_id)) is not None
@@ -385,6 +425,12 @@ class RequestAgentOpenAIManager:
             epoch=epoch,
             prompt_checksum=snapshot.prompt_checksum,
         )
+        self.request_phases.publish(
+            str(request_id),
+            "decoding",
+            epoch=epoch,
+            route_id=snapshot.route_ids[-1],
+        )
 
     def commit_generation_tokens(
         self,
@@ -426,13 +472,21 @@ class RequestAgentOpenAIManager:
         state: RecoveryState,
         failure: str | None = None,
     ) -> None:
-        if self.recovery_journal.get(str(request_id)) is None:
+        snapshot = self.recovery_journal.get(str(request_id))
+        if snapshot is None:
             return
         self.recovery_journal.finish(
             str(request_id),
             epoch=epoch,
             state=state,
             failure=failure,
+        )
+        self.request_phases.publish(
+            str(request_id),
+            state.value,
+            epoch=epoch,
+            route_id=snapshot.route_ids[-1],
+            detail=failure,
         )
 
     def promote_generation_recovery(
@@ -448,10 +502,27 @@ class RequestAgentOpenAIManager:
             raise RecoveryConflict("request is not present in the recovery journal")
         if snapshot.epoch != failed_epoch:
             raise RecoveryConflict("failed route epoch differs from the recovery journal")
-        reservation = self.runtime.replan_cold(
-            str(request_id),
-            failed_epoch=failed_epoch,
-        )
+        if not self._runtime_emits_phases:
+            self.request_phases.publish(
+                str(request_id),
+                "recovering",
+                epoch=failed_epoch,
+                route_id=snapshot.route_ids[-1],
+            )
+        try:
+            reservation = self.runtime.replan_cold(
+                str(request_id),
+                failed_epoch=failed_epoch,
+            )
+        except BaseException as error:
+            self.request_phases.publish(
+                str(request_id),
+                "failed",
+                epoch=failed_epoch,
+                route_id=snapshot.route_ids[-1],
+                detail=f"{type(error).__name__}: {error}",
+            )
+            raise
         plan = reservation.committed.plan
         try:
             recovering = self.recovery_journal.begin_recovery(
@@ -467,6 +538,12 @@ class RequestAgentOpenAIManager:
         with self._lock:
             for stage in plan.stages:
                 self._endpoint_by_worker[stage.worker_id] = stage.endpoint_id
+        self.request_phases.publish(
+            str(request_id),
+            "replaying",
+            epoch=plan.epoch,
+            route_id=plan.route_id,
+        )
         return recovering, RequestAgentRouteContext(
             manifest=self._bundle.manifest,
             primary_plan=plan,
@@ -541,6 +618,12 @@ class RequestAgentOpenAIManager:
             sequence_checksum=snapshot.sequence_checksum,
             rng_position=snapshot.rng_position,
         )
+        self.request_phases.publish(
+            str(request_id),
+            "decoding",
+            epoch=epoch,
+            route_id=snapshot.route_ids[-1],
+        )
 
     def wait_for_routing_capacity(self, timeout: float) -> bool:
         if timeout <= 0:
@@ -560,6 +643,7 @@ class RequestAgentOpenAIManager:
             "max_supported_context_tokens": self._refresh_live_context(),
             "frontend": "openai-local",
             "recovery_journal": self.recovery_journal.status(),
+            "request_phases": self.request_phases.snapshot(),
         }
 
     def close(self) -> None:
@@ -567,6 +651,9 @@ class RequestAgentOpenAIManager:
             if self._closed:
                 return
             self._closed = True
+        set_phase_observer = getattr(self.runtime, "set_phase_observer", None)
+        if callable(set_phase_observer):
+            set_phase_observer(None)
         first_error: BaseException | None = None
         try:
             self.runtime.close()
@@ -580,6 +667,7 @@ class RequestAgentOpenAIManager:
                 except BaseException as error:
                     if first_error is None:
                         first_error = error
+        self.request_phases.close()
         if first_error is not None:
             raise first_error
 
@@ -645,6 +733,68 @@ def create_request_agent_app(
             )
         return JSONResponse(content=manager.status())
 
+    @app.get("/v1/request-agent/events")
+    async def request_agent_events(raw_request: Request):
+        if not authorized(raw_request):
+            return openai_error_response(
+                "Invalid local API credential",
+                status_code=401,
+                err_type="authentication_error",
+                code="invalid_api_key",
+            )
+        raw_last_event_id = raw_request.headers.get("last-event-id")
+        if raw_last_event_id is None:
+            last_event_id: int | None = None
+        elif (
+            not raw_last_event_id.isascii()
+            or not raw_last_event_id.isdigit()
+            or len(raw_last_event_id) > 20
+        ):
+            return openai_error_response(
+                "Invalid Last-Event-ID",
+                status_code=400,
+                err_type="invalid_request_error",
+                code="invalid_last_event_id",
+            )
+        else:
+            last_event_id = int(raw_last_event_id)
+
+        async def phase_stream():
+            cursor = last_event_id
+            if cursor is None:
+                snapshot = manager.request_phases.snapshot()
+                cursor = int(snapshot["last_event_id"])
+                yield _encode_status_sse("snapshot", cursor, snapshot)
+            while not await raw_request.is_disconnected():
+                events, gap = await asyncio.to_thread(
+                    manager.request_phases.wait_after,
+                    cursor,
+                    timeout=15.0,
+                )
+                if gap:
+                    snapshot = manager.request_phases.snapshot()
+                    cursor = int(snapshot["last_event_id"])
+                    yield _encode_status_sse("reset", cursor, snapshot)
+                    continue
+                if not events:
+                    # WHATWG recommends comments to keep intermediaries from
+                    # timing out an otherwise quiet event stream. This is not
+                    # a worker liveness signal.
+                    yield b": keepalive\n\n"
+                    continue
+                for event in events:
+                    cursor = event.event_id
+                    yield _encode_status_sse("request-phase", cursor, event.to_dict())
+
+        return StreamingResponse(
+            phase_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.post("/v1/chat/completions")
     async def chat_completions(raw_request: Request):
         if not authorized(raw_request):
@@ -691,6 +841,11 @@ def create_request_agent_app(
         return response
 
     return app
+
+
+def _encode_status_sse(event: str, event_id: int, payload: Mapping[str, object]) -> bytes:
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"id: {event_id}\nevent: {event}\ndata: {data}\n\n".encode()
 
 
 def _loopback_host(value: str) -> str:

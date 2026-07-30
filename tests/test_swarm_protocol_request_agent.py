@@ -315,6 +315,8 @@ def test_request_agent_cold_replan_bans_failed_workers_and_reuses_permit():
         clock_ms=lambda: 1_000,
         start_maintenance_thread=False,
     )
+    phases = []
+    runtime.set_phase_observer(lambda request_id, phase: phases.append((request_id, phase)))
     request = RequestContract(
         request_id="request",
         model_swarm_id=model.model_swarm_id,
@@ -336,6 +338,15 @@ def test_request_agent_cold_replan_bans_failed_workers_and_reuses_permit():
     assert coordinators[0].released == [initial.committed.plan.route_id]
     assert authority.released == []
     assert runtime.status()["cold_replans"] == []
+    assert phases == [
+        ("request", "planning"),
+        ("request", "authorizing"),
+        ("request", "reserving"),
+        ("request", "recovering"),
+        ("request", "planning"),
+        ("request", "authorizing"),
+        ("request", "reserving"),
+    ]
     assert runtime.release_request("request") is True
     assert authority.released == [PERMIT]
 

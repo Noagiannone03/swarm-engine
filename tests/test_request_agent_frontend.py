@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.request_agent_frontend import (
     RequestAgentOpenAIManager,
+    _encode_status_sse,
     _loopback_host,
     _verified_frontend_assets,
     create_request_agent_app,
@@ -441,6 +442,18 @@ def test_local_request_agent_replans_replays_and_resumes_exactly_once(tmp_path):
         f"route-replacement-{request_id}",
     )
     assert snapshot.committed_output_token_ids == (40, 41)
+    phase_events, gap = manager.request_phases.read_after(0)
+    assert gap is False
+    phases = [event.phase for event in phase_events if event.request_id == request_id]
+    assert phases == [
+        "planning",
+        "prefilling",
+        "decoding",
+        "recovering",
+        "replaying",
+        "decoding",
+        "completed",
+    ]
     journal.close()
 
 
@@ -507,6 +520,9 @@ def test_local_request_agent_rejects_invalid_json_and_non_loopback_bind():
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request_error"
+    assert _encode_status_sse("request-phase", 7, {"phase": "recovering"}) == (
+        b'id: 7\nevent: request-phase\ndata: {"phase":"recovering"}\n\n'
+    )
     with pytest.raises(Exception, match="loopback"):
         _loopback_host("0.0.0.0")
 
@@ -516,10 +532,18 @@ def test_local_request_agent_rejects_missing_account_credential():
     app = create_request_agent_app(manager, api_credential=API_CREDENTIAL)
 
     with TestClient(app) as client:
+        unauthorized_events = client.get("/v1/request-agent/events")
+        invalid_cursor = client.get(
+            "/v1/request-agent/events",
+            headers={**AUTH_HEADERS, "Last-Event-ID": "not-an-integer"},
+        )
         response = client.post(
             "/v1/chat/completions",
             json={"messages": [{"role": "user", "content": "hello"}]},
         )
 
+    assert unauthorized_events.status_code == 401
+    assert invalid_cursor.status_code == 400
+    assert invalid_cursor.json()["error"]["code"] == "invalid_last_event_id"
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "invalid_api_key"
