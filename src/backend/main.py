@@ -16,13 +16,7 @@ from backend.server.route_capability_api import (
     configure_request_agent_authority,
     router as request_agent_authority_router,
 )
-from backend.server.scheduler_manage import SchedulerManage
 from backend.server.server_args import parse_args
-from backend.server.static_config import (
-    get_model_list,
-    get_node_join_command,
-    init_model_info_dict_cache,
-)
 from parallax_utils.ascii_anime import display_parallax_run
 from parallax_utils.file_util import get_project_root
 from parallax_utils.logging_config import get_logger, set_log_level
@@ -105,6 +99,11 @@ async def weight_refit_timstamp():
 
 @app.get("/model/list")
 async def model_list():
+    # Keep importing the ASGI control surface cheap. Model/runtime dependencies
+    # (torch, NumPy, MLX) belong to scheduler startup, not to route discovery or
+    # OpenAI compatibility tests that only import ``backend.main:app``.
+    from backend.server.static_config import get_model_list
+
     return JSONResponse(
         content={
             "type": "model_list",
@@ -188,6 +187,8 @@ async def scheduler_init(raw_request: Request):
 
 @app.get("/node/join/command")
 async def node_join_command():
+    from backend.server.static_config import get_node_join_command
+
     peer_id = scheduler_manage.get_peer_id()
     is_local_network = scheduler_manage.get_is_local_network()
 
@@ -307,6 +308,9 @@ app.mount(
 )
 
 if __name__ == "__main__":
+    from backend.server.scheduler_manage import SchedulerManage
+    from backend.server.static_config import init_model_info_dict_cache
+
     args = parse_args()
     set_log_level(args.log_level)
     logger.info(f"args: {args}")
