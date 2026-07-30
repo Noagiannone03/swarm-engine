@@ -244,7 +244,7 @@ def _wait_executors_check_layer_change(
                 status=ServerState.INITIALIZING.value,
             )
             if shared_state.get("memory_contract_failure") is not None:
-                return True
+                return ExecutorSupervisionOutcome.RELOAD_REQUESTED
             raise RuntimeError(f"Executor subprocess exited unexpectedly: {failed}")
 
         now = time.monotonic()

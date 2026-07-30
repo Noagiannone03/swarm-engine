@@ -440,6 +440,39 @@ def test_memory_contract_failure_keeps_heartbeat_generation_alive_for_replan():
     assert shared_state.get_status() == ServerState.INITIALIZING.value
 
 
+def test_memory_contract_failure_detected_during_supervision_requests_reload():
+    class ExecutorThatFailsAfterInitialPoll:
+        pid = 1234
+        exitcode = 1
+
+        def __init__(self):
+            self.polls = 0
+
+        def is_alive(self):
+            self.polls += 1
+            return self.polls == 1
+
+    shared_state = SharedState.create()
+    shared_state.update(
+        status=ServerState.READY.value,
+        memory_contract_failure={
+            "kind": "kv_materialization",
+            "allocation_epoch": 3,
+            "requested_tokens": 32_768,
+            "supported_tokens": 29_344,
+        },
+    )
+
+    assert (
+        _wait_executors_check_layer_change(
+            shared_state,
+            [ExecutorThatFailsAfterInitialPoll()],
+        )
+        is ExecutorSupervisionOutcome.RELOAD_REQUESTED
+    )
+    assert shared_state.get_status() == ServerState.INITIALIZING.value
+
+
 def test_autonomous_contract_replan_does_not_require_scheduler_epoch_change():
     shared_state = SharedState(
         {
