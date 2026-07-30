@@ -1,0 +1,34 @@
+[Unit]
+Description=Refresh the Fabi model-registry TUF timestamp
+Documentation=https://theupdateframework.github.io/specification/latest/
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/fabi-tuf-timestamp/refresh.env
+LoadCredential=timestamp.pem:/etc/fabi-tuf-timestamp/timestamp.pem
+LoadCredential=timestamp.passphrase:/etc/fabi-tuf-timestamp/timestamp.passphrase
+ExecCondition=/usr/bin/test -d ${FABI_TUF_REPOSITORY}/metadata
+ExecStart=/usr/bin/flock --exclusive --nonblock /run/lock/fabi-tuf-timestamp-refresh.lock /usr/bin/docker run --rm --name fabi-tuf-timestamp-refresh --network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges --mount type=bind,source=${FABI_TUF_REPOSITORY},target=/registry --mount type=bind,source=%d/timestamp.pem,target=/run/secrets/timestamp-key/timestamp.pem,readonly --mount type=bind,source=%d/timestamp.passphrase,target=/run/secrets/timestamp.passphrase,readonly --entrypoint /usr/local/bin/fabi-swarm-registry ${FABI_TUF_OPERATOR_IMAGE} refresh-timestamp --repository-dir /registry --key-dir /run/secrets/timestamp-key --passphrase-file /run/secrets/timestamp.passphrase
+TimeoutStartSec=5min
+UMask=0022
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/run/lock
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native

@@ -95,6 +95,13 @@ public repository. It must not receive root, targets or snapshot private keys.
 A separate full `publish` must run before the seven-day snapshot expires.
 `refresh-timestamp` refuses to extend an already expired snapshot.
 
+For a Linux registry mirror, maintained hardened systemd units are provided in
+`deploy/model-registry/`. The timer runs every six hours, catches up after
+downtime and executes an exact operator image without network or Linux
+capabilities. Provisioning performs one immediate refresh and remote
+verification; a timer that has merely been enabled is not evidence that its
+credentials or image are valid.
+
 Generate the short-lived Request Agent capability authority without printing
 its private seed:
 

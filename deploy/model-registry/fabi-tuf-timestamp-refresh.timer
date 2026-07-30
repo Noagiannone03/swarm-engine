@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh the Fabi TUF timestamp before half of its validity elapses
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:15:00
+Persistent=true
+RandomizedDelaySec=5min
+AccuracySec=1min
+Unit=fabi-tuf-timestamp-refresh.service
+
+[Install]
+WantedBy=timers.target
+
