@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 
 import pytest
@@ -69,7 +70,8 @@ def test_sqlite_journal_persists_exact_commits_across_reopen(tmp_path) -> None:
     assert after_restart == before_restart
     assert after_restart is not None
     assert after_restart.committed_output_token_ids == (40, 50, 60)
-    assert path.stat().st_mode & 0o077 == 0
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o077 == 0
     reopened.close()
 
 
