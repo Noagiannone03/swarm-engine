@@ -80,6 +80,36 @@ fabi-swarm-registry publish \
   --passphrase-file /private/operator/secrets/registry.passphrase
 ```
 
+The timestamp role is deliberately short-lived. Refresh it from an automated
+operator before half of its 24-hour validity has elapsed:
+
+```console
+fabi-swarm-registry refresh-timestamp \
+  --repository-dir /srv/fabi-registry-v3 \
+  --key-dir /private/operator/timestamp-key \
+  --passphrase-file /private/operator/secrets/timestamp.passphrase
+```
+
+The refresh host needs only `timestamp.pem`, its owner-only passphrase and the
+public repository. It must not receive root, targets or snapshot private keys.
+A separate full `publish` must run before the seven-day snapshot expires.
+`refresh-timestamp` refuses to extend an already expired snapshot.
+
+Generate the short-lived Request Agent capability authority without printing
+its private seed:
+
+```console
+fabi-swarm-registry generate-route-authority \
+  --private-key-output /private/operator/secrets/route-capability.key \
+  --keyset-output /private/operator/route-authorities.json \
+  --generation 1 \
+  --valid-for-days 90
+```
+
+Publish the public keyset with `publish --route-authorities ...`; mount only
+the owner-only seed into the request authority. Never copy that seed into the
+public repository.
+
 Only the public repository and `bootstrap-root.json` are distributed. Private keys and their
 passphrase never go to the scheduler, workers, web root, container image, shell arguments, logs,
 or source control.

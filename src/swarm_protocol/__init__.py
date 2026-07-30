@@ -91,6 +91,7 @@ from swarm_protocol.registry import (
     RouteAuthorityKeyset,
     TrustedModelRegistry,
     TufRegistryPublisher,
+    TufTimestampRefresher,
     model_target_path,
 )
 from swarm_protocol.reservations import (
@@ -209,6 +210,7 @@ __all__ = [
     "RouteAuthorityKeyset",
     "TrustedModelRegistry",
     "TufRegistryPublisher",
+    "TufTimestampRefresher",
     "model_target_path",
     "ExactRoutePlanner",
     "NoFeasibleRoute",

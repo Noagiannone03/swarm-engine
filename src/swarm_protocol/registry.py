@@ -509,6 +509,93 @@ class TufRegistryPublisher:
         return metadata
 
 
+class TufTimestampRefresher:
+    """Refresh only online timestamp metadata over one existing snapshot.
+
+    TUF intentionally allows the frequently-rotated timestamp signer to stay
+    online without exposing root, targets or snapshot signing keys.
+    """
+
+    def __init__(
+        self,
+        repository_dir: Path,
+        signers: tuple[Signer, ...],
+        *,
+        validity: timedelta = RegistryExpiryPolicy().timestamp,
+    ) -> None:
+        if not signers:
+            raise ValueError("timestamp refresh requires at least one signer")
+        if validity <= timedelta(0):
+            raise ValueError("timestamp validity must be positive")
+        self.metadata_dir = repository_dir / "metadata"
+        self.signers = signers
+        self.validity = validity
+
+    def refresh(self, *, now: datetime | None = None) -> int:
+        """Sign and atomically publish a fresh timestamp for the current snapshot."""
+
+        current = _utc_now(now)
+        root = self._latest_root()
+        previous = Metadata.from_file(str(self.metadata_dir / "timestamp.json"))
+        if not isinstance(previous.signed, Timestamp):
+            raise ValueError("timestamp.json does not contain TUF timestamp metadata")
+        root.signed.verify_delegate(
+            "timestamp",
+            previous.signed_bytes,
+            previous.signatures,
+        )
+
+        snapshot_version = previous.signed.snapshot_meta.version
+        snapshot_path = self.metadata_dir / f"{snapshot_version}.snapshot.json"
+        snapshot = Metadata.from_file(str(snapshot_path))
+        if not isinstance(snapshot.signed, Snapshot):
+            raise ValueError("referenced metadata does not contain a TUF snapshot role")
+        if snapshot.signed.version != snapshot_version:
+            raise ValueError("timestamp and snapshot versions disagree")
+        root.signed.verify_delegate(
+            "snapshot",
+            snapshot.signed_bytes,
+            snapshot.signatures,
+        )
+        if snapshot.signed.is_expired(current):
+            raise ValueError("refusing to refresh timestamp over an expired snapshot")
+
+        version = previous.signed.version + 1
+        replacement = Metadata(
+            Timestamp(
+                version=version,
+                expires=current + self.validity,
+                snapshot_meta=MetaFile.from_data(
+                    snapshot_version,
+                    snapshot.to_bytes(_SERIALIZER),
+                    ["sha256"],
+                ),
+            )
+        )
+        payload = _sign(replacement, self.signers)
+        root.signed.verify_delegate(
+            "timestamp",
+            replacement.signed_bytes,
+            replacement.signatures,
+        )
+        _atomic_write(self.metadata_dir / "timestamp.json", payload)
+        return version
+
+    def _latest_root(self) -> Metadata[Root]:
+        versions = []
+        for path in self.metadata_dir.glob("*.root.json"):
+            try:
+                versions.append(int(path.name.split(".", 1)[0]))
+            except ValueError:
+                continue
+        if not versions:
+            raise FileNotFoundError("TUF registry has no versioned root metadata")
+        metadata = Metadata.from_file(str(self.metadata_dir / f"{max(versions)}.root.json"))
+        if not isinstance(metadata.signed, Root):
+            raise ValueError("latest root metadata does not contain a TUF root role")
+        return metadata
+
+
 class _PortableTufUpdater(Updater):
     """Project the current trusted root without requiring filesystem symlinks.
 

@@ -22,9 +22,11 @@ from swarm_protocol import (
 )
 from swarm_protocol.registry_operator import (
     generate_passphrase_file,
+    generate_route_authority,
     generate_staging_keys,
     initialize_staging_registry,
     load_staging_keys,
+    load_staging_timestamp_signers,
     publish_staging_registry,
     read_passphrase_file,
 )
@@ -132,6 +134,37 @@ def test_staging_keys_reject_wrong_password_and_public_permissions(tmp_path):
             load_staging_keys(key_dir, PASSPHRASE)
 
 
+def test_timestamp_signer_can_refresh_without_other_private_roles(tmp_path):
+    bundle_path = tmp_path / "bundle.json"
+    _write_bundle(bundle_path, _bundle())
+    repository = tmp_path / "repository"
+    key_dir = tmp_path / "keys"
+    initialize_staging_registry(
+        repository,
+        key_dir,
+        (bundle_path,),
+        PASSPHRASE,
+        bootstrap_root_output=tmp_path / "root.json",
+    )
+    previous_snapshot = (repository / "metadata" / "1.snapshot.json").read_bytes()
+    previous_targets = (repository / "metadata" / "1.targets.json").read_bytes()
+
+    from swarm_protocol.registry import TufTimestampRefresher
+
+    version = TufTimestampRefresher(
+        repository,
+        load_staging_timestamp_signers(key_dir, PASSPHRASE),
+    ).refresh()
+
+    assert version == 2
+    assert (repository / "metadata" / "1.snapshot.json").read_bytes() == previous_snapshot
+    assert (repository / "metadata" / "1.targets.json").read_bytes() == previous_targets
+    assert not (repository / "metadata" / "2.snapshot.json").exists()
+    timestamp = __import__("json").loads((repository / "metadata" / "timestamp.json").read_bytes())
+    assert timestamp["signed"]["version"] == 2
+    assert timestamp["signed"]["meta"]["snapshot.json"]["version"] == 1
+
+
 def test_passphrase_file_must_be_private_and_nonempty(tmp_path):
     secret = tmp_path / "passphrase"
     secret.write_bytes(PASSPHRASE + b"\n")
@@ -161,6 +194,53 @@ def test_generated_passphrase_is_private_high_entropy_and_never_overwritten(tmp_
 
     with pytest.raises(FileExistsError):
         generate_passphrase_file(secret)
+
+
+def test_generated_route_authority_is_private_public_and_never_overwritten(tmp_path):
+    private_key = tmp_path / "secrets" / "route-authority.key"
+    keyset_path = tmp_path / "public" / "route-authorities.json"
+
+    keyset = generate_route_authority(
+        private_key,
+        keyset_path,
+        generation=7,
+        valid_for_days=30,
+        clock_skew_seconds=60,
+        now_ms=1_800_000_000_000,
+    )
+
+    payload = private_key.read_text().strip()
+    assert len(payload) == 64
+    assert payload == payload.lower()
+    assert all(character in "0123456789abcdef" for character in payload)
+    assert keyset == RouteAuthorityKeyset.model_validate_json(keyset_path.read_bytes())
+    assert keyset.generation == 7
+    assert keyset.issued_at_ms == 1_799_999_940_000
+    assert keyset.expires_at_ms == 1_802_592_000_000
+    assert keyset.keys[0].not_before_ms == keyset.issued_at_ms
+    assert keyset.keys[0].not_after_ms == keyset.expires_at_ms
+    if os.name != "nt":
+        assert stat.S_IMODE(private_key.stat().st_mode) == 0o600
+        assert stat.S_IMODE(private_key.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(keyset_path.stat().st_mode) == 0o644
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        generate_route_authority(private_key, tmp_path / "other.json")
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        generate_route_authority(tmp_path / "other.key", keyset_path)
+
+
+def test_route_authority_generation_rejects_invalid_contracts(tmp_path):
+    private_key = tmp_path / "authority.key"
+    keyset = tmp_path / "authority.json"
+    with pytest.raises(ValueError, match="different"):
+        generate_route_authority(private_key, private_key)
+    with pytest.raises(ValueError, match="generation"):
+        generate_route_authority(private_key, keyset, generation=0)
+    with pytest.raises(ValueError, match="validity"):
+        generate_route_authority(private_key, keyset, valid_for_days=0)
+    with pytest.raises(ValueError, match="clock skew"):
+        generate_route_authority(private_key, keyset, clock_skew_seconds=3601)
 
 
 def test_staging_registry_initializes_publishes_and_verifies(tmp_path):
