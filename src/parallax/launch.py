@@ -22,11 +22,14 @@ import multiprocessing
 import os
 import time
 from dataclasses import dataclass
-from enum import Enum
 from typing import Callable
 
 from parallax.p2p.server import ServerState, launch_p2p_server_process, stop_p2p_server
 from parallax.server.executor.factory import run_executor_process, stop_executor_process
+from parallax.server.executor_supervision import (
+    ExecutorSupervisionOutcome,
+    failed_executor_outcome,
+)
 from parallax.server.memory_budget import (
     DEFAULT_PRESSURE_POLL_SECONDS,
     GIB,
@@ -60,14 +63,6 @@ class MemoryPressureGuard:
     name: str
     controller: MemoryPressureController
     available_reader: Callable[[], int]
-
-
-class ExecutorSupervisionOutcome(str, Enum):
-    """Reason why one executor generation stopped being supervised."""
-
-    EXITED = "exited"
-    RELOAD_REQUESTED = "reload_requested"
-    MEMORY_SHUTDOWN_REQUESTED = "memory_shutdown_requested"
 
 
 def _update_args_from_shared_state(args, shared_state: SharedState, force_update: bool):
@@ -243,8 +238,13 @@ def _wait_executors_check_layer_change(
                 frontend_alive=False,
                 status=ServerState.INITIALIZING.value,
             )
-            if shared_state.get("memory_contract_failure") is not None:
-                return ExecutorSupervisionOutcome.RELOAD_REQUESTED
+            failure_outcome = failed_executor_outcome(
+                has_memory_contract_failure=(
+                    shared_state.get("memory_contract_failure") is not None
+                )
+            )
+            if failure_outcome is not None:
+                return failure_outcome
             raise RuntimeError(f"Executor subprocess exited unexpectedly: {failed}")
 
         now = time.monotonic()
