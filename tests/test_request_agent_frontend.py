@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -33,6 +35,23 @@ MODEL_SWARM_ID = "11" * 32
 ENDPOINT_ID = "22" * 32
 API_CREDENTIAL = "33" * 32
 AUTH_HEADERS = {"Authorization": f"Bearer {API_CREDENTIAL}"}
+
+
+def test_request_agent_frontend_module_is_executable() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "backend.server.request_agent_frontend",
+            "--help",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert "usage: fabi-request-agent" in completed.stdout
 
 
 class FakeTokenizer:
