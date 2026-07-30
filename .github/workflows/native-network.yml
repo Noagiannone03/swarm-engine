@@ -10,11 +10,13 @@ on:
       - 'src/backend/main.py'
       - 'src/backend/server/request_handler.py'
       - 'src/backend/server/request_agent_frontend.py'
+      - 'src/parallax/launch.py'
       - 'src/parallax/utils/model_config.py'
       - 'src/parallax/utils/model_download.py'
       - 'src/swarm_protocol/**'
       - 'tests/test_backend_request_handler.py'
       - 'tests/test_request_agent_frontend.py'
+      - 'tests/test_launch.py'
       - 'tests/test_swarm_protocol_*.py'
   push:
     branches:
@@ -26,11 +28,13 @@ on:
       - 'src/backend/main.py'
       - 'src/backend/server/request_handler.py'
       - 'src/backend/server/request_agent_frontend.py'
+      - 'src/parallax/launch.py'
       - 'src/parallax/utils/model_config.py'
       - 'src/parallax/utils/model_download.py'
       - 'src/swarm_protocol/**'
       - 'tests/test_backend_request_handler.py'
       - 'tests/test_request_agent_frontend.py'
+      - 'tests/test_launch.py'
       - 'tests/test_swarm_protocol_*.py'
 
 permissions:
@@ -133,6 +137,7 @@ jobs:
             tests/test_swarm_protocol_*.py \
             tests/test_backend_request_handler.py \
             tests/test_request_agent_frontend.py \
+            tests/test_launch.py \
             tests/test_route_capability_http.py \
             tests/scheduler_tests/test_contribution_gate_v2.py
 
