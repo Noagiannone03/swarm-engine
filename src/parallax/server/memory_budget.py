@@ -323,9 +323,20 @@ def calculate_mlx_memory_budget(
 
 
 def current_mlx_memory_budget(
-    mx, *, psutil_module=None, process_limit_cap_bytes: Optional[int] = None
+    mx,
+    *,
+    psutil_module=None,
+    process_limit_cap_bytes: Optional[int] = None,
+    system_reserve_bytes: Optional[int] = None,
 ) -> MlxMemoryBudget:
-    """Read live MLX/system counters and return the current safe budget."""
+    """Read live MLX/system counters and return the current safe budget.
+
+    ``system_reserve_bytes`` pins the reserve selected when a worker generation
+    starts. Loading this process' own Metal allocations lowers
+    ``virtual_memory().available`` and can cross an adaptive reserve tier; that
+    must not retroactively shrink the already-applied MLX process cap. External
+    pressure still reduces the safe remainder through ``available_bytes``.
+    """
 
     if psutil_module is None:
         import psutil as psutil_module  # type: ignore[no-redef]
@@ -349,7 +360,11 @@ def current_mlx_memory_budget(
         available_bytes=available,
         active_bytes=active,
         max_working_set_bytes=working_set,
-        system_reserve_bytes=configured_system_reserve_bytes(total, available),
+        system_reserve_bytes=(
+            configured_system_reserve_bytes(total, available)
+            if system_reserve_bytes is None
+            else min(total, max(0, int(system_reserve_bytes)))
+        ),
         explicit_process_limit_bytes=explicit_limit,
         cache_limit_bytes=(
             configured_cache

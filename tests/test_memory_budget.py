@@ -149,6 +149,34 @@ def test_configure_applies_one_cap_to_memory_and_wired_limits(monkeypatch):
     assert later.additional_bytes == gb(5)
 
 
+def test_worker_generation_keeps_its_startup_reserve_tier(monkeypatch):
+    """The worker's own weights must not look like new desktop pressure."""
+
+    monkeypatch.delenv("PARALLAX_SYSTEM_RESERVE_GB", raising=False)
+    mlx = FakeMlx()
+    psutil = SimpleNamespace(
+        virtual_memory=lambda: SimpleNamespace(total=gb(16), available=gb(4.5))
+    )
+    startup = configure_mlx_memory_limits(mlx, psutil_module=psutil)
+    assert startup.system_reserve_bytes == gb(2.5)
+    assert startup.process_limit_bytes == gb(2)
+
+    # Loading 1.5 GiB makes macOS availability cross the next adaptive tier.
+    # The reserve is immutable inside this generation, while the live
+    # availability still bounds the remaining 0.5 GiB.
+    mlx.get_active_memory = lambda: gb(1.5)
+    psutil.virtual_memory = lambda: SimpleNamespace(total=gb(16), available=gb(3))
+    loaded = current_mlx_memory_budget(
+        mlx,
+        psutil_module=psutil,
+        process_limit_cap_bytes=startup.process_limit_bytes,
+        system_reserve_bytes=startup.system_reserve_bytes,
+    )
+    assert loaded.system_reserve_bytes == gb(2.5)
+    assert loaded.process_limit_bytes == gb(2)
+    assert loaded.additional_bytes == gb(0.5)
+
+
 def test_explicit_system_reserve_override_still_wins(monkeypatch):
     monkeypatch.setenv("PARALLAX_SYSTEM_RESERVE_GB", "6")
     mlx = FakeMlx()

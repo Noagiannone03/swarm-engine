@@ -249,6 +249,11 @@ class MLXExecutor(BaseExecutor):
                 if self.mlx_memory_budget is not None
                 else None
             ),
+            mlx_system_reserve_bytes=(
+                self.mlx_memory_budget.system_reserve_bytes
+                if self.mlx_memory_budget is not None
+                else None
+            ),
             minimum_kv_tokens=planned_context_tokens,
         )
 

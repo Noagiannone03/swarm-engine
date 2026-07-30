@@ -59,6 +59,7 @@ class CacheManager:
         sliding_window: Optional[int] = None,
         chunked_prefill_size: Optional[int] = None,
         mlx_process_limit_bytes: Optional[int] = None,
+        mlx_system_reserve_bytes: Optional[int] = None,
         minimum_kv_tokens: Optional[int] = None,
     ):
         self.num_layers = num_layers
@@ -90,6 +91,7 @@ class CacheManager:
         self.linear_num_v_heads = linear_num_v_heads
         self.cache_memory_fraction = cache_memory_fraction
         self.mlx_process_limit_bytes = mlx_process_limit_bytes
+        self.mlx_system_reserve_bytes = mlx_system_reserve_bytes
         self.minimum_kv_tokens = (
             None if minimum_kv_tokens is None else max(0, int(minimum_kv_tokens))
         )
@@ -368,6 +370,7 @@ class CacheManager:
         budget = current_mlx_memory_budget(
             mx,
             process_limit_cap_bytes=self.mlx_process_limit_bytes,
+            system_reserve_bytes=self.mlx_system_reserve_bytes,
         )
         # The old implementation used MLX's complete recommended working set,
         # ignoring desktop pressure and PARALLAX_SYSTEM_RESERVE_GB. Size the
