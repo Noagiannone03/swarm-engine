@@ -8,6 +8,7 @@ import hmac
 import ipaddress
 import json
 import os
+import socket
 import threading
 import time
 import uuid
@@ -860,13 +861,102 @@ def _loopback_host(value: str) -> str:
     return value
 
 
+def _bound_base_url(server: uvicorn.Server, configured_host: str) -> str:
+    """Return the actual loopback URL after Uvicorn has bound its listener."""
+
+    listeners = [
+        listener
+        for asyncio_server in server.servers
+        for listener in (asyncio_server.sockets or ())
+    ]
+    if len(listeners) != 1:
+        raise RuntimeError(
+            f"Request Agent expected exactly one listener, found {len(listeners)}"
+        )
+    address = listeners[0].getsockname()
+    if not isinstance(address, tuple) or len(address) < 2:
+        raise RuntimeError("Request Agent listener is not a TCP socket")
+    port = address[1]
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+        raise RuntimeError("Request Agent listener returned an invalid port")
+    host = configured_host
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
+
+
+def _write_ready_file(path: Path, *, base_url: str) -> None:
+    """Atomically publish the process endpoint without exposing credentials."""
+
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "base_url": base_url,
+        },
+        separators=(",", ":"),
+    ).encode() + b"\n"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            # Windows ACLs, not POSIX mode bits, are authoritative.
+            pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+class _ReadyFileServer(uvicorn.Server):
+    """Uvicorn server that publishes readiness only after the socket is bound."""
+
+    def __init__(self, config: uvicorn.Config, *, ready_file: Path | None) -> None:
+        super().__init__(config)
+        self._ready_file = ready_file.expanduser().resolve() if ready_file else None
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        await super().startup(sockets=sockets)
+        if self.started and self._ready_file is not None:
+            _write_ready_file(
+                self._ready_file,
+                base_url=_bound_base_url(self, self.config.host),
+            )
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        try:
+            await super().shutdown(sockets=sockets)
+        finally:
+            if self._ready_file is not None:
+                self._ready_file.unlink(missing_ok=True)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="fabi-request-agent")
     parser.add_argument("--host", default="127.0.0.1", type=_loopback_host)
     parser.add_argument("--port", default=7778, type=int)
+    parser.add_argument(
+        "--ready-file",
+        type=Path,
+        help="atomically publish the bound loopback URL after startup",
+    )
     args = parser.parse_args(argv)
-    if not 1 <= args.port <= 65_535:
-        parser.error("--port must be between 1 and 65535")
+    if not 0 <= args.port <= 65_535:
+        parser.error("--port must be between 0 and 65535")
+    if args.port == 0 and args.ready_file is None:
+        parser.error("--port 0 requires --ready-file")
+    if args.ready_file is not None:
+        args.ready_file.expanduser().resolve().unlink(missing_ok=True)
     model_swarm_id = os.environ.get("FABI_REQUEST_AGENT_MODEL_SWARM_ID", "").strip()
     if len(model_swarm_id) != 64 or any(
         character not in "0123456789abcdef" for character in model_swarm_id
@@ -883,10 +973,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except BaseException:
         runtime.close()
         raise
-    uvicorn.run(
+    config = uvicorn.Config(
         create_request_agent_app(manager, api_credential=api_credential),
         host=args.host,
         port=args.port,
         access_log=False,
     )
+    _ReadyFileServer(config, ready_file=args.ready_file).run()
     return 0

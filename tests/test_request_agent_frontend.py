@@ -2,16 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
+import time
+import urllib.request
 from types import SimpleNamespace
 
 import pytest
+import uvicorn
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.server.openai_compat import encode_http_response_envelope
 from backend.server.request_agent_frontend import (
     RequestAgentOpenAIManager,
+    _ReadyFileServer,
+    _bound_base_url,
     _encode_status_sse,
     _loopback_host,
+    _write_ready_file,
     _verified_frontend_assets,
     create_request_agent_app,
 )
@@ -525,6 +534,72 @@ def test_local_request_agent_rejects_invalid_json_and_non_loopback_bind():
     )
     with pytest.raises(Exception, match="loopback"):
         _loopback_host("0.0.0.0")
+
+
+def test_request_agent_ready_file_uses_actual_bound_port_and_owner_only_mode(tmp_path):
+    listener = SimpleNamespace(getsockname=lambda: ("127.0.0.1", 43127))
+    server = SimpleNamespace(
+        servers=[SimpleNamespace(sockets=[listener])],
+    )
+    ready_file = tmp_path / "request-agent.json"
+
+    base_url = _bound_base_url(server, "127.0.0.1")
+    _write_ready_file(ready_file, base_url=base_url)
+
+    assert json.loads(ready_file.read_text()) == {
+        "schema_version": 1,
+        "pid": os.getpid(),
+        "base_url": "http://127.0.0.1:43127",
+    }
+    if os.name != "nt":
+        assert ready_file.stat().st_mode & 0o077 == 0
+
+
+def test_request_agent_bound_url_brackets_ipv6_and_rejects_ambiguous_listeners():
+    server = SimpleNamespace(
+        servers=[
+            SimpleNamespace(
+                sockets=[SimpleNamespace(getsockname=lambda: ("::1", 43128, 0, 0))]
+            )
+        ],
+    )
+    assert _bound_base_url(server, "::1") == "http://[::1]:43128"
+
+    server.servers[0].sockets.append(
+        SimpleNamespace(getsockname=lambda: ("::1", 43129, 0, 0))
+    )
+    with pytest.raises(RuntimeError, match="exactly one listener"):
+        _bound_base_url(server, "::1")
+
+
+def test_request_agent_server_publishes_bound_port_only_while_serving(tmp_path):
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ready"}
+
+    ready_file = tmp_path / "request-agent.json"
+    server = _ReadyFileServer(
+        uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"),
+        ready_file=ready_file,
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    try:
+        while not ready_file.exists() and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready_file.exists()
+        base_url = json.loads(ready_file.read_text())["base_url"]
+        with urllib.request.urlopen(f"{base_url}/health", timeout=2) as response:
+            assert json.load(response) == {"status": "ready"}
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert not ready_file.exists()
 
 
 def test_local_request_agent_rejects_missing_account_credential():
