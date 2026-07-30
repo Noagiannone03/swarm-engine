@@ -154,8 +154,8 @@ def test_permit_requires_idempotency_and_capability_rechecks_account(monkeypatch
         signed = SignedControlMessage(
             kind=ControlMessageKind.ROUTE_PLAN,
             signer_endpoint_id=COORDINATOR,
-            payload=b"{}",
-            signature=b"x" * 64,
+            payload=b"\x8a{}",
+            signature=bytes(range(64)),
         )
         capability_payload = {
             "permit_id": permit["permit_id"],
@@ -176,6 +176,7 @@ def test_permit_requires_idempotency_and_capability_rechecks_account(monkeypatch
         assert accepted.status_code == 200
         assert accepted.json() == {"capability": "persisted"}
         assert len(capabilities.calls) == 1
+        assert capabilities.calls[0][0] == signed
     finally:
         set_request_agent_authority(None)
 

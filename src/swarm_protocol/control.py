@@ -35,7 +35,12 @@ class ControlCrypto(Protocol):
 class SignedControlMessage(BaseModel):
     """Exact signed bytes plus the endpoint identity that must verify them."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        ser_json_bytes="base64",
+        val_json_bytes="base64",
+    )
 
     kind: ControlMessageKind
     signer_endpoint_id: str = Field(pattern=r"^[0-9a-f]{64}$")
