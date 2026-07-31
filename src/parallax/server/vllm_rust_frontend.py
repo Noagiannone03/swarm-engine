@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import shutil
@@ -81,6 +82,29 @@ def _bind_listener_socket(host: str, port: int) -> socket.socket:
     raise last_error
 
 
+def _numeric_listen_address(host: str, port: int) -> str:
+    """Resolve a host to the numeric SocketAddr syntax expected by vllm-rs."""
+    normalized_host = host.strip()
+    if normalized_host.lower() == "localhost":
+        # Fabi's loopback clients use IPv4 today. Pinning localhost avoids an
+        # OS-dependent choice of ::1 which can make a later 127.0.0.1 health
+        # probe fail even though both names denote the local machine.
+        normalized_host = "127.0.0.1"
+
+    try:
+        address = ipaddress.ip_address(normalized_host)
+    except ValueError:
+        addrinfos = socket.getaddrinfo(normalized_host, port, type=socket.SOCK_STREAM)
+        if not addrinfos:
+            raise OSError(f"Unable to resolve frontend listen host: {host}")
+        normalized_host = str(addrinfos[0][4][0])
+        address = ipaddress.ip_address(normalized_host)
+
+    if address.version == 6:
+        return f"[{address.compressed}]:{port}"
+    return f"{address.compressed}:{port}"
+
+
 def _runtime_args_json(args) -> str:
     runtime_args = {
         "model_tag": args.model_path,
@@ -142,9 +166,7 @@ def launch_vllm_rust_frontend(args) -> VllmRustFrontendProcess:
         # The portable vLLM frontend binds TCP itself on Windows. Passing a
         # socket HANDLE through subprocess is not equivalent to POSIX fd
         # inheritance; direct bind is the native, race-free primitive.
-        host = str(args.host)
-        listen_address = f"[{host}]:{bound_port}" if ":" in host else f"{host}:{bound_port}"
-        cmd.extend(["--listen-address", listen_address])
+        cmd.extend(["--listen-address", _numeric_listen_address(str(args.host), bound_port)])
     cmd.extend(
         [
             "--input-address",

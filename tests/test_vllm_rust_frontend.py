@@ -175,3 +175,43 @@ def test_windows_frontend_binds_tcp_without_posix_fd_inheritance(monkeypatch):
     address_index = launched["command"].index("--listen-address") + 1
     assert launched["command"][address_index] == "127.0.0.1:19080"
     assert "pass_fds" not in launched["kwargs"]
+
+
+def test_windows_frontend_normalizes_default_localhost_for_socket_addr(monkeypatch):
+    launched = {}
+
+    class FakeProcess:
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_popen(command, **kwargs):
+        launched["command"] = command
+        launched["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(vllm_rust_frontend.os, "name", "nt")
+    monkeypatch.setattr(
+        vllm_rust_frontend, "resolve_vllm_rs_binary", lambda: r"C:\Fabi\vllm-rs.exe"
+    )
+    monkeypatch.setattr(vllm_rust_frontend.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vllm_rust_frontend.time, "sleep", lambda _: None)
+    args = SimpleNamespace(
+        host="localhost",
+        port=3001,
+        executor_input_ipc="tcp://127.0.0.1:19081",
+        executor_output_ipc="tcp://127.0.0.1:19082",
+        model_path="Qwen/Qwen3-0.6B",
+        max_sequence_length=4096,
+    )
+
+    vllm_rust_frontend.launch_vllm_rust_frontend(args)
+
+    address_index = launched["command"].index("--listen-address") + 1
+    assert launched["command"][address_index] == "127.0.0.1:3001"
+
+
+def test_windows_frontend_formats_ipv6_socket_addr():
+    assert vllm_rust_frontend._numeric_listen_address("::1", 3001) == "[::1]:3001"
