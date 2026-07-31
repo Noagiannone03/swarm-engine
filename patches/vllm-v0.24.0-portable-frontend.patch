@@ -268,3 +268,44 @@ index b7b715b..aba7656 100644
 +        assert!(matches!(listener, Listener::Tcp(_)));
 +    }
  }
+diff --git a/rust/src/managed-engine/src/process.rs b/rust/src/managed-engine/src/process.rs
+index 0a50624..f5c4c13 100644
+--- a/rust/src/managed-engine/src/process.rs
++++ b/rust/src/managed-engine/src/process.rs
+@@ -0,0 +1 @@
++#[cfg(unix)]
+@@ -162,0 +164 @@ impl ManagedEngineHandle {
++#[cfg(unix)]
+@@ -203,0 +206,32 @@ mod process_group {
++#[cfg(windows)]
++mod process_group {
++    use super::*;
++
++    /// Windows has no POSIX process-group setup equivalent. `taskkill /T`
++    /// traverses the process tree from the concrete PID instead.
++    pub fn configure(_command: &mut Command) {}
++
++    /// Windows does not expose a portable SIGTERM for console subprocess
++    /// trees. Use the maintained system process-tree primitive.
++    pub fn terminate(pid: u32) -> Result<()> {
++        taskkill(pid)
++    }
++
++    pub fn kill(pid: u32) -> Result<()> {
++        taskkill(pid)
++    }
++
++    fn taskkill(pid: u32) -> Result<()> {
++        let output = StdCommand::new("taskkill")
++            .args(["/PID", &pid.to_string(), "/T", "/F"])
++            .output()
++            .context("failed to execute taskkill for managed engine process tree")?;
++        if output.status.success() {
++            return Ok(());
++        }
++
++        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
++        anyhow::bail!("taskkill failed for managed engine process tree {pid}: {stderr}")
++    }
++}
++

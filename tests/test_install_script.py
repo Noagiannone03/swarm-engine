@@ -44,6 +44,8 @@ def test_frontend_build_pins_and_hashes_all_fabi_patches():
     portable_patch = VLLM_PORTABLE_FRONTEND_PATCH.read_text()
     assert "--listen-address" in portable_patch
     assert "cfg(not(unix))" in portable_patch
+    assert "cfg(windows)" in portable_patch
+    assert 'StdCommand::new("taskkill")' in portable_patch
 
 
 def test_frontend_only_requires_existing_virtualenv(tmp_path):

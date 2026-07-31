@@ -386,12 +386,12 @@ apply_vllm_fabi_patch() {
     fi
 
     echo "Applying Fabi portable frontend listener patch"
-    if ! git -C "$clone_root" apply --check "$VLLM_PORTABLE_FRONTEND_PATCH"; then
+    if ! git -C "$clone_root" apply --unidiff-zero --check "$VLLM_PORTABLE_FRONTEND_PATCH"; then
         echo "The portable frontend patch is incompatible with vLLM ref $VLLM_REF." >&2
         echo "Qualify and update the patch before building this frontend." >&2
         exit 1
     fi
-    git -C "$clone_root" apply "$VLLM_PORTABLE_FRONTEND_PATCH"
+    git -C "$clone_root" apply --unidiff-zero "$VLLM_PORTABLE_FRONTEND_PATCH"
 }
 
 update_vllm_minijinja() {
