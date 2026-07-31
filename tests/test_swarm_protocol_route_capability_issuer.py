@@ -210,6 +210,7 @@ def test_service_persists_one_biscuit_for_an_exact_retry(tmp_path):
     ledger.issue(
         account_id=ACCOUNT,
         request_id="request",
+        idempotency_key="permit-request",
         coordinator_endpoint_id=COORDINATOR,
         model_swarm_id=MODEL,
         max_context_tokens=2_000,

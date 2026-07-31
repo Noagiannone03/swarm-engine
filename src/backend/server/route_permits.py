@@ -143,6 +143,7 @@ class SqliteRoutePermitLedger:
                 permit_id TEXT PRIMARY KEY NOT NULL,
                 account_id TEXT NOT NULL,
                 request_id TEXT NOT NULL,
+                logical_request_id TEXT NOT NULL,
                 coordinator_endpoint_id TEXT NOT NULL,
                 model_swarm_id TEXT NOT NULL,
                 max_context_tokens INTEGER NOT NULL,
@@ -203,6 +204,15 @@ class SqliteRoutePermitLedger:
         columns = {
             str(row["name"]) for row in self._connection.execute("PRAGMA table_info(route_permits)")
         }
+        if "logical_request_id" not in columns:
+            # rc38 and earlier used request_id as both the signed request identity
+            # and the HTTP idempotency key. Preserve those rows while separating
+            # the two concepts for all new permits.
+            self._connection.execute("ALTER TABLE route_permits ADD COLUMN logical_request_id TEXT")
+            self._connection.execute(
+                "UPDATE route_permits SET logical_request_id = request_id "
+                "WHERE logical_request_id IS NULL"
+            )
         if "authorization_generation" not in columns:
             self._connection.execute(
                 "ALTER TABLE route_permits "
@@ -274,7 +284,7 @@ class SqliteRoutePermitLedger:
         return AuthorizedContributionPermit(
             permit_id=str(row["permit_id"]),
             account_id=str(row["account_id"]),
-            request_id=str(row["request_id"]),
+            request_id=str(row["logical_request_id"]),
             coordinator_endpoint_id=str(row["coordinator_endpoint_id"]),
             model_swarm_id=str(row["model_swarm_id"]),
             max_context_tokens=int(row["max_context_tokens"]),
@@ -421,15 +431,15 @@ class SqliteRoutePermitLedger:
             assert row is not None
             return int(row["count"])
 
-    def find_active(
+    def find_active_by_idempotency(
         self,
         *,
         account_id: str,
-        request_id: str,
+        idempotency_key: str,
         coordinator_endpoint_id: str,
     ) -> AuthorizedContributionPermit | None:
         _validate_hash(account_id, "account ID")
-        _validate_request_id(request_id)
+        _validate_request_id(idempotency_key)
         _validate_hash(coordinator_endpoint_id, "coordinator EndpointId")
         now_ms = self._now_ms()
         with self._lock:
@@ -442,7 +452,7 @@ class SqliteRoutePermitLedger:
                 """,
                 (
                     account_id,
-                    request_id,
+                    idempotency_key,
                     coordinator_endpoint_id,
                     RoutePermitState.ACTIVE.value,
                     now_ms,
@@ -455,6 +465,7 @@ class SqliteRoutePermitLedger:
         *,
         account_id: str,
         request_id: str,
+        idempotency_key: str,
         coordinator_endpoint_id: str,
         model_swarm_id: str,
         max_context_tokens: int,
@@ -470,6 +481,7 @@ class SqliteRoutePermitLedger:
         ):
             _validate_hash(value, name)
         _validate_request_id(request_id)
+        _validate_request_id(idempotency_key)
         if max_context_tokens <= 0 or ttl_ms <= 0 or max_active_per_account <= 0:
             raise ValueError("context, TTL, and account capacity must be positive")
         if not recovery_policies:
@@ -491,12 +503,13 @@ class SqliteRoutePermitLedger:
                 WHERE account_id = ? AND request_id = ?
                   AND coordinator_endpoint_id = ?
                 """,
-                (account_id, request_id, coordinator_endpoint_id),
+                (account_id, idempotency_key, coordinator_endpoint_id),
             ).fetchone()
             if existing is not None:
                 permit = self._permit(existing)
                 if (
                     existing["state"] == RoutePermitState.ACTIVE.value
+                    and permit.request_id == request_id
                     and permit.model_swarm_id == model_swarm_id
                     and permit.max_context_tokens == max_context_tokens
                     and permit.recovery_policies == recovery_policies
@@ -520,14 +533,16 @@ class SqliteRoutePermitLedger:
             self._connection.execute(
                 """
                 INSERT INTO route_permits(
-                    permit_id, account_id, request_id, coordinator_endpoint_id,
+                    permit_id, account_id, request_id, logical_request_id,
+                    coordinator_endpoint_id,
                     model_swarm_id, max_context_tokens, recovery_policies_json,
                     issued_at_ms, expires_at_ms, initial_ttl_ms, state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     identifier,
                     account_id,
+                    idempotency_key,
                     request_id,
                     coordinator_endpoint_id,
                     model_swarm_id,

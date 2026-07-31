@@ -45,11 +45,11 @@ class ContributionRoutePermitLedger(Protocol):
 
     def active_count(self, account_id: str) -> int: ...
 
-    def find_active(
+    def find_active_by_idempotency(
         self,
         *,
         account_id: str,
-        request_id: str,
+        idempotency_key: str,
         coordinator_endpoint_id: str,
     ) -> AuthorizedContributionPermit | None: ...
 
@@ -58,6 +58,7 @@ class ContributionRoutePermitLedger(Protocol):
         *,
         account_id: str,
         request_id: str,
+        idempotency_key: str,
         coordinator_endpoint_id: str,
         model_swarm_id: str,
         max_context_tokens: int,
@@ -369,6 +370,7 @@ class ContributionGate:
         scheduler,
         *,
         request_id: str,
+        idempotency_key: str,
         coordinator_endpoint_id: str,
         model_swarm_id: str,
         max_context_tokens: int,
@@ -391,14 +393,15 @@ class ContributionGate:
             if identity is None:
                 reason = "missing_credential" if not credential else "invalid_credential"
                 raise ContributionPermitDenied(ContributionStatus(False, reason))
-            existing = ledger.find_active(
+            existing = ledger.find_active_by_idempotency(
                 account_id=identity,
-                request_id=request_id,
+                idempotency_key=idempotency_key,
                 coordinator_endpoint_id=coordinator_endpoint_id,
             )
             if existing is not None:
                 if (
-                    existing.model_swarm_id != model_swarm_id
+                    existing.request_id != request_id
+                    or existing.model_swarm_id != model_swarm_id
                     or existing.max_context_tokens != max_context_tokens
                     or existing.recovery_policies != recovery_policies
                     or existing.initial_ttl_ms != ttl_ms
@@ -426,6 +429,7 @@ class ContributionGate:
             return ledger.issue(
                 account_id=status.account_id,
                 request_id=request_id,
+                idempotency_key=idempotency_key,
                 coordinator_endpoint_id=coordinator_endpoint_id,
                 model_swarm_id=model_swarm_id,
                 max_context_tokens=max_context_tokens,

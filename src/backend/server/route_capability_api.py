@@ -42,6 +42,7 @@ router = APIRouter(prefix="/v1/swarm", tags=["Fabi Request Agent"])
 class RoutePermitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    request_id: str = Field(min_length=1, max_length=512)
     coordinator_endpoint_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     model_swarm_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     max_context_tokens: int = Field(gt=0)
@@ -163,21 +164,22 @@ class RequestAgentAuthority:
         self,
         *,
         credential: object,
-        request_id: str,
+        idempotency_key: str,
         contract: RoutePermitRequest,
     ) -> RoutePermitResponse:
         identity = account_hash(credential)
         if identity is None:
             reason = "missing_credential" if not credential else "invalid_credential"
             raise ContributionPermitDenied(ContributionStatus(False, reason))
-        existing = self.ledger.find_active(
+        existing = self.ledger.find_active_by_idempotency(
             account_id=identity,
-            request_id=request_id,
+            idempotency_key=idempotency_key,
             coordinator_endpoint_id=contract.coordinator_endpoint_id,
         )
         if existing is not None:
             if (
-                existing.model_swarm_id != contract.model_swarm_id
+                existing.request_id != contract.request_id
+                or existing.model_swarm_id != contract.model_swarm_id
                 or existing.max_context_tokens != contract.max_context_tokens
                 or existing.recovery_policies != frozenset(contract.recovery_policies)
                 or existing.initial_ttl_ms != contract.ttl_ms
@@ -200,7 +202,8 @@ class RequestAgentAuthority:
         permit = self.gate.issue_route_permit(
             credential,
             self._scheduler_provider(),
-            request_id=request_id,
+            request_id=contract.request_id,
+            idempotency_key=idempotency_key,
             coordinator_endpoint_id=contract.coordinator_endpoint_id,
             model_swarm_id=contract.model_swarm_id,
             max_context_tokens=contract.max_context_tokens,
@@ -347,12 +350,12 @@ def create_route_permit(
         return _error(
             400,
             "idempotency_key_required",
-            "Idempotency-Key is required and becomes the signed route request_id.",
+            "Idempotency-Key is required for safe permit retries.",
         )
     try:
         return authority.issue_permit(
             credential=_bearer_credential(raw_request),
-            request_id=idempotency_key,
+            idempotency_key=idempotency_key,
             contract=contract,
         )
     except ContributionPermitDenied as error:

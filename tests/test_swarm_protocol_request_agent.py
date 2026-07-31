@@ -611,8 +611,31 @@ def test_authority_http_client_bounds_security_and_preserves_retry_metadata():
     assert caught.value.status_code == 429
     assert caught.value.code == "contribution_capacity_reached"
     assert caught.value.retry_after_seconds == 2
-    assert session.calls[0][2]["headers"]["Idempotency-Key"] == "request"
+    issue_key = session.calls[0][2]["headers"]["Idempotency-Key"]
+    assert issue_key.startswith("permit-issue:")
+    assert len(issue_key) == len("permit-issue:") + 64
+    assert session.calls[0][2]["json"]["request_id"] == "request"
     assert session.calls[0][2]["headers"]["Authorization"] == "Bearer " + "ab" * 32
+
+    with pytest.raises(RequestAgentAuthorityError):
+        client.issue_permit(
+            request_id="request",
+            coordinator_endpoint_id=COORDINATOR,
+            model_swarm_id="77" * 32,
+            max_context_tokens=16_384,
+            recovery_policies=(RouteRecoveryPolicy.REPLAN_COLD,),
+        )
+    assert session.calls[1][2]["headers"]["Idempotency-Key"] == issue_key
+
+    with pytest.raises(RequestAgentAuthorityError):
+        client.issue_permit(
+            request_id="request",
+            coordinator_endpoint_id=COORDINATOR,
+            model_swarm_id="77" * 32,
+            max_context_tokens=16_393,
+            recovery_policies=(RouteRecoveryPolicy.REPLAN_COLD,),
+        )
+    assert session.calls[2][2]["headers"]["Idempotency-Key"] != issue_key
 
     with pytest.raises(ValueError, match="HTTPS"):
         RequestAgentAuthorityClient("http://authority.example", "ab" * 32)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 import threading
 
@@ -23,10 +24,18 @@ PERMIT = "44" * 32
 DIGEST = "55" * 32
 
 
-def issue(ledger, *, request_id="request", permit_id=PERMIT, capacity=1):
+def issue(
+    ledger,
+    *,
+    request_id="request",
+    idempotency_key=None,
+    permit_id=PERMIT,
+    capacity=1,
+):
     return ledger.issue(
         account_id=ACCOUNT,
         request_id=request_id,
+        idempotency_key=idempotency_key or f"permit-{request_id}",
         coordinator_endpoint_id=COORDINATOR,
         model_swarm_id=MODEL,
         max_context_tokens=16_384,
@@ -66,6 +75,50 @@ def test_permit_issue_is_idempotent_and_quota_is_atomic(tmp_path):
 
     ledger.release(first.permit_id)
     assert issue(ledger, request_id="other", permit_id="66" * 32).request_id == "other"
+
+
+def test_new_contract_can_keep_logical_request_id_with_new_idempotency_key(tmp_path):
+    ledger = SqliteRoutePermitLedger(tmp_path / "permits.sqlite3", clock_ms=lambda: 1_000)
+    first = issue(ledger)
+    ledger.release(first.permit_id)
+
+    corrected = issue(
+        ledger,
+        request_id="request",
+        idempotency_key="permit-request-corrected",
+        permit_id="66" * 32,
+    )
+
+    assert corrected.request_id == "request"
+    assert corrected.permit_id != first.permit_id
+
+
+def test_rc38_ledger_migrates_request_identity_without_losing_permit(tmp_path):
+    path = tmp_path / "permits.sqlite3"
+    ledger = SqliteRoutePermitLedger(path, clock_ms=lambda: 1_000)
+    first = issue(ledger)
+    ledger.close()
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "UPDATE route_permits SET request_id = logical_request_id "
+        "WHERE permit_id = ?",
+        (first.permit_id,),
+    )
+    connection.commit()
+    connection.execute("ALTER TABLE route_permits DROP COLUMN logical_request_id")
+    connection.close()
+
+    migrated = SqliteRoutePermitLedger(path, clock_ms=lambda: 1_000)
+
+    assert migrated.get_active(first.permit_id).request_id == "request"
+    assert (
+        migrated.find_active_by_idempotency(
+            account_id=ACCOUNT,
+            idempotency_key="request",
+            coordinator_endpoint_id=COORDINATOR,
+        )
+        == first
+    )
 
 
 def test_epoch_cas_is_idempotent_but_never_forks_or_moves_backwards(tmp_path):
@@ -121,6 +174,7 @@ def test_two_connections_cannot_both_consume_the_last_account_slot(tmp_path):
             ledger.issue(
                 account_id=ACCOUNT,
                 request_id=request_id,
+                idempotency_key=f"permit-{request_id}",
                 coordinator_endpoint_id=COORDINATOR,
                 model_swarm_id=MODEL,
                 max_context_tokens=16_384,

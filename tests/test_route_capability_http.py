@@ -13,7 +13,9 @@ from backend.server.route_capability_api import (
     set_request_agent_authority,
 )
 from backend.server.route_permits import SqliteRoutePermitLedger
+from fabi_network.capability import RouteRecoveryPolicy
 from swarm_protocol.control import ControlMessageKind, SignedControlMessage
+from swarm_protocol.request_agent import RequestAgentAuthorityClient
 
 CREDENTIAL = "12" * 32
 OTHER_CREDENTIAL = "13" * 32
@@ -68,8 +70,9 @@ def install_authority(monkeypatch, tmp_path):
     return authority, capabilities
 
 
-def permit_payload(*, context=16_384):
+def permit_payload(*, request_id="request", context=16_384):
     return {
+        "request_id": request_id,
         "coordinator_endpoint_id": COORDINATOR,
         "model_swarm_id": MODEL,
         "max_context_tokens": context,
@@ -78,10 +81,10 @@ def permit_payload(*, context=16_384):
     }
 
 
-def auth_headers(*, credential=CREDENTIAL, request_id="request"):
+def auth_headers(*, credential=CREDENTIAL, idempotency_key="permit-issue"):
     return {
         "Authorization": f"Bearer {credential}",
-        "Idempotency-Key": request_id,
+        "Idempotency-Key": idempotency_key,
     }
 
 
@@ -113,8 +116,8 @@ def test_permit_endpoint_is_idempotent_account_scoped_and_shares_capacity(monkey
 
         capacity = client.post(
             "/v1/swarm/route-permits",
-            headers=auth_headers(request_id="other"),
-            json=permit_payload(),
+            headers=auth_headers(idempotency_key="other-permit-issue"),
+            json=permit_payload(request_id="other"),
         )
         assert capacity.status_code == 429
 
@@ -130,6 +133,53 @@ def test_permit_endpoint_is_idempotent_account_scoped_and_shares_capacity(monkey
             f"/v1/swarm/route-permits/{permit_id}",
             headers=auth_headers(),
         ).json() == {"released": True}
+
+        corrected = client.post(
+            "/v1/swarm/route-permits",
+            headers=auth_headers(idempotency_key="corrected-token-budget"),
+            json=permit_payload(context=16_393),
+        )
+        assert corrected.status_code == 200
+        assert corrected.json()["request_id"] == "request"
+        assert corrected.json()["max_context_tokens"] == 16_393
+        assert corrected.json()["permit_id"] != permit_id
+    finally:
+        set_request_agent_authority(None)
+
+
+def test_request_agent_reuses_exact_contract_key_but_rekeys_token_correction(
+    monkeypatch,
+    tmp_path,
+):
+    install_authority(monkeypatch, tmp_path)
+    transport = TestClient(app)
+    client = RequestAgentAuthorityClient(
+        "http://127.0.0.1",
+        CREDENTIAL,
+        session=transport,
+    )
+    kwargs = {
+        "request_id": "opencode-request",
+        "coordinator_endpoint_id": COORDINATOR,
+        "model_swarm_id": MODEL,
+        "max_context_tokens": 16_316,
+        "recovery_policies": (RouteRecoveryPolicy.REPLAN_COLD,),
+        "ttl_ms": 60_000,
+    }
+    try:
+        first = client.issue_permit(**kwargs)
+        assert client.issue_permit(**kwargs) == first
+        assert client.release_permit(first.permit_id)
+
+        corrected = client.issue_permit(
+            **{
+                **kwargs,
+                "max_context_tokens": 16_325,
+            }
+        )
+        assert corrected.request_id == first.request_id
+        assert corrected.permit_id != first.permit_id
+        assert corrected.max_context_tokens == 16_325
     finally:
         set_request_agent_authority(None)
 

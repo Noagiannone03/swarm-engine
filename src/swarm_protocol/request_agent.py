@@ -50,6 +50,40 @@ def _permit_keepalive_key(*parts: object) -> str:
     return f"permit-keepalive:{digest.hexdigest()}"
 
 
+def _permit_issue_key(
+    *,
+    request_id: str,
+    coordinator_endpoint_id: str,
+    model_swarm_id: str,
+    max_context_tokens: int,
+    recovery_policies: tuple[RouteRecoveryPolicy, ...],
+    ttl_ms: int,
+) -> str:
+    """Fingerprint one exact permit contract for transport-safe retries.
+
+    The logical request ID remains stable across an exact-token replan.  The
+    idempotency key does not: changing any authority-visible parameter creates
+    a new operation, while retrying the same HTTP operation reuses the same
+    bounded key.
+    """
+
+    digest = hashlib.sha256()
+    digest.update(b"fabi-request-agent-permit-issue-v1\0")
+    parts: tuple[object, ...] = (
+        request_id,
+        coordinator_endpoint_id,
+        model_swarm_id,
+        max_context_tokens,
+        *(policy.value for policy in sorted(recovery_policies, key=lambda item: item.value)),
+        ttl_ms,
+    )
+    for part in parts:
+        encoded = str(part).encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return f"permit-issue:{digest.hexdigest()}"
+
+
 def _system_clock_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -230,11 +264,20 @@ class RequestAgentAuthorityClient:
         recovery_policies: tuple[RouteRecoveryPolicy, ...],
         ttl_ms: int = 120_000,
     ) -> RoutePermitGrant:
+        idempotency_key = _permit_issue_key(
+            request_id=request_id,
+            coordinator_endpoint_id=coordinator_endpoint_id,
+            model_swarm_id=model_swarm_id,
+            max_context_tokens=max_context_tokens,
+            recovery_policies=recovery_policies,
+            ttl_ms=ttl_ms,
+        )
         payload = self._request(
             "POST",
             "/v1/swarm/route-permits",
-            headers={"Idempotency-Key": request_id},
+            headers={"Idempotency-Key": idempotency_key},
             json={
+                "request_id": request_id,
                 "coordinator_endpoint_id": coordinator_endpoint_id,
                 "model_swarm_id": model_swarm_id,
                 "max_context_tokens": max_context_tokens,
