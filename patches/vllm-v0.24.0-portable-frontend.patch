@@ -127,13 +127,29 @@ index c57c23e..9ea01d9 100644
  #[test]
  fn frontend_args_json_applies_defaults() {
      let cli = Cli::try_parse_from([
+diff --git a/rust/src/server/src/lib.rs b/rust/src/server/src/lib.rs
+index c22a06d..8bec08f 100644
+--- a/rust/src/server/src/lib.rs
++++ b/rust/src/server/src/lib.rs
+@@ -23,0 +24 @@ use tokio_stream::wrappers::TcpListenerStream;
++#[cfg(unix)]
+@@ -173,0 +175 @@ where
++    #[cfg(unix)]
+@@ -180,0 +183,6 @@ where
++    #[cfg(not(unix))]
++    let listener = listener.tap_io(|tcp_stream| {
++        if let Err(err) = tcp_stream.set_nodelay(true) {
++            trace!(error = %err, "failed to enable TCP_NODELAY on accepted HTTP connection");
++        }
++    });
 diff --git a/rust/src/server/src/listener.rs b/rust/src/server/src/listener.rs
-index b7b715b..aba7656 100644
+index b7b715b..2928cb3 100644
 --- a/rust/src/server/src/listener.rs
 +++ b/rust/src/server/src/listener.rs
-@@ -6,11 +6,17 @@
+@@ -6,11 +6,18 @@
  
  use std::io::Result;
++#[cfg(unix)]
  use std::net::TcpListener as StdTcpListener;
 +#[cfg(unix)]
  use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
