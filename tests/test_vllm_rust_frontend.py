@@ -66,15 +66,11 @@ def test_resolve_vllm_rs_binary_raises_when_missing(monkeypatch, tmp_path):
         vllm_rust_frontend.resolve_vllm_rs_binary()
 
 
-def test_frontend_is_unavailable_when_listener_fd_inheritance_is_unsupported(monkeypatch):
+def test_frontend_is_available_on_windows_with_portable_binary(monkeypatch):
     monkeypatch.setattr(vllm_rust_frontend.os, "name", "nt")
-    monkeypatch.setattr(
-        vllm_rust_frontend,
-        "resolve_vllm_rs_binary",
-        lambda: pytest.fail("binary resolution must not run on Windows"),
-    )
+    monkeypatch.setattr(vllm_rust_frontend, "resolve_vllm_rs_binary", lambda: "vllm-rs.exe")
 
-    assert vllm_rust_frontend.vllm_rust_frontend_available() is False
+    assert vllm_rust_frontend.vllm_rust_frontend_available() is True
 
 
 def test_frontend_is_available_with_posix_runtime_and_binary(monkeypatch):
@@ -140,3 +136,42 @@ def test_runtime_args_alias_local_model_path_to_scheduler_model_name():
         "language_model_only": True,
         "max_model_len": 4096,
     }
+
+
+def test_windows_frontend_binds_tcp_without_posix_fd_inheritance(monkeypatch):
+    launched = {}
+
+    class FakeProcess:
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_popen(command, **kwargs):
+        launched["command"] = command
+        launched["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(vllm_rust_frontend.os, "name", "nt")
+    monkeypatch.setattr(
+        vllm_rust_frontend, "resolve_vllm_rs_binary", lambda: r"C:\Fabi\vllm-rs.exe"
+    )
+    monkeypatch.setattr(vllm_rust_frontend.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(vllm_rust_frontend.time, "sleep", lambda _: None)
+    args = SimpleNamespace(
+        host="127.0.0.1",
+        port=19080,
+        executor_input_ipc="tcp://127.0.0.1:19081",
+        executor_output_ipc="tcp://127.0.0.1:19082",
+        model_path="Qwen/Qwen3-0.6B",
+        max_sequence_length=4096,
+    )
+
+    process = vllm_rust_frontend.launch_vllm_rust_frontend(args)
+
+    assert process.listen_fd is None
+    assert "--listen-fd" not in launched["command"]
+    address_index = launched["command"].index("--listen-address") + 1
+    assert launched["command"][address_index] == "127.0.0.1:19080"
+    assert "pass_fds" not in launched["kwargs"]

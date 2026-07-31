@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -27,7 +26,7 @@ class VllmRustFrontendNotFound(RuntimeError):
 @dataclass
 class VllmRustFrontendProcess:
     process: subprocess.Popen
-    listen_fd: int
+    listen_fd: Optional[int]
     host: str
     port: int
 
@@ -41,9 +40,10 @@ def resolve_vllm_rs_binary() -> str:
     if binary is not None:
         return binary
 
+    executable_name = "vllm-rs.exe" if os.name == "nt" else "vllm-rs"
     candidates = [
-        Path(sysconfig.get_path("scripts")) / "vllm-rs",
-        Path(sys.executable).parent / "vllm-rs",
+        Path(sysconfig.get_path("scripts")) / executable_name,
+        Path(sys.executable).parent / executable_name,
     ]
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -57,10 +57,6 @@ def resolve_vllm_rs_binary() -> str:
 
 def vllm_rust_frontend_available() -> bool:
     """Return whether this runtime can host Parallax's HTTP frontend."""
-    if os.name != "posix":
-        # The official frontend inherits a listener file descriptor through
-        # `pass_fds`, which Python subprocess does not support on Windows.
-        return False
     try:
         resolve_vllm_rs_binary()
     except VllmRustFrontendNotFound:
@@ -126,25 +122,41 @@ def launch_vllm_rust_frontend(args) -> VllmRustFrontendProcess:
         # exposes a separate route-fenced RPC to the authenticated coordinator.
         child_env["VLLM_SERVER_DEV_MODE"] = "1"
 
-    listener = _bind_listener_socket(args.host, args.port)
-    listen_fd = listener.fileno()
-    bound_port = listener.getsockname()[1]
     runtime_args = _runtime_args_json(args)
 
     cmd = [
         binary,
         "frontend",
-        "--listen-fd",
-        str(listen_fd),
-        "--input-address",
-        args.executor_input_ipc,
-        "--output-address",
-        args.executor_output_ipc,
-        "--engine-count",
-        "1",
-        "--args-json",
-        runtime_args,
     ]
+    listener: Optional[socket.socket] = None
+    listen_fd: Optional[int] = None
+    bound_port = int(args.port)
+    popen_kwargs = {"env": child_env}
+    if os.name == "posix":
+        listener = _bind_listener_socket(args.host, args.port)
+        listen_fd = listener.fileno()
+        bound_port = int(listener.getsockname()[1])
+        cmd.extend(["--listen-fd", str(listen_fd)])
+        popen_kwargs["pass_fds"] = (listen_fd,)
+    else:
+        # The portable vLLM frontend binds TCP itself on Windows. Passing a
+        # socket HANDLE through subprocess is not equivalent to POSIX fd
+        # inheritance; direct bind is the native, race-free primitive.
+        host = str(args.host)
+        listen_address = f"[{host}]:{bound_port}" if ":" in host else f"{host}:{bound_port}"
+        cmd.extend(["--listen-address", listen_address])
+    cmd.extend(
+        [
+            "--input-address",
+            args.executor_input_ipc,
+            "--output-address",
+            args.executor_output_ipc,
+            "--engine-count",
+            "1",
+            "--args-json",
+            runtime_args,
+        ]
+    )
 
     logger.info(
         "Launching vLLM Rust frontend on %s:%s with input=%s output=%s",
@@ -153,15 +165,12 @@ def launch_vllm_rust_frontend(args) -> VllmRustFrontendProcess:
         args.executor_input_ipc,
         args.executor_output_ipc,
     )
-    process = subprocess.Popen(
-        cmd,
-        pass_fds=(listen_fd,),
-        env=child_env,
-    )
+    process = subprocess.Popen(cmd, **popen_kwargs)
 
-    # The child inherited the listener fd; close the parent's copy so shutdown
-    # fully releases the port when the Rust frontend exits.
-    listener.close()
+    # On POSIX the child inherited the listener fd; close the parent's copy so
+    # shutdown fully releases the port when the Rust frontend exits.
+    if listener is not None:
+        listener.close()
     time.sleep(0.05)
     if process.poll() is not None:
         raise RuntimeError(f"vLLM Rust frontend exited early with code {process.returncode}")
@@ -191,9 +200,9 @@ def stop_vllm_rust_frontend(frontend_process: Optional[VllmRustFrontendProcess])
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        logger.warning("vLLM Rust frontend did not exit after SIGTERM; killing it")
+        logger.warning("vLLM Rust frontend did not exit after termination; killing it")
         try:
-            process.send_signal(signal.SIGKILL)
+            process.kill()
         except ProcessLookupError:
             pass
         process.wait(timeout=5)

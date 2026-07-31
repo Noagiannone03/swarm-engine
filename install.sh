@@ -17,6 +17,7 @@ VENV_DIR="${PARALLAX_VENV_DIR:-$SCRIPT_DIR/.venv}"
 VLLM_REF="${VLLM_REF:-ee0da84ab9e04ac7610e28580af62c365e898389}"
 VLLM_MINIJINJA_VERSION="${VLLM_MINIJINJA_VERSION-2.20.0}"
 VLLM_FABI_PATCH="$SCRIPT_DIR/patches/vllm-v0.24.0-fabi-chat-replay.patch"
+VLLM_PORTABLE_FRONTEND_PATCH="$SCRIPT_DIR/patches/vllm-v0.24.0-portable-frontend.patch"
 FRONTEND_ONLY=false
 
 show_help() {
@@ -31,7 +32,7 @@ Options:
   --extras EXTRAS         Python extras to install, for example "mac", "gpu",
                           or "mac,dev". Defaults to mac on macOS and gpu on Linux.
   --python PYTHON_VERSION Python version for uv venv. Defaults to 3.12.
-  --frontend-only         Build vllm-rs into an existing POSIX virtualenv.
+  --frontend-only         Build vllm-rs into an existing virtualenv.
                           Does not create a venv or install Python packages.
 
 Environment:
@@ -160,11 +161,24 @@ install_parallax_python() {
 }
 
 resolve_venv_bin_dir() {
-    "$VENV_DIR/bin/python" - <<'PY'
+    "$(resolve_venv_python)" - <<'PY'
 import sysconfig
 
 print(sysconfig.get_path("scripts"))
 PY
+}
+
+resolve_venv_python() {
+    if [[ -x "$VENV_DIR/bin/python" ]]; then
+        printf '%s\n' "$VENV_DIR/bin/python"
+        return
+    fi
+    if [[ -x "$VENV_DIR/Scripts/python.exe" ]]; then
+        printf '%s\n' "$VENV_DIR/Scripts/python.exe"
+        return
+    fi
+    echo "Existing virtualenv Python is missing under $VENV_DIR." >&2
+    return 1
 }
 
 ensure_git() {
@@ -192,6 +206,8 @@ ensure_protoc() {
         run_with_sudo_if_needed yum install -y protobuf-compiler
     elif command -v apk &>/dev/null; then
         run_with_sudo_if_needed apk add --no-cache protobuf
+    elif command -v choco &>/dev/null; then
+        choco install protoc -y
     else
         echo "Unable to install protoc automatically." >&2
         echo "Install protobuf compiler manually, then rerun this script." >&2
@@ -237,9 +253,17 @@ build_vllm_rust_frontend() {
     local target_version
     local existing_version
     local toolchain
+    local executable_suffix
+    local built_binary
 
     parallax_scripts_dir="$(resolve_venv_bin_dir)"
-    target_path="$parallax_scripts_dir/vllm-rs"
+    executable_suffix="$("$(resolve_venv_python)" - <<'PY'
+import sysconfig
+
+print(sysconfig.get_config_var("EXE") or "")
+PY
+)"
+    target_path="$parallax_scripts_dir/vllm-rs$executable_suffix"
     target_version_path="$target_path.version"
     target_version="$(vllm_rust_frontend_version)"
 
@@ -295,11 +319,12 @@ build_vllm_rust_frontend() {
         --bin vllm-rs \
         --features native-tls-vendored
 
+    built_binary="$rust_dir/target/release/vllm-rs$executable_suffix"
     bash "$SCRIPT_DIR/scripts/check-vllm-rs-portability.sh" \
-        "$rust_dir/target/release/vllm-rs"
+        "$built_binary"
 
     mkdir -p "$(dirname "$target_path")"
-    cp "$rust_dir/target/release/vllm-rs" "$target_path"
+    cp "$built_binary" "$target_path"
     chmod +x "$target_path"
     printf '%s\n' "$target_version" > "$target_version_path"
     echo "Installed vllm-rs to $target_path"
@@ -308,9 +333,20 @@ build_vllm_rust_frontend() {
 }
 
 vllm_rust_frontend_version() {
-    local patch_hash
+    local replay_patch_hash
+    local portable_patch_hash
+    local venv_python
 
-    patch_hash="$("$VENV_DIR/bin/python" - "$VLLM_FABI_PATCH" <<'PY'
+    venv_python="$(resolve_venv_python)"
+    replay_patch_hash="$("$venv_python" - "$VLLM_FABI_PATCH" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+    portable_patch_hash="$("$venv_python" - "$VLLM_PORTABLE_FRONTEND_PATCH" <<'PY'
 import hashlib
 from pathlib import Path
 import sys
@@ -319,10 +355,12 @@ print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 )"
     if [[ -n "$VLLM_MINIJINJA_VERSION" ]]; then
-        printf '%s+minijinja-%s+fabi-%s\n' \
-            "$VLLM_REF" "$VLLM_MINIJINJA_VERSION" "$patch_hash"
+        printf '%s+minijinja-%s+fabi-%s+portable-%s\n' \
+            "$VLLM_REF" "$VLLM_MINIJINJA_VERSION" \
+            "$replay_patch_hash" "$portable_patch_hash"
     else
-        printf '%s+fabi-%s\n' "$VLLM_REF" "$patch_hash"
+        printf '%s+fabi-%s+portable-%s\n' \
+            "$VLLM_REF" "$replay_patch_hash" "$portable_patch_hash"
     fi
 }
 
@@ -341,6 +379,19 @@ apply_vllm_fabi_patch() {
         exit 1
     fi
     git -C "$clone_root" apply --unidiff-zero "$VLLM_FABI_PATCH"
+
+    if [[ ! -f "$VLLM_PORTABLE_FRONTEND_PATCH" ]]; then
+        echo "Required portable frontend patch is missing: $VLLM_PORTABLE_FRONTEND_PATCH" >&2
+        exit 1
+    fi
+
+    echo "Applying Fabi portable frontend listener patch"
+    if ! git -C "$clone_root" apply --check "$VLLM_PORTABLE_FRONTEND_PATCH"; then
+        echo "The portable frontend patch is incompatible with vLLM ref $VLLM_REF." >&2
+        echo "Qualify and update the patch before building this frontend." >&2
+        exit 1
+    fi
+    git -C "$clone_root" apply "$VLLM_PORTABLE_FRONTEND_PATCH"
 }
 
 update_vllm_minijinja() {
@@ -402,8 +453,8 @@ main() {
     cd "$SCRIPT_DIR"
 
     if [[ "$FRONTEND_ONLY" == true ]]; then
-        if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-            echo "Existing POSIX virtualenv is required for --frontend-only: $VENV_DIR" >&2
+        if ! resolve_venv_python >/dev/null; then
+            echo "Existing virtualenv is required for --frontend-only: $VENV_DIR" >&2
             exit 1
         fi
         ensure_git

@@ -1,0 +1,270 @@
+diff --git a/rust/src/cmd/src/cli.rs b/rust/src/cmd/src/cli.rs
+index 003d96f..af45aeb 100644
+--- a/rust/src/cmd/src/cli.rs
++++ b/rust/src/cmd/src/cli.rs
+@@ -8,10 +8,11 @@ mod unsupported;
+ 
+ use std::collections::HashMap;
+ use std::ffi::{OsStr, OsString};
++use std::net::SocketAddr;
+ use std::path::PathBuf;
+ use std::time::Duration;
+ 
+-use clap::{Args, Parser, Subcommand};
++use clap::{ArgGroup, Args, Parser, Subcommand};
+ use educe::Educe;
+ use serde::Deserialize;
+ use serde::de::DeserializeOwned;
+@@ -286,7 +287,7 @@ impl SharedRuntimeArgs {
+     /// inherits an already open HTTP listener from the supervisor process.
+     fn into_bootstrapped_config(
+         self,
+-        listen_fd: i32,
++        listener_mode: HttpListenerMode,
+         input_address: String,
+         output_address: String,
+         coordinator_address: Option<String>,
+@@ -312,7 +313,7 @@ impl SharedRuntimeArgs {
+             },
+             model: self.model,
+             served_model_name: self.served_model_name,
+-            listener_mode: HttpListenerMode::InheritedFd { fd: listen_fd },
++            listener_mode,
+             tool_call_parser: self.tool_call_parser,
+             reasoning_parser: self.reasoning_parser,
+             renderer: self.renderer,
+@@ -419,11 +420,21 @@ fn parse_runtime_args_json(value: &str) -> Result<SharedRuntimeArgs, String> {
+ /// Arguments for running the Rust frontend as a Python-bootstrapped worker.
+ #[derive(Educe, Clone, Args, PartialEq, Eq)]
+ #[educe(Debug)]
++#[command(group(
++    ArgGroup::new("listener")
++        .required(true)
++        .multiple(false)
++        .args(["listen_fd", "listen_address"])
++))]
+ pub struct FrontendArgs {
+-    /// Inherited listening socket file descriptor passed by the Python
++    /// Inherited listening socket file descriptor passed by a POSIX
+     /// supervisor.
+     #[arg(long)]
+-    pub listen_fd: i32,
++    pub listen_fd: Option<i32>,
++    /// TCP address bound directly by the frontend. This avoids descriptor
++    /// inheritance on Windows while retaining an atomic bind.
++    #[arg(long, value_name = "HOST:PORT")]
++    pub listen_address: Option<SocketAddr>,
+     /// Frontend input ROUTER socket address that the Python engines will
+     /// connect to.
+     #[arg(long)]
+@@ -453,8 +464,16 @@ pub struct FrontendArgs {
+ impl FrontendArgs {
+     /// Convert the CLI arguments into the OpenAI server's runtime config.
+     pub fn into_config(self) -> Config {
++        let listener_mode = match (self.listen_fd, self.listen_address) {
++            (Some(fd), None) => HttpListenerMode::InheritedFd { fd },
++            (None, Some(address)) => HttpListenerMode::BindTcp {
++                host: address.ip().to_string(),
++                port: address.port(),
++            },
++            _ => unreachable!("clap enforces exactly one frontend listener"),
++        };
+         self.runtime.into_bootstrapped_config(
+-            self.listen_fd,
++            listener_mode,
+             self.input_address,
+             self.output_address,
+             self.coordinator_address,
+diff --git a/rust/src/cmd/src/cli/tests.rs b/rust/src/cmd/src/cli/tests.rs
+index c57c23e..9ea01d9 100644
+--- a/rust/src/cmd/src/cli/tests.rs
++++ b/rust/src/cmd/src/cli/tests.rs
+@@ -418,7 +418,10 @@ fn frontend_args_accept_json() {
+         Cli {
+             command: Frontend(
+                 FrontendArgs {
+-                    listen_fd: 3,
++                    listen_fd: Some(
++                        3,
++                    ),
++                    listen_address: None,
+                     input_address: "ipc:///tmp/input.sock",
+                     output_address: "ipc:///tmp/output.sock",
+                     coordinator_address: Some(
+@@ -469,6 +472,35 @@ fn frontend_args_accept_json() {
+     .assert_debug_eq(&cli);
+ }
+ 
++#[test]
++fn frontend_args_accept_direct_tcp_listener() {
++    let cli = Cli::try_parse_from([
++        "vllm-rs",
++        "frontend",
++        "--listen-address",
++        "127.0.0.1:19080",
++        "--input-address",
++        "tcp://127.0.0.1:19081",
++        "--output-address",
++        "tcp://127.0.0.1:19082",
++        "--args-json",
++        r#"{"model_tag":"Qwen/Qwen3-0.6B"}"#,
++    ])
++    .unwrap();
++
++    let Command::Frontend(args) = cli.command else {
++        panic!("expected frontend args");
++    };
++    let config = args.into_config();
++    assert_eq!(
++        config.listener_mode,
++        HttpListenerMode::BindTcp {
++            host: "127.0.0.1".to_string(),
++            port: 19080,
++        }
++    );
++}
++
+ #[test]
+ fn frontend_args_json_applies_defaults() {
+     let cli = Cli::try_parse_from([
+diff --git a/rust/src/server/src/listener.rs b/rust/src/server/src/listener.rs
+index b7b715b..aba7656 100644
+--- a/rust/src/server/src/listener.rs
++++ b/rust/src/server/src/listener.rs
+@@ -6,11 +6,17 @@
+ 
+ use std::io::Result;
+ use std::net::TcpListener as StdTcpListener;
++#[cfg(unix)]
+ use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
++#[cfg(unix)]
+ use std::os::unix::net::UnixListener as StdUnixListener;
+ 
++#[cfg(unix)]
+ use socket2::Socket;
+-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
++use tokio::net::{TcpListener, TcpStream};
++#[cfg(unix)]
++use tokio::net::{UnixListener, UnixStream};
++#[cfg(unix)]
+ use tokio_util::either::Either;
+ 
+ use crate::HttpListenerMode;
+@@ -20,6 +26,7 @@ use crate::HttpListenerMode;
+ #[derive(Debug)]
+ pub enum Listener {
+     Tcp(TcpListener),
++    #[cfg(unix)]
+     Unix(UnixListener),
+ }
+ 
+@@ -33,8 +40,17 @@ impl Listener {
+             HttpListenerMode::BindTcp { host, port } => {
+                 Ok(Self::Tcp(TcpListener::bind((host.as_str(), *port)).await?))
+             }
++            #[cfg(unix)]
+             HttpListenerMode::BindUnix { path } => Ok(Self::Unix(UnixListener::bind(path)?)),
++            #[cfg(unix)]
+             HttpListenerMode::InheritedFd { fd } => Self::from_inherited_fd(*fd),
++            #[cfg(not(unix))]
++            HttpListenerMode::BindUnix { .. } | HttpListenerMode::InheritedFd { .. } => {
++                Err(std::io::Error::new(
++                    std::io::ErrorKind::Unsupported,
++                    "Unix-domain and inherited-fd listeners are unavailable on this platform",
++                ))
++            }
+         }
+     }
+ 
+@@ -43,6 +59,7 @@ impl Listener {
+     pub fn local_addr(&self) -> Result<String> {
+         match self {
+             Self::Tcp(listener) => Ok(listener.local_addr()?.to_string()),
++            #[cfg(unix)]
+             Self::Unix(listener) => Ok(match listener.local_addr()?.as_pathname() {
+                 Some(path) => format!("unix:{}", path.display()),
+                 None => "unix:<unnamed>".to_string(),
+@@ -50,6 +67,7 @@ impl Listener {
+         }
+     }
+ 
++    #[cfg(unix)]
+     fn from_inherited_fd(fd: i32) -> Result<Self> {
+         // SAFETY: We trust the caller to only pass valid listener fds, and we only use
+         // this fd once to create a single listener.
+@@ -73,6 +91,7 @@ impl Listener {
+ }
+ 
+ /// Allow the unified listener to plug directly into `axum::serve(...)`.
++#[cfg(unix)]
+ impl axum::serve::Listener for Listener {
+     type Addr = Either<std::net::SocketAddr, tokio::net::unix::SocketAddr>;
+     type Io = Either<TcpStream, UnixStream>;
+@@ -98,17 +117,42 @@ impl axum::serve::Listener for Listener {
+     }
+ }
+ 
++/// Windows does not expose Tokio's Unix-domain listener types. The frontend
++/// still implements the same axum listener contract through its TCP variant.
++#[cfg(not(unix))]
++impl axum::serve::Listener for Listener {
++    type Addr = std::net::SocketAddr;
++    type Io = TcpStream;
++
++    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
++        match self {
++            Self::Tcp(listener) => listener.accept().await,
++        }
++    }
++
++    fn local_addr(&self) -> Result<Self::Addr> {
++        match self {
++            Self::Tcp(listener) => listener.local_addr(),
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
++    #[cfg(unix)]
+     use std::net::{Ipv4Addr, SocketAddrV4};
++    #[cfg(unix)]
+     use std::os::fd::IntoRawFd;
+ 
++    #[cfg(unix)]
+     use socket2::{Domain, SockAddr, Socket, Type};
++    #[cfg(unix)]
+     use uuid::Uuid;
+ 
+     use super::Listener;
+     use crate::HttpListenerMode;
+ 
++    #[cfg(unix)]
+     #[tokio::test(flavor = "current_thread")]
+     async fn inherited_fd_detects_tcp_listener_without_uds_hint() {
+         let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+@@ -120,6 +164,7 @@ mod tests {
+         assert!(matches!(listener, Listener::Tcp(_)));
+     }
+ 
++    #[cfg(unix)]
+     #[tokio::test(flavor = "current_thread")]
+     async fn inherited_fd_detects_unix_listener_from_fd() {
+         let path = std::env::temp_dir().join(format!("vllm-rs-{}.sock", Uuid::new_v4()));
+@@ -132,4 +177,16 @@ mod tests {
+         assert!(matches!(listener, Listener::Unix(_)));
+         let _ = std::fs::remove_file(path);
+     }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn tcp_listener_binds_without_descriptor_inheritance() {
++        let listener = Listener::bind(&HttpListenerMode::BindTcp {
++            host: "127.0.0.1".to_string(),
++            port: 0,
++        })
++        .await
++        .unwrap();
++
++        assert!(matches!(listener, Listener::Tcp(_)));
++    }
+ }
