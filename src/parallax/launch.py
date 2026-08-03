@@ -20,6 +20,7 @@ import argparse
 import math
 import multiprocessing
 import os
+import platform
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -37,6 +38,7 @@ from parallax.server.memory_budget import (
     MemoryPressureLevel,
     MemoryPressureObservation,
     configured_cuda_reserve_bytes,
+    configured_system_admission_floor_bytes,
     configured_system_reserve_bytes,
 )
 from parallax.server.runtime_capacity import (
@@ -526,11 +528,18 @@ def _build_memory_pressure_guards():
         memory = psutil.virtual_memory()
         total = int(memory.total)
         available = int(memory.available)
+        apple_unified_memory = (
+            platform.system() == "Darwin" and platform.machine().startswith("arm")
+        )
         guards.append(
             MemoryPressureGuard(
                 name="host",
                 controller=MemoryPressureController(
-                    system_reserve_bytes=configured_system_reserve_bytes(total, available)
+                    system_reserve_bytes=(
+                        configured_system_admission_floor_bytes(total, available)
+                        if apple_unified_memory
+                        else configured_system_reserve_bytes(total, available)
+                    )
                 ),
                 available_reader=lambda: int(psutil.virtual_memory().available),
             )

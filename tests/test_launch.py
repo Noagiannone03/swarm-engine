@@ -1,6 +1,7 @@
 import threading
 import time
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -705,3 +706,18 @@ def test_cuda_guard_is_created_for_every_visible_device(monkeypatch):
 
     assert [guard.name for guard in cuda_guards] == ["cuda:0", "cuda:1"]
     assert [guard.available_reader() for guard in cuda_guards] == [8 * GIB, 12 * GIB]
+
+
+def test_apple_unified_memory_guard_uses_same_ollama_overhead_as_admission(monkeypatch):
+    import psutil
+    import torch
+
+    memory = SimpleNamespace(total=16 * GIB, available=3 * GIB)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: memory)
+    monkeypatch.setattr("parallax.launch.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("parallax.launch.platform.machine", lambda: "arm64")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    host = next(guard for guard in _build_memory_pressure_guards() if guard.name == "host")
+
+    assert host.controller.system_reserve_bytes == GIB // 2

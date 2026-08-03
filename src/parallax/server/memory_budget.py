@@ -21,10 +21,12 @@ logger = get_logger(__name__)
 
 GIB = 1024**3
 MIB = 1024**2
-DEFAULT_CUDA_RESERVE_GB = 1.5
+DEFAULT_CUDA_RUNTIME_OVERHEAD_MB = 512.0
 DEFAULT_MLX_CACHE_LIMIT_MB = 256.0
+DEFAULT_MLX_RUNTIME_OVERHEAD_MB = 512.0
 DEFAULT_PRESSURE_POLL_SECONDS = 1.0
 DEFAULT_PRESSURE_DRAIN_SECONDS = 30.0
+DEFAULT_PRESSURE_WARNING_FRACTION = 0.75
 MIN_ADAPTIVE_SYSTEM_RESERVE_GB = 1.25
 MAX_ADAPTIVE_SYSTEM_RESERVE_GB = 12.0
 
@@ -78,7 +80,7 @@ class MemoryPressureController:
         self,
         *,
         system_reserve_bytes: int,
-        warning_fraction: float = 0.75,
+        warning_fraction: float = DEFAULT_PRESSURE_WARNING_FRACTION,
         critical_fraction: float = 0.40,
         warning_samples: int = 3,
         critical_samples: int = 2,
@@ -240,11 +242,45 @@ def configured_system_reserve_bytes(
     return min(max(0, reserve), max(0, int(total_bytes)))
 
 
+def configured_system_admission_floor_bytes(
+    total_bytes: int, available_bytes: Optional[int] = None
+) -> int:
+    """Return the hard free-memory floor used to admit a new MLX generation.
+
+    Ollama reserves 512 MiB for Metal context/runner overhead and otherwise
+    places against live reclaimable memory. Fabi follows that product default
+    so a pressured desktop can still host a small intermediate span. MLX's
+    official recommended working-set limit independently caps total process
+    use (about 74% of physical RAM on the qualified 16 GiB M4), and the
+    initialized executor still validates exact weights and KV before READY.
+
+    An explicit operator reserve remains a literal hard floor and is never
+    weakened.
+    """
+
+    total = max(0, int(total_bytes))
+    explicit = _positive_env_bytes("PARALLAX_SYSTEM_RESERVE_GB", GIB)
+    if explicit is not None:
+        return min(total, max(0, explicit))
+    del available_bytes
+    return min(total, int(DEFAULT_MLX_RUNTIME_OVERHEAD_MB * MIB))
+
+
 def configured_cuda_reserve_bytes(total_bytes: int) -> int:
-    """Return VRAM kept free for the display driver and other GPU apps."""
+    """Return the cross-platform CUDA runtime/driver overhead reserve.
+
+    Ollama keeps roughly 457 MiB per non-Metal device. Fabi rounds this to
+    512 MiB, then relies on the initialized vLLM/SGLang profiler to reserve its
+    real workspace and KV allocations. This lets small consumer GPUs
+    contribute instead of losing a fixed multi-GiB slice before profiling.
+    """
 
     configured = _positive_env_bytes("PARALLAX_CUDA_SYSTEM_RESERVE_GB", GIB)
-    reserve = configured if configured is not None else int(DEFAULT_CUDA_RESERVE_GB * GIB)
+    reserve = (
+        configured
+        if configured is not None
+        else int(DEFAULT_CUDA_RUNTIME_OVERHEAD_MB * MIB)
+    )
     return min(max(0, reserve), max(0, int(total_bytes)))
 
 
@@ -361,7 +397,7 @@ def current_mlx_memory_budget(
         active_bytes=active,
         max_working_set_bytes=working_set,
         system_reserve_bytes=(
-            configured_system_reserve_bytes(total, available)
+            configured_system_admission_floor_bytes(total, available)
             if system_reserve_bytes is None
             else min(total, max(0, int(system_reserve_bytes)))
         ),

@@ -10,6 +10,8 @@ from parallax.server.memory_budget import (
     calculate_cuda_memory_budget,
     calculate_mlx_memory_budget,
     configure_mlx_memory_limits,
+    configured_cuda_reserve_bytes,
+    configured_system_admission_floor_bytes,
     current_mlx_memory_budget,
 )
 from parallax.server.runtime_capacity import StableCapacityTracker
@@ -42,6 +44,19 @@ def test_adaptive_system_reserve_tracks_pressure_without_a_fixed_six_gb_floor():
     assert adaptive_system_reserve_bytes(gb(64), gb(40)) == gb(6.4)
 
 
+def test_mlx_admission_uses_ollama_metal_overhead_not_recovery_target(monkeypatch):
+    monkeypatch.delenv("PARALLAX_SYSTEM_RESERVE_GB", raising=False)
+
+    # Ollama keeps 512 MiB of Metal overhead. The MLX recommended working-set
+    # limit and post-load contract remain separate hard upper bounds.
+    assert configured_system_admission_floor_bytes(gb(16), gb(2.7)) == gb(0.5)
+
+
+def test_explicit_system_reserve_remains_a_literal_hard_floor(monkeypatch):
+    monkeypatch.setenv("PARALLAX_SYSTEM_RESERVE_GB", "6")
+    assert configured_system_admission_floor_bytes(gb(16), gb(10)) == gb(6)
+
+
 def test_cuda_budget_uses_global_free_vram_and_keeps_driver_reserve():
     budget = calculate_cuda_memory_budget(
         total_bytes=gb(16),
@@ -52,6 +67,13 @@ def test_cuda_budget_uses_global_free_vram_and_keeps_driver_reserve():
     assert budget.total_bytes == gb(16)
     assert budget.available_bytes == gb(11)
     assert budget.usable_bytes == gb(9.5)
+
+
+def test_default_cuda_reserve_matches_cross_platform_runtime_overhead(monkeypatch):
+    monkeypatch.delenv("PARALLAX_CUDA_SYSTEM_RESERVE_GB", raising=False)
+
+    assert configured_cuda_reserve_bytes(gb(8)) == gb(0.5)
+    assert configured_cuda_reserve_bytes(gb(80)) == gb(0.5)
 
 
 def test_cuda_budget_refuses_capacity_when_other_apps_consume_the_reserve():
@@ -133,8 +155,8 @@ def test_configure_applies_one_cap_to_memory_and_wired_limits(monkeypatch):
 
     budget = configure_mlx_memory_limits(mlx, psutil_module=psutil)
 
-    assert budget.process_limit_bytes == gb(8)
-    assert mlx.calls[0:2] == [("memory", gb(8)), ("wired", gb(8))]
+    assert budget.process_limit_bytes == gb(9.5)
+    assert mlx.calls[0:2] == [("memory", gb(9.5)), ("wired", gb(9.5))]
     assert mlx.calls[2][0] == "cache"
     assert mlx.calls[2][1] <= 256 * 1024**2
 
@@ -146,8 +168,8 @@ def test_configure_applies_one_cap_to_memory_and_wired_limits(monkeypatch):
         psutil_module=psutil,
         process_limit_cap_bytes=budget.process_limit_bytes,
     )
-    assert later.process_limit_bytes == gb(8)
-    assert later.additional_bytes == gb(5)
+    assert later.process_limit_bytes == gb(9.5)
+    assert later.additional_bytes == gb(6.5)
 
 
 def test_worker_generation_keeps_its_startup_reserve_tier(monkeypatch):
@@ -159,12 +181,11 @@ def test_worker_generation_keeps_its_startup_reserve_tier(monkeypatch):
         virtual_memory=lambda: SimpleNamespace(total=gb(16), available=gb(4.5))
     )
     startup = configure_mlx_memory_limits(mlx, psutil_module=psutil)
-    assert startup.system_reserve_bytes == gb(2.5)
-    assert startup.process_limit_bytes == gb(2)
+    assert startup.system_reserve_bytes == gb(0.5)
+    assert startup.process_limit_bytes == gb(4)
 
-    # Loading 1.5 GiB makes macOS availability cross the next adaptive tier.
-    # The reserve is immutable inside this generation, while the live
-    # availability still bounds the remaining 0.5 GiB.
+    # Loading 1.5 GiB keeps the 512 MiB runtime overhead immutable inside this
+    # generation, while live availability still bounds the remainder.
     mlx.get_active_memory = lambda: gb(1.5)
     psutil.virtual_memory = lambda: SimpleNamespace(total=gb(16), available=gb(3))
     loaded = current_mlx_memory_budget(
@@ -173,9 +194,9 @@ def test_worker_generation_keeps_its_startup_reserve_tier(monkeypatch):
         process_limit_cap_bytes=startup.process_limit_bytes,
         system_reserve_bytes=startup.system_reserve_bytes,
     )
-    assert loaded.system_reserve_bytes == gb(2.5)
-    assert loaded.process_limit_bytes == gb(2)
-    assert loaded.additional_bytes == gb(0.5)
+    assert loaded.system_reserve_bytes == gb(0.5)
+    assert loaded.process_limit_bytes == gb(4)
+    assert loaded.additional_bytes == gb(2.5)
 
 
 def test_explicit_system_reserve_override_still_wins(monkeypatch):
