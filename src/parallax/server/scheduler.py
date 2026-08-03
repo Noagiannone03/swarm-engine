@@ -181,6 +181,7 @@ class Scheduler:
                 if self.shared_state is not None:
                     curr = self.num_running_requests
                     self.shared_state.update_metrics(current_requests=curr)
+                    self._last_reported_running_requests = curr
             except Exception:
                 pass
         else:
@@ -206,6 +207,10 @@ class Scheduler:
     def check_and_update_request_status(self, request: InitialRequest) -> bool:
         """Checks if a request has met any finishing conditions and updates its status."""
         if request.is_finished:
+            # A terminal status may have been received from another pipeline
+            # shard and applied before this method runs.  Resource cleanup is
+            # idempotent, but the local admission slot must still be evicted.
+            self.evict_request(request.request_id)
             return True
 
         finished = False

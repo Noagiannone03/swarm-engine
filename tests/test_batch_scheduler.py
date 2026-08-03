@@ -33,6 +33,14 @@ class FakeTokenizer:
         return [ord(ch) for ch in text]
 
 
+class FakeSharedState:
+    def __init__(self):
+        self.current_requests = []
+
+    def update_metrics(self, *, current_requests):
+        self.current_requests.append(current_requests)
+
+
 def make_prefill(rid: str, prompt_len: int) -> InitialRequest:
     return InitialRequest(request_id=rid, input_ids=[0] * prompt_len)
 
@@ -249,6 +257,31 @@ def test_request_status_accepts_zero_eos_token_id():
 
     assert sched.check_and_update_request_status(req) is True
     assert req.status == RequestStatus.FINISHED_EOS
+
+
+def test_propagated_terminal_status_releases_admission_slot_and_metric():
+    shared_state = FakeSharedState()
+    sched = Scheduler(
+        max_batch_size=1,
+        max_num_tokens_per_batch=10_000,
+        shared_state=shared_state,
+    )
+    failed = make_prefill("failed-downstream", 4)
+    sched.enque_request(failed)
+    sched.admit_requests()
+    assert sched.num_running_requests == 1
+    assert shared_state.current_requests == [1]
+
+    failed.update_status(RequestStatus.ERROR)
+    assert sched.check_and_update_request_status(failed) is True
+    assert sched.num_running_requests == 0
+    assert shared_state.current_requests == [1, 0]
+
+    replacement = make_prefill("replacement", 4)
+    sched.enque_request(replacement)
+    sched.admit_requests()
+    assert sched.num_running_requests == 1
+    assert shared_state.current_requests == [1, 0, 1]
 
 
 def test_request_status_requires_eos_for_first_peer_status_checks():
