@@ -226,6 +226,57 @@ def test_active_planning_uses_dht_membership_not_legacy_scheduler_nodes():
     assert status["state"] == "route_ready"
     assert status["v3_route"] == ("mac", "rtx")
     assert "legacy_routes" not in status
+    assert status["catalog"]["topology"] == {
+        "offers": 3,
+        "leases": 3,
+        "links": 2,
+        "workers": [
+            {
+                "worker_id": "building",
+                "endpoint_id": "building",
+                "roles": ["executor", "frontend"],
+                "span": [0, 1],
+                "state": "building",
+                "available_kv_bytes": 1024**3,
+                "expires_at_ms": building.lease.expires_at_ms,
+            },
+            {
+                "worker_id": "mac",
+                "endpoint_id": "mac",
+                "roles": ["executor", "frontend"],
+                "span": [0, 2],
+                "state": "ready",
+                "available_kv_bytes": 1024**3,
+                "expires_at_ms": advertisements[0].lease.expires_at_ms,
+            },
+            {
+                "worker_id": "rtx",
+                "endpoint_id": "rtx",
+                "roles": ["executor", "frontend"],
+                "span": [2, 4],
+                "state": "ready",
+                "available_kv_bytes": 1024**3,
+                "expires_at_ms": advertisements[1].lease.expires_at_ms,
+            },
+        ],
+        "directed_links": [
+            {
+                "from_worker_id": "mac",
+                "to_worker_id": "rtx",
+                "path_kind": "direct",
+                "rtt_ms": 2.0,
+                "expires_at_ms": advertisements[0].outgoing_links[0].expires_at_ms,
+            },
+            {
+                "from_worker_id": "rtx",
+                "to_worker_id": "mac",
+                "path_kind": "direct",
+                "rtt_ms": 2.0,
+                "expires_at_ms": advertisements[1].outgoing_links[0].expires_at_ms,
+            },
+        ],
+        "truncated": False,
+    }
     deadline = time.monotonic() + 2
     while not planner.live_worker_ids() and time.monotonic() < deadline:
         time.sleep(0.01)

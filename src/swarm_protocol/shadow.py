@@ -419,9 +419,77 @@ class SchedulerProtocolV3Shadow:
                 "model_swarm_id": model_swarm_id,
                 "captured_at_ms": snapshot.captured_at_ms,
                 "workers": len(snapshot.offers),
+                "topology": self._catalog_topology_summary(snapshot),
             }
             self._catalog_read_retry_after[model_swarm_id] = time.monotonic() + 2
             self._catalog_reads_pending.discard(model_swarm_id)
+
+    @staticmethod
+    def _catalog_topology_summary(snapshot: DiscoverySnapshot) -> dict[str, object]:
+        """Return a bounded, secret-free view of the exact planner snapshot.
+
+        The active planner intentionally routes from the signed DHT snapshot,
+        not from the legacy scheduler node table. Counts alone are therefore
+        insufficient to diagnose a rejected route: a two-worker snapshot may
+        still lack one directed closure edge, a READY lease, or a frontend
+        head. Keep this status bounded so a large public swarm cannot make
+        ``status_json`` grow without limit.
+        """
+
+        max_workers = 16
+        max_links = 32
+        offers_by_worker = {offer.worker_id: offer for offer in snapshot.offers}
+        leases = sorted(
+            snapshot.leases,
+            key=lambda lease: (
+                lease.hosted_span.start,
+                lease.hosted_span.end,
+                lease.worker_id,
+            ),
+        )
+        links = sorted(
+            snapshot.links,
+            key=lambda metric: (metric.from_worker_id, metric.to_worker_id),
+        )
+        return {
+            "offers": len(snapshot.offers),
+            "leases": len(snapshot.leases),
+            "links": len(snapshot.links),
+            "workers": [
+                {
+                    "worker_id": lease.worker_id,
+                    "endpoint_id": (
+                        offers_by_worker[lease.worker_id].endpoint_id
+                        if lease.worker_id in offers_by_worker
+                        else None
+                    ),
+                    "roles": (
+                        sorted(
+                            role.value
+                            for role in offers_by_worker[lease.worker_id].supported_roles
+                        )
+                        if lease.worker_id in offers_by_worker
+                        else []
+                    ),
+                    "span": [lease.hosted_span.start, lease.hosted_span.end],
+                    "state": lease.state.value,
+                    "available_kv_bytes": lease.available_kv_bytes_snapshot,
+                    "expires_at_ms": lease.expires_at_ms,
+                }
+                for lease in leases[:max_workers]
+            ],
+            "directed_links": [
+                {
+                    "from_worker_id": metric.from_worker_id,
+                    "to_worker_id": metric.to_worker_id,
+                    "path_kind": metric.path_kind.value,
+                    "rtt_ms": metric.rtt_ms,
+                    "expires_at_ms": metric.expires_at_ms,
+                }
+                for metric in links[:max_links]
+            ],
+            "truncated": len(leases) > max_workers or len(links) > max_links,
+        }
 
     def ready_model_swarm_id(self, nodes: list[Any]) -> str:
         """Return the dominant verified swarm whose trusted bundle is ready."""
