@@ -1115,6 +1115,50 @@ def test_worker_builds_iroh_with_explicit_scheduler_endpoint(monkeypatch):
     assert server.scheduler_peer_id == "scheduler-endpoint"
 
 
+def test_active_v3_iroh_worker_always_uses_registry_capability_authority(monkeypatch, tmp_path):
+    transport = SimpleNamespace(
+        peer_id=lambda: "worker-endpoint",
+        catalog_discovery=object(),
+    )
+    registry = object()
+    reporter = SimpleNamespace(
+        mode="active",
+        registry=registry,
+        attach_catalog=lambda catalog: None,
+    )
+    capability_authority = object()
+    captured = {}
+
+    monkeypatch.setenv("FABI_SWARM_V3_FENCE_DB", str(tmp_path / "fences.sqlite3"))
+    # A stale lab/user environment must not be able to restore the removed
+    # fixed-coordinator product path.
+    monkeypatch.setenv("FABI_SWARM_V3_COORDINATION_MODE", "fixed")
+    monkeypatch.setattr(
+        "parallax.p2p.server.IrohTransport.from_environment",
+        lambda role: transport,
+    )
+    monkeypatch.setattr(
+        "swarm_protocol.route_authority.CapabilityRouteAuthority.from_trusted_registry",
+        lambda trusted_registry: (
+            capability_authority
+            if trusted_registry is registry
+            else pytest.fail("wrong trusted registry")
+        ),
+    )
+    monkeypatch.setattr(
+        "parallax.p2p.server.WorkerExecutionAdmission",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
+    )
+    server = GradientServer.__new__(GradientServer)
+    server.scheduler_addr = "scheduler-endpoint"
+    server.swarm_v3_reporter = reporter
+    server.swarm_v3_placement_mode = "autonomous"
+
+    assert server._build_iroh() is True
+    assert captured["route_authority"] is capability_authority
+    assert "coordinator_endpoint_id" not in captured
+
+
 def test_worker_qualifies_scheduler_before_reading_connection_telemetry():
     path = {"kind": "relay", "selected": True, "rtt_ms": 42.0}
     transport = SimpleNamespace(selected_path=lambda peer_id: path)

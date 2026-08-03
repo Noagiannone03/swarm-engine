@@ -1258,30 +1258,19 @@ class GradientServer:
                     )
                 )
                 fence_path = str(state_dir / "request-fences.sqlite3")
-            coordination_mode = (
-                os.environ.get(
-                    "FABI_SWARM_V3_COORDINATION_MODE",
-                    "fixed",
-                )
-                .strip()
-                .lower()
-            )
             admission_kwargs = {
                 "worker_id": self.iroh_transport.peer_id(),
                 "endpoint_id": self.iroh_transport.peer_id(),
                 "crypto": self.iroh_transport,
                 "request_epoch_fence": SqliteRequestEpochFence(fence_path),
+                # Active V3 request agents are dynamic peers. Their short-lived
+                # capabilities are verified against the keyset authenticated by
+                # the worker's pinned TUF registry; an environment default must
+                # never silently restore the fixed-coordinator migration path.
+                "route_authority": CapabilityRouteAuthority.from_trusted_registry(
+                    self.swarm_v3_reporter.registry
+                ),
             }
-            if coordination_mode == "client":
-                admission_kwargs["route_authority"] = (
-                    CapabilityRouteAuthority.from_trusted_registry(self.swarm_v3_reporter.registry)
-                )
-            elif coordination_mode == "fixed":
-                admission_kwargs["coordinator_endpoint_id"] = self.scheduler_peer_id
-            else:
-                raise ValueError(
-                    "FABI_SWARM_V3_COORDINATION_MODE supports only 'fixed' or 'client'"
-                )
             self.swarm_v3_execution_admission = WorkerExecutionAdmission(
                 **admission_kwargs,
             )
