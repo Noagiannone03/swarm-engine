@@ -266,6 +266,23 @@ def test_permit_keepalive_rechecks_contribution_and_is_idempotent(monkeypatch, t
         assert original_retry.status_code == 200
         assert original_retry.json()["authorization_generation"] == 1
 
+        # The in-flight request may consume the route's only free session.  A
+        # permit keepalive renews that existing lease; it must not ask whether
+        # a second request could be admitted through a fresh route snapshot.
+        busy_scheduler = live_scheduler()
+        busy_scheduler.serving_ready = lambda: False
+        authority._scheduler_provider = lambda: busy_scheduler
+        busy = client.post(
+            f"/v1/swarm/route-permits/{permit_id}/keepalive",
+            headers={
+                "Authorization": f"Bearer {CREDENTIAL}",
+                "Idempotency-Key": "keepalive-busy-route",
+            },
+            json={"ttl_ms": 60_000},
+        )
+        assert busy.status_code == 200
+        assert busy.json()["authorization_generation"] == 2
+
         foreign = client.post(
             f"/v1/swarm/route-permits/{permit_id}/keepalive",
             headers={

@@ -143,8 +143,10 @@ class ContributionGate:
     contribution credential from being shared to create unbounded traffic.
     Admission is checked when a request starts. V3 Request Agents then keep the
     permit alive with explicit authority acknowledgements; every acknowledgement
-    revalidates that the same account still contributes and that the swarm is
-    serving. A slow generation is therefore not mistaken for a failed one.
+    revalidates that the same account still contributes.  Existing route leases,
+    rather than fresh-admission capacity, decide whether the in-flight data plane
+    is still serving. A slow generation is therefore not mistaken for a failed
+    one merely because it consumes the swarm's last free session.
     """
 
     def __init__(self) -> None:
@@ -527,30 +529,13 @@ class ContributionGate:
             permit = ledger.get_active(permit_id)
             if permit.account_id != identity:
                 raise PermissionError("route permit belongs to a different account")
-            product_ready = getattr(scheduler, "product_serving_ready", None)
-            serving_ready = bool(
-                scheduler is not None
-                and (product_ready() if callable(product_ready) else scheduler.serving_ready())
-            )
             eligible = self._eligible_workers(scheduler, identity, time.time())
-            maximum = eligible * self.requests_per_worker
             if eligible == 0:
                 raise ContributionPermitDenied(
                     ContributionStatus(
                         False,
                         "no_eligible_worker",
                         active_requests=1,
-                        account_id=identity,
-                    )
-                )
-            if not serving_ready:
-                raise ContributionPermitDenied(
-                    ContributionStatus(
-                        False,
-                        "swarm_not_ready",
-                        eligible_workers=eligible,
-                        active_requests=1,
-                        max_concurrent_requests=maximum,
                         account_id=identity,
                     )
                 )
