@@ -1034,12 +1034,6 @@ class GradientServer:
                     immutable_revision=str(self.model_revision),
                 )
                 manifest = bundle.manifest
-                hardware = self._stable_capacity_hardware()
-                backend = (
-                    BackendKind.MLX
-                    if hardware.get("device") == "mlx"
-                    else (BackendKind.VLLM if self.gpu_backend == "vllm" else BackendKind.SGLANG)
-                )
                 controller = AutonomousWorkerPlacement(
                     catalog=self.iroh_transport.catalog_discovery,
                     admission=self.swarm_v3_execution_admission,
@@ -1050,6 +1044,7 @@ class GradientServer:
                 )
                 self.swarm_v3_placement_controller = controller
                 offer = None
+                offer_capacity_sequence = None
                 manifest_published = False
                 preferred_context_tokens = int(self.planned_context_tokens)
                 context_tiers = autonomous_context_tiers(
@@ -1068,15 +1063,42 @@ class GradientServer:
                             self.stop_event.wait(1.0)
                             continue
                         manifest_published = True
+                    hardware = self._stable_capacity_hardware()
+                    capacity_sequence = hardware.get("capacity_sequence")
+                    backend = (
+                        BackendKind.MLX
+                        if hardware.get("device") == "mlx"
+                        else (
+                            BackendKind.VLLM
+                            if self.gpu_backend == "vllm"
+                            else BackendKind.SGLANG
+                        )
+                    )
+                    stable_memory_bytes = int(hardware.get("usable_memory_bytes") or 0)
+                    if stable_memory_bytes <= 0:
+                        if self._shared_state is not None:
+                            self._shared_state.update(
+                                swarm_v3_placement_phase="standby",
+                                swarm_v3_placement_decision="insufficient_live_memory",
+                                capacity_hardware=hardware,
+                            )
+                        self.stop_event.wait(0.5)
+                        continue
                     now_ms = time.time_ns() // 1_000_000
-                    if offer is None or offer.expires_at_ms <= now_ms + 5_000:
+                    if (
+                        offer is None
+                        or offer.expires_at_ms <= now_ms + 5_000
+                        or capacity_sequence != offer_capacity_sequence
+                        or offer.stable_memory_envelope_bytes != stable_memory_bytes
+                    ):
                         offer = self.swarm_v3_reporter.bootstrap_offer(
                             worker_id=self.iroh_transport.peer_id(),
                             endpoint_id=self.iroh_transport.peer_id(),
                             backend=backend,
-                            stable_memory_envelope_bytes=int(hardware["usable_memory_bytes"]),
+                            stable_memory_envelope_bytes=stable_memory_bytes,
                             supports_frontend=self.supports_frontend,
                         )
+                        offer_capacity_sequence = capacity_sequence
                     placement = None
                     for context_tokens in context_tiers:
                         self.planned_context_tokens = context_tokens
@@ -1103,6 +1125,8 @@ class GradientServer:
                             planned_context_tokens=self.planned_context_tokens,
                             swarm_v3_placement_generation=placement["generation"],
                             swarm_v3_placement_phase=placement["phase"],
+                            swarm_v3_placement_decision=placement["decision"],
+                            capacity_hardware=hardware,
                         )
                     if placement["phase"] == "building":
                         logger.info(
@@ -2719,16 +2743,73 @@ class GradientServer:
                             }
                     info["swarm_v3"] = report
                 else:
+                    placement_phase = None
+                    placement_decision = None
+                    capacity = None
+                    if self._shared_state is not None:
+                        placement_phase = self._shared_state.get("swarm_v3_placement_phase")
+                        placement_decision = self._shared_state.get(
+                            "swarm_v3_placement_decision"
+                        )
+                        capacity_hardware = self._shared_state.get("capacity_hardware")
+                        if isinstance(capacity_hardware, dict):
+                            capacity = {
+                                key: capacity_hardware.get(key)
+                                for key in (
+                                    "usable_memory_bytes",
+                                    "system_available_memory_bytes",
+                                    "system_reserve_bytes",
+                                    "device_available_memory_bytes",
+                                    "device_reserve_bytes",
+                                    "capacity_observed_at_ms",
+                                )
+                                if capacity_hardware.get(key) is not None
+                            }
                     info["swarm_v3"] = {
                         "mode": self.swarm_v3_reporter.mode,
                         "state": "waiting_contract",
                         "placement_mode": self.swarm_v3_placement_mode,
+                        "placement": {
+                            "phase": placement_phase,
+                            "decision": placement_decision,
+                        },
+                        "capacity": capacity,
                     }
 
         return info
 
     def _stable_capacity_hardware(self) -> dict[str, Any]:
-        """Return the immutable capacity envelope for this worker generation."""
+        """Return live STANDBY capacity, then freeze the executor generation.
+
+        Apple documents available memory as an advisory value that changes
+        frequently.  It is therefore refreshed while no span is assigned, but
+        never after BUILDING begins: loaded weights would otherwise look like
+        external pressure and cause self-induced placement churn.
+        """
+
+        if self._shared_state is not None:
+            while not self.stop_event.is_set():
+                probe_state = self._shared_state.get("capacity_probe_state", "disabled")
+                if probe_state in {"starting", "sampling"}:
+                    self.stop_event.wait(0.1)
+                    continue
+                if probe_state == "failed":
+                    error = self._shared_state.get("capacity_probe_error") or {}
+                    raise RuntimeError(
+                        "backend capacity preflight failed: "
+                        f"{error.get('detail', error)}"
+                    )
+                if probe_state in {"ready", "frozen"}:
+                    detected = self._shared_state.get("capacity_hardware")
+                    if detected is not None:
+                        with self._capacity_hardware_lock:
+                            if (
+                                self._capacity_hardware_snapshot is None
+                                or not self._shared_state.get("capacity_contract_frozen", False)
+                            ):
+                                self._capacity_hardware_snapshot = copy.deepcopy(detected)
+                            return copy.deepcopy(self._capacity_hardware_snapshot)
+                break
 
         with self._capacity_hardware_lock:
             if self._capacity_hardware_snapshot is None:

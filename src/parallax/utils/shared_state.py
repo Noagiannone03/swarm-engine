@@ -180,6 +180,14 @@ class SharedState:
         shared_dict["swarm_v3_placement_error"] = None
         shared_dict["swarm_v3_previous_start_layer"] = None
         shared_dict["swarm_v3_previous_end_layer"] = None
+        shared_dict["swarm_v3_placement_decision"] = None
+        shared_dict["capacity_probe_state"] = "disabled"
+        shared_dict["capacity_probe_error"] = None
+        shared_dict["capacity_probe_device"] = None
+        shared_dict["capacity_probe_sequence"] = 0
+        shared_dict["capacity_hardware"] = None
+        shared_dict["capacity_contract_frozen"] = False
+        shared_dict["capacity_probe_stop"] = False
         shared_dict["chunked_prefill_size"] = None
         shared_dict["kv_cache_token_capacity"] = None
         shared_dict["kv_cache_block_size"] = None

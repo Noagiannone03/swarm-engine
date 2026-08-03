@@ -12,6 +12,7 @@ from parallax.p2p.server import (
     _resolve_worker_key_path,
     send_notify,
 )
+from parallax.utils.shared_state import SharedState
 from swarm_protocol.contracts import ReservationState
 
 
@@ -851,6 +852,46 @@ def test_worker_capacity_envelope_is_immutable_for_process_generation(monkeypatc
     assert heartbeat["hardware"]["usable_memory_bytes"] == 9_000
     initial["hardware"]["usable_memory_bytes"] = 0
     assert server.get_node_info(is_update=True)["hardware"]["usable_memory_bytes"] == 9_000
+
+
+def test_backend_probe_capacity_refreshes_only_before_contract_is_frozen():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    server.lattica = SimpleNamespace(peer_id=lambda: "worker-peer")
+    server._shared_state = SharedState(
+        {
+            "capacity_probe_state": "ready",
+            "capacity_contract_frozen": False,
+            "capacity_hardware": {
+                "device": "mlx",
+                "usable_memory_bytes": 9_000,
+                "capacity_sequence": 1,
+            },
+        }
+    )
+
+    assert server._stable_capacity_hardware()["usable_memory_bytes"] == 9_000
+    server._shared_state.update(
+        capacity_hardware={
+            "device": "mlx",
+            "usable_memory_bytes": 2_000,
+            "capacity_sequence": 2,
+        }
+    )
+    assert server._stable_capacity_hardware()["usable_memory_bytes"] == 2_000
+
+    server._shared_state.update(
+        capacity_contract_frozen=True,
+        capacity_hardware={
+            "device": "mlx",
+            "usable_memory_bytes": 8_000,
+            "capacity_sequence": 3,
+        },
+    )
+    assert server._stable_capacity_hardware()["usable_memory_bytes"] == 2_000
 
 
 def test_transformer_health_rpc_returns_registered_peer_identity():

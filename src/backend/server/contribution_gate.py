@@ -103,9 +103,11 @@ class ContributionStatus:
     active_requests: int = 0
     max_concurrent_requests: int = 0
     account_id: Optional[str] = None
+    worker_state: Optional[str] = None
+    worker_usable_memory_bytes: Optional[int] = None
 
     def public_payload(self, *, enabled: bool) -> dict:
-        return {
+        payload = {
             "enabled": enabled,
             "allowed": self.allowed,
             "reason": self.reason,
@@ -113,6 +115,11 @@ class ContributionStatus:
             "active_requests": self.active_requests,
             "max_concurrent_requests": self.max_concurrent_requests,
         }
+        if self.worker_state is not None:
+            payload["worker_state"] = self.worker_state
+        if self.worker_usable_memory_bytes is not None:
+            payload["worker_usable_memory_bytes"] = self.worker_usable_memory_bytes
+        return payload
 
 
 @dataclass(frozen=True)
@@ -246,6 +253,57 @@ class ContributionGate:
             workers += 1
         return workers
 
+    @staticmethod
+    def _account_worker_diagnostic(scheduler, identity: str) -> tuple[str | None, int | None]:
+        """Return an account-scoped lifecycle summary without exposing peer IDs."""
+
+        if scheduler is None:
+            return None, None
+        manager = getattr(scheduler, "node_manager", None)
+        nodes = getattr(manager, "nodes", getattr(manager, "active_nodes", ()))
+        states: list[str] = []
+        usable: list[int] = []
+        for node in nodes:
+            if getattr(node, "account_hash", None) != identity:
+                continue
+            report = getattr(node, "swarm_v3", None)
+            if not isinstance(report, dict):
+                states.append("connected")
+                continue
+            capacity = report.get("capacity")
+            if isinstance(capacity, dict):
+                value = capacity.get("usable_memory_bytes")
+                if isinstance(value, int) and value >= 0:
+                    usable.append(value)
+            if report.get("state") == "ready":
+                states.append("ready")
+                continue
+            placement = report.get("placement")
+            phase = placement.get("phase") if isinstance(placement, dict) else None
+            decision = placement.get("decision") if isinstance(placement, dict) else None
+            if phase == "building":
+                states.append("building")
+            elif decision in {
+                "insufficient_live_memory",
+                "no_exact_span_fits_the_stable_memory_envelope",
+            }:
+                states.append("insufficient_memory")
+            elif decision == "waiting_catalog":
+                states.append("waiting_catalog")
+            else:
+                states.append("standby")
+        for preferred in (
+            "ready",
+            "building",
+            "waiting_catalog",
+            "standby",
+            "insufficient_memory",
+            "connected",
+        ):
+            if preferred in states:
+                return preferred, max(usable) if usable else None
+        return None, None
+
     def status(self, credential: object, scheduler) -> ContributionStatus:
         if not self.enabled:
             return ContributionStatus(True, "gate_disabled")
@@ -283,11 +341,16 @@ class ContributionGate:
         maximum = eligible * self.requests_per_worker
 
         if eligible == 0:
+            worker_state, worker_usable_memory = self._account_worker_diagnostic(
+                scheduler, identity
+            )
             return ContributionStatus(
                 False,
                 "no_eligible_worker",
                 active_requests=active,
                 account_id=identity,
+                worker_state=worker_state,
+                worker_usable_memory_bytes=worker_usable_memory,
             )
         if active >= maximum:
             return ContributionStatus(

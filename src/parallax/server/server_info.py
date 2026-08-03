@@ -233,7 +233,10 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
             import mlx.core as mx
 
             budget = current_mlx_memory_budget(mx, psutil_module=psutil)
-            usable_memory_bytes = budget.process_limit_bytes
+            # Placement accounts model weights and KV, not allocations already
+            # owned by the initialized runtime. Publishing the process limit
+            # would count that baseline twice when the executor sizes its KV.
+            usable_memory_bytes = budget.additional_bytes
             system_available_memory_bytes = budget.available_bytes
             system_reserve_bytes = budget.system_reserve_bytes
         except Exception:
@@ -249,6 +252,9 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
             "usable_memory_bytes": usable_memory_bytes,
             "system_available_memory_bytes": system_available_memory_bytes,
             "system_reserve_bytes": system_reserve_bytes,
+            "device_process_limit_bytes": (
+                None if usable_memory_bytes is None else budget.process_limit_bytes
+            ),
             "memory_bandwidth_gbps": est_bandwidth,
             "device": "mlx",
         }

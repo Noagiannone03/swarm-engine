@@ -184,6 +184,31 @@ def test_autonomous_contributor_must_publish_verified_ready_lease(monkeypatch):
     assert gate.status(CREDENTIAL, sched).reason == "no_eligible_worker"
 
 
+def test_gate_reports_account_scoped_memory_standby_without_peer_identity(monkeypatch):
+    monkeypatch.setenv("FABI_GATE", "on")
+    gate = ContributionGate()
+    node = autonomous_worker(state="waiting_contract")
+    node.swarm_v3.update(
+        placement={
+            "phase": "standby",
+            "decision": "no_exact_span_fits_the_stable_memory_envelope",
+        },
+        capacity={"usable_memory_bytes": 178_421_760},
+    )
+    sched = SimpleNamespace(
+        node_manager=SimpleNamespace(nodes=[node], active_nodes=[]),
+        heartbeat_timeout=30,
+        external_ready_worker_ids=lambda: frozenset(),
+        product_serving_ready=lambda: True,
+        serving_ready=lambda: False,
+    )
+
+    status = gate.status(CREDENTIAL, sched)
+    assert status.worker_state == "insufficient_memory"
+    assert status.worker_usable_memory_bytes == 178_421_760
+    assert "autonomous-worker" not in str(status.public_payload(enabled=True))
+
+
 def test_v3_membership_authority_never_accepts_legacy_scheduler_worker(monkeypatch):
     monkeypatch.setenv("FABI_GATE", "on")
     gate = ContributionGate()

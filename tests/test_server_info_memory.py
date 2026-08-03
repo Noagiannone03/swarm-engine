@@ -37,3 +37,25 @@ def test_cuda_node_advertises_aggregate_live_capacity_for_visible_devices(monkey
     assert info["usable_memory_bytes"] == 15_000
     assert info["device_available_memory_bytes"] == 18_000
     assert info["device_reserve_bytes"] == 3_000
+
+
+def test_mlx_node_advertises_only_memory_additional_to_initialized_runtime(monkeypatch):
+    hardware = server_info.AppleSiliconHardwareInfo(
+        total_ram_gb=16,
+        chip="Apple M4",
+        tflops_fp16=8.52,
+        num_gpus=1,
+    )
+    budget = SimpleNamespace(
+        additional_bytes=3_000,
+        process_limit_bytes=3_750,
+        available_bytes=5_000,
+        system_reserve_bytes=2_000,
+    )
+    monkeypatch.setattr(server_info.HardwareInfo, "detect", lambda: hardware)
+    monkeypatch.setattr(server_info, "current_mlx_memory_budget", lambda *_args, **_kwargs: budget)
+
+    info = server_info.detect_node_hardware("node-1")
+
+    assert info["usable_memory_bytes"] == 3_000
+    assert info["device_process_limit_bytes"] == 3_750

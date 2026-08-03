@@ -12,6 +12,7 @@ from parallax.server.memory_budget import (
     configure_mlx_memory_limits,
     current_mlx_memory_budget,
 )
+from parallax.server.runtime_capacity import StableCapacityTracker
 
 
 def gb(value: float) -> int:
@@ -247,3 +248,28 @@ def test_pressure_controller_stops_immediately_after_requests_drain():
     controller.observe(gb(1))
 
     assert controller.should_shutdown(current_requests=0) is True
+
+
+def test_standby_capacity_drops_immediately_and_recovers_after_stable_samples():
+    tracker = StableCapacityTracker(rise_samples=3)
+
+    assert tracker.observe(gb(4)).stable_bytes == gb(4)
+    dropped = tracker.observe(gb(2))
+    assert dropped.stable_bytes == gb(2)
+    assert dropped.changed is True
+
+    # A single optimistic OS sample must not expand the advertised contract.
+    assert tracker.observe(gb(5)).stable_bytes == gb(2)
+    assert tracker.observe(gb(4)).stable_bytes == gb(2)
+    recovered = tracker.observe(gb(6))
+    assert recovered.stable_bytes == gb(4)
+    assert recovered.changed is True
+
+
+def test_standby_capacity_recovery_resets_when_signal_returns_to_current_floor():
+    tracker = StableCapacityTracker(rise_samples=2)
+    tracker.observe(100)
+    assert tracker.observe(200).stable_bytes == 100
+    assert tracker.observe(100).stable_bytes == 100
+    assert tracker.observe(300).stable_bytes == 100
+    assert tracker.observe(300).stable_bytes == 300

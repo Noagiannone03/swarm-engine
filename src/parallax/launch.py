@@ -39,6 +39,10 @@ from parallax.server.memory_budget import (
     configured_cuda_reserve_bytes,
     configured_system_reserve_bytes,
 )
+from parallax.server.runtime_capacity import (
+    freeze_and_stop_runtime_capacity_probe,
+    launch_runtime_capacity_probe,
+)
 from parallax.server.server_args import parse_args
 from parallax.server.vllm_rust_frontend import (
     launch_vllm_rust_frontend,
@@ -560,6 +564,7 @@ if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
 
     p2p_server_process = None
+    capacity_probe_process = None
     frontend_process = None
     executor_subprocs = []
     args = None
@@ -669,6 +674,16 @@ if __name__ == "__main__":
                 frontend_process,
             )
         else:
+            # Active v3 placement must not announce capacity from the light
+            # P2P controller alone. Mark the preflight pending before starting
+            # P2P so its first offer waits for a backend-initialized sample.
+            if os.environ.get("FABI_SWARM_V3_MODE", "off").strip().lower() == "active":
+                shared_state.update(
+                    capacity_probe_state="starting",
+                    capacity_probe_error=None,
+                    capacity_probe_stop=False,
+                    capacity_contract_frozen=False,
+                )
             # Launch P2P server as subprocess (with scheduler)
             # Pass dict to subprocess (multiprocessing requires serializable objects)
             p2p_server_process = launch_p2p_server_process(
@@ -700,12 +715,23 @@ if __name__ == "__main__":
                 log_level=args.log_level,
                 conn=conn_main,
             )
+            if os.environ.get("FABI_SWARM_V3_MODE", "off").strip().lower() == "active":
+                capacity_probe_process = launch_runtime_capacity_probe(args, shared_state)
 
             # Stay discoverable as JOINING until compatible peers complete a
             # route. Operators may set a finite timeout, but community workers
             # no longer disappear after an arbitrary five-minute window.
             logger.info("Waiting in JOINING for a complete layer allocation...")
             _wait_for_initial_layer_allocation(shared_state, p2p_server_process)
+
+            # The chosen offer is now an immutable generation contract. Stop
+            # the held probe before replacing it with the real executor so the
+            # two backend contexts never coexist during model loading.
+            freeze_and_stop_runtime_capacity_probe(
+                shared_state,
+                capacity_probe_process,
+            )
+            capacity_probe_process = None
 
             # Get layer allocation from shared state
             _update_args_from_shared_state(args, shared_state, force_update=False)
@@ -873,5 +899,7 @@ if __name__ == "__main__":
         # Shutdown P2P server subprocess
         if p2p_server_process is not None:
             stop_p2p_server(p2p_server_process)
+
+        freeze_and_stop_runtime_capacity_probe(shared_state, capacity_probe_process)
 
         logger.debug("All processes shut down.")
