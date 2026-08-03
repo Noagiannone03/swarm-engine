@@ -324,7 +324,7 @@ def test_worker_placement_delivers_verified_snapshots_to_topology_observer():
     assert observed == [snapshot]
 
 
-def test_worker_placement_does_not_churn_on_disconnected_coverage():
+def test_worker_placement_repairs_disconnected_coverage_from_a_redundant_span():
     manifest = model()
     current = advertisement(manifest, "current", 0, 2)
     replica = advertisement(manifest, "replica", 0, 2)
@@ -359,10 +359,10 @@ def test_worker_placement_does_not_churn_on_disconnected_coverage():
             context_tokens=10,
         )
 
-    assert status["decision"] == "movement_would_remove_the_last_executable_route"
-    assert status["phase"] == "ready"
-    assert status["current_span"] == [0, 2]
-    assert reloads == []
+    assert status["decision"] == "coverage_preserved_and_verified_gain_exceeds_hysteresis"
+    assert status["phase"] == "building"
+    assert status["target_span"] == [2, 4]
+    assert reloads == [(LayerSpan(start=2, end=4), 1)]
 
 
 def test_cold_worker_announces_building_before_executor_reload():

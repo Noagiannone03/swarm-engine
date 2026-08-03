@@ -467,6 +467,7 @@ class AutonomousPlacementPolicy:
         current_span: LayerSpan | None = None,
         current_reservations: int = 0,
         last_moved_at_ms: int | None = None,
+        serving_route_exists: bool = False,
         serving_route_survives_movement: bool = False,
         now_ms: int,
     ) -> PlacementDecision:
@@ -613,14 +614,17 @@ class AutonomousPlacementPolicy:
                 score=current_score,
                 reason="active_reservations_must_drain_before_movement",
             )
-        # Petals refuses a voluntary move that would make the advertised
-        # blocks disjoint. Layer coverage alone is not a sufficient analogue
-        # for Fabi: fixed pipeline stages also need compatible context,
-        # endpoint ownership and authenticated directed links (including the
-        # tail-to-frontend return edge). The worker-side controller proves that
-        # a complete request route remains without this worker; uncertainty is
-        # deliberately fail-closed.
-        if not serving_route_survives_movement:
+        # Petals only refuses a move that would break a swarm which is
+        # currently connected. For Fabi, layer coverage alone is not enough:
+        # the worker-side controller proves exact routes with compatible
+        # context, endpoints and authenticated links (including the decode
+        # closure). Applying that guard while the swarm is
+        # already disjoint deadlocks duplicate spans in place: no worker may
+        # move to fill the missing range because, by definition, there is no
+        # complete route to preserve yet.  ``_preserves_coverage`` above still
+        # proves that unloading this worker cannot remove the last READY copy
+        # of any layer.
+        if serving_route_exists and not serving_route_survives_movement:
             return PlacementDecision(
                 action=PlacementAction.KEEP,
                 span=current_span,

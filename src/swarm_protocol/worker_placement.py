@@ -440,11 +440,18 @@ class AutonomousWorkerPlacement:
             lease.state in {ReservationState.PREPARED, ReservationState.COMMITTED}
             for lease in self._admission.snapshot()
         )
-        serving_route_survives_movement = self._route_survives_without_worker(
+        serving_route_exists = self._route_exists(
             snapshot=snapshot,
             manifest=manifest,
-            worker_id=advertisement.offer.worker_id,
+            coordinator_id=advertisement.offer.worker_id,
             context_tokens=context_tokens,
+        )
+        serving_route_survives_movement = self._route_exists(
+            snapshot=snapshot,
+            manifest=manifest,
+            coordinator_id=advertisement.offer.worker_id,
+            context_tokens=context_tokens,
+            exclude_worker_id=advertisement.offer.worker_id,
         )
         decision = self._policy.choose(
             offer=advertisement.offer,
@@ -456,6 +463,7 @@ class AutonomousWorkerPlacement:
             current_span=state.current_span,
             current_reservations=active_reservations,
             last_moved_at_ms=self._last_moved_at_ms,
+            serving_route_exists=serving_route_exists,
             serving_route_survives_movement=serving_route_survives_movement,
             now_ms=time.time_ns() // 1_000_000,
         )
@@ -518,18 +526,22 @@ class AutonomousWorkerPlacement:
         )
 
     @staticmethod
-    def _route_survives_without_worker(
+    def _route_exists(
         *,
         snapshot: DiscoverySnapshot,
         manifest: ModelManifest,
-        worker_id: str,
+        coordinator_id: str,
         context_tokens: int,
+        exclude_worker_id: str | None = None,
     ) -> bool:
-        """Prove that one executable route remains during a voluntary reload."""
+        """Prove that one executable route exists in an exact DHT snapshot."""
 
         reserved_output_tokens = min(4_096, context_tokens - 1)
         request = RequestContract(
-            request_id=f"placement-safety-{worker_id}-{snapshot.captured_at_ms}",
+            request_id=(
+                f"placement-safety-{coordinator_id}-{exclude_worker_id or 'current'}-"
+                f"{snapshot.captured_at_ms}"
+            ),
             model_swarm_id=manifest.model_swarm_id,
             prompt_tokens=context_tokens - reserved_output_tokens,
             reserved_output_tokens=reserved_output_tokens,
@@ -539,11 +551,19 @@ class AutonomousWorkerPlacement:
             ExactRoutePlanner().plan(
                 manifest=manifest,
                 request=request,
-                offers=tuple(offer for offer in snapshot.offers if offer.worker_id != worker_id),
-                leases=tuple(lease for lease in snapshot.leases if lease.worker_id != worker_id),
-                links=snapshot.links,
+                offers=tuple(
+                    offer for offer in snapshot.offers if offer.worker_id != exclude_worker_id
+                ),
+                leases=tuple(
+                    lease for lease in snapshot.leases if lease.worker_id != exclude_worker_id
+                ),
+                links=tuple(
+                    link
+                    for link in snapshot.links
+                    if exclude_worker_id not in {link.from_worker_id, link.to_worker_id}
+                ),
                 snapshot_time_ms=snapshot.captured_at_ms,
-                coordinator_id=worker_id,
+                coordinator_id=coordinator_id,
                 reservation_deadline_ms=snapshot.captured_at_ms + 30_000,
                 plan_expires_at_ms=snapshot.captured_at_ms + 60_000,
             )

@@ -88,7 +88,7 @@ def lease(
         weight_hashes=(HASHES[0],),
         kv_geometry=KvGeometry(
             block_size_tokens=1,
-            bytes_per_token_by_layer=(10,) * 4,
+            bytes_per_token_by_layer=model.kv_bytes_per_token_by_layer,
             allocatable_bytes=10_000,
         ),
         available_kv_bytes_snapshot=10_000,
@@ -351,12 +351,43 @@ def test_ready_worker_never_moves_without_a_complete_independent_route():
         context_tokens=10,
         kv_block_size=1,
         current_span=LayerSpan(start=0, end=2),
+        serving_route_exists=True,
         serving_route_survives_movement=False,
         now_ms=20_000,
     )
 
     assert decision.action is PlacementAction.KEEP
     assert decision.reason == "movement_would_remove_the_last_executable_route"
+
+
+def test_disjoint_lab_topology_moves_redundant_head_to_uncovered_tail():
+    base = manifest()
+    model = base.model_copy(
+        update={
+            "num_layers": 36,
+            "kv_bytes_per_token_by_layer": (10,) * 36,
+            "weight_bytes_by_layer": (100,) * 36,
+        }
+    )
+    decision = AutonomousPlacementPolicy(movement_cooldown_ms=0).choose(
+        offer=offer("local", memory_bytes=2_100),
+        manifest=model,
+        leases=(
+            lease(model, "local", 0, 10),
+            lease(model, "mac-mini", 0, 32),
+        ),
+        demand=CapacityDemandMap.uniform(36, desired_replicas=2),
+        context_tokens=10,
+        kv_block_size=1,
+        current_span=LayerSpan(start=0, end=10),
+        serving_route_exists=False,
+        serving_route_survives_movement=False,
+        now_ms=20_000,
+    )
+
+    assert decision.action is PlacementAction.MOVE
+    assert decision.span == LayerSpan(start=32, end=36)
+    assert decision.reason == "coverage_preserved_and_verified_gain_exceeds_hysteresis"
 
 
 class FakeDrain:
