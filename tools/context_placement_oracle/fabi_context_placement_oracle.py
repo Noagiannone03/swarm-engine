@@ -34,6 +34,12 @@ def _positive_int(value: Any, name: str) -> int:
     return value
 
 
+def _nonnegative_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
 def _parse_scenario(payload: dict[str, Any]) -> tuple[int, tuple[Demand, ...], tuple[Option, ...]]:
     if set(payload) != {"num_layers", "context_classes", "demands", "workers"}:
         raise ValueError("scenario contains missing or unknown top-level fields")
@@ -47,7 +53,7 @@ def _parse_scenario(payload: dict[str, Any]) -> tuple[int, tuple[Demand, ...], t
     demands = tuple(
         Demand(
             context_tokens=_positive_int(item["context_tokens"], "demand context"),
-            target_slots=_positive_int(item["target_slots"], "target_slots"),
+            target_slots=_nonnegative_int(item["target_slots"], "target_slots"),
             weight=_positive_int(item["weight"], "demand weight"),
         )
         for item in payload["demands"]

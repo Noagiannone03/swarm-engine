@@ -9,6 +9,7 @@ from swarm_protocol import (
 from swarm_protocol.context_placement import MemoryPlacementPoint
 from swarm_protocol.placement_simulator import (
     SimulatedPlacement,
+    build_oracle_scenario,
     evaluate_context_service,
     score_candidate_potential,
 )
@@ -134,3 +135,48 @@ def test_coding_demand_prior_can_prefer_long_route_progress_over_short_route_tra
     assert short_score.weighted_independent_route_gain == 1
     assert long_score.weighted_independent_route_gain == 0
     assert long_score.rank() > short_score.rank()
+
+
+def test_oracle_scenario_is_deterministic_and_uses_aggregated_demand_only():
+    model = _manifest().model_copy(
+        update={
+            "model_max_context_tokens": 20,
+            "context_classes": (10, 20),
+        }
+    )
+    demand = ContextCapacityDemandMap(
+        model_swarm_id=model.model_swarm_id,
+        region_id="eu-west",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+        classes=(
+            ContextClassDemand(
+                context_tokens=10,
+                desired_independent_routes=1,
+                desired_concurrent_slots=2,
+                desired_replicas_by_layer=(1,) * 4,
+                demand_weight_by_layer=(1.0,) * 4,
+            ),
+            ContextClassDemand(
+                context_tokens=20,
+                desired_independent_routes=1,
+                desired_concurrent_slots=3,
+                desired_replicas_by_layer=(1,) * 4,
+                demand_weight_by_layer=(5.0,) * 4,
+                confidence=0.8,
+            ),
+        ),
+    )
+    frontiers = {
+        "worker-b": (_placement("ignored", 2, 4, context_tokens=20, sessions=1).point,),
+        "worker-a": (_placement("ignored", 0, 2, context_tokens=20, sessions=2).point,),
+    }
+
+    scenario = build_oracle_scenario(model, demand, frontiers, now_ms=2_000)
+
+    assert [worker["worker_id"] for worker in scenario["workers"]] == ["worker-a", "worker-b"]
+    assert scenario["demands"] == [
+        {"context_tokens": 10, "target_slots": 2, "weight": 1_000},
+        {"context_tokens": 20, "target_slots": 3, "weight": 4_000},
+    ]
+    assert set(scenario) == {"num_layers", "context_classes", "demands", "workers"}

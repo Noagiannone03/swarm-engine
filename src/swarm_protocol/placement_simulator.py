@@ -9,6 +9,7 @@ authority over live workers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 from swarm_protocol.contracts import ModelManifest
 from swarm_protocol.context_placement import (
@@ -216,3 +217,71 @@ def score_candidate_potential(
         span_length=candidate.point.span.length,
         max_sessions=candidate.point.max_sessions,
     )
+
+
+def build_oracle_scenario(
+    manifest: ModelManifest,
+    demand: ContextCapacityDemandMap,
+    worker_frontiers: Mapping[str, tuple[MemoryPlacementPoint, ...]],
+    *,
+    now_ms: int,
+    weight_scale: int = 1_000,
+) -> dict[str, Any]:
+    """Serialize exact frontiers for the protobuf-isolated CP-SAT oracle."""
+
+    demand.validate_for(manifest, now_ms=now_ms)
+    if weight_scale <= 0:
+        raise ValueError("oracle weight scale must be positive")
+
+    workers = []
+    for worker_id in sorted(worker_frontiers):
+        if not worker_id:
+            raise ValueError("oracle worker ids must be non-empty")
+        points = worker_frontiers[worker_id]
+        options = []
+        option_ids: set[str] = set()
+        for point in points:
+            if point.span.end > manifest.num_layers:
+                raise ValueError("oracle point exceeds the model layer graph")
+            if point.context_tokens not in manifest.context_classes:
+                raise ValueError("oracle point uses an unsigned context class")
+            option_id = (
+                f"l{point.span.start}-{point.span.end}"
+                f"-c{point.context_tokens}-s{point.max_sessions}"
+            )
+            if option_id in option_ids:
+                raise ValueError("oracle frontier contains duplicate placement options")
+            option_ids.add(option_id)
+            options.append(
+                {
+                    "option_id": option_id,
+                    "start_layer": point.span.start,
+                    "end_layer": point.span.end,
+                    "context_tokens": point.context_tokens,
+                    "max_sessions": point.max_sessions,
+                }
+            )
+        workers.append({"worker_id": worker_id, "options": options})
+
+    demands = []
+    for item in demand.classes:
+        class_weight = (
+            sum(item.demand_weight_by_layer)
+            / len(item.demand_weight_by_layer)
+            * item.confidence
+        )
+        target_slots = max(item.desired_independent_routes, item.desired_concurrent_slots)
+        demands.append(
+            {
+                "context_tokens": item.context_tokens,
+                "target_slots": target_slots,
+                "weight": max(1, round(class_weight * weight_scale)),
+            }
+        )
+
+    return {
+        "num_layers": manifest.num_layers,
+        "context_classes": list(manifest.context_classes),
+        "demands": demands,
+        "workers": workers,
+    }
