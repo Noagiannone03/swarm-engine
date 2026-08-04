@@ -168,6 +168,7 @@ def advertisement(
             effective_span_mode=EffectiveSpanMode.FIXED,
             state=SpanState.READY,
             weight_hashes=(HASHES[0],),
+            max_context_tokens=65_536,
             kv_geometry=KvGeometry(
                 block_size_tokens=1,
                 bytes_per_token_by_layer=(10,) * 4,
@@ -461,6 +462,7 @@ def test_cold_worker_republishes_measured_lower_context_without_moving_layers():
     assert downgraded["generation"] == status["generation"]
     replacement = publisher.publications[-1]
     assert replacement.lease.hosted_span == original.lease.hosted_span
+    assert replacement.lease.max_context_tokens == 4
     assert replacement.lease.kv_geometry.allocatable_bytes == (
         replacement.lease.kv_geometry.required_bytes(
             replacement.lease.hosted_span,

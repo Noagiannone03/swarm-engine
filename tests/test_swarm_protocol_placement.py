@@ -86,6 +86,7 @@ def lease(
         effective_span_mode=EffectiveSpanMode.FIXED,
         state=state,
         weight_hashes=(HASHES[0],),
+        max_context_tokens=65_536,
         kv_geometry=KvGeometry(
             block_size_tokens=1,
             bytes_per_token_by_layer=model.kv_bytes_per_token_by_layer,

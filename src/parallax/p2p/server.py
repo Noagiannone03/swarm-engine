@@ -594,7 +594,14 @@ class TransformerConnectionHandler(ConnectionHandler):
                     f"http://localhost:{self.http_port}/inference/v1/chat-replay",
                     json=local_request,
                 ) as response:
-                    response.raise_for_status()
+                    if response.status_code >= 400:
+                        body = response.read()
+                        yield encode_http_response_envelope(
+                            status_code=response.status_code,
+                            content_type=response.headers.get("content-type"),
+                            body=body,
+                        )
+                        return
                     for chunk in response.iter_bytes():
                         if chunk:
                             yield chunk
@@ -651,6 +658,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                         f"http://localhost:{self.http_port}/v1/chat/completions",
                         json=request,
                     ) as response:
+                        if response.status_code >= 400:
+                            # RPC streaming has no HTTP status channel. Preserve
+                            # the local frontend response in the same explicit
+                            # envelope used by non-streaming calls; the request
+                            # agent converts it into one well-framed SSE error.
+                            yield encode_http_response_envelope(
+                                status_code=response.status_code,
+                                content_type=response.headers.get("content-type"),
+                                body=response.read(),
+                            )
+                            return
                         for chunk in response.iter_bytes():
                             if chunk:
                                 yield chunk
@@ -2642,6 +2660,11 @@ class GradientServer:
                     ),
                 )
                 if all(value is not None for value in required_contract):
+                    serving_context_ceiling = (
+                        int(self.planned_context_tokens)
+                        if self.swarm_v3_placement_mode == "autonomous"
+                        else int(info["max_sequence_length"])
+                    )
                     backend = (
                         BackendKind.MLX
                         if runtime_backend == "mlx"
@@ -2659,6 +2682,7 @@ class GradientServer:
                             ),
                             backend=backend,
                             stable_memory_envelope_bytes=int(hardware["usable_memory_bytes"]),
+                            max_context_tokens=serving_context_ceiling,
                             kv_cache_token_capacity=int(runtime_kv_capacity),
                             kv_cache_block_size=int(runtime_kv_block_size),
                             max_sessions=int(runtime_max_requests),

@@ -187,6 +187,51 @@ class RequestHandler:
         )
         return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n"
 
+    @staticmethod
+    def _stream_http_error_chunk(status_code: int, body: bytes) -> bytes:
+        """Translate a downstream HTTP failure into one valid OpenAI SSE event.
+
+        The RPC transport carries HTTP failures in a binary envelope. Returning
+        the enclosed JSON bytes directly would concatenate them with the next
+        ``data:`` line and make standards-compliant EventSource parsers silently
+        discard both records.
+        """
+
+        fallback_type = "invalid_request_error" if status_code < 500 else "upstream_error"
+        fallback_code = (
+            "downstream_request_rejected" if status_code < 500 else "upstream_worker_error"
+        )
+        payload = None
+        try:
+            decoded = json.loads(body.decode("utf-8"))
+            if isinstance(decoded, dict) and isinstance(decoded.get("error"), dict):
+                error = decoded["error"]
+                message = error.get("message")
+                if isinstance(message, str) and message:
+                    payload = openai_error_payload(
+                        message,
+                        err_type=(
+                            error.get("type")
+                            if isinstance(error.get("type"), str) and error["type"]
+                            else fallback_type
+                        ),
+                        param=error.get("param") if isinstance(error.get("param"), str) else None,
+                        code=(
+                            error.get("code")
+                            if isinstance(error.get("code"), str) and error["code"]
+                            else fallback_code
+                        ),
+                    )
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        if payload is None:
+            payload = openai_error_payload(
+                f"A worker rejected the generation request (HTTP {status_code}).",
+                err_type=fallback_type,
+                code=fallback_code,
+            )
+        return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n"
+
     def _get_model_name_for_node(self, node_id: str) -> Optional[str]:
         try:
             scheduler = getattr(self.scheduler_manage, "scheduler", None)
@@ -744,6 +789,25 @@ class RequestHandler:
                                         err_type="upstream_error",
                                         code="upstream_worker_lost",
                                     )
+                                    yield b"data: [DONE]\n\n"
+                                    return
+                                decoded_stream_response = decode_http_response_envelope(chunk)
+                                if decoded_stream_response is not None:
+                                    status_code, _content_type, body = decoded_stream_response
+                                    failure = f"downstream frontend returned HTTP {status_code}"
+                                    finish_journal(RecoveryState.FAILED, failure)
+                                    logger.warning(
+                                        "Worker frontend rejected streaming request %s with "
+                                        "HTTP %s",
+                                        request_id,
+                                        status_code,
+                                    )
+                                    # This is a complete terminal response, not
+                                    # a truncated generation: do not append the
+                                    # generic worker-lost error or abort a request
+                                    # the frontend has already rejected.
+                                    stream_finished = True
+                                    yield self._stream_http_error_chunk(status_code, body)
                                     yield b"data: [DONE]\n\n"
                                     return
                                 if recovery_stream is None:

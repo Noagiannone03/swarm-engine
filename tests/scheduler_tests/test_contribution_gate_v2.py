@@ -77,6 +77,7 @@ def autonomous_worker(credential=CREDENTIAL, *, state="ready"):
             effective_span_mode=EffectiveSpanMode.FIXED,
             state=SpanState.READY,
             weight_hashes=("22" * 32,),
+            max_context_tokens=65_536,
             kv_geometry=KvGeometry(
                 block_size_tokens=16,
                 bytes_per_token_by_layer=(16,),

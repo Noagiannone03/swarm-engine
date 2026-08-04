@@ -199,6 +199,7 @@ class ExactRoutePlanner:
                 or lease.model_swarm_id != request.model_swarm_id
                 or lease.state != SpanState.READY
                 or lease.expires_at_ms <= snapshot_time_ms
+                or request.required_context_tokens > lease.max_context_tokens
             ):
                 continue
             candidates.append(RouteCandidate(offer=offer, lease=lease))

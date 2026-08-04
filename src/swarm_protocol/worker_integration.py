@@ -54,6 +54,7 @@ class WorkerServingSnapshot:
     span: LayerSpan
     backend: BackendKind
     stable_memory_envelope_bytes: int
+    max_context_tokens: int
     kv_cache_token_capacity: int
     kv_cache_block_size: int
     max_sessions: int
@@ -423,6 +424,8 @@ class WorkerProtocolV3Reporter:
     ) -> ModelMemberAdvertisement:
         if serving.stable_memory_envelope_bytes <= 0:
             raise ValueError("worker has no positive stable memory envelope")
+        if serving.max_context_tokens <= 0:
+            raise ValueError("worker has no positive per-session context ceiling")
         if serving.kv_cache_token_capacity <= 0 or serving.kv_cache_block_size <= 0:
             raise ValueError("worker has no measured positive KV cache geometry")
         if serving.max_sessions <= 0:
@@ -468,6 +471,7 @@ class WorkerProtocolV3Reporter:
             measured_decode_tokens_per_second=(
                 serving.measured_decode_tokens_per_second if serving.max_sessions == 1 else None
             ),
+            max_context_tokens=serving.max_context_tokens,
             kv_geometry=KvGeometry(
                 block_size_tokens=serving.kv_cache_block_size,
                 bytes_per_token_by_layer=per_layer,

@@ -99,6 +99,7 @@ def member(*, now: int, allocatable_bytes: int = 100_000) -> ModelMemberAdvertis
             effective_span_mode=EffectiveSpanMode.FIXED,
             state=SpanState.READY,
             weight_hashes=("55" * 32,),
+            max_context_tokens=65_536,
             kv_geometry=KvGeometry(
                 block_size_tokens=16,
                 bytes_per_token_by_layer=(4, 4, 4, 4),

@@ -102,6 +102,7 @@ def _advertisement(bundle, worker_id, start, end, target, *, measured=True):
         weight_hashes=("a" * 64,),
         measured_prefill_tokens_per_second=1000 if measured else None,
         measured_decode_tokens_per_second=50 if measured else None,
+        max_context_tokens=65_536,
         kv_geometry=KvGeometry(
             block_size_tokens=16,
             bytes_per_token_by_layer=(64,) * 4,

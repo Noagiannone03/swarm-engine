@@ -359,6 +359,10 @@ class SpanLease(ContractModel):
     weight_hashes: tuple[HashHex, ...]
     measured_prefill_tokens_per_second: Annotated[float, Field(gt=0)] | None = None
     measured_decode_tokens_per_second: Annotated[float, Field(gt=0)] | None = None
+    # Hard per-session limit enforced by the serving frontend. This must stay
+    # separate from aggregate KV capacity: a worker can have room for several
+    # sessions while rejecting one sequence that exceeds its engine max length.
+    max_context_tokens: PositiveInt
     kv_geometry: KvGeometry
     available_kv_bytes_snapshot: NonNegativeInt
     max_sessions: PositiveInt

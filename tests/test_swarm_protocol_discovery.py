@@ -78,6 +78,7 @@ def lease(
         weight_hashes=(HASHES[0],),
         measured_prefill_tokens_per_second=100,
         measured_decode_tokens_per_second=20,
+        max_context_tokens=65_536,
         kv_geometry=KvGeometry(
             block_size_tokens=16,
             bytes_per_token_per_layer=1024,

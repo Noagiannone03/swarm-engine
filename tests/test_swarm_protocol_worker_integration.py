@@ -87,6 +87,7 @@ def _serving(*, current_requests=0, max_sessions=2, measured=False, span=None):
         span=span or LayerSpan(start=0, end=4),
         backend=BackendKind.MLX,
         stable_memory_envelope_bytes=8 * 1024**3,
+        max_context_tokens=32_768,
         kv_cache_token_capacity=1024,
         kv_cache_block_size=16,
         max_sessions=max_sessions,
@@ -126,6 +127,7 @@ def test_large_artifact_verification_never_blocks_heartbeat(monkeypatch, tmp_pat
     advertisement = ready["advertisement"]
     assert set(advertisement["offer"]["supported_roles"]) == {"executor", "frontend"}
     assert advertisement["lease"]["weight_hashes"]
+    assert advertisement["lease"]["max_context_tokens"] == 32_768
     assert advertisement["lease"]["available_kv_bytes_snapshot"] == 1024 * 64 * 4
 
 

@@ -150,6 +150,7 @@ def test_span_lease_rejects_impossible_kv_snapshot() -> None:
             effective_span_mode=EffectiveSpanMode.SUBSPAN,
             state=SpanState.READY,
             weight_hashes=(HASH_B,),
+            max_context_tokens=65_536,
             kv_geometry=KvGeometry(
                 block_size_tokens=16,
                 bytes_per_token_per_layer=4096,

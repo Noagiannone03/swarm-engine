@@ -355,6 +355,7 @@ class AutonomousWorkerPlacement:
                 effective_span_mode=EffectiveSpanMode.FIXED,
                 state=SpanState.BUILDING,
                 weight_hashes=weight_hashes,
+                max_context_tokens=context_tokens,
                 kv_geometry=KvGeometry(
                     block_size_tokens=kv_block_size,
                     bytes_per_token_by_layer=manifest.kv_bytes_per_token_by_layer,
@@ -508,7 +509,10 @@ class AutonomousWorkerPlacement:
             adjusted = advertisement.model_copy(
                 update={
                     "lease": advertisement.lease.model_copy(
-                        update={"kv_geometry": adjusted_geometry}
+                        update={
+                            "max_context_tokens": context_tokens,
+                            "kv_geometry": adjusted_geometry,
+                        }
                     )
                 }
             )

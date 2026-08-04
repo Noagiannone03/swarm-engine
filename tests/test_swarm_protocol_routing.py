@@ -69,6 +69,7 @@ def lease(
     mode: EffectiveSpanMode = EffectiveSpanMode.SUBSPAN,
     prefill_tps: float | None = 10_000,
     decode_tps: float | None = 100,
+    max_context_tokens: int = 65_536,
     expires_at_ms: int = 10_000,
 ) -> SpanLease:
     return SpanLease(
@@ -80,6 +81,7 @@ def lease(
         weight_hashes=(HASHES[0],),
         measured_prefill_tokens_per_second=prefill_tps,
         measured_decode_tokens_per_second=decode_tps,
+        max_context_tokens=max_context_tokens,
         kv_geometry=KvGeometry(
             block_size_tokens=16,
             bytes_per_token_per_layer=4096,
@@ -204,6 +206,29 @@ def test_long_context_excludes_worker_with_insufficient_kv() -> None:
         [],
     )
     assert [stage.worker_id for stage in result.plan.stages] == ["large"]
+
+
+def test_per_session_context_ceiling_wins_over_large_aggregate_kv_capacity() -> None:
+    model = manifest()
+    req = request(model, prompt=16_000, output=721)
+
+    with pytest.raises(NoFeasibleRoute):
+        plan(
+            model,
+            req,
+            [offer("rtx")],
+            [
+                lease(
+                    model,
+                    "rtx",
+                    0,
+                    8,
+                    kv_bytes=10**12,
+                    max_context_tokens=16_384,
+                )
+            ],
+            [],
+        )
 
 
 def test_fixed_span_cannot_be_truncated_to_create_theoretical_route() -> None:

@@ -39,6 +39,8 @@ class FakeHttpResponse:
 
 
 class FakeStreamResponse(FakeHttpResponse):
+    headers = {"content-type": "text/event-stream"}
+
     def __enter__(self):
         return self
 
@@ -48,6 +50,22 @@ class FakeStreamResponse(FakeHttpResponse):
     def iter_bytes(self):
         yield b'data: {"choices":[{"token_ids":[42]}]}\n\n'
         yield b"data: [DONE]\n\n"
+
+
+class FakeRejectedStreamResponse(FakeStreamResponse):
+    status_code = 400
+    headers = {"content-type": "application/json; charset=utf-8"}
+    body = (
+        b'{"error":{"message":"maximum context length is 16384 tokens",'
+        b'"type":"invalid_request_error","param":"messages",'
+        b'"code":"context_length_exceeded"}}'
+    )
+
+    def read(self):
+        return self.body
+
+    def iter_bytes(self):
+        pytest.fail("a rejected local HTTP stream must not leak raw JSON into RPC streaming")
 
 
 class FakeHttpClient:
@@ -72,6 +90,12 @@ class FakeHttpClient:
     def stream(self, method, url, *, json):
         self.streams.append((method, url, json))
         return FakeStreamResponse()
+
+
+class FakeRejectedHttpClient(FakeHttpClient):
+    def stream(self, method, url, *, json):
+        self.streams.append((method, url, json))
+        return FakeRejectedStreamResponse()
 
 
 def make_handler(admission=None):
@@ -290,6 +314,29 @@ def test_generation_replay_rejects_unbounded_or_non_streaming_input(monkeypatch)
     status_code, _, body = envelope
     assert status_code == 502
     assert b"generation_replay_failed" in body
+
+
+def test_streaming_chat_preserves_local_http_error_in_transport_envelope(monkeypatch):
+    handler = make_handler()
+    FakeHttpClient.instances.clear()
+    monkeypatch.setattr(p2p_server.httpx, "Client", FakeRejectedHttpClient)
+
+    chunks = list(
+        handler.chat_completion(
+            {
+                "messages": [{"role": "user", "content": "too long"}],
+                "stream": True,
+            }
+        )
+    )
+
+    assert len(chunks) == 1
+    envelope = decode_http_response_envelope(chunks[0])
+    assert envelope is not None
+    status_code, content_type, body = envelope
+    assert status_code == 400
+    assert content_type == "application/json; charset=utf-8"
+    assert b"context_length_exceeded" in body
 
 
 def test_active_v3_frontend_enables_local_vllm_abort_route(monkeypatch):

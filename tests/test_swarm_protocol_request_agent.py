@@ -192,6 +192,7 @@ def discovery(model):
             effective_span_mode=EffectiveSpanMode.SUBSPAN,
             state=SpanState.READY,
             weight_hashes=(HASHES[0],),
+            max_context_tokens=524_288,
             kv_geometry=KvGeometry(
                 block_size_tokens=16,
                 bytes_per_token_per_layer=512,
@@ -230,6 +231,7 @@ def publish_complete_worker(store, model, *, worker_id: str, endpoint_id: str) -
             effective_span_mode=EffectiveSpanMode.SUBSPAN,
             state=SpanState.READY,
             weight_hashes=(HASHES[0],),
+            max_context_tokens=524_288,
             kv_geometry=KvGeometry(
                 block_size_tokens=16,
                 bytes_per_token_per_layer=512,

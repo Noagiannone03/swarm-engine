@@ -679,6 +679,50 @@ def test_streaming_request_releases_route_after_completion():
     assert scheduler_manage.released == ["stream-req"]
 
 
+def test_streaming_downstream_http_error_is_one_well_framed_sse_error():
+    handler = RequestHandler()
+    scheduler_manage = V3ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    body = (
+        b'{"error":{"message":"maximum context length is 16384 tokens",'
+        b'"type":"invalid_request_error","param":"messages",'
+        b'"code":"context_length_exceeded"}}'
+    )
+    stub = StaticStub(
+        [
+            encode_http_response_envelope(
+                status_code=400,
+                content_type="application/json; charset=utf-8",
+                body=body,
+            )
+        ]
+    )
+    handler.stubs["node-a"] = stub
+
+    async def consume_stream():
+        response = await handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "too long"}], "stream": True},
+            "rejected-stream-req",
+            1.0,
+        )
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    wire = asyncio.run(consume_stream())
+    events = [line.removeprefix(b"data: ") for line in wire.splitlines() if line]
+
+    assert len(events) == 2
+    error = json.loads(events[0])
+    assert error["error"] == {
+        "message": "maximum context length is 16384 tokens",
+        "type": "invalid_request_error",
+        "param": "messages",
+        "code": "context_length_exceeded",
+    }
+    assert events[1] == b"[DONE]"
+    assert stub.abort_requests == []
+    assert scheduler_manage.released == ["rejected-stream-req"]
+
+
 def test_recoverable_stream_commits_official_tokens_before_sanitized_sse():
     handler = RequestHandler()
     scheduler_manage = RecoveryForwardingSchedulerManage()
