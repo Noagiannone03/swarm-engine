@@ -21,6 +21,7 @@ from swarm_protocol import (
     artifact_collection_hash,
 )
 from swarm_protocol.registry_operator import (
+    _bundle_summary,
     generate_passphrase_file,
     generate_route_authority,
     generate_staging_keys,
@@ -66,6 +67,8 @@ def _bundle() -> ModelRegistryBundle:
             quantization="unquantized",
             dtype="bfloat16",
             num_layers=2,
+            model_max_context_tokens=65_536,
+            context_classes=(4_096, 8_192, 16_384, 32_768, 65_536),
             activation_bytes_per_token=128,
             kv_bytes_per_token_by_layer=(64, 64),
             rope_context_contract_hash="1" * 64,
@@ -79,6 +82,13 @@ def _bundle() -> ModelRegistryBundle:
 
 def _write_bundle(path, bundle):
     path.write_bytes(bundle.canonical_bytes())
+
+
+def test_bundle_summary_exposes_signed_context_contract():
+    summary = _bundle_summary(_bundle())
+
+    assert summary["model_max_context_tokens"] == 65_536
+    assert summary["context_classes"] == [4_096, 8_192, 16_384, 32_768, 65_536]
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):

@@ -93,6 +93,12 @@ benchmark = [
   "pillow",
 ]
 
+simulation = [
+  # The offline lab uses the maintained max-flow implementation. It is not
+  # installed on production workers and is never part of placement authority.
+  "networkx>=3.4,<4",
+]
+
 dev = [
   "black>=24.3",
   "cmake>=3.27",

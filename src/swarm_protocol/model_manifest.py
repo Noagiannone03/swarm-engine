@@ -23,7 +23,7 @@ import requests
 from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
 from huggingface_hub.utils import build_hf_headers
 
-from parallax.utils.model_config import normalize_model_config
+from parallax.utils.model_config import get_model_context_limit, normalize_model_config
 from swarm_protocol.contracts import (
     ArtifactDescriptor,
     ArtifactRole,
@@ -438,6 +438,29 @@ def _runtime_contract(config: Mapping[str, Any], keys: tuple[str, ...]) -> dict[
     return {key: config[key] for key in keys if key in config and config[key] is not None}
 
 
+def context_classes_for(
+    model_max_context_tokens: int,
+    *,
+    minimum_class_tokens: int = 4_096,
+) -> tuple[int, ...]:
+    """Build a compact deterministic context ladder ending at the exact limit.
+
+    Powers of two keep distributed demand summaries interoperable while the
+    final non-power-of-two model boundary (for example Qwen3's 40,960 tokens)
+    is never rounded up or silently discarded.
+    """
+
+    if model_max_context_tokens <= 0 or minimum_class_tokens <= 0:
+        raise ValueError("model context limit and minimum class must be positive")
+    current = min(model_max_context_tokens, minimum_class_tokens)
+    classes: list[int] = []
+    while current < model_max_context_tokens:
+        classes.append(current)
+        current = min(model_max_context_tokens, current * 2)
+    classes.append(model_max_context_tokens)
+    return tuple(classes)
+
+
 def _kv_bytes_per_token_by_layer(
     config: Mapping[str, Any],
     *,
@@ -652,6 +675,9 @@ def build_hub_model_bundle(
     hidden_size = int(config.get("hidden_size") or config.get("d_model") or config.get("dim") or 0)
     if num_layers <= 0 or hidden_size <= 0:
         raise ValueError("model config does not expose positive layer count and hidden size")
+    model_max_context_tokens = get_model_context_limit(config)
+    if model_max_context_tokens is None:
+        raise ValueError("model config does not expose a finite context limit")
 
     rope_contract = _runtime_contract(
         config,
@@ -728,6 +754,8 @@ def build_hub_model_bundle(
         quantization=_quantization_identity(quantization, config),
         dtype=dtype_key,
         num_layers=num_layers,
+        model_max_context_tokens=model_max_context_tokens,
+        context_classes=context_classes_for(model_max_context_tokens),
         activation_bytes_per_token=hidden_size * _DTYPE_BYTES[dtype_key],
         kv_bytes_per_token_by_layer=_kv_bytes_per_token_by_layer(
             config,

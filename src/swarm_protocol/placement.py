@@ -8,8 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict, model_validator
-
+from swarm_protocol.context_placement import CapacityDemandMap, MemoryPlacementPoint
 from swarm_protocol.contracts import (
     LayerSpan,
     ModelManifest,
@@ -192,41 +191,6 @@ class PlacementMaterializer:
             return self.snapshot()
 
 
-class CapacityDemandMap(BaseModel):
-    """Desired independent READY replicas and relative demand per layer."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    desired_replicas_by_layer: tuple[int, ...]
-    demand_weight_by_layer: tuple[float, ...]
-
-    @model_validator(mode="after")
-    def validate_shape(self) -> "CapacityDemandMap":
-        if not self.desired_replicas_by_layer:
-            raise ValueError("capacity demand map must contain model layers")
-        if len(self.demand_weight_by_layer) != len(self.desired_replicas_by_layer):
-            raise ValueError("capacity demand arrays must have identical lengths")
-        if any(value <= 0 for value in self.desired_replicas_by_layer):
-            raise ValueError("desired replica counts must be positive")
-        if any(value <= 0 for value in self.demand_weight_by_layer):
-            raise ValueError("demand weights must be positive")
-        return self
-
-    @classmethod
-    def uniform(
-        cls,
-        num_layers: int,
-        *,
-        desired_replicas: int = 2,
-    ) -> "CapacityDemandMap":
-        if num_layers <= 0 or desired_replicas <= 0:
-            raise ValueError("layer and replica counts must be positive")
-        return cls(
-            desired_replicas_by_layer=(desired_replicas,) * num_layers,
-            demand_weight_by_layer=(1.0,) * num_layers,
-        )
-
-
 @dataclass(frozen=True)
 class PlacementScore:
     completes_fixed_route: int
@@ -337,6 +301,83 @@ class AutonomousPlacementPolicy:
                 # ownership appears only at the final boundary. Do not break:
                 # tied endpoints can make the full-model delta non-monotonic.
         return tuple(result)
+
+    def memory_frontier(
+        self,
+        *,
+        offer: WorkerOffer,
+        manifest: ModelManifest,
+        qualified_context_limit_tokens: int,
+        kv_block_size: int,
+        maximum_sessions: int = 32,
+    ) -> tuple[MemoryPlacementPoint, ...]:
+        """Return non-dominated exact memory choices across signed classes.
+
+        This deliberately models only hard resident bytes.  Runtime throughput,
+        network boundaries, cached downloads and profile confidence are added
+        by the second-pass scorer; they must not weaken the memory invariant.
+        """
+
+        if (
+            qualified_context_limit_tokens <= 0
+            or qualified_context_limit_tokens > manifest.model_max_context_tokens
+        ):
+            raise ValueError("qualified backend context limit must fit the model contract")
+        if kv_block_size <= 0 or maximum_sessions <= 0:
+            raise ValueError("KV block size and session bound must be positive")
+
+        points: list[MemoryPlacementPoint] = []
+        for context_tokens in manifest.context_classes:
+            if context_tokens > qualified_context_limit_tokens:
+                continue
+            for span, _ in self.feasible_spans(
+                offer=offer,
+                manifest=manifest,
+                context_tokens=context_tokens,
+                kv_block_size=kv_block_size,
+            ):
+                weight_bytes = manifest.weight_bytes(span)
+                rounded_tokens = (
+                    (context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
+                )
+                kv_bytes_per_session = rounded_tokens * sum(
+                    manifest.kv_bytes_per_token_by_layer[span.start : span.end]
+                )
+                if kv_bytes_per_session <= 0:
+                    continue
+                available_kv_bytes = offer.stable_memory_envelope_bytes - weight_bytes
+                max_sessions = min(maximum_sessions, available_kv_bytes // kv_bytes_per_session)
+                if max_sessions <= 0:
+                    continue
+                points.append(
+                    MemoryPlacementPoint(
+                        span=span,
+                        context_tokens=context_tokens,
+                        weight_bytes=weight_bytes,
+                        kv_bytes_per_session=kv_bytes_per_session,
+                        max_sessions=max_sessions,
+                        memory_headroom_bytes=(
+                            available_kv_bytes - max_sessions * kv_bytes_per_session
+                        ),
+                    )
+                )
+
+        frontier = [
+            point
+            for point in points
+            if not any(other.dominates(point) for other in points if other is not point)
+        ]
+        return tuple(
+            sorted(
+                frontier,
+                key=lambda point: (
+                    point.span.start,
+                    point.span.end,
+                    point.context_tokens,
+                    -point.max_sessions,
+                ),
+            )
+        )
 
     @staticmethod
     def _coverage(

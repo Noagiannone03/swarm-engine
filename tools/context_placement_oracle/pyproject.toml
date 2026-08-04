@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fabi-context-placement-oracle"
+version = "0.1.0"
+description = "Offline CP-SAT oracle for Fabi context-aware placement"
+requires-python = ">=3.10,<3.14"
+dependencies = ["ortools>=9.15,<9.16"]
+
+[project.scripts]
+fabi-context-placement-oracle = "fabi_context_placement_oracle:main"
+
+[tool.setuptools]
+py-modules = ["fabi_context_placement_oracle"]

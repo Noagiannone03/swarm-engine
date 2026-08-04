@@ -33,6 +33,13 @@ from swarm_protocol.contracts import (
     WorkerRole,
 )
 from swarm_protocol.dht_discovery import DhtDiscoveryStore
+from swarm_protocol.context_placement import (
+    CapacityDemandMap,
+    ContextCapacityDemandMap,
+    ContextClassDemand,
+    MemoryPlacementPoint,
+    cumulative_context_coverage,
+)
 from swarm_protocol.discovery import (
     CatalogRecordConflict,
     DiscoveryError,
@@ -48,7 +55,6 @@ from swarm_protocol.model_manifest import (
 )
 from swarm_protocol.placement import (
     AutonomousPlacementPolicy,
-    CapacityDemandMap,
     MaterializationPhase,
     MaterializationSnapshot,
     PlacementAction,
@@ -133,8 +139,11 @@ __all__ = [
     "BackendKind",
     "ContributionReceipt",
     "CapacityDemandMap",
+    "ContextCapacityDemandMap",
+    "ContextClassDemand",
     "MaterializationPhase",
     "MaterializationSnapshot",
+    "MemoryPlacementPoint",
     "EffectiveSpanMode",
     "KvGeometry",
     "LayerSpan",
@@ -147,6 +156,7 @@ __all__ = [
     "PlacementDecision",
     "PlacementMaterializer",
     "PlacementScore",
+    "cumulative_context_coverage",
     "RecoveryLevel",
     "RecoveryConflict",
     "RecoveryJournalCapacityError",

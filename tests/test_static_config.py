@@ -79,6 +79,18 @@ def test_model_context_limit_reads_nested_text_config_and_ignores_sentinel():
     )
 
 
+def test_model_context_limit_prefers_architecture_capacity_over_tokenizer_fallback():
+    assert (
+        get_model_context_limit(
+            {
+                "max_position_embeddings": 40_960,
+                "model_max_length": 8_192,
+            }
+        )
+        == 40_960
+    )
+
+
 def test_model_sequence_limit_is_a_safe_cap_not_a_permanent_worker_override():
     config = {"max_position_embeddings": 40960}
 

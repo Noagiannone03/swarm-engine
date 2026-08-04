@@ -10,6 +10,7 @@ from swarm_protocol.contracts import ArtifactDescriptor
 from swarm_protocol.model_manifest import (
     _get_safetensors_metadata_with_backoff,
     _hash_xet_tensor_ranges,
+    context_classes_for,
 )
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -96,6 +97,8 @@ def test_builder_resolves_moving_ref_then_hashes_exact_runtime_artifacts():
     assert [read[1] for read in reads] == ["config.json", "modeling_qwen3.py"]
     assert bundle.manifest.immutable_revision == REVISION
     assert bundle.manifest.num_layers == 28
+    assert bundle.manifest.model_max_context_tokens == 32_768
+    assert bundle.manifest.context_classes == (4_096, 8_192, 16_384, 32_768)
     assert bundle.manifest.activation_bytes_per_token == 2048 * 2
     assert {artifact.path for artifact in bundle.artifact_index.artifacts} == {
         "config.json",
@@ -232,6 +235,31 @@ def test_runtime_code_and_dtype_fork_the_swarm_but_readme_does_not():
     assert changed_code.manifest.architecture_graph_hash != base.manifest.architecture_graph_hash
     assert changed_code.manifest.model_swarm_id != base.manifest.model_swarm_id
     assert changed_dtype.manifest.model_swarm_id != base.manifest.model_swarm_id
+
+
+def test_context_classes_preserve_non_power_of_two_model_boundary():
+    assert context_classes_for(40_960) == (4_096, 8_192, 16_384, 32_768, 40_960)
+    assert context_classes_for(2_048) == (2_048,)
+
+
+def test_builder_rejects_model_without_a_finite_context_contract():
+    files, siblings, _, _ = _fixture()
+    config = json.loads(files["config.json"])
+    del config["max_position_embeddings"]
+    files["config.json"] = json.dumps(config, sort_keys=True).encode()
+    siblings = [
+        _sibling(item.rfilename, files[item.rfilename], lfs=item.lfs is not None)
+        for item in siblings
+    ]
+
+    with pytest.raises(ValueError, match="finite context limit"):
+        build_hub_model_bundle(
+            "Qwen/Qwen3-1.7B",
+            quantization="bf16",
+            dtype="bfloat16",
+            api=FakeApi(siblings),
+            artifact_reader=lambda repo_id, path, revision, token: files[path],
+        )
 
 
 def test_builder_rejects_dtype_that_cuda_loaders_would_ignore():

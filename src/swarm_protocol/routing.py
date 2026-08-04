@@ -422,6 +422,10 @@ class ExactRoutePlanner:
     ) -> PlannedRoute:
         if request.model_swarm_id != manifest.model_swarm_id:
             raise NoFeasibleRoute("request and model manifest identify different swarms")
+        if request.required_context_tokens > manifest.model_max_context_tokens:
+            raise NoFeasibleRoute(
+                "request context exceeds the signed model context limit"
+            )
 
         candidates = self._eligible_candidates(
             request=request,

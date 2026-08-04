@@ -38,6 +38,8 @@ def manifest() -> ModelManifest:
         quantization="bf16",
         dtype="bfloat16",
         num_layers=28,
+        model_max_context_tokens=65_536,
+        context_classes=(4_096, 8_192, 16_384, 32_768, 65_536),
         activation_bytes_per_token=4096,
         kv_bytes_per_token_by_layer=(512,) * 28,
         rope_context_contract_hash=HASHES[3],

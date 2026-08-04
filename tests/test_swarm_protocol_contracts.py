@@ -66,6 +66,8 @@ def make_manifest() -> ModelManifest:
         quantization="bf16",
         dtype="bfloat16",
         num_layers=28,
+        model_max_context_tokens=32_768,
+        context_classes=(4_096, 8_192, 16_384, 32_768),
         activation_bytes_per_token=4096,
         kv_bytes_per_token_by_layer=(512,) * 28,
         rope_context_contract_hash=HASH_D,
@@ -78,9 +80,31 @@ def make_manifest() -> ModelManifest:
 def test_model_swarm_id_is_deterministic_and_contract_sensitive() -> None:
     manifest = make_manifest()
     assert manifest.model_swarm_id == make_manifest().model_swarm_id
+    assert manifest.context_class_for(12_220 + 4_096) == 16_384
 
     changed = manifest.model_copy(update={"quantization": "int8"})
     assert changed.model_swarm_id != manifest.model_swarm_id
+
+    with pytest.raises(ValueError, match="exceeds"):
+        manifest.context_class_for(32_769)
+
+
+def test_manifest_rejects_ambiguous_context_classes() -> None:
+    manifest = make_manifest()
+    with pytest.raises(ValidationError, match="strictly increasing"):
+        ModelManifest.model_validate(
+            {
+                **manifest.model_dump(),
+                "context_classes": (4_096, 16_384, 8_192, 32_768),
+            }
+        )
+    with pytest.raises(ValidationError, match="final context class"):
+        ModelManifest.model_validate(
+            {
+                **manifest.model_dump(),
+                "context_classes": (4_096, 8_192, 16_384),
+            }
+        )
 
 
 def test_manifest_accounts_exact_stage_weights_and_tied_endpoints() -> None:

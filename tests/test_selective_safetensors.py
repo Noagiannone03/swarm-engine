@@ -109,6 +109,8 @@ def _fixture(root: Path) -> tuple[ModelArtifactIndex, ModelManifest, bytes]:
         quantization="unquantized",
         dtype="float32",
         num_layers=2,
+        model_max_context_tokens=65_536,
+        context_classes=(4_096, 8_192, 16_384, 32_768, 65_536),
         activation_bytes_per_token=16,
         kv_bytes_per_token_by_layer=(8, 8),
         rope_context_contract_hash="1" * 64,

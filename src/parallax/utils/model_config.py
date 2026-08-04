@@ -106,21 +106,31 @@ def get_model_context_limit(config: dict) -> int | None:
     "unknown" and are excluded.
     """
 
-    candidates = [
-        config.get("max_position_embeddings"),
-        config.get("model_max_length"),
-    ]
+    def finite_limit(value: Any) -> int | None:
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and 0 < value < 2**63
+        ):
+            return int(value)
+        return None
+
     text_config = config.get("text_config")
     if isinstance(text_config, dict):
-        candidates.extend(
-            [
-                text_config.get("max_position_embeddings"),
-                text_config.get("model_max_length"),
-            ]
-        )
-    limits = [
-        int(value)
-        for value in candidates
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < 2**63
-    ]
-    return min(limits) if limits else None
+        # A VLM's text tower is authoritative over similarly named top-level
+        # image/video fields.
+        nested_position_limit = finite_limit(text_config.get("max_position_embeddings"))
+        if nested_position_limit is not None:
+            return nested_position_limit
+    position_limit = finite_limit(config.get("max_position_embeddings"))
+    if position_limit is not None:
+        return position_limit
+
+    # ``model_max_length`` is commonly tokenizer metadata. It is only a
+    # fallback when the architecture does not declare positional capacity; it
+    # must not silently lower a real ``max_position_embeddings`` contract.
+    if isinstance(text_config, dict):
+        nested_model_limit = finite_limit(text_config.get("model_max_length"))
+        if nested_model_limit is not None:
+            return nested_model_limit
+    return finite_limit(config.get("model_max_length"))

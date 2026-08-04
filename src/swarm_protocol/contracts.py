@@ -268,6 +268,13 @@ class ModelManifest(ContractModel):
     quantization: NonEmpty
     dtype: NonEmpty
     num_layers: PositiveInt
+    # Explicit, signed total-sequence limit derived from the immutable model
+    # configuration.  The rope contract hash alone proves equality but cannot
+    # be used by autonomous workers to build context-aware demand classes.
+    model_max_context_tokens: PositiveInt
+    context_classes: Annotated[
+        tuple[PositiveInt, ...], Field(min_length=1, max_length=32)
+    ]
     activation_bytes_per_token: PositiveInt
     kv_bytes_per_token_by_layer: tuple[PositiveInt, ...]
     weight_bytes_by_layer: tuple[PositiveInt, ...] = ()
@@ -285,6 +292,10 @@ class ModelManifest(ContractModel):
             raise ValueError(f"unsupported protocol version: {self.protocol_version}")
         if len(self.kv_bytes_per_token_by_layer) != self.num_layers:
             raise ValueError("KV byte geometry must contain exactly one value per model layer")
+        if tuple(sorted(set(self.context_classes))) != self.context_classes:
+            raise ValueError("context classes must be strictly increasing and unique")
+        if self.context_classes[-1] != self.model_max_context_tokens:
+            raise ValueError("the final context class must equal the model context limit")
         if self.weight_bytes_by_layer and len(self.weight_bytes_by_layer) != self.num_layers:
             raise ValueError("weight byte geometry must contain exactly one value per model layer")
         if self.shared_endpoint_weight_bytes > min(
@@ -311,6 +322,16 @@ class ModelManifest(ContractModel):
         if owns_input and owns_output:
             total -= self.shared_endpoint_weight_bytes
         return total
+
+    def context_class_for(self, required_tokens: int) -> int:
+        """Return the smallest signed service class that can hold a request."""
+
+        if required_tokens <= 0:
+            raise ValueError("required context tokens must be positive")
+        for context_class in self.context_classes:
+            if context_class >= required_tokens:
+                return context_class
+        raise ValueError("required context exceeds the signed model limit")
 
     @property
     def model_swarm_id(self) -> str:

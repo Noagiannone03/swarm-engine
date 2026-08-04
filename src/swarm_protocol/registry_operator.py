@@ -411,6 +411,8 @@ def _bundle_summary(bundle: ModelRegistryBundle) -> dict[str, object]:
         "immutable_revision": bundle.manifest.immutable_revision,
         "model_swarm_id": bundle.model_swarm_id,
         "num_layers": bundle.manifest.num_layers,
+        "model_max_context_tokens": bundle.manifest.model_max_context_tokens,
+        "context_classes": list(bundle.manifest.context_classes),
         "artifacts": len(bundle.artifact_index.artifacts),
         "tensors": len(bundle.artifact_index.tensors),
         "signed_tensor_bytes": sum(tensor.length for tensor in bundle.artifact_index.tensors),

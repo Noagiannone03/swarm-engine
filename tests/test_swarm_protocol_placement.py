@@ -6,6 +6,8 @@ from swarm_protocol import (
     AutonomousPlacementPolicy,
     BackendKind,
     CapacityDemandMap,
+    ContextCapacityDemandMap,
+    ContextClassDemand,
     EffectiveSpanMode,
     KvGeometry,
     LayerSpan,
@@ -18,6 +20,7 @@ from swarm_protocol import (
     SpanState,
     WorkerOffer,
     WorkerRole,
+    cumulative_context_coverage,
 )
 
 HASHES = tuple(character * 64 for character in "abcdef")
@@ -35,6 +38,8 @@ def manifest() -> ModelManifest:
         quantization="bf16",
         dtype="bfloat16",
         num_layers=4,
+        model_max_context_tokens=65_536,
+        context_classes=(4_096, 8_192, 16_384, 32_768, 65_536),
         activation_bytes_per_token=128,
         kv_bytes_per_token_by_layer=(10,) * 4,
         weight_bytes_by_layer=(100,) * 4,
@@ -389,6 +394,129 @@ def test_disjoint_lab_topology_moves_redundant_head_to_uncovered_tail():
     assert decision.action is PlacementAction.MOVE
     assert decision.span == LayerSpan(start=32, end=36)
     assert decision.reason == "coverage_preserved_and_verified_gain_exceeds_hysteresis"
+
+
+def _context_demand(model: ModelManifest) -> ContextCapacityDemandMap:
+    return ContextCapacityDemandMap(
+        model_swarm_id=model.model_swarm_id,
+        region_id="eu-west",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+        classes=tuple(
+            ContextClassDemand(
+                context_tokens=context_tokens,
+                desired_independent_routes=1 if context_tokens <= 32_768 else 0,
+                desired_replicas_by_layer=(1,) * model.num_layers,
+                demand_weight_by_layer=(1.0,) * model.num_layers,
+            )
+            for context_tokens in model.context_classes
+        ),
+    )
+
+
+def test_context_demand_is_versioned_expiring_and_matches_the_signed_ladder():
+    model = manifest()
+    demand = _context_demand(model)
+
+    demand.validate_for(model, now_ms=2_000)
+    assert demand.class_for(16_385).context_tokens == 32_768
+    assert demand.class_for(16_384).layer_screen() == CapacityDemandMap.uniform(4, desired_replicas=1)
+
+    with pytest.raises(ValueError, match="expired"):
+        demand.validate_for(model, now_ms=61_000)
+    with pytest.raises(ValueError, match="exceeds"):
+        demand.class_for(65_537)
+
+
+def test_context_demand_rejects_unsorted_or_wrong_model_classes():
+    model = manifest()
+    demand = _context_demand(model)
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        ContextCapacityDemandMap.model_validate(
+            {
+                **demand.model_dump(),
+                "classes": tuple(reversed(demand.classes)),
+            }
+        )
+
+    missing_class = demand.model_copy(update={"classes": demand.classes[:-1]})
+    with pytest.raises(ValueError, match="signed model contract"):
+        missing_class.validate_for(model, now_ms=2_000)
+
+
+def test_memory_frontier_exposes_exact_span_context_session_tradeoffs():
+    model = manifest().model_copy(
+        update={
+            "model_max_context_tokens": 40,
+            "context_classes": (10, 20, 40),
+        }
+    )
+    points = AutonomousPlacementPolicy().memory_frontier(
+        offer=offer(memory_bytes=700),
+        manifest=model,
+        qualified_context_limit_tokens=40,
+        kv_block_size=1,
+    )
+
+    by_key = {(point.span, point.context_tokens): point for point in points}
+    short = by_key[(LayerSpan(start=0, end=2), 10)]
+    long = by_key[(LayerSpan(start=0, end=2), 20)]
+    assert (short.weight_bytes, short.kv_bytes_per_session, short.max_sessions) == (300, 200, 2)
+    assert (long.weight_bytes, long.kv_bytes_per_session, long.max_sessions) == (300, 400, 1)
+    assert (LayerSpan(start=0, end=2), 40) not in by_key
+    assert all(point.required_memory_bytes <= 700 for point in points)
+
+
+def test_memory_frontier_never_offers_frontend_layers_to_executor_only_worker():
+    model = manifest().model_copy(
+        update={
+            "model_max_context_tokens": 40,
+            "context_classes": (10, 20, 40),
+        }
+    )
+
+    points = AutonomousPlacementPolicy().memory_frontier(
+        offer=offer(memory_bytes=700, frontend=False),
+        manifest=model,
+        qualified_context_limit_tokens=40,
+        kv_block_size=1,
+    )
+
+    assert points
+    assert all(point.span.start > 0 for point in points)
+
+
+def test_memory_frontier_never_exceeds_the_qualified_backend_limit():
+    model = manifest().model_copy(
+        update={
+            "model_max_context_tokens": 40,
+            "context_classes": (10, 20, 40),
+        }
+    )
+
+    points = AutonomousPlacementPolicy().memory_frontier(
+        offer=offer(memory_bytes=700),
+        manifest=model,
+        qualified_context_limit_tokens=20,
+        kv_block_size=1,
+    )
+
+    assert points
+    assert all(point.context_tokens <= 20 for point in points)
+
+
+def test_long_context_lease_counts_cumulatively_but_short_lease_does_not():
+    model = manifest()
+    long_lease = lease(model, "long", 0, 2).model_copy(update={"max_context_tokens": 65_536})
+    short_lease = lease(model, "short", 2, 4).model_copy(update={"max_context_tokens": 16_384})
+
+    coverage = cumulative_context_coverage(model, (long_lease, short_lease))
+
+    assert coverage[4_096] == (1, 1, 1, 1)
+    assert coverage[16_384] == (1, 1, 1, 1)
+    assert coverage[32_768] == (1, 1, 0, 0)
+    assert coverage[65_536] == (1, 1, 0, 0)
 
 
 class FakeDrain:

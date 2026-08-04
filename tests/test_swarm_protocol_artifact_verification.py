@@ -90,6 +90,8 @@ def _fixture(root: Path):
         quantization="unquantized",
         dtype="bfloat16",
         num_layers=4,
+        model_max_context_tokens=65_536,
+        context_classes=(4_096, 8_192, 16_384, 32_768, 65_536),
         activation_bytes_per_token=128,
         kv_bytes_per_token_by_layer=(64,) * 4,
         rope_context_contract_hash="1" * 64,

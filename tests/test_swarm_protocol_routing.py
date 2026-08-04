@@ -32,6 +32,8 @@ def manifest(num_layers: int = 8) -> ModelManifest:
         quantization="bf16",
         dtype="bfloat16",
         num_layers=num_layers,
+        model_max_context_tokens=65_536,
+        context_classes=(4_096, 8_192, 16_384, 32_768, 65_536),
         activation_bytes_per_token=4096,
         kv_bytes_per_token_by_layer=(512,) * num_layers,
         rope_context_contract_hash=HASHES[3],
@@ -227,6 +229,25 @@ def test_per_session_context_ceiling_wins_over_large_aggregate_kv_capacity() -> 
                     max_context_tokens=16_384,
                 )
             ],
+            [],
+        )
+
+
+def test_signed_model_context_limit_wins_over_worker_claim() -> None:
+    model = manifest().model_copy(
+        update={
+            "model_max_context_tokens": 16_384,
+            "context_classes": (4_096, 8_192, 16_384),
+        }
+    )
+    req = request(model, prompt=16_000, output=721)
+
+    with pytest.raises(NoFeasibleRoute, match="signed model context limit"):
+        plan(
+            model,
+            req,
+            [offer("worker")],
+            [lease(model, "worker", 0, 8, max_context_tokens=65_536)],
             [],
         )
 
