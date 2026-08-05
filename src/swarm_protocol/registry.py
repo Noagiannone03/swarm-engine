@@ -19,6 +19,7 @@ from typing import Annotated
 
 from pydantic import Field, model_validator
 from securesystemslib.signer import Signer
+from tuf.api.exceptions import UnsignedMetadataError
 from tuf.api.metadata import (
     Metadata,
     MetaFile,
@@ -372,7 +373,9 @@ class TufRegistryPublisher:
         _atomic_write(self.metadata_dir / "1.root.json", root_bytes)
         self._publish_generation(
             bundles,
-            version=1,
+            targets_version=1,
+            snapshot_version=1,
+            timestamp_version=1,
             root=root,
             now=current,
             route_authorities=route_authorities,
@@ -389,22 +392,27 @@ class TufRegistryPublisher:
         """Atomically expose a new complete targets/snapshot/timestamp generation."""
 
         root = self._load_latest_root()
-        current_version = self._latest_role_version("targets")
-        version = current_version + 1
+        targets_version = self._latest_role_version("targets") + 1
+        snapshot_version = self._latest_role_version("snapshot") + 1
+        timestamp_version = self._current_timestamp_version() + 1
         self._publish_generation(
             bundles,
-            version=version,
+            targets_version=targets_version,
+            snapshot_version=snapshot_version,
+            timestamp_version=timestamp_version,
             root=root,
             now=_utc_now(now),
             route_authorities=route_authorities,
         )
-        return version
+        return targets_version
 
     def _publish_generation(
         self,
         bundles: tuple[ModelRegistryBundle, ...],
         *,
-        version: int,
+        targets_version: int,
+        snapshot_version: int,
+        timestamp_version: int,
         root: Metadata[Root],
         now: datetime,
         route_authorities: RouteAuthorityKeyset | None,
@@ -412,7 +420,7 @@ class TufRegistryPublisher:
         payloads = _target_payloads(bundles, route_authorities)
         targets = Metadata(
             Targets(
-                version=version,
+                version=targets_version,
                 expires=now + self.expiry.targets,
                 targets={
                     path: TargetFile.from_data(path, payload)
@@ -425,10 +433,14 @@ class TufRegistryPublisher:
 
         snapshot = Metadata(
             Snapshot(
-                version=version,
+                version=snapshot_version,
                 expires=now + self.expiry.snapshot,
                 meta={
-                    "targets.json": MetaFile.from_data(version, targets_bytes, ["sha256"]),
+                    "targets.json": MetaFile.from_data(
+                        targets_version,
+                        targets_bytes,
+                        ["sha256"],
+                    ),
                 },
             )
         )
@@ -437,9 +449,13 @@ class TufRegistryPublisher:
 
         timestamp = Metadata(
             Timestamp(
-                version=version,
+                version=timestamp_version,
                 expires=now + self.expiry.timestamp,
-                snapshot_meta=MetaFile.from_data(version, snapshot_bytes, ["sha256"]),
+                snapshot_meta=MetaFile.from_data(
+                    snapshot_version,
+                    snapshot_bytes,
+                    ["sha256"],
+                ),
             )
         )
         timestamp_bytes = _sign(timestamp, self.signers.timestamp)
@@ -452,9 +468,44 @@ class TufRegistryPublisher:
             logical = Path(target_path)
             consistent_name = logical.with_name(f"{target_hash}.{logical.name}")
             _atomic_write(self.targets_dir / consistent_name, payload)
-        _atomic_write(self.metadata_dir / f"{version}.targets.json", targets_bytes)
-        _atomic_write(self.metadata_dir / f"{version}.snapshot.json", snapshot_bytes)
+        _atomic_write(
+            self.metadata_dir / f"{targets_version}.targets.json",
+            targets_bytes,
+        )
+        _atomic_write(
+            self.metadata_dir / f"{snapshot_version}.snapshot.json",
+            snapshot_bytes,
+        )
         _atomic_write(self.metadata_dir / "timestamp.json", timestamp_bytes)
+
+    def _current_timestamp_version(self) -> int:
+        path = self.metadata_dir / "timestamp.json"
+        metadata = Metadata.from_file(str(path))
+        if not isinstance(metadata.signed, Timestamp):
+            raise ValueError("timestamp.json does not contain TUF timestamp metadata")
+        # A root rotation can replace the timestamp key before the next full
+        # publication.  The current timestamp is then correctly signed by the
+        # immediately preceding root, not by the latest one.  Accept its
+        # version only if one root in the retained, versioned trust history
+        # authenticates it; never derive a rollback-sensitive version from
+        # unverified local JSON.
+        for version in range(self._latest_role_version("root"), 0, -1):
+            root_path = self.metadata_dir / f"{version}.root.json"
+            if not root_path.exists():
+                continue
+            root = Metadata.from_file(str(root_path))
+            if not isinstance(root.signed, Root):
+                continue
+            try:
+                root.signed.verify_delegate(
+                    "timestamp",
+                    metadata.signed_bytes,
+                    metadata.signatures,
+                )
+            except (UnsignedMetadataError, ValueError):
+                continue
+            return metadata.signed.version
+        raise ValueError("timestamp.json is not authenticated by any retained root")
 
     def rotate_root(
         self,

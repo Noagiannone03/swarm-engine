@@ -25,6 +25,7 @@ from swarm_protocol import (
     RouteAuthorityKeyset,
     TrustedModelRegistry,
     TufRegistryPublisher,
+    TufTimestampRefresher,
     artifact_collection_hash,
 )
 
@@ -257,6 +258,30 @@ def test_tuf_registry_rejects_timestamp_rollback(tmp_path):
         (repository / "metadata" / "timestamp.json").write_bytes(old_timestamp)
         with pytest.raises(BadVersionNumberError):
             client.fetch(bundle.model_swarm_id)
+
+
+def test_full_publish_advances_timestamp_after_independent_refreshes(tmp_path):
+    repository = tmp_path / "repository"
+    signers = _signers()
+    publisher = TufRegistryPublisher(repository, signers)
+    bundle = _bundle()
+    now = datetime.now(timezone.utc)
+    root_bytes = publisher.initialize((bundle,), now=now)
+    refresher = TufTimestampRefresher(repository, signers.timestamp)
+
+    assert refresher.refresh(now=now + timedelta(minutes=1)) == 2
+    assert refresher.refresh(now=now + timedelta(minutes=2)) == 3
+
+    with _serve(repository) as base_url:
+        client = _client(tmp_path / "client", base_url, root_bytes)
+        assert client.fetch(bundle.model_swarm_id) == bundle
+
+        assert publisher.publish((bundle,), now=now + timedelta(minutes=3)) == 2
+        assert client.fetch(bundle.model_swarm_id) == bundle
+
+    timestamp = __import__("json").loads((repository / "metadata" / "timestamp.json").read_bytes())
+    assert timestamp["signed"]["version"] == 4
+    assert timestamp["signed"]["meta"]["snapshot.json"]["version"] == 2
 
 
 def test_registry_bundle_rejects_manifest_index_substitution():
