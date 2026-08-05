@@ -11,8 +11,18 @@ class PlacementOracleTest(unittest.TestCase):
             "num_layers": 4,
             "context_classes": [10, 20],
             "demands": [
-                {"context_tokens": 10, "target_slots": 1, "weight": 1},
-                {"context_tokens": 20, "target_slots": 1, "weight": 10},
+                {
+                    "context_tokens": 10,
+                    "target_concurrent_slots": 1,
+                    "target_independent_routes": 1,
+                    "weight": 1,
+                },
+                {
+                    "context_tokens": 20,
+                    "target_concurrent_slots": 1,
+                    "target_independent_routes": 1,
+                    "weight": 10,
+                },
             ],
             "workers": [
                 {
@@ -51,7 +61,12 @@ class PlacementOracleTest(unittest.TestCase):
 
         result = solve(scenario)
 
-        self.assertEqual(result["served_slots_by_context"], {"10": 0, "20": 1})
+        self.assertEqual(
+            result["served_concurrent_slots_by_context"], {"10": 0, "20": 1}
+        )
+        self.assertEqual(
+            result["served_independent_routes_by_context"], {"10": 0, "20": 1}
+        )
         self.assertEqual(
             {(item["worker_id"], item["option_id"]) for item in result["placements"]},
             {("adaptive", "long-head"), ("tail", "long-tail")},
@@ -62,8 +77,18 @@ class PlacementOracleTest(unittest.TestCase):
             "num_layers": 2,
             "context_classes": [10, 20],
             "demands": [
-                {"context_tokens": 10, "target_slots": 2, "weight": 1},
-                {"context_tokens": 20, "target_slots": 2, "weight": 1},
+                {
+                    "context_tokens": 10,
+                    "target_concurrent_slots": 2,
+                    "target_independent_routes": 1,
+                    "weight": 1,
+                },
+                {
+                    "context_tokens": 20,
+                    "target_concurrent_slots": 2,
+                    "target_independent_routes": 1,
+                    "weight": 1,
+                },
             ],
             "workers": [
                 {
@@ -83,7 +108,45 @@ class PlacementOracleTest(unittest.TestCase):
 
         result = solve(scenario)
 
-        self.assertEqual(sum(result["served_slots_by_context"].values()), 2)
+        self.assertEqual(
+            sum(result["served_concurrent_slots_by_context"].values()), 2
+        )
+        self.assertEqual(
+            sum(result["served_independent_routes_by_context"].values()), 1
+        )
+
+    def test_one_worker_with_many_sessions_is_not_route_redundancy(self) -> None:
+        scenario = {
+            "num_layers": 2,
+            "context_classes": [20],
+            "demands": [
+                {
+                    "context_tokens": 20,
+                    "target_concurrent_slots": 4,
+                    "target_independent_routes": 4,
+                    "weight": 1,
+                }
+            ],
+            "workers": [
+                {
+                    "worker_id": "one-domain",
+                    "options": [
+                        {
+                            "option_id": "full",
+                            "start_layer": 0,
+                            "end_layer": 2,
+                            "context_tokens": 20,
+                            "max_sessions": 4,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        result = solve(scenario)
+
+        self.assertEqual(result["served_concurrent_slots_by_context"], {"20": 4})
+        self.assertEqual(result["served_independent_routes_by_context"], {"20": 1})
 
 
 if __name__ == "__main__":

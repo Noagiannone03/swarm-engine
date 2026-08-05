@@ -13,6 +13,7 @@ from swarm_protocol.placement_simulator import (
     build_oracle_scenario,
     build_synthetic_memory_frontiers,
     evaluate_context_service,
+    exo_memory_proportional_fixed_context_placements,
     greedy_context_placements,
     maximum_span_placements,
     petals_fixed_context_placements,
@@ -181,8 +182,18 @@ def test_oracle_scenario_is_deterministic_and_uses_aggregated_demand_only():
 
     assert [worker["worker_id"] for worker in scenario["workers"]] == ["worker-a", "worker-b"]
     assert scenario["demands"] == [
-        {"context_tokens": 10, "target_slots": 2, "weight": 1_000},
-        {"context_tokens": 20, "target_slots": 3, "weight": 4_000},
+        {
+            "context_tokens": 10,
+            "target_concurrent_slots": 2,
+            "target_independent_routes": 1,
+            "weight": 1_000,
+        },
+        {
+            "context_tokens": 20,
+            "target_concurrent_slots": 3,
+            "target_independent_routes": 1,
+            "weight": 4_000,
+        },
     ]
     assert set(scenario) == {"num_layers", "context_classes", "demands", "workers"}
 
@@ -307,6 +318,17 @@ def test_agentic_policy_spreads_an_explicit_8_16g_class_population_for_context()
         context_tokens=65_536,
         now_ms=2_000,
     )
+    exo_long = exo_memory_proportional_fixed_context_placements(
+        model,
+        demand,
+        frontiers,
+        {
+            worker_id: (4 * gib if worker_id.startswith("stable-4g") else 10 * gib)
+            for worker_id in frontiers
+        },
+        context_tokens=65_536,
+        now_ms=2_000,
+    )
     context_aware = greedy_context_placements(model, demand, frontiers, now_ms=2_000)
 
     assert [item.concurrent_service_slots for item in maximum_span.service] == [4, 0, 0]
@@ -320,7 +342,26 @@ def test_agentic_policy_spreads_an_explicit_8_16g_class_population_for_context()
     # backend contract may not, so layer coverage alone does not prove that
     # the exact span boundaries form a route.
     assert petals_long.service[-1].concurrent_service_slots == 0
+    assert [placement.point.span.length for placement in exo_long.placements] == [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        6,
+        6,
+        6,
+        6,
+    ]
+    assert exo_long.service[-1].concurrent_service_slots == 4
+    assert exo_long.service[-1].independent_worker_routes == 1
     assert [item.concurrent_service_slots for item in context_aware.service] == [2, 2, 2]
+    assert [item.independent_worker_routes for item in context_aware.service] == [
+        2,
+        2,
+        2,
+    ]
     assert all(
         placement.point.context_tokens == 65_536
         for placement in context_aware.placements

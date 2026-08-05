@@ -21,3 +21,9 @@ contiguous layer edge with a qualified context class and a session capacity.
 For every demand class CP-SAT creates a conserved source-to-tail flow. Flows
 share the selected option's capacity across classes, so one long-context slot
 cannot be counted again as simultaneous short-context capacity.
+
+The oracle keeps two separate conserved flows: concurrent KV session slots use
+each option's `max_sessions`, while independent routes cap every worker option
+at one. Both capacities are shared across context classes, and route capacity
+has the same two-to-one priority used by the shadow heuristic. This prevents a
+single high-concurrency failure domain from being reported as route redundancy.

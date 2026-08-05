@@ -14,7 +14,8 @@ from ortools.sat.python import cp_model
 @dataclass(frozen=True)
 class Demand:
     context_tokens: int
-    target_slots: int
+    target_concurrent_slots: int
+    target_independent_routes: int
     weight: int
 
 
@@ -40,6 +41,27 @@ def _nonnegative_int(value: Any, name: str) -> int:
     return value
 
 
+def _parse_demand(item: Any) -> Demand:
+    expected = {
+        "context_tokens",
+        "target_concurrent_slots",
+        "target_independent_routes",
+        "weight",
+    }
+    if not isinstance(item, dict) or set(item) != expected:
+        raise ValueError("demand contains missing or unknown fields")
+    return Demand(
+        context_tokens=_positive_int(item["context_tokens"], "demand context"),
+        target_concurrent_slots=_nonnegative_int(
+            item["target_concurrent_slots"], "target_concurrent_slots"
+        ),
+        target_independent_routes=_nonnegative_int(
+            item["target_independent_routes"], "target_independent_routes"
+        ),
+        weight=_positive_int(item["weight"], "demand weight"),
+    )
+
+
 def _parse_scenario(payload: dict[str, Any]) -> tuple[int, tuple[Demand, ...], tuple[Option, ...]]:
     if set(payload) != {"num_layers", "context_classes", "demands", "workers"}:
         raise ValueError("scenario contains missing or unknown top-level fields")
@@ -50,14 +72,7 @@ def _parse_scenario(payload: dict[str, Any]) -> tuple[int, tuple[Demand, ...], t
     if context_classes != tuple(sorted(set(context_classes))):
         raise ValueError("context classes must be strictly increasing and unique")
 
-    demands = tuple(
-        Demand(
-            context_tokens=_positive_int(item["context_tokens"], "demand context"),
-            target_slots=_nonnegative_int(item["target_slots"], "target_slots"),
-            weight=_positive_int(item["weight"], "demand weight"),
-        )
-        for item in payload["demands"]
-    )
+    demands = tuple(_parse_demand(item) for item in payload["demands"])
     demand_contexts = tuple(item.context_tokens for item in demands)
     if demand_contexts != context_classes:
         raise ValueError("demands must exactly match the ordered context classes")
@@ -129,58 +144,92 @@ def solve(payload: dict[str, Any], *, max_time_seconds: float = 30.0) -> dict[st
     for indices in by_worker.values():
         model.add(sum(selected[index] for index in indices) <= 1)
 
-    flows: dict[tuple[int, int], cp_model.IntVar] = {}
+    slot_flows: dict[tuple[int, int], cp_model.IntVar] = {}
+    route_flows: dict[tuple[int, int], cp_model.IntVar] = {}
     for demand_index, demand in enumerate(demands):
         for option_index, option in enumerate(options):
             if option.context_tokens < demand.context_tokens:
                 continue
-            flow = model.new_int_var(
+            slot_flow = model.new_int_var(
                 0,
                 option.max_sessions,
-                f"flow_c{demand.context_tokens}_o{option_index}",
+                f"slot_flow_c{demand.context_tokens}_o{option_index}",
             )
-            model.add(flow <= option.max_sessions * selected[option_index])
-            flows[demand_index, option_index] = flow
+            model.add(slot_flow <= option.max_sessions * selected[option_index])
+            slot_flows[demand_index, option_index] = slot_flow
+            route_flow = model.new_int_var(
+                0,
+                1,
+                f"route_flow_c{demand.context_tokens}_o{option_index}",
+            )
+            model.add(route_flow <= selected[option_index])
+            route_flows[demand_index, option_index] = route_flow
 
     # A selected placement has one shared KV pool. A long-context option can
     # serve a shorter class, but the same session slot cannot serve both at the
     # same instant.
     for option_index, option in enumerate(options):
-        option_flows = [
+        option_slot_flows = [
             flow
-            for (demand_index, index), flow in flows.items()
+            for (_demand_index, index), flow in slot_flows.items()
             if index == option_index
         ]
-        if option_flows:
-            model.add(sum(option_flows) <= option.max_sessions * selected[option_index])
+        if option_slot_flows:
+            model.add(
+                sum(option_slot_flows)
+                <= option.max_sessions * selected[option_index]
+            )
+        option_route_flows = [
+            flow
+            for (_demand_index, index), flow in route_flows.items()
+            if index == option_index
+        ]
+        if option_route_flows:
+            model.add(sum(option_route_flows) <= selected[option_index])
 
-    served: dict[int, cp_model.IntVar] = {}
+    served_slots: dict[int, cp_model.IntVar] = {}
+    served_routes: dict[int, cp_model.IntVar] = {}
     for demand_index, demand in enumerate(demands):
-        served[demand_index] = model.new_int_var(
-            0, demand.target_slots, f"served_c{demand.context_tokens}"
+        served_slots[demand_index] = model.new_int_var(
+            0,
+            demand.target_concurrent_slots,
+            f"served_slots_c{demand.context_tokens}",
         )
-        for boundary in range(num_layers + 1):
-            outgoing = [
-                flow
-                for (class_index, option_index), flow in flows.items()
-                if class_index == demand_index and options[option_index].start_layer == boundary
-            ]
-            incoming = [
-                flow
-                for (class_index, option_index), flow in flows.items()
-                if class_index == demand_index and options[option_index].end_layer == boundary
-            ]
-            if boundary == 0:
-                model.add(sum(outgoing) - sum(incoming) == served[demand_index])
-            elif boundary == num_layers:
-                model.add(sum(incoming) - sum(outgoing) == served[demand_index])
-            else:
-                model.add(sum(incoming) == sum(outgoing))
+        served_routes[demand_index] = model.new_int_var(
+            0,
+            demand.target_independent_routes,
+            f"served_routes_c{demand.context_tokens}",
+        )
+        for flows, served in (
+            (slot_flows, served_slots[demand_index]),
+            (route_flows, served_routes[demand_index]),
+        ):
+            for boundary in range(num_layers + 1):
+                outgoing = [
+                    flow
+                    for (class_index, option_index), flow in flows.items()
+                    if class_index == demand_index
+                    and options[option_index].start_layer == boundary
+                ]
+                incoming = [
+                    flow
+                    for (class_index, option_index), flow in flows.items()
+                    if class_index == demand_index
+                    and options[option_index].end_layer == boundary
+                ]
+                if boundary == 0:
+                    model.add(sum(outgoing) - sum(incoming) == served)
+                elif boundary == num_layers:
+                    model.add(sum(incoming) - sum(outgoing) == served)
+                else:
+                    model.add(sum(incoming) == sum(outgoing))
 
     selection_penalty_bound = len(options) + 1
     model.maximize(
         sum(
-            demand.weight * selection_penalty_bound * served[index]
+            demand.weight
+            * selection_penalty_bound
+            * (served_slots[index] + 2 * served_routes[index])
             for index, demand in enumerate(demands)
         )
         - sum(selected.values())
@@ -209,8 +258,12 @@ def solve(payload: dict[str, Any], *, max_time_seconds: float = 30.0) -> dict[st
     return {
         "status": solver.status_name(status).lower(),
         "placements": chosen,
-        "served_slots_by_context": {
-            str(demand.context_tokens): solver.value(served[index])
+        "served_concurrent_slots_by_context": {
+            str(demand.context_tokens): solver.value(served_slots[index])
+            for index, demand in enumerate(demands)
+        },
+        "served_independent_routes_by_context": {
+            str(demand.context_tokens): solver.value(served_routes[index])
             for index, demand in enumerate(demands)
         },
     }

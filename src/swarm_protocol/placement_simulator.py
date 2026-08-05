@@ -382,6 +382,113 @@ def petals_fixed_context_placements(
     )
 
 
+def _largest_remainder_layer_allocation(
+    total_layers: int,
+    memory_bytes: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Mirror Exo's proportional allocation without importing its runtime."""
+
+    if not memory_bytes:
+        raise ValueError("Exo baseline requires at least one worker")
+    if any(value <= 0 for value in memory_bytes):
+        raise ValueError("Exo baseline memory values must be positive")
+    if total_layers < len(memory_bytes):
+        raise ValueError("Exo baseline requires at least one layer per worker")
+
+    total_memory = sum(memory_bytes)
+    numerators = tuple(value * total_layers for value in memory_bytes)
+    result = [value // total_memory for value in numerators]
+    by_remainder = sorted(
+        range(len(memory_bytes)),
+        key=lambda index: (numerators[index] % total_memory, -index),
+        reverse=True,
+    )
+    for index in by_remainder[: total_layers - sum(result)]:
+        result[index] += 1
+
+    # This is the same minimum-one correction as Exo. It matters for large
+    # heterogeneous cycles where a small contributor rounds down to zero.
+    for index, allocated in enumerate(result):
+        if allocated != 0:
+            continue
+        donor = max(range(len(result)), key=lambda item: (result[item], -item))
+        if result[donor] <= 1:
+            raise ValueError("Exo baseline cannot preserve one layer per worker")
+        result[donor] -= 1
+        result[index] = 1
+    return tuple(result)
+
+
+def exo_memory_proportional_fixed_context_placements(
+    manifest: ModelManifest,
+    demand: ContextCapacityDemandMap,
+    worker_frontiers: Mapping[str, tuple[MemoryPlacementPoint, ...]],
+    worker_memory_bytes: Mapping[str, int],
+    *,
+    context_tokens: int,
+    now_ms: int,
+) -> GreedyPlacementResult:
+    """Exo-style one-cycle baseline adapted to Fabi's exact span contract.
+
+    Exo allocates a contiguous pipeline proportionally to each node's reported
+    available memory. It does not optimize multiple context classes or route
+    redundancy. This baseline keeps that objective, fixes one signed context,
+    and selects the closest feasible contiguous chain from Fabi's exact local
+    frontiers. A dynamic program is required because Fabi's endpoint weights
+    make some otherwise proportional boundaries infeasible.
+    """
+
+    demand.validate_for(manifest, now_ms=now_ms)
+    if context_tokens not in manifest.context_classes:
+        raise ValueError("Exo baseline requires a signed context class")
+    worker_ids = tuple(worker_frontiers)
+    if set(worker_ids) != set(worker_memory_bytes):
+        raise ValueError("Exo baseline memory map must exactly match worker frontiers")
+    targets = _largest_remainder_layer_allocation(
+        manifest.num_layers,
+        tuple(worker_memory_bytes[worker_id] for worker_id in worker_ids),
+    )
+
+    # cursor -> (rank, placements). The rank first minimizes deviation from
+    # Exo's proportional split, then prefers the strongest KV bottleneck.
+    states: dict[
+        int,
+        tuple[tuple[int, int, int], tuple[SimulatedPlacement, ...]],
+    ] = {0: ((0, 0, 0), ())}
+    for worker_id, target_layers in zip(worker_ids, targets, strict=True):
+        next_states: dict[
+            int,
+            tuple[tuple[int, int, int], tuple[SimulatedPlacement, ...]],
+        ] = {}
+        for cursor, (rank, selected) in states.items():
+            for point in worker_frontiers[worker_id]:
+                if point.context_tokens != context_tokens or point.span.start != cursor:
+                    continue
+                candidate_rank = (
+                    rank[0] - abs(point.span.length - target_layers),
+                    min(rank[1], point.max_sessions) if selected else point.max_sessions,
+                    rank[2] + point.max_sessions,
+                )
+                candidate = (*selected, SimulatedPlacement(worker_id, point))
+                previous = next_states.get(point.span.end)
+                if previous is None or candidate_rank > previous[0]:
+                    next_states[point.span.end] = (candidate_rank, candidate)
+        states = next_states
+        if not states:
+            break
+
+    complete = states.get(manifest.num_layers)
+    if complete is None:
+        raise ValueError(
+            "Exo proportional split cannot form an exact Fabi fixed-span route"
+        )
+    result = complete[1]
+    return GreedyPlacementResult(
+        placements=result,
+        service=evaluate_context_service(manifest, result),
+    )
+
+
 def score_candidate_potential(
     manifest: ModelManifest,
     demand: ContextCapacityDemandMap,
@@ -399,6 +506,27 @@ def score_candidate_potential(
     before = {
         item.context_tokens: item for item in evaluate_context_service(manifest, placements)
     }
+    return _score_candidate_potential_from_state(
+        manifest,
+        demand,
+        placements,
+        candidate,
+        before=before,
+        coverage=_placement_context_coverage(manifest, placements),
+    )
+
+
+def _score_candidate_potential_from_state(
+    manifest: ModelManifest,
+    demand: ContextCapacityDemandMap,
+    placements: tuple[SimulatedPlacement, ...],
+    candidate: SimulatedPlacement,
+    *,
+    before: Mapping[int, ContextServiceCapacity],
+    coverage: Mapping[int, list[int]],
+) -> CandidatePotential:
+    """Score one candidate against state cached once for the joining worker."""
+
     after = {
         item.context_tokens: item
         for item in evaluate_context_service(manifest, (*placements, candidate))
@@ -432,8 +560,8 @@ def score_candidate_potential(
     return CandidatePotential(
         weighted_independent_route_gain=route_gain,
         weighted_concurrent_slot_gain=slot_gain,
-        weighted_layer_deficit_filled=weighted_layer_deficit_score(
-            manifest, demand, placements, candidate.point
+        weighted_layer_deficit_filled=_weighted_layer_deficit_from_coverage(
+            manifest, demand, coverage, candidate.point
         ),
         context_tokens=candidate.point.context_tokens,
         span_length=candidate.point.span.length,
@@ -463,6 +591,10 @@ def greedy_context_placements(
             continue
         current = tuple(placements)
         coverage = _placement_context_coverage(manifest, current)
+        before = {
+            item.context_tokens: item
+            for item in evaluate_context_service(manifest, current)
+        }
         cheap_ranked = sorted(
             [
                 (
@@ -493,12 +625,13 @@ def greedy_context_placements(
         chosen, _ = max(
             candidates,
             key=lambda item: (
-                score_candidate_potential(
+                _score_candidate_potential_from_state(
                     manifest,
                     demand,
                     current,
                     item[0],
-                    now_ms=now_ms,
+                    before=before,
+                    coverage=coverage,
                 ).rank(),
                 item[1],
                 -item[0].point.span.start,
@@ -564,11 +697,11 @@ def build_oracle_scenario(
             / len(item.demand_weight_by_layer)
             * item.confidence
         )
-        target_slots = max(item.desired_independent_routes, item.desired_concurrent_slots)
         demands.append(
             {
                 "context_tokens": item.context_tokens,
-                "target_slots": target_slots,
+                "target_concurrent_slots": item.desired_concurrent_slots,
+                "target_independent_routes": item.desired_independent_routes,
                 "weight": max(1, round(class_weight * weight_scale)),
             }
         )
