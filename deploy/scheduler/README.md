@@ -59,8 +59,29 @@ docker compose \
   up -d --no-deps parallax-scheduler-qwen3-4b
 ```
 
-This service is deliberately isolated on HTTP `3015`, keeps its own scheduler
-identity and uses the same commit-addressed qualified image.
+This service is deliberately isolated on HTTP `3025`, keeps its own scheduler
+identity and uses the same commit-addressed qualified image. The override is
+the authoritative V3 deployment contract: it includes the registry discovery
+labels, TUF root, route-authority key, catalogue identity and persistent state
+mounts instead of relying on variables inherited from an unrelated compose
+service.
+
+An existing laboratory must name its already-provisioned state volume and
+identity path explicitly during promotion. This preserves the Iroh EndpointId
+and fencing ledger while still selecting the candidate image by immutable tag:
+
+```shell
+FABI_QWEN3_4B_SCHEDULER_IMAGE=local/parallax-scheduler:<short-commit-sha> \
+FABI_QWEN3_4B_STATE_VOLUME=parallax-state-qwen3-4b-v3-eb3d4ff \
+FABI_QWEN3_4B_NETWORK_IDENTITY_PATH=/opt/parallax-runtime/network/scheduler-2fabfbf.key \
+docker compose \
+  -f docker-compose.lab-iroh-qwen3-4b.yml \
+  up -d --no-deps --force-recreate parallax-scheduler-qwen3-4b
+```
+
+Fresh laboratories may omit those two state overrides and receive a new named
+volume and scheduler identity. Private relay and route-authority bytes remain
+root-owned bind mounts; they are never placed in Compose environment values.
 
 Product scheduler context tiers can be configured without changing worker
 ratios:
