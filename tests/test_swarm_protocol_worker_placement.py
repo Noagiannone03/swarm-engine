@@ -249,7 +249,7 @@ def context_demand(manifest: ModelManifest) -> ContextCapacityDemandMap:
         model_swarm_id=manifest.model_swarm_id,
         region_id="eu-west",
         issued_at_ms=500,
-        expires_at_ms=60_000,
+        expires_at_ms=4_000_000_000_000,
         classes=tuple(
             ContextClassDemand(
                 context_tokens=tokens,

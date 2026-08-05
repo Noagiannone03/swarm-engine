@@ -791,6 +791,7 @@ class AutonomousWorkerPlacement:
                 }
             return
         try:
+            demand.validate_for(manifest, now_ms=now_ms)
             demand_class = demand.class_for(context_tokens)
             if (
                 demand_class.desired_independent_routes == 0

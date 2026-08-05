@@ -103,7 +103,13 @@ def _trusted_demand_publishers() -> dict[str, str]:
         raise ValueError(
             "FABI_SWARM_V3_DEMAND_AUTHORITIES must map at most 32 regions to endpoint IDs"
         )
-    return {region.strip(): endpoint.strip() for region, endpoint in decoded.items()}
+    normalized: dict[str, str] = {}
+    for region, endpoint in decoded.items():
+        region_id = region.strip()
+        if region_id in normalized:
+            raise ValueError("FABI_SWARM_V3_DEMAND_AUTHORITIES has duplicate normalized regions")
+        normalized[region_id] = endpoint.strip()
+    return normalized
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -201,10 +207,22 @@ class IrohTransport:
             self.runtime._node.catalog_bootstrap()
         self.catalog_peer_id = str(peer_id)
         self.catalog_listen_address = str(bound_address)
+        trusted_demand_publishers = _trusted_demand_publishers()
+        # Parse every pinned Iroh identity through the native implementation at
+        # startup. A typo must fail the runtime configuration once, not become
+        # an endless stream of shadow lookup failures.
+        for region_id, publisher in trusted_demand_publishers.items():
+            self.runtime._node.catalog_key(
+                "context_demand",
+                "0" * 64,
+                None,
+                region_id,
+                publisher,
+            )
         self.catalog_discovery = DhtDiscoveryStore(
             self.runtime._node,
             self.catalog_peer_id,
-            trusted_demand_publishers=_trusted_demand_publishers(),
+            trusted_demand_publishers=trusted_demand_publishers,
         )
 
     def peer_id(self) -> str:

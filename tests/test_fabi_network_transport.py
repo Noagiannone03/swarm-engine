@@ -87,6 +87,12 @@ def test_trusted_demand_publishers_require_a_bounded_json_mapping(monkeypatch):
     monkeypatch.setenv("FABI_SWARM_V3_DEMAND_AUTHORITIES", "[]")
     with pytest.raises(ValueError, match="map at most 32 regions"):
         _trusted_demand_publishers()
+    monkeypatch.setenv(
+        "FABI_SWARM_V3_DEMAND_AUTHORITIES",
+        '{"eu-west":"endpoint-a"," eu-west ":"endpoint-b"}',
+    )
+    with pytest.raises(ValueError, match="duplicate normalized regions"):
+        _trusted_demand_publishers()
     monkeypatch.setenv("FABI_CATALOG_DHT_BOOTSTRAPS", "/dns/a/tcp/1\n/dns/b/tcp/2")
     assert _catalog_bootstrap_addresses() == ["/dns/a/tcp/1", "/dns/b/tcp/2"]
 
