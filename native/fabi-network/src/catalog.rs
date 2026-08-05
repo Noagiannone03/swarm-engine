@@ -42,6 +42,7 @@ pub enum CatalogRecordKind {
     SpanLease = 3,
     LinkMetric = 4,
     ModelMember = 5,
+    ContextDemand = 6,
 }
 
 /// Exact bytes signed by the publisher's Iroh endpoint identity.
@@ -185,6 +186,17 @@ fn validate_logical_key(
                     && is_lower_hex(parts[4], HASH_HEX)
                     && parts[5] == format!("{:02x}", membership_shard(publisher)),
                 "model membership key is not bound to its publisher shard"
+            );
+        }
+        CatalogRecordKind::ContextDemand => {
+            ensure!(
+                parts.len() == 7
+                    && parts[..3] == ["fabi", "swarm", "v3"]
+                    && parts[3] == "demand"
+                    && is_lower_hex(parts[4], HASH_HEX)
+                    && is_lower_hex(parts[5], HASH_HEX)
+                    && parts[6] == expected_publisher,
+                "context demand key is not bound to model, region and publisher"
             );
         }
         CatalogRecordKind::Unspecified => bail!("catalogue record kind is unspecified"),
@@ -527,6 +539,17 @@ pub mod keys {
             .map(|shard| format!("{KEY_PREFIX}/member/{model_swarm_id}/{shard:02x}"))
             .collect()
     }
+
+    /// One advisory request-demand stream per trusted publisher and region.
+    ///
+    /// Region names are hashed so arbitrary operator labels cannot escape the
+    /// slash-delimited logical-key grammar. The signed payload retains the
+    /// human-readable region and readers verify that it hashes to this key.
+    #[must_use]
+    pub fn context_demand(model_swarm_id: &str, region_id: &str, publisher: &EndpointId) -> String {
+        let region_hash = blake3::hash(region_id.as_bytes()).to_hex();
+        format!("{KEY_PREFIX}/demand/{model_swarm_id}/{region_hash}/{publisher}")
+    }
 }
 
 #[cfg(test)]
@@ -634,6 +657,10 @@ mod tests {
                 CatalogRecordKind::LinkMetric,
                 keys::link_metric(&source.public(), &target.public()),
             ),
+            (
+                CatalogRecordKind::ContextDemand,
+                keys::context_demand(&model, "eu-west", &source.public()),
+            ),
         ];
         for (kind, logical_key) in cases {
             let mut record_params = params(&logical_key, b"payload");
@@ -646,6 +673,22 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn context_demand_key_binds_region_and_cannot_be_published_by_an_impostor() {
+        let publisher = SecretKey::generate();
+        let impostor = SecretKey::generate();
+        let model = "c".repeat(HASH_HEX);
+        let eu = keys::context_demand(&model, "eu-west", &publisher.public());
+        let us = keys::context_demand(&model, "us-east", &publisher.public());
+        assert_ne!(eu, us);
+
+        let mut record_params = params(&eu, b"demand");
+        record_params.kind = CatalogRecordKind::ContextDemand;
+        let error = sign_catalog_record(&impostor, record_params)
+            .expect_err("another endpoint must not overwrite the demand authority");
+        assert!(error.to_string().contains("model, region and publisher"));
     }
 
     fn signed_member(key: &SecretKey, model: &str, sequence: u64, issued_at_ms: u64) -> Vec<u8> {

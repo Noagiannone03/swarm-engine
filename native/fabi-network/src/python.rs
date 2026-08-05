@@ -167,6 +167,7 @@ fn catalog_kind_name(kind: CatalogRecordKind) -> &'static str {
         CatalogRecordKind::SpanLease => "span_lease",
         CatalogRecordKind::LinkMetric => "link_metric",
         CatalogRecordKind::ModelMember => "model_member",
+        CatalogRecordKind::ContextDemand => "context_demand",
         CatalogRecordKind::Unspecified => "unspecified",
     }
 }
@@ -178,6 +179,7 @@ fn parse_catalog_kind(kind: &str) -> PyResult<CatalogRecordKind> {
         "span_lease" => Ok(CatalogRecordKind::SpanLease),
         "link_metric" => Ok(CatalogRecordKind::LinkMetric),
         "model_member" => Ok(CatalogRecordKind::ModelMember),
+        "context_demand" => Ok(CatalogRecordKind::ContextDemand),
         _ => Err(PyRuntimeError::new_err(format!(
             "unsupported catalogue record kind {kind:?}"
         ))),
@@ -607,12 +609,20 @@ impl PyNetworkNode {
             .map_err(py_error)
     }
 
-    #[pyo3(signature = (kind, model_swarm_id=None, target_endpoint_id=None))]
+    #[pyo3(signature = (
+        kind,
+        model_swarm_id=None,
+        target_endpoint_id=None,
+        region_id=None,
+        publisher_endpoint_id=None,
+    ))]
     fn catalog_key(
         &self,
         kind: &str,
         model_swarm_id: Option<&str>,
         target_endpoint_id: Option<&str>,
+        region_id: Option<&str>,
+        publisher_endpoint_id: Option<&str>,
     ) -> PyResult<String> {
         let kind = parse_catalog_kind(kind)?;
         let source = self.endpoint.id();
@@ -633,6 +643,18 @@ impl PyNetworkNode {
             CatalogRecordKind::ModelMember => model_swarm_id
                 .map(|model| catalog::keys::model_member(model, &source))
                 .ok_or_else(|| PyRuntimeError::new_err("model_swarm_id is required")),
+            CatalogRecordKind::ContextDemand => {
+                let model = model_swarm_id
+                    .ok_or_else(|| PyRuntimeError::new_err("model_swarm_id is required"))?;
+                let region =
+                    region_id.ok_or_else(|| PyRuntimeError::new_err("region_id is required"))?;
+                let publisher = publisher_endpoint_id
+                    .map(EndpointId::from_str)
+                    .transpose()
+                    .map_err(py_error)?
+                    .unwrap_or(source);
+                Ok(catalog::keys::context_demand(model, region, &publisher))
+            }
             CatalogRecordKind::Unspecified => Err(PyRuntimeError::new_err(
                 "catalogue record kind is unspecified",
             )),

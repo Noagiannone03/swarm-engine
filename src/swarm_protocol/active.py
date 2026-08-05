@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from swarm_protocol.contracts import ModelManifest, RecoveryLevel, RequestContract, RoutePlan
+from swarm_protocol.context_demand import ContextDemandAnnouncer
 from swarm_protocol.coordinator import (
     CommittedRoute,
     ControlTransport,
@@ -81,6 +82,7 @@ class ActiveRouteRuntime:
         lease_expiry_guard_ms: int = 1_000,
         coordinator: RouteReservationCoordinator | None = None,
         epoch_allocator: EpochAllocator | None = None,
+        demand_observer: ContextDemandAnnouncer | None = None,
     ) -> None:
         if planner.mode != "active":
             raise ValueError("active route runtime requires an active v3 planner")
@@ -115,6 +117,7 @@ class ActiveRouteRuntime:
         ):
             raise ValueError("session TTL leaves no safe renewal retry window")
         self.epoch_allocator = epoch_allocator or InMemoryEpochAllocator()
+        self.demand_observer = demand_observer
         self._routes: dict[str, _ActiveRoute] = {}
         self._request_locks: dict[str, threading.Lock] = {}
         self._failures: deque[dict[str, object]] = deque(maxlen=64)
@@ -168,6 +171,7 @@ class ActiveRouteRuntime:
 
             nodes = self.nodes_provider()
             model_swarm_id = self.planner.ready_model_swarm_id(nodes)
+            manifest = self.planner.trusted_manifest(model_swarm_id)
             request = RequestContract(
                 request_id=request_key,
                 model_swarm_id=model_swarm_id,
@@ -176,14 +180,18 @@ class ActiveRouteRuntime:
                 recovery_level=recovery_level,
             )
             now_ms = self._now_ms()
-            planned = self.planner.plan_request(
-                nodes,
-                request=request,
-                coordinator_id=self.transport.peer_id(),
-                epoch=epoch,
-                reservation_deadline_ms=now_ms + self.prepare_ttl_ms,
-                plan_expires_at_ms=now_ms + self.plan_ttl_ms,
-            )
+            try:
+                planned = self.planner.plan_request(
+                    nodes,
+                    request=request,
+                    coordinator_id=self.transport.peer_id(),
+                    epoch=epoch,
+                    reservation_deadline_ms=now_ms + self.prepare_ttl_ms,
+                    plan_expires_at_ms=now_ms + self.plan_ttl_ms,
+                )
+            except RoutePlanningError:
+                self._observe_no_route(manifest, request.required_context_tokens)
+                raise
             # Measure lease safety against the coordinator's monotonic progress,
             # not worker-produced wall-clock timestamps. Starting the local
             # deadline before the RPC is conservative: the worker can only
@@ -230,6 +238,7 @@ class ActiveRouteRuntime:
             )
             with self._lock:
                 self._routes[request_key] = active
+            self._observe_admission(request_key, manifest, request.required_context_tokens)
             return tuple(stage.worker_id for stage in active.committed.plan.stages)
 
     def route_available(self, required_context_tokens: int) -> bool:
@@ -500,7 +509,48 @@ class ActiveRouteRuntime:
                 with self._capacity_changed:
                     self._routes.pop(request_key, None)
                     self._capacity_changed.notify_all()
+            self._observe_completion(request_key)
         return True
+
+    def _observe_admission(
+        self,
+        request_id: str,
+        manifest: ModelManifest,
+        required_context_tokens: int,
+    ) -> None:
+        if self.demand_observer is None:
+            return
+        try:
+            self.demand_observer.record_admission(
+                request_id,
+                manifest,
+                required_context_tokens=required_context_tokens,
+            )
+        except Exception:
+            logger.warning("Context demand admission observation failed", exc_info=True)
+
+    def _observe_no_route(
+        self,
+        manifest: ModelManifest,
+        required_context_tokens: int,
+    ) -> None:
+        if self.demand_observer is None:
+            return
+        try:
+            self.demand_observer.record_no_route(
+                manifest,
+                required_context_tokens=required_context_tokens,
+            )
+        except Exception:
+            logger.warning("Context demand rejection observation failed", exc_info=True)
+
+    def _observe_completion(self, request_id: str) -> None:
+        if self.demand_observer is None:
+            return
+        try:
+            self.demand_observer.record_completion(request_id)
+        except Exception:
+            logger.warning("Context demand completion observation failed", exc_info=True)
 
     def wait_for_capacity(self, timeout: float) -> bool:
         """Wake route retries after any active reservation releases."""
@@ -548,6 +598,9 @@ class ActiveRouteRuntime:
             ]
             return {
                 "mode": "active",
+                "context_demand": (
+                    self.demand_observer.status() if self.demand_observer is not None else None
+                ),
                 "active_routes": routes,
                 "recent_failures": list(self._failures),
                 "recent_recovery_degradations": list(self._recovery_degradations),
@@ -734,6 +787,7 @@ class ActiveRouteRuntime:
             with self._capacity_changed:
                 self._routes.pop(request_id, None)
                 self._capacity_changed.notify_all()
+            self._observe_completion(request_id)
 
     def _renew_one(self, request_id: str, route: _ActiveRoute) -> None:
         renewal_error: Exception | None = None

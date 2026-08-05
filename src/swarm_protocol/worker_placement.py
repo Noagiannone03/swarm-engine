@@ -25,12 +25,14 @@ from swarm_protocol.contracts import (
     WorkerRole,
 )
 from swarm_protocol.discovery import DiscoverySnapshot
+from swarm_protocol.context_placement import ContextCapacityDemandMap
 from swarm_protocol.execution import WorkerExecutionAdmission
 from swarm_protocol.placement import (
     AutonomousPlacementPolicy,
     CapacityDemandMap,
     MaterializationPhase,
     PlacementAction,
+    PlacementDecision,
     PlacementMaterializer,
 )
 from swarm_protocol.routing import ExactRoutePlanner, RoutePlanningError
@@ -47,6 +49,14 @@ class PlacementCatalog(Protocol):
         model_swarm_id: str | None = None,
         now_ms: int | None = None,
     ) -> DiscoverySnapshot: ...
+
+    def context_demand(
+        self,
+        manifest: ModelManifest,
+        *,
+        region_id: str,
+        now_ms: int | None = None,
+    ) -> ContextCapacityDemandMap | None: ...
 
 
 class SpanStatePublisher(Protocol):
@@ -249,6 +259,7 @@ class AutonomousWorkerPlacement:
         policy: AutonomousPlacementPolicy | None = None,
         topology_observer: Callable[[DiscoverySnapshot], None] | None = None,
         transition_refresh_interval_s: float = _TRANSITION_REFRESH_INTERVAL_SECONDS,
+        demand_region_id: str | None = None,
     ) -> None:
         if transition_refresh_interval_s <= 0:
             raise ValueError("transition refresh interval must be positive")
@@ -278,6 +289,10 @@ class AutonomousWorkerPlacement:
         self._transition_publish_lock = threading.RLock()
         self._error: dict[str, str] | None = None
         self._context_tokens: int | None = None
+        self._demand_region_id = demand_region_id
+        self._context_demand: ContextCapacityDemandMap | None = None
+        self._context_demand_state = "off" if demand_region_id is None else "waiting"
+        self._context_demand_shadow: dict[str, object] | None = None
         self._lock = threading.RLock()
 
     def bootstrap(
@@ -329,6 +344,17 @@ class AutonomousWorkerPlacement:
             manifest=manifest,
             leases=snapshot.leases,
             demand=CapacityDemandMap.uniform(manifest.num_layers, desired_replicas=2),
+            context_tokens=context_tokens,
+            kv_block_size=kv_block_size,
+            current_span=None,
+            current_reservations=0,
+            now_ms=time.time_ns() // 1_000_000,
+        )
+        self._compare_context_demand(
+            baseline=decision,
+            offer=offer,
+            manifest=manifest,
+            leases=snapshot.leases,
             context_tokens=context_tokens,
             kv_block_size=kv_block_size,
             current_span=None,
@@ -459,6 +485,20 @@ class AutonomousWorkerPlacement:
             manifest=manifest,
             leases=snapshot.leases,
             demand=CapacityDemandMap.uniform(manifest.num_layers, desired_replicas=2),
+            context_tokens=context_tokens,
+            kv_block_size=advertisement.lease.kv_geometry.block_size_tokens,
+            current_span=state.current_span,
+            current_reservations=active_reservations,
+            last_moved_at_ms=self._last_moved_at_ms,
+            serving_route_exists=serving_route_exists,
+            serving_route_survives_movement=serving_route_survives_movement,
+            now_ms=time.time_ns() // 1_000_000,
+        )
+        self._compare_context_demand(
+            baseline=decision,
+            offer=advertisement.offer,
+            manifest=manifest,
+            leases=snapshot.leases,
             context_tokens=context_tokens,
             kv_block_size=advertisement.lease.kv_geometry.block_size_tokens,
             current_span=state.current_span,
@@ -683,6 +723,19 @@ class AutonomousWorkerPlacement:
     def _refresh(self, model_swarm_id: str) -> None:
         try:
             snapshot = self._catalog.snapshot(model_swarm_id=model_swarm_id)
+            demand = None
+            demand_state = "off"
+            if self._demand_region_id is not None:
+                manifest = snapshot.manifest(model_swarm_id)
+                if manifest is None:
+                    demand_state = "missing_manifest"
+                else:
+                    demand = self._catalog.context_demand(
+                        manifest,
+                        region_id=self._demand_region_id,
+                        now_ms=snapshot.captured_at_ms,
+                    )
+                    demand_state = "valid" if demand is not None else "missing"
         except Exception as exc:  # noqa: BLE001 - asynchronous discovery boundary
             with self._lock:
                 self._error = {
@@ -695,6 +748,8 @@ class AutonomousWorkerPlacement:
         with self._lock:
             self._snapshot = snapshot
             self._snapshot_model_id = model_swarm_id
+            self._context_demand = demand
+            self._context_demand_state = demand_state
             self._error = None
             self._retry_after = time.monotonic() + 2
             self._read_pending = False
@@ -706,6 +761,91 @@ class AutonomousWorkerPlacement:
                 # missing link will keep route admission fail-closed and a
                 # later refresh retries topology publication.
                 logger.warning("Autonomous topology projection failed", exc_info=True)
+
+    def _compare_context_demand(
+        self,
+        *,
+        baseline: PlacementDecision,
+        offer: WorkerOffer,
+        manifest: ModelManifest,
+        leases: tuple[SpanLease, ...],
+        context_tokens: int,
+        kv_block_size: int,
+        current_span: LayerSpan | None,
+        current_reservations: int,
+        now_ms: int,
+        last_moved_at_ms: int | None = None,
+        serving_route_exists: bool = False,
+        serving_route_survives_movement: bool = False,
+    ) -> None:
+        """Compare trusted DHT advice without applying its placement decision."""
+
+        with self._lock:
+            demand = self._context_demand
+            demand_state = self._context_demand_state
+        if demand is None:
+            with self._lock:
+                self._context_demand_shadow = {
+                    "state": demand_state,
+                    "applied": False,
+                }
+            return
+        try:
+            demand_class = demand.class_for(context_tokens)
+            if (
+                demand_class.desired_independent_routes == 0
+                and demand_class.desired_concurrent_slots == 0
+            ):
+                with self._lock:
+                    self._context_demand_shadow = {
+                        "state": "no_demand",
+                        "applied": False,
+                        "region_id": demand.region_id,
+                        "context_class_tokens": demand_class.context_tokens,
+                    }
+                return
+            shadow = self._policy.choose(
+                offer=offer,
+                manifest=manifest,
+                leases=leases,
+                demand=demand_class.layer_screen(),
+                context_tokens=context_tokens,
+                kv_block_size=kv_block_size,
+                current_span=current_span,
+                current_reservations=current_reservations,
+                last_moved_at_ms=last_moved_at_ms,
+                serving_route_exists=serving_route_exists,
+                serving_route_survives_movement=serving_route_survives_movement,
+                now_ms=now_ms,
+            )
+        except ValueError as exc:
+            comparison: dict[str, object] = {
+                "state": "invalid",
+                "applied": False,
+                "error": str(exc)[:256],
+            }
+        else:
+            comparison = {
+                "state": "compared",
+                "applied": False,
+                "region_id": demand.region_id,
+                "demand_issued_at_ms": demand.issued_at_ms,
+                "context_class_tokens": demand_class.context_tokens,
+                "baseline_action": baseline.action.value,
+                "baseline_span": (
+                    None if baseline.span is None else [baseline.span.start, baseline.span.end]
+                ),
+                "advised_action": shadow.action.value,
+                "advised_span": (
+                    None if shadow.span is None else [shadow.span.start, shadow.span.end]
+                ),
+                "decision_changed": (
+                    shadow.action != baseline.action or shadow.span != baseline.span
+                ),
+                "advised_reason": shadow.reason,
+            }
+        with self._lock:
+            self._context_demand_shadow = comparison
 
     def _status(self, state, *, decision: str, error) -> dict[str, object]:
         return {
@@ -724,5 +864,6 @@ class AutonomousWorkerPlacement:
                 else [state.target_span.start, state.target_span.end]
             ),
             "decision": decision,
+            "context_demand_shadow": self._context_demand_shadow,
             "error": error,
         }

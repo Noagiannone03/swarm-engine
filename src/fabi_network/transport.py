@@ -78,6 +78,34 @@ def _catalog_bootstrap_addresses() -> list[str]:
     return [address.strip() for address in decoded]
 
 
+def _trusted_demand_publishers() -> dict[str, str]:
+    """Parse region-to-endpoint pins provisioned with the signed runtime."""
+
+    raw = os.environ.get("FABI_SWARM_V3_DEMAND_AUTHORITIES", "").strip()
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("FABI_SWARM_V3_DEMAND_AUTHORITIES must be a JSON object") from exc
+    if (
+        not isinstance(decoded, dict)
+        or len(decoded) > 32
+        or any(
+            not isinstance(region, str)
+            or not region.strip()
+            or len(region) > 128
+            or not isinstance(endpoint, str)
+            or not endpoint.strip()
+            for region, endpoint in decoded.items()
+        )
+    ):
+        raise ValueError(
+            "FABI_SWARM_V3_DEMAND_AUTHORITIES must map at most 32 regions to endpoint IDs"
+        )
+    return {region.strip(): endpoint.strip() for region, endpoint in decoded.items()}
+
+
 def _positive_env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, str(default)).strip()
     try:
@@ -176,6 +204,7 @@ class IrohTransport:
         self.catalog_discovery = DhtDiscoveryStore(
             self.runtime._node,
             self.catalog_peer_id,
+            trusted_demand_publishers=_trusted_demand_publishers(),
         )
 
     def peer_id(self) -> str:

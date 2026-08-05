@@ -1059,6 +1059,9 @@ class GradientServer:
                     reload_target=self._apply_v3_span_reload,
                     current_span=None,
                     topology_observer=self._observe_autonomous_topology,
+                    demand_region_id=(
+                        os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip() or None
+                    ),
                 )
                 self.swarm_v3_placement_controller = controller
                 offer = None
@@ -2724,6 +2727,12 @@ class GradientServer:
                                         reload_target=self._apply_v3_span_reload,
                                         current_span=advertisement.lease.hosted_span,
                                         topology_observer=self._observe_autonomous_topology,
+                                        demand_region_id=(
+                                            os.environ.get(
+                                                "FABI_SWARM_V3_DEMAND_REGION", ""
+                                            ).strip()
+                                            or None
+                                        ),
                                     )
                                 placement = self.swarm_v3_placement_controller.observe(
                                     advertisement=advertisement,

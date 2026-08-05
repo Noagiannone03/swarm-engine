@@ -6,6 +6,8 @@ from swarm_protocol import (
     AutonomousPlacementPolicy,
     AutonomousWorkerPlacement,
     BackendKind,
+    ContextCapacityDemandMap,
+    ContextClassDemand,
     DiscoverySnapshot,
     EffectiveSpanMode,
     KvGeometry,
@@ -226,13 +228,79 @@ class FakePublisher:
 
 
 class FakeCatalog:
-    def __init__(self, value) -> None:
+    def __init__(self, value, context_demand=None) -> None:
         self.value = value
+        self.demand = context_demand
 
     def snapshot(self, *, model_swarm_id=None, now_ms=None):
         del now_ms
         assert model_swarm_id == self.value.manifests[0].model_swarm_id
         return self.value
+
+    def context_demand(self, manifest, *, region_id, now_ms=None):
+        del now_ms
+        assert manifest == self.value.manifests[0]
+        assert region_id == "eu-west"
+        return self.demand
+
+
+def context_demand(manifest: ModelManifest) -> ContextCapacityDemandMap:
+    return ContextCapacityDemandMap(
+        model_swarm_id=manifest.model_swarm_id,
+        region_id="eu-west",
+        issued_at_ms=500,
+        expires_at_ms=60_000,
+        classes=tuple(
+            ContextClassDemand(
+                context_tokens=tokens,
+                desired_independent_routes=2,
+                desired_concurrent_slots=2,
+                desired_replicas_by_layer=(2,) * manifest.num_layers,
+                demand_weight_by_layer=(1.0, 1.0, 4.0, 4.0),
+                confidence=0.9,
+            )
+            for tokens in manifest.context_classes
+        ),
+    )
+
+
+def test_worker_compares_signed_context_demand_without_applying_it():
+    manifest = model()
+    current = advertisement(manifest, "current", 0, 4)
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(current.offer,),
+        leases=(current.lease,),
+        links=(),
+    )
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot, context_demand(manifest)),
+        admission=FakeAdmission(),
+        state_publisher=FakePublisher(),
+        reload_target=lambda span, generation: None,
+        current_span=current.lease.hosted_span,
+        demand_region_id="eu-west",
+    )
+
+    deadline = time.monotonic() + 1
+    status = controller.observe(advertisement=current, manifest=manifest, context_tokens=4_096)
+    while (
+        (status["context_demand_shadow"] or {}).get("state") != "compared"
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+        status = controller.observe(
+            advertisement=current,
+            manifest=manifest,
+            context_tokens=4_096,
+        )
+
+    comparison = status["context_demand_shadow"]
+    assert comparison["state"] == "compared"
+    assert comparison["applied"] is False
+    assert comparison["region_id"] == "eu-west"
+    assert comparison["context_class_tokens"] == 4_096
 
 
 def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():

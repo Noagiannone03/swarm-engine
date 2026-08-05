@@ -8,6 +8,8 @@ import pytest
 
 from swarm_protocol import (
     BackendKind,
+    ContextCapacityDemandMap,
+    ContextClassDemand,
     DhtDiscoveryStore,
     EffectiveSpanMode,
     KvGeometry,
@@ -88,6 +90,29 @@ def lease(model_id: str, worker_id: str, start: int, end: int) -> SpanLease:
     )
 
 
+def demand(model: ModelManifest, *, region_id: str = "eu-west") -> ContextCapacityDemandMap:
+    classes = tuple(
+        ContextClassDemand(
+            context_tokens=context_tokens,
+            desired_independent_routes=2,
+            desired_concurrent_slots=4,
+            desired_replicas_by_layer=(2,) * model.num_layers,
+            demand_weight_by_layer=(1.0,) * model.num_layers,
+            admitted_requests_per_minute=3.0,
+            queued_requests=1,
+            confidence=0.8,
+        )
+        for context_tokens in model.context_classes
+    )
+    return ContextCapacityDemandMap(
+        model_swarm_id=model.model_swarm_id,
+        region_id=region_id,
+        issued_at_ms=2_000,
+        expires_at_ms=62_000,
+        classes=classes,
+    )
+
+
 @dataclass
 class FakeRecord:
     kind: str
@@ -111,6 +136,8 @@ class FakeNativeCatalog:
         kind: str,
         model_swarm_id: str | None = None,
         target_endpoint_id: str | None = None,
+        region_id: str | None = None,
+        publisher_endpoint_id: str | None = None,
     ) -> str:
         prefix = "fabi/swarm/v3"
         if kind == "model_manifest":
@@ -123,6 +150,9 @@ class FakeNativeCatalog:
             return f"{prefix}/link/{self.endpoint_id}/{target_endpoint_id}"
         if kind == "model_member":
             return f"{prefix}/member/{model_swarm_id}/00"
+        if kind == "context_demand":
+            publisher = publisher_endpoint_id or self.endpoint_id
+            return f"{prefix}/demand/{model_swarm_id}/{region_id}/{publisher}"
         raise AssertionError(kind)
 
     def sign_catalog_record(
@@ -238,6 +268,67 @@ def test_dht_store_rejects_offer_for_another_signing_endpoint() -> None:
     store = DhtDiscoveryStore(native, "dht-mac", clock_ms=lambda: 2_000)
     with pytest.raises(DiscoveryError, match="signing endpoint"):
         store.publish_offer(offer("mac", "endpoint-impostor"))
+
+
+def test_dht_store_round_trips_only_the_pinned_context_demand_authority() -> None:
+    model = manifest()
+    native = FakeNativeCatalog("endpoint-authority")
+    store = DhtDiscoveryStore(
+        native,
+        "dht-authority",
+        clock_ms=lambda: 2_500,
+        trusted_demand_publishers={"eu-west": native.endpoint_id},
+    )
+    store.publish_manifest(model)
+    advice = demand(model)
+    store.publish_context_demand(advice)
+
+    assert store.context_demand(model, region_id="eu-west") == advice
+    assert store.context_demand(model, region_id="unknown") is None
+
+
+def test_dht_store_drops_wrong_publisher_stale_and_wrong_region_demand() -> None:
+    model = manifest()
+    native = FakeNativeCatalog("endpoint-local")
+    store = DhtDiscoveryStore(
+        native,
+        "dht-local",
+        clock_ms=lambda: 70_000,
+        trusted_demand_publishers={"eu-west": "endpoint-authority"},
+    )
+    wrong_publisher = demand(model)
+    key = native.catalog_key(
+        "context_demand",
+        model.model_swarm_id,
+        None,
+        "eu-west",
+        "endpoint-authority",
+    )
+    native.records[key] = FakeRecord(
+        kind="context_demand",
+        logical_key=key,
+        publisher_endpoint_id="endpoint-impostor",
+        discovery_peer_id="dht-impostor",
+        sequence=wrong_publisher.issued_at_ms,
+        issued_at_ms=wrong_publisher.issued_at_ms,
+        expires_at_ms=90_000,
+        payload=wrong_publisher.model_dump_json().encode(),
+    )
+    assert store.context_demand(model, region_id="eu-west") is None
+
+    native.records[key] = FakeRecord(
+        kind="context_demand",
+        logical_key=key,
+        publisher_endpoint_id="endpoint-authority",
+        discovery_peer_id="dht-authority",
+        sequence=wrong_publisher.issued_at_ms,
+        issued_at_ms=wrong_publisher.issued_at_ms,
+        expires_at_ms=90_000,
+        payload=wrong_publisher.model_dump_json().encode(),
+    )
+    # The signed envelope may still be live while the domain snapshot has
+    # expired. Readers enforce both clocks and retain their baseline.
+    assert store.context_demand(model, region_id="eu-west") is None
 
 
 def test_snapshot_drops_member_whose_signed_endpoint_and_offer_disagree() -> None:

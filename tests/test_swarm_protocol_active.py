@@ -185,7 +185,7 @@ class FakeCoordinator:
         self.fenced.append((route, epoch))
 
 
-def runtime(now, *, nodes=None, wall_clock=None, session_ttl_ms=600):
+def runtime(now, *, nodes=None, wall_clock=None, session_ttl_ms=600, demand_observer=None):
     planner = FakePlanner()
     coordinator = FakeCoordinator(now)
     current_nodes = [SimpleNamespace(node_id="worker", is_active=True)] if nodes is None else nodes
@@ -202,8 +202,52 @@ def runtime(now, *, nodes=None, wall_clock=None, session_ttl_ms=600):
         renew_retry_interval_ms=50,
         lease_expiry_guard_ms=25,
         coordinator=coordinator,
+        demand_observer=demand_observer,
     )
     return active, planner, coordinator, current_nodes
+
+
+class FakeDemandObserver:
+    def __init__(self):
+        self.admissions = []
+        self.rejections = []
+        self.completions = []
+
+    def record_admission(self, request_id, manifest, *, required_context_tokens):
+        self.admissions.append((request_id, manifest.model_swarm_id, required_context_tokens))
+
+    def record_no_route(self, manifest, *, required_context_tokens):
+        self.rejections.append((manifest.model_swarm_id, required_context_tokens))
+
+    def record_completion(self, request_id):
+        self.completions.append(request_id)
+
+
+def test_active_runtime_observes_admission_completion_and_no_route_without_controlling_them():
+    now = [1_000]
+    observer = FakeDemandObserver()
+    active, planner, _, _ = runtime(now, demand_observer=observer)
+    try:
+        active.reserve(
+            request_id="admitted",
+            prompt_tokens=12_220,
+            reserved_output_tokens=4_096,
+        )
+        trusted_swarm_id = planner.trusted_manifest(SWARM_ID).model_swarm_id
+        assert observer.admissions == [("admitted", trusted_swarm_id, 16_316)]
+        assert active.release("admitted")
+        assert observer.completions == ["admitted"]
+
+        planner.fail_planning = True
+        with pytest.raises(NoFeasibleRoute):
+            active.reserve(
+                request_id="rejected",
+                prompt_tokens=20_000,
+                reserved_output_tokens=2_048,
+            )
+        assert observer.rejections == [(trusted_swarm_id, 22_048)]
+    finally:
+        active.close()
 
 
 def test_active_runtime_routes_only_after_complete_reservation():

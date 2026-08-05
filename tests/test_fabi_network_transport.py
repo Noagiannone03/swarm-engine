@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from fabi_network.transport import IrohTransport, _catalog_bootstrap_addresses
+from fabi_network.transport import (
+    IrohTransport,
+    _catalog_bootstrap_addresses,
+    _trusted_demand_publishers,
+)
 
 
 class FakeNode:
@@ -69,6 +73,20 @@ def base_environment(monkeypatch):
 def test_catalogue_bootstrap_parser_accepts_json_or_newline_lists(monkeypatch):
     monkeypatch.setenv("FABI_CATALOG_DHT_BOOTSTRAPS", '["/dns/a/tcp/1", "/dns/b/tcp/2"]')
     assert _catalog_bootstrap_addresses() == ["/dns/a/tcp/1", "/dns/b/tcp/2"]
+
+
+def test_trusted_demand_publishers_require_a_bounded_json_mapping(monkeypatch):
+    monkeypatch.setenv(
+        "FABI_SWARM_V3_DEMAND_AUTHORITIES",
+        '{"eu-west":"endpoint-a","local":"endpoint-b"}',
+    )
+    assert _trusted_demand_publishers() == {
+        "eu-west": "endpoint-a",
+        "local": "endpoint-b",
+    }
+    monkeypatch.setenv("FABI_SWARM_V3_DEMAND_AUTHORITIES", "[]")
+    with pytest.raises(ValueError, match="map at most 32 regions"):
+        _trusted_demand_publishers()
     monkeypatch.setenv("FABI_CATALOG_DHT_BOOTSTRAPS", "/dns/a/tcp/1\n/dns/b/tcp/2")
     assert _catalog_bootstrap_addresses() == ["/dns/a/tcp/1", "/dns/b/tcp/2"]
 

@@ -32,7 +32,7 @@ from swarm_protocol.contracts import (
     WorkerOffer,
     WorkerRole,
 )
-from swarm_protocol.dht_discovery import DhtDiscoveryStore
+from swarm_protocol.context_demand import ContextDemandAnnouncer, ContextDemandWindow
 from swarm_protocol.context_placement import (
     CapacityDemandMap,
     ContextCapacityDemandMap,
@@ -40,6 +40,7 @@ from swarm_protocol.context_placement import (
     MemoryPlacementPoint,
     cumulative_context_coverage,
 )
+from swarm_protocol.dht_discovery import DhtDiscoveryStore
 from swarm_protocol.discovery import (
     CatalogRecordConflict,
     DiscoveryError,
@@ -141,6 +142,8 @@ __all__ = [
     "CapacityDemandMap",
     "ContextCapacityDemandMap",
     "ContextClassDemand",
+    "ContextDemandAnnouncer",
+    "ContextDemandWindow",
     "MaterializationPhase",
     "MaterializationSnapshot",
     "MemoryPlacementPoint",

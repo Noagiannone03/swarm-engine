@@ -20,6 +20,7 @@ from swarm_protocol.contracts import (
     SpanLease,
     WorkerOffer,
 )
+from swarm_protocol.context_placement import ContextCapacityDemandMap
 from swarm_protocol.discovery import DiscoveryError, DiscoverySnapshot, InMemoryDiscoveryStore
 
 _CATALOG_TTL_MS = 4 * 60 * 1000
@@ -47,6 +48,8 @@ class NativeCatalogNode(Protocol):
         kind: str,
         model_swarm_id: str | None = None,
         target_endpoint_id: str | None = None,
+        region_id: str | None = None,
+        publisher_endpoint_id: str | None = None,
     ) -> str: ...
 
     def sign_catalog_record(
@@ -72,7 +75,14 @@ def _system_clock_ms() -> int:
 
 
 def _json_payload(
-    model: ModelManifest | WorkerOffer | SpanLease | LinkMetric | ModelMemberAdvertisement,
+    model: (
+        ModelManifest
+        | WorkerOffer
+        | SpanLease
+        | LinkMetric
+        | ModelMemberAdvertisement
+        | ContextCapacityDemandMap
+    ),
 ) -> bytes:
     return model.model_dump_json().encode("utf-8")
 
@@ -93,6 +103,7 @@ class DhtDiscoveryStore:
         *,
         clock_ms: Callable[[], int] = _system_clock_ms,
         quorum: int = 1,
+        trusted_demand_publishers: dict[str, str] | None = None,
     ) -> None:
         if not discovery_peer_id:
             raise ValueError("discovery_peer_id must not be empty")
@@ -110,6 +121,7 @@ class DhtDiscoveryStore:
         self._member_sequences: dict[str, int] = {}
         self._known_manifests: dict[str, ModelManifest] = {}
         self._known_offers: dict[str, WorkerOffer] = {}
+        self._trusted_demand_publishers = dict(trusted_demand_publishers or {})
 
     def _now_ms(self) -> int:
         now = int(self._clock_ms())
@@ -153,6 +165,87 @@ class DhtDiscoveryStore:
             changed = self._shadow.publish_manifest(manifest)
             self._known_manifests[manifest.model_swarm_id] = manifest
             return changed
+
+    def publish_context_demand(self, demand: ContextCapacityDemandMap) -> None:
+        """Publish bounded aggregate demand, never a worker placement command.
+
+        Any endpoint may publish its own namespaced observation. Consumers
+        explicitly pin the endpoint trusted for each region, so a third party
+        cannot overwrite or impersonate that stream.
+        """
+
+        now = self._now_ms()
+        if demand.issued_at_ms > now:
+            raise DiscoveryError("context demand issue time is in the future")
+        if demand.expires_at_ms <= now:
+            raise DiscoveryError("cannot publish expired context demand")
+        if demand.expires_at_ms - demand.issued_at_ms > _CATALOG_TTL_MS:
+            raise DiscoveryError("context demand TTL exceeds the catalogue maximum")
+        with self._lock:
+            manifest = self._known_manifests.get(demand.model_swarm_id)
+            if manifest is not None:
+                demand.validate_for(manifest, now_ms=now)
+            logical_key = self._node.catalog_key(
+                "context_demand",
+                demand.model_swarm_id,
+                None,
+                demand.region_id,
+            )
+            self._sign_and_put(
+                kind="context_demand",
+                logical_key=logical_key,
+                sequence=demand.issued_at_ms,
+                issued_at_ms=demand.issued_at_ms,
+                expires_at_ms=demand.expires_at_ms,
+                payload=_json_payload(demand),
+            )
+
+    def context_demand(
+        self,
+        manifest: ModelManifest,
+        *,
+        region_id: str,
+        now_ms: int | None = None,
+    ) -> ContextCapacityDemandMap | None:
+        """Read one trusted region aggregate or return no advice.
+
+        Missing, unreachable, stale or malformed advice is deliberately not a
+        placement failure: autonomous workers retain their safe deterministic
+        baseline. A valid record must be signed by the endpoint pinned for the
+        region and must exactly match the trusted model contract.
+        """
+
+        captured_at = self._now_ms() if now_ms is None else now_ms
+        if captured_at < 0:
+            raise ValueError("now_ms must be non-negative")
+        publisher = self._trusted_demand_publishers.get(region_id)
+        if publisher is None:
+            return None
+        logical_key = self._node.catalog_key(
+            "context_demand",
+            manifest.model_swarm_id,
+            None,
+            region_id,
+            publisher,
+        )
+        try:
+            record = self._node.catalog_get(logical_key)
+        except Exception:
+            return None
+        if (
+            record.kind != "context_demand"
+            or record.publisher_endpoint_id != publisher
+            or record.expires_at_ms <= captured_at
+        ):
+            return None
+        try:
+            demand = ContextCapacityDemandMap.model_validate_json(bytes(record.payload))
+            demand.validate_for(manifest, now_ms=captured_at)
+        except ValueError:
+            return None
+        if demand.region_id != region_id:
+            return None
+        return demand
 
     def publish_offer(self, offer: WorkerOffer) -> bool:
         if offer.endpoint_id != self._node.endpoint_id:

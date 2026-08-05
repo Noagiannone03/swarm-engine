@@ -24,6 +24,7 @@ from scheduling.scheduler import Scheduler
 from swarm_protocol.active import ActiveRouteContext, ActiveRouteRuntime
 from swarm_protocol.contracts import RecoveryLevel
 from swarm_protocol.coordinator import RouteReservationError
+from swarm_protocol.context_demand import ContextDemandAnnouncer
 from swarm_protocol.epochs import InMemoryEpochAllocator, SqliteEpochAllocator
 from swarm_protocol.recovery import (
     InMemoryRecoveryJournal,
@@ -90,6 +91,7 @@ class SchedulerManage:
         self.lattica = None
         self.iroh_transport = None
         self.active_v3_routes = None
+        self.context_demand_announcer = None
         self.stubs = {}
         self.is_local_network = False
         self._context_tokenizer = None
@@ -167,6 +169,9 @@ class SchedulerManage:
         if self.active_v3_routes is not None:
             self.active_v3_routes.close()
             self.active_v3_routes = None
+        if self.context_demand_announcer is not None:
+            self.context_demand_announcer.close()
+            self.context_demand_announcer = None
 
         # Stop scheduler if running
         if self.scheduler is not None:
@@ -542,11 +547,26 @@ class SchedulerManage:
             raise RuntimeError("protocol-v3 active mode requires the authenticated Iroh transport")
         if self.active_v3_routes is not None:
             self.active_v3_routes.close()
+        if self.context_demand_announcer is not None:
+            self.context_demand_announcer.close()
+            self.context_demand_announcer = None
+        demand_region = os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip()
+        catalog = (
+            getattr(self.iroh_transport, "catalog_discovery", None) if demand_region else None
+        )
+        if demand_region and catalog is None:
+            raise RuntimeError("context demand publication requires the active catalogue DHT")
+        if demand_region and catalog is not None:
+            self.context_demand_announcer = ContextDemandAnnouncer(
+                catalog,
+                demand_region,
+            )
         self.active_v3_routes = ActiveRouteRuntime(
             planner=planner,
             transport=self.iroh_transport,
             nodes_provider=lambda: list(self.scheduler.node_manager.nodes),
             epoch_allocator=self.epoch_allocator,
+            demand_observer=self.context_demand_announcer,
         )
         self.scheduler.external_routes_active = self.active_v3_routes.has_active_routes
         self.scheduler.external_ready_worker_ids = planner.ready_worker_ids
