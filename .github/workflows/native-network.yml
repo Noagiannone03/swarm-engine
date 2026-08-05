@@ -14,10 +14,12 @@ on:
       - 'src/parallax/utils/model_config.py'
       - 'src/parallax/utils/model_download.py'
       - 'src/swarm_protocol/**'
+      - 'tools/agentic_workload_sim/**'
       - 'tests/test_backend_request_handler.py'
       - 'tests/test_request_agent_frontend.py'
       - 'tests/test_executor_supervision.py'
       - 'tests/test_swarm_protocol_*.py'
+      - 'tests/test_agentic_workload_probe.py'
   push:
     branches:
       - codex/swarm-protocol-v3
@@ -32,10 +34,12 @@ on:
       - 'src/parallax/utils/model_config.py'
       - 'src/parallax/utils/model_download.py'
       - 'src/swarm_protocol/**'
+      - 'tools/agentic_workload_sim/**'
       - 'tests/test_backend_request_handler.py'
       - 'tests/test_request_agent_frontend.py'
       - 'tests/test_executor_supervision.py'
       - 'tests/test_swarm_protocol_*.py'
+      - 'tests/test_agentic_workload_probe.py'
 
 permissions:
   contents: read
@@ -136,6 +140,7 @@ jobs:
           cd ../..
           python -m pytest -q --noconftest \
             tests/test_swarm_protocol_*.py \
+            tests/test_agentic_workload_probe.py \
             tests/test_backend_request_handler.py \
             tests/test_request_agent_frontend.py \
             tests/test_executor_supervision.py \

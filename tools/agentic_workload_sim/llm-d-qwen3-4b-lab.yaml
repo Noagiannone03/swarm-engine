@@ -1,0 +1,22 @@
+# Reproducible llm-d-inference-sim profile for the qualified Fabi Qwen3-4B
+# Mac mini + RTX route. This is a calibration fixture, not a product default.
+port: 18080
+model: "fabi-qwen3-4b-v3"
+force-dummy-tokenizer: true
+max-model-len: 65536
+max-num-seqs: 4
+max-waiting-queue-length: 32
+max-request-body-size-mb: 64
+mode: "random"
+seed: 336
+
+latency-calculator: "per-token"
+prefill-overhead: "500ms"
+prefill-time-per-token: "1.335ms"
+prefill-time-std-dev: "0s"
+inter-token-latency: "130ms"
+inter-token-latency-std-dev: "0s"
+
+# Keep latency calibration independent from the simulator's asynchronously
+# updated running-request gauge. Queue saturation is measured separately.
+time-factor-under-load: 1.0
