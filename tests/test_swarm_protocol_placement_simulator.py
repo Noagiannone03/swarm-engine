@@ -9,9 +9,12 @@ from swarm_protocol import (
 from swarm_protocol.context_placement import MemoryPlacementPoint
 from swarm_protocol.placement_simulator import (
     SimulatedPlacement,
+    SyntheticWorkerEnvelope,
     build_oracle_scenario,
+    build_synthetic_memory_frontiers,
     evaluate_context_service,
     greedy_context_placements,
+    maximum_span_placements,
     score_candidate_potential,
 )
 
@@ -225,3 +228,119 @@ def test_two_pass_greedy_bootstraps_the_weighted_agentic_route():
     assert result.placements[0].point == frontiers["adaptive"][1]
     assert result.service[-1].context_tokens == 20
     assert result.service[-1].concurrent_service_slots == 1
+
+
+def test_agentic_policy_spreads_an_explicit_8_16g_class_population_for_context():
+    mib = 1024**2
+    gib = 1024**3
+    model = _manifest().model_copy(
+        update={
+            "model_id": "test/qwen3-4b-long-geometry",
+            "num_layers": 36,
+            "model_max_context_tokens": 65_536,
+            "context_classes": (16_384, 40_960, 65_536),
+            "kv_bytes_per_token_by_layer": (4_096,) * 36,
+            "weight_bytes_by_layer": (200 * mib,) * 36,
+            "input_endpoint_weight_bytes": 256 * mib,
+            "output_endpoint_weight_bytes": 256 * mib,
+        }
+    )
+    frontiers = build_synthetic_memory_frontiers(
+        model,
+        tuple(
+            SyntheticWorkerEnvelope(f"stable-4g-{index}", 4 * gib, 65_536)
+            for index in range(6)
+        )
+        + tuple(
+            SyntheticWorkerEnvelope(f"stable-10g-{index}", 10 * gib, 65_536)
+            for index in range(4)
+        ),
+        kv_block_size=16,
+        maximum_sessions=4,
+    )
+
+    small = frontiers["stable-4g-0"]
+    large = frontiers["stable-10g-0"]
+    assert max(point.span.length for point in small) == 15
+    assert any(
+        point.context_tokens == 65_536 and point.span.length == 8 for point in small
+    )
+    assert any(
+        point.context_tokens == 16_384 and point.span.length == 36 for point in large
+    )
+    assert all(point.required_memory_bytes <= 4 * gib for point in small)
+    assert all(point.required_memory_bytes <= 10 * gib for point in large)
+
+    demand = ContextCapacityDemandMap(
+        model_swarm_id=model.model_swarm_id,
+        region_id="synthetic-eu",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+        classes=tuple(
+            ContextClassDemand(
+                context_tokens=context_tokens,
+                desired_independent_routes=2,
+                desired_concurrent_slots=2,
+                desired_replicas_by_layer=(2,) * 36,
+                demand_weight_by_layer=(weight,) * 36,
+            )
+            for context_tokens, weight in (
+                (16_384, 1.0),
+                (40_960, 3.0),
+                (65_536, 8.0),
+            )
+        ),
+    )
+    maximum_span = maximum_span_placements(model, demand, frontiers, now_ms=2_000)
+    context_aware = greedy_context_placements(model, demand, frontiers, now_ms=2_000)
+
+    assert [item.concurrent_service_slots for item in maximum_span.service] == [4, 0, 0]
+    assert [item.concurrent_service_slots for item in context_aware.service] == [2, 2, 2]
+    assert all(
+        placement.point.context_tokens == 65_536
+        for placement in context_aware.placements
+    )
+
+
+def test_context_policy_beats_maximum_span_trap_for_agentic_demand():
+    model = _manifest().model_copy(
+        update={
+            "model_max_context_tokens": 20,
+            "context_classes": (10, 20),
+        }
+    )
+    demand = ContextCapacityDemandMap(
+        model_swarm_id=model.model_swarm_id,
+        region_id="eu-west",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+        classes=(
+            ContextClassDemand(
+                context_tokens=10,
+                desired_independent_routes=1,
+                desired_concurrent_slots=1,
+                desired_replicas_by_layer=(1,) * 4,
+                demand_weight_by_layer=(1.0,) * 4,
+            ),
+            ContextClassDemand(
+                context_tokens=20,
+                desired_independent_routes=1,
+                desired_concurrent_slots=1,
+                desired_replicas_by_layer=(1,) * 4,
+                demand_weight_by_layer=(10.0,) * 4,
+            ),
+        ),
+    )
+    frontiers = {
+        "adaptive": (
+            _placement("ignored", 0, 4, context_tokens=10, sessions=1).point,
+            _placement("ignored", 0, 2, context_tokens=20, sessions=1).point,
+        ),
+        "tail": (_placement("ignored", 2, 4, context_tokens=20, sessions=1).point,),
+    }
+
+    maximum_span = maximum_span_placements(model, demand, frontiers, now_ms=2_000)
+    context_aware = greedy_context_placements(model, demand, frontiers, now_ms=2_000)
+
+    assert maximum_span.service[-1].concurrent_service_slots == 0
+    assert context_aware.service[-1].concurrent_service_slots == 1

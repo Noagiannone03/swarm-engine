@@ -11,11 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from swarm_protocol.contracts import ModelManifest
+from swarm_protocol.contracts import BackendKind, ModelManifest, WorkerOffer, WorkerRole
 from swarm_protocol.context_placement import (
     ContextCapacityDemandMap,
     MemoryPlacementPoint,
 )
+from swarm_protocol.placement import AutonomousPlacementPolicy
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,32 @@ class CandidatePotential:
 class GreedyPlacementResult:
     placements: tuple[SimulatedPlacement, ...]
     service: tuple[ContextServiceCapacity, ...]
+
+
+@dataclass(frozen=True)
+class SyntheticWorkerEnvelope:
+    """One explicit stable envelope for deterministic offline populations.
+
+    This is intentionally not physical RAM. Benchmarks must feed the same
+    post-OS, post-application stable envelope that a real worker would publish.
+    """
+
+    worker_id: str
+    stable_memory_envelope_bytes: int
+    qualified_context_limit_tokens: int
+    backend: BackendKind = BackendKind.MLX
+    can_host_frontend: bool = True
+    execution_granularity_layers: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.worker_id:
+            raise ValueError("synthetic worker id must be non-empty")
+        if self.stable_memory_envelope_bytes <= 0:
+            raise ValueError("synthetic stable memory envelope must be positive")
+        if self.qualified_context_limit_tokens <= 0:
+            raise ValueError("synthetic qualified context limit must be positive")
+        if self.execution_granularity_layers <= 0:
+            raise ValueError("synthetic execution granularity must be positive")
 
 
 def _maximum_flow_value(
@@ -195,6 +222,102 @@ def weighted_layer_deficit_score(
         demand,
         _placement_context_coverage(manifest, placements),
         point,
+    )
+
+
+def build_synthetic_memory_frontiers(
+    manifest: ModelManifest,
+    workers: tuple[SyntheticWorkerEnvelope, ...],
+    *,
+    kv_block_size: int,
+    maximum_sessions: int = 32,
+) -> dict[str, tuple[MemoryPlacementPoint, ...]]:
+    """Build exact local frontiers from explicit stable-memory scenarios."""
+
+    if len({worker.worker_id for worker in workers}) != len(workers):
+        raise ValueError("synthetic worker ids must be unique")
+    policy = AutonomousPlacementPolicy()
+    result: dict[str, tuple[MemoryPlacementPoint, ...]] = {}
+    cached_frontiers: dict[
+        tuple[int, int, BackendKind, bool, int],
+        tuple[MemoryPlacementPoint, ...],
+    ] = {}
+    for worker in workers:
+        cache_key = (
+            worker.stable_memory_envelope_bytes,
+            worker.qualified_context_limit_tokens,
+            worker.backend,
+            worker.can_host_frontend,
+            worker.execution_granularity_layers,
+        )
+        cached = cached_frontiers.get(cache_key)
+        if cached is not None:
+            result[worker.worker_id] = cached
+            continue
+        roles = {WorkerRole.EXECUTOR}
+        if worker.can_host_frontend:
+            roles.add(WorkerRole.FRONTEND)
+        offer = WorkerOffer(
+            worker_id=worker.worker_id,
+            endpoint_id=f"simulation-{worker.worker_id}",
+            runtime_version="simulation",
+            platform="simulation",
+            backend=worker.backend,
+            stable_memory_envelope_bytes=worker.stable_memory_envelope_bytes,
+            execution_granularity_layers=worker.execution_granularity_layers,
+            supported_roles=frozenset(roles),
+            offer_seq=0,
+            issued_at_ms=0,
+            expires_at_ms=1,
+        )
+        frontier = policy.memory_frontier(
+            offer=offer,
+            manifest=manifest,
+            qualified_context_limit_tokens=worker.qualified_context_limit_tokens,
+            kv_block_size=kv_block_size,
+            maximum_sessions=maximum_sessions,
+        )
+        cached_frontiers[cache_key] = frontier
+        result[worker.worker_id] = frontier
+    return result
+
+
+def maximum_span_placements(
+    manifest: ModelManifest,
+    demand: ContextCapacityDemandMap,
+    worker_frontiers: Mapping[str, tuple[MemoryPlacementPoint, ...]],
+    *,
+    now_ms: int,
+) -> GreedyPlacementResult:
+    """Baseline that maximizes resident layers before considering demand."""
+
+    demand.validate_for(manifest, now_ms=now_ms)
+    placements: list[SimulatedPlacement] = []
+    for worker_id, frontier in worker_frontiers.items():
+        if not worker_id:
+            raise ValueError("simulated worker ids must be non-empty")
+        if not frontier:
+            continue
+        current = tuple(placements)
+        coverage = _placement_context_coverage(manifest, current)
+        point = max(
+            frontier,
+            key=lambda candidate: (
+                candidate.span.length,
+                _weighted_layer_deficit_from_coverage(
+                    manifest, demand, coverage, candidate
+                ),
+                candidate.context_tokens,
+                candidate.max_sessions,
+                -candidate.span.start,
+            ),
+        )
+        placements.append(SimulatedPlacement(worker_id=worker_id, point=point))
+
+    result = tuple(placements)
+    return GreedyPlacementResult(
+        placements=result,
+        service=evaluate_context_service(manifest, result),
     )
 
 
