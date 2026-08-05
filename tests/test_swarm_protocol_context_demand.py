@@ -33,7 +33,7 @@ def test_window_uses_exact_context_bucket_little_law_and_no_route_pressure():
     model = manifest()
     window = ContextDemandWindow(model, "eu-west")
     window.record_admission("request-1", required_context_tokens=12_220, now_ms=1_000)
-    window.record_no_route(required_context_tokens=12_220, now_ms=2_000)
+    window.record_no_route("request-2", required_context_tokens=12_220, now_ms=2_000)
     window.record_completion("request-1", now_ms=61_000)
 
     demand = window.snapshot(now_ms=61_000)
@@ -48,6 +48,15 @@ def test_window_uses_exact_context_bucket_little_law_and_no_route_pressure():
     assert agentic.demand_weight_by_layer[0] > agentic.confidence
     assert long.desired_concurrent_slots == 0
     demand.validate_for(model, now_ms=61_000)
+
+
+def test_window_deduplicates_retried_no_route_request_ids():
+    model = manifest()
+    window = ContextDemandWindow(model, "eu-west")
+    window.record_no_route("retry", required_context_tokens=60_000, now_ms=1_000)
+    window.record_no_route("retry", required_context_tokens=60_000, now_ms=2_000)
+
+    assert window.snapshot(now_ms=2_000).classes[-1].no_route_rejections == 1
 
 
 def test_window_is_idempotent_for_duplicate_admission_and_tracks_live_long_request():

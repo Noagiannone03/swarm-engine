@@ -143,6 +143,33 @@ class RequestHandler:
             return
         await asyncio.to_thread(wait, self.RETRY_DELAY_SEC)
 
+    async def _observe_unmet_context_demand(
+        self,
+        request_id: str,
+        required_context_tokens: int,
+    ) -> None:
+        """Best-effort placement feedback, isolated from OpenAI admission."""
+
+        observe = getattr(
+            self.scheduler_manage,
+            "observe_unmet_context_demand",
+            None,
+        )
+        if observe is None:
+            return
+        try:
+            await asyncio.to_thread(
+                observe,
+                str(request_id),
+                int(required_context_tokens),
+            )
+        except Exception:
+            logger.warning(
+                "Unable to observe unmet context demand for request %s",
+                request_id,
+                exc_info=True,
+            )
+
     async def _next_chunk_until_disconnect(
         self,
         response,
@@ -392,6 +419,10 @@ class RequestHandler:
                     code="context_route_not_ready",
                 )
             if required_context_tokens > route_context_limit:
+                await self._observe_unmet_context_demand(
+                    str(request_id),
+                    required_context_tokens,
+                )
                 return openai_error_response(
                     (
                         f"This request requires {required_context_tokens} tokens "
@@ -540,6 +571,10 @@ class RequestHandler:
                                 code="frontend_tokenizer_unstable",
                             )
                         if frontend_budget.required_tokens > max_supported_context():
+                            await self._observe_unmet_context_demand(
+                                str(request_id),
+                                frontend_budget.required_tokens,
+                            )
                             return openai_error_response(
                                 (
                                     f"This request requires {frontend_budget.required_tokens} "

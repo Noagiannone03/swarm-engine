@@ -42,6 +42,7 @@ class ForwardingSchedulerManage(DummySchedulerManage):
         self.context_budget = context_budget
         self.max_context = max_context
         self.routing_requests = []
+        self.unmet_context_requests = []
         self.active_routes = set()
 
     def get_schedule_status(self):
@@ -52,6 +53,10 @@ class ForwardingSchedulerManage(DummySchedulerManage):
 
     def max_supported_context_tokens(self):
         return self.max_context
+
+    def observe_unmet_context_demand(self, request_id, required_context_tokens):
+        self.unmet_context_requests.append((request_id, required_context_tokens))
+        return True
 
     def get_routing_table(
         self,
@@ -441,6 +446,34 @@ def test_forward_request_rejects_context_larger_than_every_pipeline():
     assert payload["error"]["code"] == "context_length_exceeded"
     assert "32768 prompt + 4096 maximum output" in payload["error"]["message"]
     assert scheduler_manage.routing_requests == []
+    assert scheduler_manage.unmet_context_requests == [("oversized-req", 36864)]
+
+
+def test_context_rejection_is_unchanged_when_demand_observer_fails():
+    class FailingDemandObserver(ForwardingSchedulerManage):
+        def observe_unmet_context_demand(self, request_id, required_context_tokens):
+            del request_id, required_context_tokens
+            raise RuntimeError("DHT unavailable")
+
+    handler = RequestHandler()
+    handler.set_scheduler_manage(
+        FailingDemandObserver(
+            context_budget=ContextBudget(prompt_tokens=32768, max_output_tokens=4096),
+            max_context=32768,
+        )
+    )
+
+    response = asyncio.run(
+        handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "large context"}]},
+            "observer-failure",
+            1.0,
+        )
+    )
+
+    payload = json.loads(response.body)
+    assert response.status_code == 400
+    assert payload["error"]["code"] == "context_length_exceeded"
 
 
 def test_forward_request_routes_with_exact_required_context():

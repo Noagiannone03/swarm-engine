@@ -72,7 +72,11 @@ class ContextDemandWindow:
         self.maximum_concurrent_slots = maximum_concurrent_slots
         self.maximum_events = maximum_events
         self._admissions: deque[_TimedClass] = deque(maxlen=maximum_events)
-        self._rejections: deque[_TimedClass] = deque(maxlen=maximum_events)
+        # Rejections are keyed by the private coordinator request id so HTTP,
+        # route-reservation, or client retries cannot manufacture placement
+        # pressure. Request ids never leave this process: snapshots contain
+        # only per-class aggregates.
+        self._rejections: OrderedDict[str, _TimedClass] = OrderedDict()
         self._completed: deque[_CompletedRequest] = deque(maxlen=maximum_events)
         self._inflight: OrderedDict[str, tuple[int, int]] = OrderedDict()
         self._lock = threading.RLock()
@@ -87,9 +91,14 @@ class ContextDemandWindow:
 
     def _prune_locked(self, now_ms: int) -> None:
         cutoff = now_ms - self.window_ms
-        for events in (self._admissions, self._rejections, self._completed):
+        for events in (self._admissions, self._completed):
             while events and events[0].at_ms < cutoff:
                 events.popleft()
+        while self._rejections:
+            request_id, event = next(iter(self._rejections.items()))
+            if event.at_ms >= cutoff:
+                break
+            self._rejections.pop(request_id, None)
 
     def record_admission(
         self,
@@ -110,13 +119,23 @@ class ContextDemandWindow:
             while len(self._inflight) > self.maximum_events:
                 self._inflight.popitem(last=False)
 
-    def record_no_route(self, *, required_context_tokens: int, now_ms: int) -> None:
-        if now_ms < 0:
-            raise ValueError("rejection time must be non-negative")
+    def record_no_route(
+        self,
+        request_id: str,
+        *,
+        required_context_tokens: int,
+        now_ms: int,
+    ) -> None:
+        if not request_id or now_ms < 0:
+            raise ValueError("rejected request identity and time must be valid")
         context_tokens = self._class_for(required_context_tokens)
         with self._lock:
             self._prune_locked(now_ms)
-            self._rejections.append(_TimedClass(now_ms, context_tokens))
+            if request_id in self._rejections:
+                return
+            self._rejections[request_id] = _TimedClass(now_ms, context_tokens)
+            while len(self._rejections) > self.maximum_events:
+                self._rejections.popitem(last=False)
 
     def record_completion(self, request_id: str, *, now_ms: int) -> None:
         if not request_id or now_ms < 0:
@@ -149,7 +168,7 @@ class ContextDemandWindow:
         with self._lock:
             self._prune_locked(now_ms)
             admissions = tuple(self._admissions)
-            rejections = tuple(self._rejections)
+            rejections = tuple(self._rejections.values())
             completed = tuple(self._completed)
             inflight = tuple(self._inflight.values())
 
@@ -273,11 +292,13 @@ class ContextDemandAnnouncer:
 
     def record_no_route(
         self,
+        request_id: str,
         manifest: ModelManifest,
         *,
         required_context_tokens: int,
     ) -> None:
         self._window(manifest).record_no_route(
+            request_id,
             required_context_tokens=required_context_tokens,
             now_ms=self._clock_ms(),
         )

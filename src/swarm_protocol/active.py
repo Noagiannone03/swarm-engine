@@ -190,7 +190,11 @@ class ActiveRouteRuntime:
                     plan_expires_at_ms=now_ms + self.plan_ttl_ms,
                 )
             except RoutePlanningError:
-                self._observe_no_route(manifest, request.required_context_tokens)
+                self._observe_no_route(
+                    request_key,
+                    manifest,
+                    request.required_context_tokens,
+                )
                 raise
             # Measure lease safety against the coordinator's monotonic progress,
             # not worker-produced wall-clock timestamps. Starting the local
@@ -324,6 +328,30 @@ class ActiveRouteRuntime:
             else:
                 rejected = candidate
         return supported
+
+    def observe_unmet_context_demand(
+        self,
+        request_id: str,
+        required_context_tokens: int,
+    ) -> bool:
+        """Record one valid request that exceeds current loaded coverage.
+
+        This does not plan, reserve, or advance an epoch. The signed manifest
+        remains the hard upper bound, while the demand window deduplicates the
+        private request identity before publishing aggregate class pressure.
+        """
+
+        request_key = str(request_id)
+        required = int(required_context_tokens)
+        if not request_key or required <= 0:
+            raise ValueError("unmet context demand requires a request id and token budget")
+        nodes = self.nodes_provider()
+        model_swarm_id = self.planner.ready_model_swarm_id(nodes)
+        manifest = self.planner.trusted_manifest(model_swarm_id)
+        if required > manifest.model_max_context_tokens:
+            return False
+        self._observe_no_route(request_key, manifest, required)
+        return True
 
     def is_active(self, request_id: str) -> bool:
         with self._lock:
@@ -531,6 +559,7 @@ class ActiveRouteRuntime:
 
     def _observe_no_route(
         self,
+        request_id: str,
         manifest: ModelManifest,
         required_context_tokens: int,
     ) -> None:
@@ -538,6 +567,7 @@ class ActiveRouteRuntime:
             return
         try:
             self.demand_observer.record_no_route(
+                request_id,
                 manifest,
                 required_context_tokens=required_context_tokens,
             )

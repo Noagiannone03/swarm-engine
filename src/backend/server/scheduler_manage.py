@@ -624,6 +624,30 @@ class SchedulerManage:
             )
         return self.scheduler.max_supported_context_tokens()
 
+    def observe_unmet_context_demand(
+        self,
+        request_id: str,
+        required_context_tokens: int,
+    ) -> bool:
+        """Feed valid, currently unroutable demand to autonomous placement."""
+
+        if self.swarm_v3_mode != "active" or self.active_v3_routes is None:
+            return False
+        try:
+            return self.active_v3_routes.observe_unmet_context_demand(
+                str(request_id),
+                int(required_context_tokens),
+            )
+        except Exception:
+            # Demand is advisory and must never change the OpenAI response or
+            # make admission fail less safely than the route planner itself.
+            logger.warning(
+                "Unable to observe unmet context demand for request %s",
+                request_id,
+                exc_info=True,
+            )
+            return False
+
     def get_routing_table(
         self,
         request_id,

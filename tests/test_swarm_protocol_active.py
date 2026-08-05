@@ -216,8 +216,10 @@ class FakeDemandObserver:
     def record_admission(self, request_id, manifest, *, required_context_tokens):
         self.admissions.append((request_id, manifest.model_swarm_id, required_context_tokens))
 
-    def record_no_route(self, manifest, *, required_context_tokens):
-        self.rejections.append((manifest.model_swarm_id, required_context_tokens))
+    def record_no_route(self, request_id, manifest, *, required_context_tokens):
+        self.rejections.append(
+            (request_id, manifest.model_swarm_id, required_context_tokens)
+        )
 
     def record_completion(self, request_id):
         self.completions.append(request_id)
@@ -245,7 +247,24 @@ def test_active_runtime_observes_admission_completion_and_no_route_without_contr
                 prompt_tokens=20_000,
                 reserved_output_tokens=2_048,
             )
-        assert observer.rejections == [(trusted_swarm_id, 22_048)]
+        assert observer.rejections == [("rejected", trusted_swarm_id, 22_048)]
+    finally:
+        active.close()
+
+
+def test_active_runtime_observes_unmet_valid_context_without_planning_or_epoch():
+    now = [1_000]
+    observer = FakeDemandObserver()
+    active, planner, coordinator, _ = runtime(now, demand_observer=observer)
+    try:
+        trusted_swarm_id = planner.trusted_manifest(SWARM_ID).model_swarm_id
+        assert active.observe_unmet_context_demand("long-request", 32_768)
+        assert observer.rejections == [("long-request", trusted_swarm_id, 32_768)]
+        assert planner.epochs == []
+        assert coordinator.reserved == []
+
+        assert not active.observe_unmet_context_demand("invalid-request", 65_537)
+        assert len(observer.rejections) == 1
     finally:
         active.close()
 
