@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use biscuit_auth::{
-    Biscuit, KeyPair, PublicKey,
+    AuthorizerLimits, Biscuit, KeyPair, PublicKey,
     builder::Algorithm,
     macros::{authorizer, biscuit},
 };
@@ -24,6 +24,17 @@ const HASH_HEX_LEN: usize = 64;
 const MAX_TEXT_LEN: usize = 512;
 const MAX_CAPABILITY_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 const MAX_CLOCK_SKEW_MS: u64 = 30_000;
+const AUTHORIZER_MAX_TIME: Duration = Duration::from_millis(50);
+
+fn authorizer_limits() -> AuthorizerLimits {
+    AuthorizerLimits {
+        // Keep Biscuit's bounded fact and iteration defaults. Only the 1 ms
+        // wall-clock default is machine-sensitive enough to reject this fixed,
+        // authority-sealed policy on loaded Windows hosts.
+        max_time: AUTHORIZER_MAX_TIME,
+        ..AuthorizerLimits::default()
+    }
+}
 
 /// Explicit recovery cost/guarantee attached to an admitted route.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -345,6 +356,7 @@ pub fn verify_route_capability(
         capability_expires_at_ms = capability_expires_at_ms,
         recovery_policy = context.recovery_policy.as_str(),
     )
+    .set_limits(authorizer_limits())
     .build(&biscuit)
     .context("failed to construct route capability authorizer")?;
     authorizer
