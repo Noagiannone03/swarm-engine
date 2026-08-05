@@ -83,6 +83,7 @@ def lease(
     end: int,
     *,
     state: SpanState = SpanState.READY,
+    max_context_tokens: int = 65_536,
 ) -> SpanLease:
     return SpanLease(
         model_swarm_id=model.model_swarm_id,
@@ -91,7 +92,7 @@ def lease(
         effective_span_mode=EffectiveSpanMode.FIXED,
         state=state,
         weight_hashes=(HASHES[0],),
-        max_context_tokens=65_536,
+        max_context_tokens=max_context_tokens,
         kv_geometry=KvGeometry(
             block_size_tokens=1,
             bytes_per_token_by_layer=model.kv_bytes_per_token_by_layer,
@@ -366,6 +367,50 @@ def test_ready_worker_never_moves_without_a_complete_independent_route():
     assert decision.reason == "movement_would_remove_the_last_executable_route"
 
 
+def test_short_context_replica_cannot_displace_the_last_long_context_head():
+    """Coverage is cumulative by context, not global across every lease.
+
+    A fast 16k full-model replica must not make the only 32k head appear
+    redundant. Otherwise that head may move by one layer, silently collapsing
+    the long route even though every layer remains covered at *some* context.
+    """
+
+    model = manifest()
+    current = lease(
+        model,
+        "long-head",
+        0,
+        2,
+        max_context_tokens=20,
+    )
+    decision = AutonomousPlacementPolicy(
+        minimum_improvement=0,
+        movement_cooldown_ms=0,
+    ).choose(
+        offer=offer("long-head", memory_bytes=700),
+        manifest=model,
+        leases=(
+            current,
+            lease(model, "long-tail", 2, 4, max_context_tokens=20),
+            lease(model, "short-replica", 0, 4, max_context_tokens=10),
+        ),
+        demand=CapacityDemandMap(
+            desired_replicas_by_layer=(1, 1, 3, 3),
+            demand_weight_by_layer=(1, 1, 10, 10),
+        ),
+        context_tokens=20,
+        kv_block_size=1,
+        current_span=current.hosted_span,
+        serving_route_exists=True,
+        serving_route_survives_movement=True,
+        now_ms=20_000,
+    )
+
+    assert decision.action is PlacementAction.KEEP
+    assert decision.span == LayerSpan(start=0, end=2)
+    assert decision.reason == "current_span_is_still_the_best_stable_choice"
+
+
 def test_disjoint_lab_topology_moves_redundant_head_to_uncovered_tail():
     base = manifest()
     model = base.model_copy(
@@ -420,7 +465,9 @@ def test_context_demand_is_versioned_expiring_and_matches_the_signed_ladder():
 
     demand.validate_for(model, now_ms=2_000)
     assert demand.class_for(16_385).context_tokens == 32_768
-    assert demand.class_for(16_384).layer_screen() == CapacityDemandMap.uniform(4, desired_replicas=1)
+    assert demand.class_for(16_384).layer_screen() == CapacityDemandMap.uniform(
+        4, desired_replicas=1
+    )
 
     with pytest.raises(ValueError, match="expired"):
         demand.validate_for(model, now_ms=61_000)

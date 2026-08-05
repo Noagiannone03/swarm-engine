@@ -385,14 +385,18 @@ class AutonomousPlacementPolicy:
         leases: tuple[SpanLease, ...],
         *,
         exclude_worker_id: str,
+        minimum_context_tokens: int,
         states: frozenset[SpanState] = frozenset({SpanState.READY}),
     ) -> list[int]:
+        if minimum_context_tokens <= 0:
+            raise ValueError("coverage context must be positive")
         coverage = [0] * manifest.num_layers
         for lease in leases:
             if (
                 lease.model_swarm_id != manifest.model_swarm_id
                 or lease.worker_id == exclude_worker_id
                 or lease.state not in states
+                or lease.max_context_tokens < minimum_context_tokens
             ):
                 continue
             for layer in range(lease.hosted_span.start, lease.hosted_span.end):
@@ -457,8 +461,12 @@ class AutonomousPlacementPolicy:
         leases: tuple[SpanLease, ...],
         *,
         exclude_worker_id: str,
+        minimum_context_tokens: int,
     ) -> tuple[frozenset[int], frozenset[int]]:
         """Return exact prefix/suffix boundaries reachable through live intents."""
+
+        if minimum_context_tokens <= 0:
+            raise ValueError("route-boundary context must be positive")
 
         spans = tuple(
             lease.hosted_span
@@ -466,6 +474,7 @@ class AutonomousPlacementPolicy:
             if lease.model_swarm_id == manifest.model_swarm_id
             and lease.worker_id != exclude_worker_id
             and lease.state in {SpanState.BUILDING, SpanState.WARMING, SpanState.READY}
+            and lease.max_context_tokens >= minimum_context_tokens
         )
         prefix = {0}
         suffix = {manifest.num_layers}
@@ -538,17 +547,20 @@ class AutonomousPlacementPolicy:
             manifest,
             leases,
             exclude_worker_id=offer.worker_id,
+            minimum_context_tokens=context_tokens,
             states=frozenset({SpanState.BUILDING, SpanState.WARMING, SpanState.READY}),
         )
         ready_coverage = self._coverage(
             manifest,
             leases,
             exclude_worker_id=offer.worker_id,
+            minimum_context_tokens=context_tokens,
         )
         prefix_boundaries, suffix_boundaries = self._fixed_route_boundaries(
             manifest,
             leases,
             exclude_worker_id=offer.worker_id,
+            minimum_context_tokens=context_tokens,
         )
         candidates = [
             (
