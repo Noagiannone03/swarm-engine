@@ -69,6 +69,12 @@ class CandidatePotential:
         )
 
 
+@dataclass(frozen=True)
+class GreedyPlacementResult:
+    placements: tuple[SimulatedPlacement, ...]
+    service: tuple[ContextServiceCapacity, ...]
+
+
 def _maximum_flow_value(
     *,
     num_layers: int,
@@ -139,6 +145,59 @@ def evaluate_context_service(
     )
 
 
+def _placement_context_coverage(
+    manifest: ModelManifest,
+    placements: tuple[SimulatedPlacement, ...],
+) -> dict[int, list[int]]:
+    coverage: dict[int, list[int]] = {
+        context_tokens: [0] * manifest.num_layers
+        for context_tokens in manifest.context_classes
+    }
+    for placement in placements:
+        for context_tokens, by_layer in coverage.items():
+            if placement.point.context_tokens < context_tokens:
+                continue
+            for layer in range(placement.point.span.start, placement.point.span.end):
+                by_layer[layer] += 1
+    return coverage
+
+
+def _weighted_layer_deficit_from_coverage(
+    manifest: ModelManifest,
+    demand: ContextCapacityDemandMap,
+    coverage: Mapping[int, list[int]],
+    point: MemoryPlacementPoint,
+) -> float:
+    deficit_filled = 0.0
+    for class_demand in demand.classes:
+        if point.context_tokens < class_demand.context_tokens:
+            continue
+        deficit_filled += class_demand.confidence * sum(
+            weight
+            for layer, weight in enumerate(class_demand.demand_weight_by_layer)
+            if point.span.start <= layer < point.span.end
+            and coverage[class_demand.context_tokens][layer]
+            < class_demand.desired_replicas_by_layer[layer]
+        ) / manifest.num_layers
+    return deficit_filled
+
+
+def weighted_layer_deficit_score(
+    manifest: ModelManifest,
+    demand: ContextCapacityDemandMap,
+    placements: tuple[SimulatedPlacement, ...],
+    point: MemoryPlacementPoint,
+) -> float:
+    """Cheap Petals-style first-pass score across cumulative classes."""
+
+    return _weighted_layer_deficit_from_coverage(
+        manifest,
+        demand,
+        _placement_context_coverage(manifest, placements),
+        point,
+    )
+
+
 def score_candidate_potential(
     manifest: ModelManifest,
     demand: ContextCapacityDemandMap,
@@ -161,20 +220,8 @@ def score_candidate_potential(
         for item in evaluate_context_service(manifest, (*placements, candidate))
     }
 
-    coverage: dict[int, list[int]] = {
-        context_tokens: [0] * manifest.num_layers
-        for context_tokens in manifest.context_classes
-    }
-    for placement in placements:
-        for context_tokens, by_layer in coverage.items():
-            if placement.point.context_tokens < context_tokens:
-                continue
-            for layer in range(placement.point.span.start, placement.point.span.end):
-                by_layer[layer] += 1
-
     route_gain = 0.0
     slot_gain = 0.0
-    deficit_filled = 0.0
     for class_demand in demand.classes:
         class_weight = (
             sum(class_demand.demand_weight_by_layer)
@@ -198,24 +245,87 @@ def score_candidate_potential(
             min(after_capacity.concurrent_service_slots, class_demand.desired_concurrent_slots)
             - min(before_capacity.concurrent_service_slots, class_demand.desired_concurrent_slots)
         )
-        if candidate.point.context_tokens < context_tokens:
-            continue
-        per_layer_gain = sum(
-            weight
-            for layer, weight in enumerate(class_demand.demand_weight_by_layer)
-            if candidate.point.span.start <= layer < candidate.point.span.end
-            and coverage[context_tokens][layer]
-            < class_demand.desired_replicas_by_layer[layer]
-        )
-        deficit_filled += class_demand.confidence * per_layer_gain / manifest.num_layers
-
     return CandidatePotential(
         weighted_independent_route_gain=route_gain,
         weighted_concurrent_slot_gain=slot_gain,
-        weighted_layer_deficit_filled=deficit_filled,
+        weighted_layer_deficit_filled=weighted_layer_deficit_score(
+            manifest, demand, placements, candidate.point
+        ),
         context_tokens=candidate.point.context_tokens,
         span_length=candidate.point.span.length,
         max_sessions=candidate.point.max_sessions,
+    )
+
+
+def greedy_context_placements(
+    manifest: ModelManifest,
+    demand: ContextCapacityDemandMap,
+    worker_frontiers: Mapping[str, tuple[MemoryPlacementPoint, ...]],
+    *,
+    now_ms: int,
+    exact_candidate_bound: int = 32,
+) -> GreedyPlacementResult:
+    """Run the bounded two-pass decentralized heuristic in arrival order."""
+
+    demand.validate_for(manifest, now_ms=now_ms)
+    if exact_candidate_bound <= 0:
+        raise ValueError("exact candidate bound must be positive")
+
+    placements: list[SimulatedPlacement] = []
+    for worker_id, frontier in worker_frontiers.items():
+        if not worker_id:
+            raise ValueError("simulated worker ids must be non-empty")
+        if not frontier:
+            continue
+        current = tuple(placements)
+        coverage = _placement_context_coverage(manifest, current)
+        cheap_ranked = sorted(
+            [
+                (
+                    point,
+                    _weighted_layer_deficit_from_coverage(
+                        manifest, demand, coverage, point
+                    ),
+                )
+                for point in frontier
+            ],
+            key=lambda item: (
+                item[1],
+                item[0].context_tokens,
+                item[0].span.length,
+                item[0].max_sessions,
+                -item[0].span.start,
+            ),
+            reverse=True,
+        )
+        finalists = cheap_ranked[:exact_candidate_bound]
+        candidates = [
+            (
+                SimulatedPlacement(worker_id=worker_id, point=point),
+                cheap_score,
+            )
+            for point, cheap_score in finalists
+        ]
+        chosen, _ = max(
+            candidates,
+            key=lambda item: (
+                score_candidate_potential(
+                    manifest,
+                    demand,
+                    current,
+                    item[0],
+                    now_ms=now_ms,
+                ).rank(),
+                item[1],
+                -item[0].point.span.start,
+            ),
+        )
+        placements.append(chosen)
+
+    result = tuple(placements)
+    return GreedyPlacementResult(
+        placements=result,
+        service=evaluate_context_service(manifest, result),
     )
 
 

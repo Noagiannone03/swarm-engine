@@ -11,6 +11,7 @@ from swarm_protocol.placement_simulator import (
     SimulatedPlacement,
     build_oracle_scenario,
     evaluate_context_service,
+    greedy_context_placements,
     score_candidate_potential,
 )
 
@@ -180,3 +181,47 @@ def test_oracle_scenario_is_deterministic_and_uses_aggregated_demand_only():
         {"context_tokens": 20, "target_slots": 3, "weight": 4_000},
     ]
     assert set(scenario) == {"num_layers", "context_classes", "demands", "workers"}
+
+
+def test_two_pass_greedy_bootstraps_the_weighted_agentic_route():
+    model = _manifest().model_copy(
+        update={
+            "model_max_context_tokens": 20,
+            "context_classes": (10, 20),
+        }
+    )
+    demand = ContextCapacityDemandMap(
+        model_swarm_id=model.model_swarm_id,
+        region_id="eu-west",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+        classes=(
+            ContextClassDemand(
+                context_tokens=10,
+                desired_independent_routes=1,
+                desired_concurrent_slots=1,
+                desired_replicas_by_layer=(1,) * 4,
+                demand_weight_by_layer=(1.0,) * 4,
+            ),
+            ContextClassDemand(
+                context_tokens=20,
+                desired_independent_routes=1,
+                desired_concurrent_slots=1,
+                desired_replicas_by_layer=(1,) * 4,
+                demand_weight_by_layer=(10.0,) * 4,
+            ),
+        ),
+    )
+    frontiers = {
+        "adaptive": (
+            _placement("ignored", 0, 4, context_tokens=10, sessions=1).point,
+            _placement("ignored", 0, 2, context_tokens=20, sessions=1).point,
+        ),
+        "tail": (_placement("ignored", 2, 4, context_tokens=20, sessions=1).point,),
+    }
+
+    result = greedy_context_placements(model, demand, frontiers, now_ms=2_000)
+
+    assert result.placements[0].point == frontiers["adaptive"][1]
+    assert result.service[-1].context_tokens == 20
+    assert result.service[-1].concurrent_service_slots == 1
