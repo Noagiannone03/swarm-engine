@@ -321,6 +321,67 @@ def maximum_span_placements(
     )
 
 
+def petals_fixed_context_placements(
+    manifest: ModelManifest,
+    demand: ContextCapacityDemandMap,
+    worker_frontiers: Mapping[str, tuple[MemoryPlacementPoint, ...]],
+    *,
+    context_tokens: int,
+    now_ms: int,
+) -> GreedyPlacementResult:
+    """Petals-style single-context baseline over exact local frontiers.
+
+    Petals determines a server's block count from local capacity, then places
+    that fixed-length span where supply is weakest. Fabi's input/output
+    endpoints make feasible length depend on position, so this adaptation
+    compares the resulting global minimum-supply vector across all feasible
+    spans. It deliberately does not claim to model Petals throughput
+    calibration or routing latency.
+    """
+
+    demand.validate_for(manifest, now_ms=now_ms)
+    if context_tokens not in manifest.context_classes:
+        raise ValueError("Petals baseline requires a signed context class")
+    placements: list[SimulatedPlacement] = []
+    for worker_id, frontier in worker_frontiers.items():
+        if not worker_id:
+            raise ValueError("simulated worker ids must be non-empty")
+        eligible = tuple(
+            point for point in frontier if point.context_tokens == context_tokens
+        )
+        if not eligible:
+            continue
+        coverage = _placement_context_coverage(manifest, tuple(placements))[context_tokens]
+
+        # Petals compares sorted per-layer throughputs lexicographically. For
+        # variable endpoint-aware lengths, compare the complete supply vector
+        # after each join: this first improves the global bottleneck, then the
+        # next weakest layer. Unit capacity is used because this memory-only
+        # scenario has no measured throughput profile yet.
+        point = max(
+            eligible,
+            key=lambda candidate: (
+                tuple(
+                    sorted(
+                        value
+                        + int(candidate.span.start <= layer < candidate.span.end)
+                        for layer, value in enumerate(coverage)
+                    )
+                ),
+                candidate.span.length,
+                candidate.max_sessions,
+                -candidate.span.start,
+            ),
+        )
+        placements.append(SimulatedPlacement(worker_id=worker_id, point=point))
+
+    result = tuple(placements)
+    return GreedyPlacementResult(
+        placements=result,
+        service=evaluate_context_service(manifest, result),
+    )
+
+
 def score_candidate_potential(
     manifest: ModelManifest,
     demand: ContextCapacityDemandMap,

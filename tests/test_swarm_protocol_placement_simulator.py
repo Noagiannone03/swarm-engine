@@ -15,6 +15,7 @@ from swarm_protocol.placement_simulator import (
     evaluate_context_service,
     greedy_context_placements,
     maximum_span_placements,
+    petals_fixed_context_placements,
     score_candidate_potential,
 )
 
@@ -292,9 +293,33 @@ def test_agentic_policy_spreads_an_explicit_8_16g_class_population_for_context()
         ),
     )
     maximum_span = maximum_span_placements(model, demand, frontiers, now_ms=2_000)
+    petals_short = petals_fixed_context_placements(
+        model,
+        demand,
+        frontiers,
+        context_tokens=16_384,
+        now_ms=2_000,
+    )
+    petals_long = petals_fixed_context_placements(
+        model,
+        demand,
+        frontiers,
+        context_tokens=65_536,
+        now_ms=2_000,
+    )
     context_aware = greedy_context_placements(model, demand, frontiers, now_ms=2_000)
 
     assert [item.concurrent_service_slots for item in maximum_span.service] == [4, 0, 0]
+    assert [item.concurrent_service_slots for item in petals_short.service] == [4, 0, 0]
+    petals_long_coverage = [0] * model.num_layers
+    for placement in petals_long.placements:
+        for layer in range(placement.point.span.start, placement.point.span.end):
+            petals_long_coverage[layer] += 1
+    assert min(petals_long_coverage) >= 2
+    # Petals may execute a suffix of a hosted span. Fabi's current FIXED
+    # backend contract may not, so layer coverage alone does not prove that
+    # the exact span boundaries form a route.
+    assert petals_long.service[-1].concurrent_service_slots == 0
     assert [item.concurrent_service_slots for item in context_aware.service] == [2, 2, 2]
     assert all(
         placement.point.context_tokens == 65_536
