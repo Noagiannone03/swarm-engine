@@ -215,34 +215,34 @@ def autonomous_context_tiers(
     return tuple(dict.fromkeys(tiers))
 
 
-def next_autonomous_context_tier(
+def reconciled_autonomous_context_limit(
     requested_tokens: int,
     supported_tokens: int,
     *,
     minimum_tokens: int = 4_096,
 ) -> int | None:
-    """Choose the highest bounded tier proved to fit by the live executor.
+    """Keep the exact KV ceiling proved to fit by the live executor.
 
     Static placement uses the stable pre-load memory envelope, but only the
     initialized backend can measure its final workspace and KV footprint.  A
-    failed cold join therefore reconciles the worker's own context claim from
-    the measured limit instead of asking the legacy scheduler to resize an
-    autonomous DHT generation.
+    failed cold join therefore reconciles the worker's own context claim to
+    that measured limit instead of rounding it down to a demand-summary class
+    or asking the legacy scheduler to resize an autonomous DHT generation.
+
+    Context classes are cumulative aggregation buckets, not machine capacity
+    limits.  The backend already reports ``supported_tokens`` in its concrete
+    KV geometry, so replacing (for example) 30,752 with the 16,384 demand class
+    would discard usable capacity without adding a safety invariant.
     """
 
+    if requested_tokens <= 0 or minimum_tokens <= 0:
+        raise ValueError("requested and minimum context tokens must be positive")
     if supported_tokens < 0:
         raise ValueError("supported context tokens cannot be negative")
-    return next(
-        (
-            tier
-            for tier in autonomous_context_tiers(
-                requested_tokens,
-                minimum_tokens=minimum_tokens,
-            )
-            if tier < requested_tokens and tier <= supported_tokens
-        ),
-        None,
-    )
+    floor = min(requested_tokens, minimum_tokens)
+    if supported_tokens < floor or supported_tokens >= requested_tokens:
+        return None
+    return supported_tokens
 
 
 class AutonomousWorkerPlacement:

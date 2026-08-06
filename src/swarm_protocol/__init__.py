@@ -124,7 +124,7 @@ from swarm_protocol.worker_placement import (
     AutonomousWorkerPlacement,
     autonomous_context_tiers,
     autonomous_peer_topology,
-    next_autonomous_context_tier,
+    reconciled_autonomous_context_limit,
 )
 
 __all__ = [
@@ -136,7 +136,7 @@ __all__ = [
     "AutonomousWorkerPlacement",
     "autonomous_peer_topology",
     "autonomous_context_tiers",
-    "next_autonomous_context_tier",
+    "reconciled_autonomous_context_limit",
     "BackendKind",
     "ContributionReceipt",
     "CapacityDemandMap",

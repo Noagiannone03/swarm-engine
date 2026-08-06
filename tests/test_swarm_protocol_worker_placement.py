@@ -20,7 +20,7 @@ from swarm_protocol import (
     WorkerRole,
     autonomous_context_tiers,
     autonomous_peer_topology,
-    next_autonomous_context_tier,
+    reconciled_autonomous_context_limit,
 )
 
 HASHES = tuple(character * 64 for character in "abcdef")
@@ -47,10 +47,11 @@ def test_autonomous_context_tiers_reject_non_positive_contracts():
             raise AssertionError("non-positive context tier contract was accepted")
 
 
-def test_measured_context_limit_selects_highest_strictly_lower_tier():
-    assert next_autonomous_context_tier(32_768, 30_752) == 16_384
-    assert next_autonomous_context_tier(32_768, 8_192) == 8_192
-    assert next_autonomous_context_tier(4_096, 4_095) is None
+def test_measured_context_limit_preserves_the_exact_backend_ceiling():
+    assert reconciled_autonomous_context_limit(32_768, 30_752) == 30_752
+    assert reconciled_autonomous_context_limit(32_768, 8_192) == 8_192
+    assert reconciled_autonomous_context_limit(32_768, 32_768) is None
+    assert reconciled_autonomous_context_limit(4_096, 4_095) is None
 
 
 def test_autonomous_topology_forms_sparse_forward_edges_and_decode_closure():

@@ -69,7 +69,7 @@ from swarm_protocol.worker_placement import (
     AutonomousWorkerPlacement,
     autonomous_context_tiers,
     autonomous_peer_topology,
-    next_autonomous_context_tier,
+    reconciled_autonomous_context_limit,
 )
 
 logger = get_logger(__name__)
@@ -2588,15 +2588,15 @@ class GradientServer:
             return False
 
         minimum_tokens = int(os.environ.get("FABI_SWARM_V3_MIN_CONTEXT_TOKENS", "4096"))
-        next_tier = next_autonomous_context_tier(
+        next_limit = reconciled_autonomous_context_limit(
             requested_tokens,
             supported_tokens,
             minimum_tokens=minimum_tokens,
         )
-        if next_tier is None:
+        if next_limit is None:
             detail = (
-                f"measured KV ceiling {supported_tokens} is below every configured "
-                f"context tier after {requested_tokens} (minimum={minimum_tokens})"
+                f"measured KV ceiling {supported_tokens} cannot replace the requested "
+                f"limit {requested_tokens} (minimum usable context={minimum_tokens})"
             )
             logger.error("Autonomous v3 context reconciliation failed: %s", detail)
             if self._shared_state is not None:
@@ -2610,13 +2610,13 @@ class GradientServer:
         if self.swarm_v3_placement_controller is None:
             raise RuntimeError("autonomous memory reconciliation has no placement controller")
 
-        placement = self.swarm_v3_placement_controller.downgrade_building_context(next_tier)
-        self.planned_context_tokens = next_tier
+        placement = self.swarm_v3_placement_controller.downgrade_building_context(next_limit)
+        self.planned_context_tokens = next_limit
         self.status = ServerState.INITIALIZING
         self._layer_allocation_changed = True
         if self._shared_state is not None:
             self._shared_state.update(
-                planned_context_tokens=next_tier,
+                planned_context_tokens=next_limit,
                 status=ServerState.INITIALIZING.value,
                 frontend_alive=False,
                 memory_contract_failure=None,
@@ -2629,7 +2629,7 @@ class GradientServer:
             "Autonomous v3 worker reconciled measured KV capacity: %d -> %d tokens "
             "(measured ceiling=%d); retrying the same layer generation",
             requested_tokens,
-            next_tier,
+            next_limit,
             supported_tokens,
         )
         return True

@@ -271,11 +271,11 @@ def test_autonomous_worker_reconciles_live_kv_limit_without_scheduler(monkeypatc
     )
 
     assert reconciled is True
-    assert calls == [16_384]
-    assert server.planned_context_tokens == 16_384
+    assert calls == [30_752]
+    assert server.planned_context_tokens == 30_752
     assert server.status is ServerState.INITIALIZING
     assert values["memory_contract_failure"] is None
-    assert values["planned_context_tokens"] == 16_384
+    assert values["planned_context_tokens"] == 30_752
     assert values["_layer_allocation_changed"] is True
     assert values["swarm_v3_placement_generation"] == 7
 
