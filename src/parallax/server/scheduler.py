@@ -345,6 +345,13 @@ class Scheduler:
         now = time.time()
         for req in list(self._running_requests.values()):
             try:
+                # Active V3 requests are owned by renewable, worker-local KV
+                # leases.  Their expiry is converted into an explicit local
+                # abort by WorkerExecutionAdmission.  A fixed wall-clock limit
+                # here would race that authority and kill legitimate long
+                # prefills or slow relay transfers.
+                if int(getattr(req, "route_epoch", 0) or 0) > 0:
+                    continue
                 if req.last_updated_time is None:
                     raise ValueError("Requests should have last updated time set.")
                 if now - req.last_updated_time > self.request_timeout_s:

@@ -11,6 +11,13 @@ from scheduling.scheduler import Scheduler
 
 logger = get_logger(__name__)
 
+_INFERENCE_HTTP_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    read=None,
+    write=60.0,
+    pool=10.0,
+)
+
 
 def node_log_summary(message: object) -> dict:
     """Return useful node telemetry without credentials or oversized payloads."""
@@ -250,7 +257,11 @@ class RPCConnectionHandler(ConnectionHandler):
         """Handle chat completion request"""
         logger.debug(f"Chat completion request: {request}, type: {type(request)}")
         try:
-            with httpx.Client(timeout=10 * 60, proxy=None, trust_env=False) as client:
+            with httpx.Client(
+                timeout=_INFERENCE_HTTP_TIMEOUT,
+                proxy=None,
+                trust_env=False,
+            ) as client:
                 if request.get("stream", False):
                     with client.stream(
                         "POST",

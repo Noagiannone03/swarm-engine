@@ -26,6 +26,21 @@ KV, then calls the authenticated frontend worker directly over Iroh.
 8. Route and authority keepalives run on their independent control thread until
    the HTTP response ends or is aborted.
 
+Long prefills deliberately have no wall-clock read deadline once the local
+frontend request and Iroh RPC stream are established. Connection setup remains
+bounded, while termination comes from an explicit engine result, client abort,
+QUIC failure, route fencing or reservation-lease expiry. The OpenAI stream emits
+WHATWG SSE comments while no model event is available; these comments keep HTTP
+intermediaries alive but are never journalled as tokens or interpreted as model
+progress. If the worker RPC itself fails, the Request Agent either performs the
+qualified cold replan or emits one typed SSE error followed by `[DONE]`.
+
+Worker lease expiry is active cleanup, not only accounting: each worker consumes
+newly expired V3 reservations and injects a local fenced abort into its executor.
+The inherited Parallax ten-minute request timer therefore remains a legacy-only
+safety net and cannot race a valid renewable V3 lease during a slow relay
+transfer.
+
 The OpenAI endpoint is loopback-only. `/v1/models`,
 `/v1/request-agent/status`, `/v1/request-agent/events` and
 `/v1/chat/completions` require the same account Bearer credential that the
@@ -109,6 +124,10 @@ replay as the correctness fallback.
 Primary references:
 
 - [Petals inference session recovery](https://github.com/bigscience-workshop/petals/blob/main/src/petals/client/inference_session.py)
+- [HTTPX timeout semantics](https://www.python-httpx.org/advanced/timeouts/)
+- [WHATWG server-sent event keepalive comments](https://html.spec.whatwg.org/dev/server-sent-events.html#authoring-notes)
+- [gRPC keepalive versus health checking](https://grpc.io/docs/guides/keepalive/)
+- [Iroh QUIC stream cancellation](https://docs.iroh.computer/protocols/using-quic#aborting-streams)
 - [SQLite write-ahead logging](https://www.sqlite.org/wal.html)
 - [SQLite transaction semantics](https://www.sqlite.org/lang_transaction.html)
 - [vLLM KV connector base](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/kv_transfer/kv_connector/v1/base.py)

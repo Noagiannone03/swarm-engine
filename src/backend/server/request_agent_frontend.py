@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -60,6 +60,46 @@ from swarm_protocol.routing import RoutePlanningError
 
 _MAX_OPENAI_REQUEST_BYTES = 16 * 1024 * 1024
 _READINESS_CACHE_MS = 1_000
+_OPENAI_SSE_KEEPALIVE_SECONDS = 15.0
+
+
+async def _with_sse_keepalive(source, *, interval_seconds: float):
+    """Keep a quiet OpenAI SSE response alive without inventing model progress.
+
+    The comment is ignored by WHATWG-compatible parsers.  The pending source
+    ``anext`` remains active, so backpressure, cancellation and the worker's
+    terminal event keep their original ordering.
+    """
+
+    if interval_seconds <= 0:
+        raise ValueError("SSE keepalive interval must be positive")
+    iterator = source.__aiter__()
+    pending: asyncio.Task | None = None
+    try:
+        while True:
+            pending = asyncio.create_task(anext(iterator))
+            while not pending.done():
+                done, _pending = await asyncio.wait(
+                    {pending},
+                    timeout=interval_seconds,
+                )
+                if done:
+                    break
+                yield b": keepalive\n\n"
+            try:
+                chunk = pending.result()
+            except StopAsyncIteration:
+                return
+            pending = None
+            yield chunk
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()
 
 
 @dataclass(frozen=True)
@@ -232,6 +272,19 @@ class RequestAgentOpenAIManager:
 
     def max_supported_context_tokens(self) -> int:
         return self._refresh_live_context()
+
+    def observe_unmet_context_demand(
+        self,
+        request_id: str,
+        required_context_tokens: int,
+    ) -> bool:
+        return bool(
+            self.runtime.observe_unmet_context_demand(
+                str(request_id),
+                self.model_swarm_id,
+                int(required_context_tokens),
+            )
+        )
 
     def get_schedule_status(self):
         return NODE_STATUS_AVAILABLE if self._refresh_live_context() >= 2 else NODE_STATUS_WAITING
@@ -839,6 +892,11 @@ def create_request_agent_app(
         response.headers["X-Request-Id"] = request_id
         if isinstance(response, StreamingResponse):
             response.headers["Cache-Control"] = "no-cache"
+            response.headers["X-Accel-Buffering"] = "no"
+            response.body_iterator = _with_sse_keepalive(
+                response.body_iterator,
+                interval_seconds=_OPENAI_SSE_KEEPALIVE_SECONDS,
+            )
         return response
 
     return app

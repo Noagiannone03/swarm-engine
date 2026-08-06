@@ -47,6 +47,12 @@ The native transport owns:
 - connection/path health and network measurements;
 - deadlines, cancellation and backpressure.
 
+For streaming RPCs, a deadline bounds connection/open/write setup only. Once a
+stream is established, Iroh's QUIC connection state, explicit cancellation and
+the V3 reservation lease own liveness; a silent prefill is not failed merely
+because no application chunk has arrived for a fixed duration. Unary RPCs keep
+their normal response deadlines.
+
 Python owns protobuf schemas and RPC dispatch initially. The native boundary
 now exposes byte-oriented unary and streaming operations through a stable-ABI
 PyO3 extension. The service adapter uses explicit MessagePack, protobuf and raw

@@ -294,6 +294,31 @@ class RequestAgentAuthorityClient:
                 code="invalid_route_authority_response",
             ) from error
 
+    def observe_unmet_context_demand(
+        self,
+        *,
+        request_id: str,
+        model_swarm_id: str,
+        required_context_tokens: int,
+    ) -> bool:
+        payload = self._request(
+            "POST",
+            "/v1/swarm/context-demand",
+            json={
+                "request_id": request_id,
+                "model_swarm_id": model_swarm_id,
+                "required_context_tokens": required_context_tokens,
+            },
+        )
+        assert isinstance(payload, dict)
+        observed = payload.get("observed")
+        if not isinstance(observed, bool):
+            raise RequestAgentAuthorityError(
+                "route authority returned an invalid context demand acknowledgement",
+                code="invalid_route_authority_response",
+            )
+        return observed
+
     def issue_capability(
         self,
         *,
@@ -1011,6 +1036,22 @@ class RequestAgentRouteRuntime:
             else:
                 rejected = candidate
         return supported
+
+    def observe_unmet_context_demand(
+        self,
+        request_id: str,
+        model_swarm_id: str,
+        required_context_tokens: int,
+    ) -> bool:
+        """Report aggregate placement pressure through the account authority."""
+
+        if str(model_swarm_id) != str(self.registry.fetch(model_swarm_id).manifest.model_swarm_id):
+            raise PermissionError("context demand model does not match the trusted bundle")
+        return self.authority.observe_unmet_context_demand(
+            request_id=str(request_id),
+            model_swarm_id=str(model_swarm_id),
+            required_context_tokens=int(required_context_tokens),
+        )
 
     def renew(
         self,

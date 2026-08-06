@@ -261,6 +261,15 @@ class CancellableResponse:
         self.cancelled = True
 
 
+class FailingResponse(CancellableResponse):
+    def __init__(self, error):
+        super().__init__(())
+        self.error = error
+
+    def __next__(self):
+        raise self.error
+
+
 class BlockingCancellableResponse:
     def __init__(self):
         self.cancelled = False
@@ -1026,6 +1035,39 @@ def test_incomplete_upstream_stream_emits_error_and_terminal_event():
         }
     ]
     assert scheduler_manage.released == ["incomplete-stream-req"]
+
+
+def test_streaming_rpc_failure_emits_typed_error_and_terminal_event():
+    handler = RequestHandler()
+    scheduler_manage = V3ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+    stub = StaticStub([])
+
+    def fail_chat_completion(request):
+        stub.request = request
+        stub.response = FailingResponse(TimeoutError("transport stalled"))
+        return stub.response
+
+    stub.chat_completion = fail_chat_completion
+    handler.stubs["node-a"] = stub
+
+    async def consume_stream():
+        response = await handler.v1_chat_completions(
+            {"messages": [{"role": "user", "content": "hello"}], "stream": True},
+            "failed-stream-req",
+            1.0,
+        )
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    body = asyncio.run(consume_stream())
+
+    events = [line.removeprefix(b"data: ") for line in body.splitlines() if line]
+    error = json.loads(events[-2])
+    assert error["error"]["type"] == "upstream_error"
+    assert error["error"]["code"] == "upstream_stream_failed"
+    assert events[-1] == b"[DONE]"
+    assert stub.response.cancelled
+    assert scheduler_manage.released == ["failed-stream-req"]
 
 
 def test_streaming_worker_loss_cancels_rpc_emits_error_and_releases_route():

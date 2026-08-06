@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ from backend.server.request_agent_frontend import (
     _bound_base_url,
     _encode_status_sse,
     _loopback_host,
+    _with_sse_keepalive,
     _write_ready_file,
     _verified_frontend_assets,
     create_request_agent_app,
@@ -35,6 +37,55 @@ MODEL_SWARM_ID = "11" * 32
 ENDPOINT_ID = "22" * 32
 API_CREDENTIAL = "33" * 32
 AUTH_HEADERS = {"Authorization": f"Bearer {API_CREDENTIAL}"}
+
+
+def test_openai_sse_keepalive_does_not_cancel_a_quiet_source() -> None:
+    async def collect() -> list[bytes]:
+        async def delayed_source():
+            await asyncio.sleep(0.035)
+            yield b'data: {"token":"ready"}\n\n'
+
+        return [
+            chunk
+            async for chunk in _with_sse_keepalive(
+                delayed_source(),
+                interval_seconds=0.01,
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+
+    assert chunks[-1] == b'data: {"token":"ready"}\n\n'
+    assert chunks[:-1]
+    assert set(chunks[:-1]) == {b": keepalive\n\n"}
+
+
+def test_openai_sse_keepalive_propagates_consumer_cancellation() -> None:
+    async def exercise() -> bool:
+        closed = asyncio.Event()
+
+        async def blocked_source():
+            try:
+                await asyncio.Event().wait()
+                yield b"unreachable"
+            finally:
+                closed.set()
+
+        async def consume() -> None:
+            async for _chunk in _with_sse_keepalive(
+                blocked_source(),
+                interval_seconds=30.0,
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return closed.is_set()
+
+    assert asyncio.run(exercise()) is True
 
 
 def test_request_agent_frontend_module_is_executable() -> None:
@@ -168,6 +219,7 @@ class FakeRuntime:
         self.active = {}
         self.requests = []
         self.released = []
+        self.unmet_context_requests = []
         self.closed = False
 
     def max_supported_context_tokens(self, model_swarm_id, upper_bound):
@@ -188,6 +240,17 @@ class FakeRuntime:
         )
         self.active[request.request_id] = reservation
         return reservation
+
+    def observe_unmet_context_demand(
+        self,
+        request_id,
+        model_swarm_id,
+        required_context_tokens,
+    ):
+        self.unmet_context_requests.append(
+            (request_id, model_swarm_id, required_context_tokens)
+        )
+        return True
 
     def active_reservation(self, request_id):
         return self.active.get(request_id)
@@ -377,6 +440,29 @@ def test_local_request_agent_executes_non_streaming_openai_request():
     assert downstream["vllm_xargs"]["parallax_routing_table"] == ["worker-head"]
     assert downstream["vllm_xargs"]["fabi_route_epoch"] == 1
     assert runtime.closed is True
+
+
+def test_local_request_agent_reports_context_rejected_before_route_planning():
+    manager, runtime = manager_and_runtime()
+    app = create_request_agent_app(manager, api_credential=API_CREDENTIAL)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers=AUTH_HEADERS,
+            json={
+                "model": "fabi-swarm",
+                "messages": [{"role": "user", "content": "large"}],
+                "max_completion_tokens": 4096,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "context_length_exceeded"
+    assert runtime.requests == []
+    assert runtime.unmet_context_requests == [
+        (response.headers["x-request-id"], MODEL_SWARM_ID, 4099)
+    ]
 
 
 def test_local_request_agent_preserves_openai_sse_and_releases_after_done():

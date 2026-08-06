@@ -269,6 +269,20 @@ def test_signed_prepare_commit_renew_release_is_exact_and_idempotent():
     assert admission.snapshot()[0].state == ReservationState.RELEASED
 
 
+def test_expired_committed_route_is_consumed_once_for_executor_abort():
+    now = [1_000]
+    admission = controller(now)
+    route = commit_route(admission, now=now[0])
+
+    now[0] = route.reservation_deadline_ms - 1
+    assert admission.consume_expired_routes() == ()
+
+    now[0] = route.reservation_deadline_ms
+    assert admission.consume_expired_routes() == (route,)
+    assert admission.snapshot()[0].state == ReservationState.EXPIRED
+    assert admission.consume_expired_routes() == ()
+
+
 def test_admission_rejects_wrong_caller_tampering_and_impossible_kv():
     now = [1_000]
     admission = controller(now)

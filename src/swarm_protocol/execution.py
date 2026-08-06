@@ -421,6 +421,31 @@ class WorkerExecutionAdmission:
         with self._lock:
             return () if self._reservations is None else self._reservations.snapshot()
 
+    def consume_expired_routes(self) -> tuple[RoutePlan, ...]:
+        """Return newly expired committed routes exactly once for engine abort.
+
+        Reservation expiry releases admission capacity, but the backend KV
+        allocation lives in the executor process.  The worker control loop
+        consumes these plans and sends a local fenced abort so a vanished
+        Request Agent cannot leave model state resident indefinitely.
+        """
+
+        table = self._configured_table()
+        expired_route_ids = {
+            lease.route_id
+            for lease in table.snapshot()
+            if lease.state == ReservationState.EXPIRED
+        }
+        if not expired_route_ids:
+            return ()
+        expired: list[RoutePlan] = []
+        with self._lock:
+            for route_id in sorted(expired_route_ids):
+                authorized = self._routes_by_route_id.pop(route_id, None)
+                if authorized is not None:
+                    expired.append(authorized.plan)
+        return tuple(expired)
+
     def _lookup_authorized_route(
         self,
         *,

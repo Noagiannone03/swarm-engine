@@ -100,6 +100,14 @@ class RouteCapabilityRequest(BaseModel):
     recovery_policy: RouteRecoveryPolicy
 
 
+class ContextDemandRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    request_id: str = Field(min_length=1, max_length=512)
+    model_swarm_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    required_context_tokens: int = Field(gt=0)
+
+
 class _IssuerTrustView:
     def __init__(self, trust_store: RouteAuthorityTrustStore) -> None:
         self._trust_store = trust_store
@@ -149,6 +157,7 @@ class RequestAgentAuthority:
         scheduler_provider: Callable[[], object | None],
         model_swarm_id_provider: Callable[[], str],
         max_context_tokens_provider: Callable[[], int],
+        unmet_context_observer: Callable[[str, int], bool],
     ) -> None:
         if not gate.enabled:
             raise RuntimeError("Request Agent authority requires FABI_GATE=on")
@@ -158,7 +167,29 @@ class RequestAgentAuthority:
         self._scheduler_provider = scheduler_provider
         self._model_swarm_id_provider = model_swarm_id_provider
         self._max_context_tokens_provider = max_context_tokens_provider
+        self._unmet_context_observer = unmet_context_observer
         gate.bind_route_permit_ledger(ledger)
+
+    def observe_unmet_context(
+        self,
+        *,
+        credential: object,
+        contract: ContextDemandRequest,
+    ) -> bool:
+        """Accept bounded placement pressure only from a live contributor."""
+
+        scheduler = self._scheduler_provider()
+        status = self.gate.status(credential, scheduler)
+        if not status.allowed:
+            raise ContributionPermitDenied(status)
+        if contract.model_swarm_id != self._model_swarm_id_provider():
+            raise PermissionError("context demand targets a different model swarm")
+        return bool(
+            self._unmet_context_observer(
+                contract.request_id,
+                contract.required_context_tokens,
+            )
+        )
 
     def issue_permit(
         self,
@@ -320,6 +351,7 @@ def configure_request_agent_authority(
             scheduler_provider=lambda: getattr(scheduler_manage, "scheduler", None),
             model_swarm_id_provider=current_model_swarm_id,
             max_context_tokens_provider=scheduler_manage.max_supported_context_tokens,
+            unmet_context_observer=scheduler_manage.observe_unmet_context_demand,
         )
         set_request_agent_authority(authority)
         return authority
@@ -377,6 +409,32 @@ def create_route_permit(
         return _error(422, "invalid_route_permit", str(error))
     except RuntimeError as error:
         return _error(503, "route_authority_unavailable", str(error), retry_after=1)
+
+
+@router.post("/context-demand")
+def observe_context_demand(contract: ContextDemandRequest, raw_request: Request):
+    authority = _required_authority()
+    if isinstance(authority, JSONResponse):
+        return authority
+    try:
+        observed = authority.observe_unmet_context(
+            credential=_bearer_credential(raw_request),
+            contract=contract,
+        )
+    except ContributionPermitDenied as error:
+        reason = error.status.reason
+        if reason in {"missing_credential", "invalid_credential"}:
+            return _error(401, reason, str(error))
+        if reason in {"swarm_not_ready", "admission_unavailable"}:
+            return _error(503, reason, str(error), retry_after=1)
+        return _error(403, "contribution_required", str(error))
+    except PermissionError as error:
+        return _error(403, "model_not_authorized", str(error))
+    except ValueError as error:
+        return _error(422, "invalid_context_demand", str(error))
+    except RuntimeError as error:
+        return _error(503, "route_authority_unavailable", str(error), retry_after=1)
+    return JSONResponse(status_code=202, content={"observed": observed})
 
 
 @router.post("/route-capabilities")

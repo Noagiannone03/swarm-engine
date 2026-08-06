@@ -58,6 +58,7 @@ def install_authority(monkeypatch, tmp_path):
     gate = ContributionGate()
     ledger = SqliteRoutePermitLedger(tmp_path / "permits.sqlite3")
     capabilities = FakeCapabilities(account_hash(CREDENTIAL))
+    unmet_context_requests = []
     authority = RequestAgentAuthority(
         gate=gate,
         ledger=ledger,
@@ -65,9 +66,12 @@ def install_authority(monkeypatch, tmp_path):
         scheduler_provider=live_scheduler,
         model_swarm_id_provider=lambda: MODEL,
         max_context_tokens_provider=lambda: 32_768,
+        unmet_context_observer=lambda request_id, required: (
+            unmet_context_requests.append((request_id, required)) or True
+        ),
     )
     set_request_agent_authority(authority)
-    return authority, capabilities
+    return authority, capabilities, unmet_context_requests
 
 
 def permit_payload(*, request_id="request", context=16_384):
@@ -184,8 +188,55 @@ def test_request_agent_reuses_exact_contract_key_but_rekeys_token_correction(
         set_request_agent_authority(None)
 
 
+def test_context_demand_is_authenticated_and_available_to_request_agent_client(
+    monkeypatch,
+    tmp_path,
+):
+    _authority, _capabilities, observed = install_authority(monkeypatch, tmp_path)
+    transport = TestClient(app)
+    client = RequestAgentAuthorityClient(
+        "http://127.0.0.1",
+        CREDENTIAL,
+        session=transport,
+    )
+    try:
+        assert client.observe_unmet_context_demand(
+            request_id="long-request",
+            model_swarm_id=MODEL,
+            required_context_tokens=40_960,
+        )
+        assert observed == [("long-request", 40_960)]
+
+        foreign = transport.post(
+            "/v1/swarm/context-demand",
+            headers={"Authorization": f"Bearer {OTHER_CREDENTIAL}"},
+            json={
+                "request_id": "foreign",
+                "model_swarm_id": MODEL,
+                "required_context_tokens": 40_960,
+            },
+        )
+        assert foreign.status_code == 403
+        assert foreign.json()["error"]["code"] == "contribution_required"
+
+        wrong_model = transport.post(
+            "/v1/swarm/context-demand",
+            headers={"Authorization": f"Bearer {CREDENTIAL}"},
+            json={
+                "request_id": "wrong-model",
+                "model_swarm_id": "44" * 32,
+                "required_context_tokens": 40_960,
+            },
+        )
+        assert wrong_model.status_code == 403
+        assert wrong_model.json()["error"]["code"] == "model_not_authorized"
+        assert observed == [("long-request", 40_960)]
+    finally:
+        set_request_agent_authority(None)
+
+
 def test_permit_requires_idempotency_and_capability_rechecks_account(monkeypatch, tmp_path):
-    _, capabilities = install_authority(monkeypatch, tmp_path)
+    _, capabilities, _ = install_authority(monkeypatch, tmp_path)
     client = TestClient(app)
     try:
         missing_key = client.post(
@@ -232,7 +283,7 @@ def test_permit_requires_idempotency_and_capability_rechecks_account(monkeypatch
 
 
 def test_permit_keepalive_rechecks_contribution_and_is_idempotent(monkeypatch, tmp_path):
-    authority, _capabilities = install_authority(monkeypatch, tmp_path)
+    authority, _capabilities, _ = install_authority(monkeypatch, tmp_path)
     client = TestClient(app)
     try:
         permit = client.post(

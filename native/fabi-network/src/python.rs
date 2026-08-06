@@ -364,7 +364,6 @@ enum StreamEvent {
 struct PyRpcStream {
     events: Arc<Mutex<Receiver<StreamEvent>>>,
     cancel: Mutex<Option<oneshot::Sender<()>>>,
-    timeout: Duration,
     finished: AtomicBool,
 }
 
@@ -379,13 +378,12 @@ impl PyRpcStream {
             return Ok(None);
         }
         let events = Arc::clone(&self.events);
-        let timeout = self.timeout;
         let event = py.detach(move || {
             events
                 .lock()
                 .map_err(|_| RecvError::Disconnected)?
-                .recv_timeout(timeout)
-                .map_err(RecvError::from)
+                .recv()
+                .map_err(|_| RecvError::Disconnected)
         });
         match event {
             Ok(StreamEvent::Chunk(chunk)) => Ok(Some(PyBytes::new(py, &chunk).unbind())),
@@ -397,11 +395,7 @@ impl PyRpcStream {
                 self.finished.store(true, Ordering::SeqCst);
                 Err(PyRuntimeError::new_err(message))
             }
-            Err(RecvError::Timeout) => {
-                self.cancel_inner();
-                self.finished.store(true, Ordering::SeqCst);
-                Err(PyTimeoutError::new_err("RPC stream receive timed out"))
-            }
+            Err(RecvError::Timeout) => unreachable!("blocking stream receive cannot time out"),
         }
     }
 
@@ -895,6 +889,7 @@ impl PyNetworkNode {
                 method,
                 body,
                 max_payload,
+                timeout,
                 event_tx,
                 cancel_rx,
             )
@@ -908,7 +903,6 @@ impl PyNetworkNode {
             PyRpcStream {
                 events: Arc::new(Mutex::new(event_rx)),
                 cancel: Mutex::new(Some(cancel_tx)),
-                timeout,
                 finished: AtomicBool::new(false),
             },
         )
@@ -1210,8 +1204,8 @@ async fn handle_rpc_stream(
         },
     );
     loop {
-        match tokio::time::timeout(response_timeout, response_rx.recv()).await {
-            Ok(Some(Ok(payload))) => {
+        match response_rx.recv().await {
+            Some(Ok(payload)) => {
                 write_stream_frame_or_stopped(
                     &mut send,
                     MessageKind::RpcStreamChunk,
@@ -1221,7 +1215,7 @@ async fn handle_rpc_stream(
                 )
                 .await?;
             }
-            Ok(Some(Err(message))) => {
+            Some(Err(message)) => {
                 write_stream_frame_or_stopped(
                     &mut send,
                     MessageKind::RpcStreamError,
@@ -1233,7 +1227,7 @@ async fn handle_rpc_stream(
                 send.finish().context("failed to finish RPC stream error")?;
                 return Ok(());
             }
-            Ok(None) => {
+            None => {
                 write_stream_frame_or_stopped(
                     &mut send,
                     MessageKind::RpcStreamEnd,
@@ -1243,19 +1237,6 @@ async fn handle_rpc_stream(
                 )
                 .await?;
                 send.finish().context("failed to finish RPC stream")?;
-                return Ok(());
-            }
-            Err(_) => {
-                write_stream_frame_or_stopped(
-                    &mut send,
-                    MessageKind::RpcStreamError,
-                    header.request_id,
-                    b"Python streaming RPC handler timed out",
-                    max_payload,
-                )
-                .await?;
-                send.finish()
-                    .context("failed to finish timed-out RPC stream")?;
                 return Ok(());
             }
         }
@@ -1389,6 +1370,7 @@ async fn call_stream_rpc(
     method: String,
     body: Vec<u8>,
     max_payload: u64,
+    setup_timeout: Duration,
     events: tokio_mpsc::Sender<StreamEvent>,
     mut cancel: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -1397,24 +1379,31 @@ async fn call_stream_rpc(
         u64::try_from(payload.len()).unwrap_or(u64::MAX) <= max_payload,
         "RPC stream request exceeds configured payload limit"
     );
-    let connection = tokio::select! {
-        _ = &mut cancel => return Ok(()),
-        result = get_connection(&endpoint, relay_url, &dispatcher, &connections, peer_id) => result?,
+    let setup = async {
+        let connection =
+            get_connection(&endpoint, relay_url, &dispatcher, &connections, peer_id).await?;
+        let (mut send, recv) = connection
+            .open_bi()
+            .await
+            .context("failed to open RPC stream")?;
+        write_rpc_frame(
+            &mut send,
+            MessageKind::RpcStreamRequest,
+            request_id,
+            &payload,
+            max_payload,
+        )
+        .await?;
+        send.finish()
+            .context("failed to finish RPC stream request")?;
+        Ok::<_, anyhow::Error>((send, recv))
     };
     let (mut send, mut recv) = tokio::select! {
         _ = &mut cancel => return Ok(()),
-        result = connection.open_bi() => result.context("failed to open RPC stream")?,
+        result = tokio::time::timeout(setup_timeout, setup) => {
+            result.context("RPC stream setup deadline exceeded")??
+        },
     };
-    write_rpc_frame(
-        &mut send,
-        MessageKind::RpcStreamRequest,
-        request_id,
-        &payload,
-        max_payload,
-    )
-    .await?;
-    send.finish()
-        .context("failed to finish RPC stream request")?;
 
     loop {
         let response_header = tokio::select! {
@@ -1646,6 +1635,107 @@ mod tests {
         .await?;
 
         ensure!(reply == b"pong", "unexpected reverse RPC response");
+        responder.await.context("responder task panicked")??;
+        listener.close().await;
+        dialer.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn established_stream_outlives_unary_handler_timeout() -> Result<()> {
+        let listener = direct_endpoint().await?;
+        let dialer = direct_endpoint().await?;
+
+        let accepting_endpoint = listener.clone();
+        let accept_task = tokio::spawn(async move {
+            let incoming = accepting_endpoint
+                .accept()
+                .await
+                .context("listener closed before accepting")?;
+            incoming
+                .accept()
+                .context("failed to accept direct connection")?
+                .await
+                .context("direct connection handshake failed")
+        });
+        let outbound_connection = tokio::time::timeout(
+            Duration::from_secs(5),
+            dialer.connect(listener.addr(), ALPN),
+        )
+        .await
+        .context("direct dial timed out")?
+        .context("failed to dial direct endpoint")?;
+        let accepted = tokio::time::timeout(Duration::from_secs(5), accept_task)
+            .await
+            .context("direct accept timed out")?
+            .context("accept task panicked")??;
+
+        let (dialer_tx, dialer_rx) = sync_channel(1);
+        let dialer_dispatcher = InboundDispatcher {
+            sender: dialer_tx,
+            max_payload: DEFAULT_MAX_PAYLOAD,
+            response_timeout: Duration::from_millis(100),
+        };
+        dialer_dispatcher.spawn(outbound_connection);
+        let responder = tokio::task::spawn_blocking(move || -> Result<()> {
+            let request = dialer_rx
+                .recv_timeout(Duration::from_secs(5))
+                .context("dialer never accepted the reverse streaming RPC")?;
+            ensure!(
+                request.method == "test.slow-stream",
+                "unexpected RPC method"
+            );
+            match request.response {
+                InboundResponse::Stream(sender) => {
+                    std::thread::sleep(Duration::from_millis(300));
+                    sender
+                        .blocking_send(Ok(b"late-chunk".to_vec()))
+                        .map_err(|_| anyhow!("stream caller stopped waiting"))?;
+                    Ok(())
+                }
+                InboundResponse::Unary(_) => bail!("expected a streaming RPC"),
+            }
+        });
+
+        let connections = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            dialer.id(),
+            accepted,
+        )])));
+        let (unused_tx, _unused_rx) = sync_channel(1);
+        let listener_dispatcher = InboundDispatcher {
+            sender: unused_tx,
+            max_payload: DEFAULT_MAX_PAYLOAD,
+            response_timeout: Duration::from_secs(5),
+        };
+        let (events_tx, mut events_rx) = tokio_mpsc::channel(4);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+
+        call_stream_rpc(
+            listener.clone(),
+            RelayUrl::from_str("https://unused.invalid")?,
+            listener_dispatcher,
+            connections,
+            dialer.id(),
+            2,
+            "test.slow-stream".to_owned(),
+            b"ping".to_vec(),
+            DEFAULT_MAX_PAYLOAD,
+            Duration::from_secs(2),
+            events_tx,
+            cancel_rx,
+        )
+        .await?;
+
+        match events_rx.recv().await {
+            Some(StreamEvent::Chunk(payload)) => {
+                ensure!(payload == b"late-chunk", "unexpected streaming payload");
+            }
+            _ => bail!("stream did not deliver its delayed chunk"),
+        }
+        ensure!(
+            matches!(events_rx.recv().await, Some(StreamEvent::End)),
+            "stream did not terminate explicitly"
+        );
         responder.await.context("responder task panicked")??;
         listener.close().await;
         dialer.close().await;

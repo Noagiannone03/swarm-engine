@@ -88,7 +88,12 @@ class FakeAuthority:
         self.permits = []
         self.capabilities = []
         self.released = []
+        self.unmet_context_requests = []
         self.current_permit = None
+
+    def observe_unmet_context_demand(self, **kwargs):
+        self.unmet_context_requests.append(kwargs)
+        return True
 
     def issue_permit(self, **kwargs):
         self.permits.append(kwargs)
@@ -438,6 +443,19 @@ def test_request_agent_probes_exact_live_context_without_reserving():
     assert runtime.max_supported_context_tokens(model.model_swarm_id, 600_000) == 524_288
     assert authority.permits == []
     assert runtime.status()["active_routes"] == []
+
+    assert runtime.observe_unmet_context_demand(
+        "long-request",
+        model.model_swarm_id,
+        400_000,
+    )
+    assert authority.unmet_context_requests == [
+        {
+            "request_id": "long-request",
+            "model_swarm_id": model.model_swarm_id,
+            "required_context_tokens": 400_000,
+        }
+    ]
 
 
 class MutableClock:

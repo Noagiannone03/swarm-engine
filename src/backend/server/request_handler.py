@@ -826,6 +826,29 @@ class RequestHandler:
                                     )
                                     yield b"data: [DONE]\n\n"
                                     return
+                                except Exception as exc:
+                                    if await promote_stream_recovery():
+                                        continue
+                                    failure = (
+                                        "upstream streaming RPC failed: "
+                                        f"{type(exc).__name__}: {exc}"
+                                    )
+                                    finish_journal(RecoveryState.FAILED, failure)
+                                    logger.warning(
+                                        "Upstream streaming RPC failed for request %s",
+                                        request_id,
+                                        exc_info=True,
+                                    )
+                                    yield self._stream_error_chunk(
+                                        (
+                                            "The worker stream failed before the request "
+                                            "completed. Please retry."
+                                        ),
+                                        err_type="upstream_error",
+                                        code="upstream_stream_failed",
+                                    )
+                                    yield b"data: [DONE]\n\n"
+                                    return
                                 decoded_stream_response = decode_http_response_envelope(chunk)
                                 if decoded_stream_response is not None:
                                     status_code, _content_type, body = decoded_stream_response

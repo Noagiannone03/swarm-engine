@@ -101,6 +101,16 @@ _LINK_REACHABILITY_TTL_MS = int(
 _SCHEDULER_CONNECT_ATTEMPT_TIMEOUT_SECONDS = 15.0
 _SCHEDULER_CONNECT_INITIAL_BACKOFF_SECONDS = 1.0
 _SCHEDULER_CONNECT_MAX_BACKOFF_SECONDS = 60.0
+# Establishing the loopback frontend request remains bounded, but a live
+# streaming response has no read deadline.  Long prefills can legitimately be
+# silent; route capabilities, worker leases, explicit abort and the Iroh
+# connection are the request liveness contract.
+_INFERENCE_HTTP_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    read=None,
+    write=60.0,
+    pool=10.0,
+)
 
 
 def _configured_nonnegative_float(name: str, default: float) -> float:
@@ -285,6 +295,28 @@ class TransformerConnectionHandler(ConnectionHandler):
         with self._recv_from_peer_lock:
             self.block_start_index = block_start_index
             self.block_end_index = block_end_index
+
+    def abort_expired_v3_routes(self) -> tuple[str, ...]:
+        """Release executor state whose signed reservation lease expired."""
+
+        if self.execution_admission is None:
+            return ()
+        expired = self.execution_admission.consume_expired_routes()
+        if not expired:
+            return ()
+        aborted: list[str] = []
+        with self._recv_from_peer_lock:
+            for plan in expired:
+                request = forward_pb2.AbortRequest()
+                item = request.reqs.add()
+                item.rid = plan.request_id
+                item.routing_table.append(self.execution_admission.worker_id)
+                item.route_id = plan.route_id
+                item.route_epoch = plan.epoch
+                item.authority_request_id = plan.request_id
+                self.recv_from_peer.send_multipart([b"abort", request.SerializeToString()])
+                aborted.append(plan.request_id)
+        return tuple(aborted)
 
     @rpc_stream
     def rpc_pp_forward(
@@ -588,7 +620,11 @@ class TransformerConnectionHandler(ConnectionHandler):
 
             local_request = dict(request)
             local_request.pop("authority_request_id", None)
-            with httpx.Client(timeout=10 * 60, proxy=None, trust_env=False) as client:
+            with httpx.Client(
+                timeout=_INFERENCE_HTTP_TIMEOUT,
+                proxy=None,
+                trust_env=False,
+            ) as client:
                 with client.stream(
                     "POST",
                     f"http://localhost:{self.http_port}/inference/v1/chat-replay",
@@ -651,7 +687,11 @@ class TransformerConnectionHandler(ConnectionHandler):
                     request.get("vllm_xargs"),
                     purpose="active v3 request",
                 )
-            with httpx.Client(timeout=10 * 60, proxy=None, trust_env=False) as client:
+            with httpx.Client(
+                timeout=_INFERENCE_HTTP_TIMEOUT,
+                proxy=None,
+                trust_env=False,
+            ) as client:
                 if request.get("stream", False):
                     with client.stream(
                         "POST",
@@ -2221,6 +2261,13 @@ class GradientServer:
                     else None
                 )
                 while not self.stop_event.is_set():
+                    if self.connection_handler is not None:
+                        expired_requests = self.connection_handler.abort_expired_v3_routes()
+                        if expired_requests:
+                            logger.warning(
+                                "Aborted expired V3 execution leases: %s",
+                                list(expired_requests),
+                            )
                     # Announce the range ID
                     try:
                         if self.scheduler_peer_id is not None:

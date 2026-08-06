@@ -19,9 +19,24 @@ class FakeIrohTransport:
 class FakeAdmission:
     def __init__(self):
         self.calls = []
+        self.worker_id = "worker-endpoint"
+        self.expired_routes = []
 
     def authorize_frontend(self, **kwargs):
         self.calls.append(kwargs)
+
+    def consume_expired_routes(self):
+        routes = tuple(self.expired_routes)
+        self.expired_routes.clear()
+        return routes
+
+
+class FakePushSocket:
+    def __init__(self):
+        self.frames = []
+
+    def send_multipart(self, frames):
+        self.frames.append(frames)
 
 
 class FakeHttpResponse:
@@ -154,6 +169,30 @@ def test_abort_completion_fails_closed_without_active_v3():
         handler.abort_completion({"request_id": "request", "vllm_xargs": {}})
 
 
+def test_expired_v3_route_is_aborted_locally_exactly_once():
+    admission = FakeAdmission()
+    admission.expired_routes.append(
+        SimpleNamespace(request_id="expired-request", route_id="route-9", epoch=9)
+    )
+    handler = make_handler(admission)
+    socket = FakePushSocket()
+    handler._recv_from_peer = socket
+
+    assert handler.abort_expired_v3_routes() == ("expired-request",)
+    assert handler.abort_expired_v3_routes() == ()
+
+    assert len(socket.frames) == 1
+    kind, payload = socket.frames[0]
+    assert kind == b"abort"
+    request = p2p_server.forward_pb2.AbortRequest()
+    request.ParseFromString(payload)
+    assert len(request.reqs) == 1
+    assert request.reqs[0].rid == "expired-request"
+    assert list(request.reqs[0].routing_table) == ["worker-endpoint"]
+    assert request.reqs[0].route_id == "route-9"
+    assert request.reqs[0].route_epoch == 9
+
+
 def test_chat_tokenization_is_route_fenced_and_uses_official_frontend(monkeypatch):
     admission = FakeAdmission()
     handler = make_handler(admission)
@@ -281,6 +320,11 @@ def test_generation_replay_is_route_fenced_and_uses_qualified_chat_api(monkeypat
             {key: value for key, value in request.items() if key != "authority_request_id"},
         )
     ]
+    timeout = FakeHttpClient.instances[0].kwargs["timeout"]
+    assert timeout.connect == 10.0
+    assert timeout.read is None
+    assert timeout.write == 60.0
+    assert timeout.pool == 10.0
 
 
 def test_generation_replay_rejects_unbounded_or_non_streaming_input(monkeypatch):
@@ -337,6 +381,7 @@ def test_streaming_chat_preserves_local_http_error_in_transport_envelope(monkeyp
     assert status_code == 400
     assert content_type == "application/json; charset=utf-8"
     assert b"context_length_exceeded" in body
+    assert FakeHttpClient.instances[0].kwargs["timeout"].read is None
 
 
 def test_active_v3_frontend_enables_local_vllm_abort_route(monkeypatch):

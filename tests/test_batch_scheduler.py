@@ -1,3 +1,4 @@
+import time
 from typing import Optional
 
 import pytest
@@ -49,6 +50,19 @@ def make_decode(rid: str, ready: bool = True) -> Request:
     r = Request(request_id=rid, status=RequestStatus.DECODING)
     r.ready_for_next_step = ready
     return r
+
+
+def test_legacy_timeout_does_not_race_active_v3_execution_lease():
+    sched = Scheduler(request_timeout_s=1)
+    legacy = make_decode("legacy")
+    v3 = Request(request_id="v3", status=RequestStatus.DECODING, route_epoch=7)
+    legacy.last_updated_time = time.time() - 2
+    v3.last_updated_time = time.time() - 2
+    sched._running_requests = {legacy.request_id: legacy, v3.request_id: v3}
+
+    assert sched.get_timed_out_requests() == [legacy]
+    assert legacy.abort is True
+    assert v3.abort is False
 
 
 def test_prefill_fifo_and_micro_batch():
