@@ -231,6 +231,13 @@ def test_stale_download_reservation_is_reaped_by_process_identity(tmp_path):
     payload = json.loads(lease_path.read_text())
     payload["pid"] = max(os.getpid() + 1_000_000, 9_999_999)
     lease_path.write_text(json.dumps(payload))
+    orphaned_pack = (
+        tmp_path
+        / identity
+        / ".model-fabi-layer-00000.safetensors.interrupted"
+    )
+    orphaned_pack.parent.mkdir(parents=True)
+    orphaned_pack.write_bytes(b"partial")
 
     replacement, snapshot = cache.reserve(
         artifact_identity=_identity("b"),
@@ -241,8 +248,47 @@ def test_stale_download_reservation_is_reaped_by_process_identity(tmp_path):
     try:
         assert snapshot.reserved_bytes == 0
         assert not lease_path.exists()
+        assert not orphaned_pack.exists()
     finally:
         cache.abort(replacement)
+
+
+def test_live_download_lease_protects_its_temporary_pack(tmp_path):
+    identity = _identity("a")
+    volume = SyntheticVolume(tmp_path)
+    cache = ModelArtifactCache(
+        tmp_path,
+        minimum_free_bytes=0,
+        cleanup_hysteresis_bytes=0,
+        disk_usage=volume,
+    )
+    reservation, _ = cache.reserve(
+        artifact_identity=identity,
+        model_id="test/a",
+        immutable_revision=identity,
+        required_objects=(_requirement(),),
+    )
+    temporary_pack = (
+        tmp_path
+        / identity
+        / ".model-fabi-layer-00000.safetensors.downloading"
+    )
+    temporary_pack.parent.mkdir(parents=True)
+    temporary_pack.write_bytes(b"partial")
+    try:
+        cache.plan(
+            artifact_identity=_identity("b"),
+            required_objects=(_requirement(),),
+        )
+        assert temporary_pack.is_file()
+    finally:
+        cache.abort(reservation)
+
+    cache.plan(
+        artifact_identity=_identity("b"),
+        required_objects=(_requirement(),),
+    )
+    assert not temporary_pack.exists()
 
 
 def test_selected_cached_pack_is_not_sacrificed_to_make_its_own_reservation(tmp_path):

@@ -82,6 +82,11 @@ process creation time, so PID reuse cannot preserve stale content. Concurrent do
 their outstanding reservations before a new one is admitted. A SQLite journal records only
 successfully verified uses; eviction uses GreedyDual-Size-Frequency dynamic ageing and therefore
 retains spans that repeatedly avoid a download without feeding cache popularity back into placement.
+An abrupt process death may prevent Python's `mkstemp()` cleanup from running. Before a new
+admission plan, Fabi reaps only exact hidden pack-temporary names from projections with no live
+lease, while holding the cache lock and acquiring the projection writer lock without waiting. A
+live downloader is therefore never touched, and an antivirus-held Windows orphan remains charged
+to measured free space instead of turning cleanup contention into a worker crash.
 The selected span is always protected during its own cleanup. A worker either materializes that
 placement, reclaims unleased cold packs, or raises a typed storage error before network transfer.
 That typed failure carries the exact missing bytes and fenced placement generation. The P2P

@@ -34,11 +34,14 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Iterator, Protocol
 
 import psutil
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 _IDENTITY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PACK_PATTERN = re.compile(
     r"^model-fabi-(?:layer-[0-9]{5}|embedding|output)\.safetensors$"
+)
+_TEMPORARY_PACK_PATTERN = re.compile(
+    r"^\.model-fabi-(?:layer-[0-9]{5}|embedding|output)\.safetensors\.[A-Za-z0-9_-]+$"
 )
 _RECEIPT_NAME = ".fabi-selective-artifacts.json"
 _STATE_NAME = ".fabi-cache-v1.sqlite3"
@@ -358,6 +361,7 @@ class ModelArtifactCache:
         requirements: tuple[CacheObjectRequirement, ...],
     ) -> CacheReservationPlan:
         leases = self._live_leases_locked()
+        self._reap_orphaned_pack_temps_locked(leases)
         reserved_bytes = sum(int(item.get("reserved_growth_bytes", 0)) for item in leases)
         reserved_content_bytes = sum(
             int(item.get("reserved_content_growth_bytes", 0)) for item in leases
@@ -438,6 +442,7 @@ class ModelArtifactCache:
 
         with self._lock:
             leases = self._live_leases_locked()
+            self._reap_orphaned_pack_temps_locked(leases)
             reserved_bytes = sum(int(item.get("reserved_growth_bytes", 0)) for item in leases)
             reserved_content_bytes = sum(
                 int(item.get("reserved_content_growth_bytes", 0)) for item in leases
@@ -683,6 +688,65 @@ class ModelArtifactCache:
                 continue
             live.append(payload)
         return tuple(live)
+
+    def _reap_orphaned_pack_temps_locked(
+        self,
+        leases: Iterable[dict[str, object]],
+    ) -> None:
+        """Remove crash leftovers without racing an active materializer.
+
+        ``mkstemp`` deliberately leaves cleanup to its caller, and a killed
+        process cannot execute its ``finally`` block. A live lease protects
+        the whole projection. For every unleased projection, the same lock
+        used by the selective writer is acquired without waiting before any
+        exact Fabi pack-temporary name is removed. Holding the cache lock
+        prevents a new reservation from appearing between the lease snapshot
+        and this cleanup; non-blocking acquisition keeps admission from waiting
+        behind an active or externally locked projection.
+        """
+
+        protected_identities = {
+            identity
+            for lease in leases
+            if isinstance((identity := lease.get("artifact_identity")), str)
+        }
+        try:
+            candidates = tuple(self.cache_root.iterdir())
+        except OSError:
+            return
+        for projection_root in candidates:
+            if (
+                not projection_root.is_dir()
+                or projection_root.is_symlink()
+                or not _IDENTITY_PATTERN.fullmatch(projection_root.name)
+                or projection_root.name in protected_identities
+            ):
+                continue
+            projection_lock = FileLock(str(projection_root.with_suffix(".lock")))
+            try:
+                projection_lock.acquire(timeout=0)
+            except Timeout:
+                continue
+            try:
+                try:
+                    entries = tuple(projection_root.iterdir())
+                except OSError:
+                    continue
+                for path in entries:
+                    if (
+                        _TEMPORARY_PACK_PATTERN.fullmatch(path.name)
+                        and path.is_file()
+                        and not path.is_symlink()
+                    ):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            # Antivirus/indexer handles can transiently retain
+                            # a dead Windows file. Its bytes remain visible to
+                            # the exact free-space admission calculation.
+                            continue
+            finally:
+                projection_lock.release()
 
     @staticmethod
     def _protected_objects(
