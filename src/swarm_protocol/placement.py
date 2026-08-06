@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
-from swarm_protocol.context_placement import CapacityDemandMap, MemoryPlacementPoint
+from swarm_protocol.context_placement import (
+    CapacityDemandMap,
+    ContextCapacityDemandMap,
+    MemoryPlacementPoint,
+)
 from swarm_protocol.contracts import (
     LayerSpan,
     ModelManifest,
@@ -45,7 +49,7 @@ class PlacementDrain(Protocol):
 
 
 class SpanReloadTarget(Protocol):
-    def __call__(self, span: LayerSpan, generation: int) -> None: ...
+    def __call__(self, span: LayerSpan, context_tokens: int, generation: int) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -53,8 +57,11 @@ class MaterializationSnapshot:
     phase: MaterializationPhase
     generation: int
     current_span: LayerSpan | None
+    current_context_tokens: int | None
     target_span: LayerSpan | None
+    target_context_tokens: int | None
     previous_span: LayerSpan | None
+    previous_context_tokens: int | None
     error: str | None = None
 
 
@@ -73,7 +80,12 @@ class PlacementMaterializer:
         drain: PlacementDrain,
         reload_target: SpanReloadTarget,
         current_span: LayerSpan | None = None,
+        current_context_tokens: int | None = None,
     ) -> None:
+        if (current_span is None) != (current_context_tokens is None):
+            raise ValueError("current span and context must be supplied together")
+        if current_context_tokens is not None and current_context_tokens <= 0:
+            raise ValueError("current context must be positive")
         self._drain = drain
         self._reload_target = reload_target
         self._phase = (
@@ -81,8 +93,11 @@ class PlacementMaterializer:
         )
         self._generation = 0
         self._current_span = current_span
+        self._current_context_tokens = current_context_tokens
         self._target_span: LayerSpan | None = None
+        self._target_context_tokens: int | None = None
         self._previous_span: LayerSpan | None = None
+        self._previous_context_tokens: int | None = None
         self._error: str | None = None
         self._lock = threading.RLock()
 
@@ -92,8 +107,11 @@ class PlacementMaterializer:
                 phase=self._phase,
                 generation=self._generation,
                 current_span=self._current_span,
+                current_context_tokens=self._current_context_tokens,
                 target_span=self._target_span,
+                target_context_tokens=self._target_context_tokens,
                 previous_span=self._previous_span,
+                previous_context_tokens=self._previous_context_tokens,
                 error=self._error,
             )
 
@@ -102,7 +120,10 @@ class PlacementMaterializer:
 
         with self._lock:
             if self._phase is MaterializationPhase.BUILDING:
-                if decision.span != self._target_span:
+                if (
+                    decision.span != self._target_span
+                    or decision.context_tokens != self._target_context_tokens
+                ):
                     raise RuntimeError("cannot replace an in-flight materialization target")
                 return self.snapshot()
             if decision.action is PlacementAction.KEEP:
@@ -116,19 +137,23 @@ class PlacementMaterializer:
                 return self.snapshot()
             if decision.span is None:
                 raise ValueError("join and move decisions require a target span")
+            if decision.context_tokens is None or decision.context_tokens <= 0:
+                raise ValueError("join and move decisions require a positive target context")
             if decision.action is PlacementAction.JOIN and self._current_span is not None:
                 raise RuntimeError("a serving worker cannot execute a join decision")
             if decision.action is PlacementAction.MOVE and self._current_span is None:
                 raise RuntimeError("a standby worker cannot execute a move decision")
 
             self._target_span = decision.span
+            self._target_context_tokens = decision.context_tokens
             self._previous_span = self._current_span
+            self._previous_context_tokens = self._current_context_tokens
             self._error = None
             if self._current_span is not None:
                 self._phase = MaterializationPhase.DRAINING
                 if self._drain.begin_drain() > 0:
                     return self.snapshot()
-            self._start_reload_locked(decision.span)
+            self._start_reload_locked(decision.span, decision.context_tokens)
             return self.snapshot()
 
     def continue_after_drain(self) -> MaterializationSnapshot:
@@ -138,15 +163,18 @@ class PlacementMaterializer:
             if self._drain.draining_reservations() > 0:
                 return self.snapshot()
             assert self._target_span is not None
-            self._start_reload_locked(self._target_span)
+            assert self._target_context_tokens is not None
+            self._start_reload_locked(self._target_span, self._target_context_tokens)
             return self.snapshot()
 
-    def _start_reload_locked(self, span: LayerSpan) -> None:
+    def _start_reload_locked(self, span: LayerSpan, context_tokens: int) -> None:
+        if context_tokens <= 0:
+            raise ValueError("reload context must be positive")
         self._generation += 1
         generation = self._generation
         self._phase = MaterializationPhase.BUILDING
         try:
-            self._reload_target(span, generation)
+            self._reload_target(span, context_tokens, generation)
         except Exception as exc:
             self._phase = MaterializationPhase.FAILED
             self._error = f"{type(exc).__name__}: {exc}"[:256]
@@ -155,8 +183,15 @@ class PlacementMaterializer:
                 self._phase = MaterializationPhase.READY
             raise
         self._current_span = None
+        self._current_context_tokens = None
 
-    def mark_ready(self, *, span: LayerSpan, generation: int) -> MaterializationSnapshot:
+    def mark_ready(
+        self,
+        *,
+        span: LayerSpan,
+        context_tokens: int,
+        generation: int,
+    ) -> MaterializationSnapshot:
         """Accept only the verified completion for the current reload generation."""
 
         with self._lock:
@@ -164,14 +199,31 @@ class PlacementMaterializer:
                 self._phase is not MaterializationPhase.BUILDING
                 or generation != self._generation
                 or span != self._target_span
+                or context_tokens != self._target_context_tokens
             ):
                 raise RuntimeError("stale or mismatched materialization completion")
             self._current_span = span
+            self._current_context_tokens = context_tokens
             self._target_span = None
+            self._target_context_tokens = None
             self._previous_span = None
+            self._previous_context_tokens = None
             self._phase = MaterializationPhase.READY
             self._error = None
             self._drain.finish_drain()
+            return self.snapshot()
+
+    def downgrade_building_context(self, context_tokens: int) -> MaterializationSnapshot:
+        """Reconcile a backend-measured lower KV ceiling for this generation."""
+
+        if context_tokens <= 0:
+            raise ValueError("measured context must be positive")
+        with self._lock:
+            if self._phase is not MaterializationPhase.BUILDING:
+                raise RuntimeError("context downgrade requires a BUILDING placement")
+            if self._target_context_tokens is None or context_tokens >= self._target_context_tokens:
+                raise ValueError("context downgrade must reduce the current target")
+            self._target_context_tokens = context_tokens
             return self.snapshot()
 
     def mark_failed(self, *, generation: int, error: Exception) -> MaterializationSnapshot:
@@ -182,9 +234,12 @@ class PlacementMaterializer:
             self._error = f"{type(error).__name__}: {error}"[:256]
             if self._previous_span is not None:
                 rollback_span = self._previous_span
+                rollback_context_tokens = self._previous_context_tokens
+                assert rollback_context_tokens is not None
                 self._target_span = rollback_span
+                self._target_context_tokens = rollback_context_tokens
                 try:
-                    self._start_reload_locked(rollback_span)
+                    self._start_reload_locked(rollback_span, rollback_context_tokens)
                 except Exception:
                     # ``_start_reload_locked`` records the synchronous failure.
                     pass
@@ -212,16 +267,22 @@ class PlacementMaterializer:
             self._error = f"{type(error).__name__}: {error}"[:256]
             if self._previous_span is not None:
                 rollback_span = self._previous_span
+                rollback_context_tokens = self._previous_context_tokens
+                assert rollback_context_tokens is not None
                 self._target_span = rollback_span
+                self._target_context_tokens = rollback_context_tokens
                 try:
-                    self._start_reload_locked(rollback_span)
+                    self._start_reload_locked(rollback_span, rollback_context_tokens)
                 except Exception:
                     pass
             else:
                 self._phase = MaterializationPhase.STANDBY
                 self._target_span = None
+                self._target_context_tokens = None
                 self._current_span = None
+                self._current_context_tokens = None
                 self._previous_span = None
+                self._previous_context_tokens = None
             return self.snapshot()
 
 
@@ -256,6 +317,43 @@ class PlacementDecision:
     required_memory_bytes: int
     score: PlacementScore | None
     reason: str
+    context_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class ContextPlacementUtility:
+    """Demand served by one local span/context choice.
+
+    The fields deliberately remain explainable.  They are computed only from
+    a trusted aggregate and signed/leased capacity; no prompt content or
+    coordinator-owned layer assignment enters the worker decision.
+    """
+
+    weighted_complete_routes: float
+    weighted_concurrent_slots: float
+    weighted_layer_deficit_filled: float
+    context_tokens: int
+    span_length: int
+    max_sessions: int
+
+    @property
+    def value(self) -> float:
+        return (
+            2.0 * self.weighted_complete_routes
+            + self.weighted_concurrent_slots
+            + self.weighted_layer_deficit_filled
+        )
+
+    def rank(self) -> tuple[float, float, float, float, int, int, int]:
+        return (
+            self.value,
+            self.weighted_complete_routes,
+            self.weighted_concurrent_slots,
+            self.weighted_layer_deficit_filled,
+            self.context_tokens,
+            self.span_length,
+            self.max_sessions,
+        )
 
 
 class AutonomousPlacementPolicy:
@@ -343,6 +441,7 @@ class AutonomousPlacementPolicy:
         manifest: ModelManifest,
         qualified_context_limit_tokens: int,
         kv_block_size: int,
+        context_targets: tuple[int, ...] | None = None,
         maximum_sessions: int = 32,
     ) -> tuple[MemoryPlacementPoint, ...]:
         """Return non-dominated exact memory choices across signed classes.
@@ -360,8 +459,15 @@ class AutonomousPlacementPolicy:
         if kv_block_size <= 0 or maximum_sessions <= 0:
             raise ValueError("KV block size and session bound must be positive")
 
+        targets = manifest.context_classes if context_targets is None else context_targets
+        if not targets or any(value <= 0 for value in targets):
+            raise ValueError("memory frontier context targets must be positive")
+        targets = tuple(sorted(set(targets)))
+        if targets[-1] > manifest.model_max_context_tokens:
+            raise ValueError("memory frontier target exceeds the model contract")
+
         points: list[MemoryPlacementPoint] = []
-        for context_tokens in manifest.context_classes:
+        for context_tokens in targets:
             if context_tokens > qualified_context_limit_tokens:
                 continue
             for span, _ in self.feasible_spans(
@@ -573,6 +679,7 @@ class AutonomousPlacementPolicy:
                 required_memory_bytes=0,
                 score=None,
                 reason="no_exact_span_fits_the_stable_memory_envelope",
+                context_tokens=context_tokens,
             )
         if excluded_spans:
             feasible = tuple(item for item in feasible if item[0] not in excluded_spans)
@@ -583,6 +690,7 @@ class AutonomousPlacementPolicy:
                     required_memory_bytes=0,
                     score=None,
                     reason="no_exact_span_fits_local_artifact_storage",
+                    context_tokens=context_tokens,
                 )
 
         # BUILDING/WARMING leases are demand intents, like Petals' JOINING
@@ -652,6 +760,7 @@ class AutonomousPlacementPolicy:
                         can_host_frontend=WorkerRole.FRONTEND in offer.supported_roles,
                     ),
                     reason="movement_would_remove_the_last_ready_coverage",
+                    context_tokens=context_tokens,
                 )
             return PlacementDecision(
                 action=PlacementAction.STANDBY,
@@ -659,6 +768,7 @@ class AutonomousPlacementPolicy:
                 required_memory_bytes=0,
                 score=None,
                 reason="no_candidate_preserves_ready_coverage",
+                context_tokens=context_tokens,
             )
 
         best_span, best_required, best_score = max(
@@ -672,6 +782,7 @@ class AutonomousPlacementPolicy:
                 required_memory_bytes=best_required,
                 score=best_score,
                 reason="fills_the_highest_verified_capacity_deficit",
+                context_tokens=context_tokens,
             )
         current = next(
             (item for item in candidates if item[0] == current_span),
@@ -703,6 +814,7 @@ class AutonomousPlacementPolicy:
                 required_memory_bytes=current_required,
                 score=current_score,
                 reason="current_span_is_still_the_best_stable_choice",
+                context_tokens=context_tokens,
             )
         if current_reservations:
             return PlacementDecision(
@@ -711,6 +823,7 @@ class AutonomousPlacementPolicy:
                 required_memory_bytes=current_required,
                 score=current_score,
                 reason="active_reservations_must_drain_before_movement",
+                context_tokens=context_tokens,
             )
         # Petals only refuses a move that would break a swarm which is
         # currently connected. For Fabi, layer coverage alone is not enough:
@@ -729,6 +842,7 @@ class AutonomousPlacementPolicy:
                 required_memory_bytes=current_required,
                 score=current_score,
                 reason="movement_would_remove_the_last_executable_route",
+                context_tokens=context_tokens,
             )
         if last_moved_at_ms is not None and now_ms - last_moved_at_ms < self.movement_cooldown_ms:
             return PlacementDecision(
@@ -737,6 +851,7 @@ class AutonomousPlacementPolicy:
                 required_memory_bytes=current_required,
                 score=current_score,
                 reason="movement_cooldown_has_not_elapsed",
+                context_tokens=context_tokens,
             )
         current_value = max(current_score.weighted_deficit_filled, 1.0)
         improvement = (
@@ -752,6 +867,7 @@ class AutonomousPlacementPolicy:
                 required_memory_bytes=current_required,
                 score=current_score,
                 reason="durable_gain_is_below_the_movement_threshold",
+                context_tokens=context_tokens,
             )
         return PlacementDecision(
             action=PlacementAction.MOVE,
@@ -759,4 +875,336 @@ class AutonomousPlacementPolicy:
             required_memory_bytes=best_required,
             score=best_score,
             reason="coverage_preserved_and_verified_gain_exceeds_hysteresis",
+            context_tokens=context_tokens,
+        )
+
+    def _context_utility(
+        self,
+        *,
+        offer: WorkerOffer,
+        manifest: ModelManifest,
+        leases: tuple[SpanLease, ...],
+        demand: ContextCapacityDemandMap,
+        span: LayerSpan,
+        context_tokens: int,
+        kv_block_size: int,
+        maximum_sessions: int | None = None,
+    ) -> ContextPlacementUtility:
+        """Score one exact target across all cumulative demand classes."""
+
+        rounded_tokens = (context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
+        kv_bytes_per_session = rounded_tokens * sum(
+            manifest.kv_bytes_per_token_by_layer[span.start : span.end]
+        )
+        available_kv_bytes = max(
+            0,
+            offer.stable_memory_envelope_bytes - manifest.weight_bytes(span),
+        )
+        max_sessions = available_kv_bytes // kv_bytes_per_session if kv_bytes_per_session > 0 else 0
+        if maximum_sessions is not None:
+            if maximum_sessions <= 0:
+                raise ValueError("session capacity must be positive")
+            max_sessions = min(max_sessions, maximum_sessions)
+
+        weighted_complete_routes = 0.0
+        weighted_concurrent_slots = 0.0
+        weighted_layer_deficit_filled = 0.0
+        for class_demand in demand.classes:
+            if class_demand.context_tokens > context_tokens:
+                continue
+            if (
+                class_demand.desired_independent_routes == 0
+                and class_demand.desired_concurrent_slots == 0
+            ):
+                continue
+            class_weight = (
+                sum(class_demand.demand_weight_by_layer)
+                / manifest.num_layers
+                * class_demand.confidence
+            )
+            if class_weight <= 0:
+                continue
+            planned_coverage = self._coverage(
+                manifest,
+                leases,
+                exclude_worker_id=offer.worker_id,
+                minimum_context_tokens=class_demand.context_tokens,
+                states=frozenset({SpanState.BUILDING, SpanState.WARMING, SpanState.READY}),
+            )
+            prefix, suffix = self._fixed_route_boundaries(
+                manifest,
+                leases,
+                exclude_worker_id=offer.worker_id,
+                minimum_context_tokens=class_demand.context_tokens,
+            )
+            completes_route = span.start in prefix and span.end in suffix
+            weighted_complete_routes += class_weight * int(completes_route)
+            if completes_route:
+                weighted_concurrent_slots += class_weight * min(
+                    max_sessions,
+                    class_demand.desired_concurrent_slots,
+                )
+            weighted_layer_deficit_filled += (
+                class_demand.confidence
+                * sum(
+                    weight
+                    for layer, weight in enumerate(class_demand.demand_weight_by_layer)
+                    if span.start <= layer < span.end
+                    and planned_coverage[layer] < class_demand.desired_replicas_by_layer[layer]
+                )
+                / manifest.num_layers
+            )
+
+        return ContextPlacementUtility(
+            weighted_complete_routes=weighted_complete_routes,
+            weighted_concurrent_slots=weighted_concurrent_slots,
+            weighted_layer_deficit_filled=weighted_layer_deficit_filled,
+            context_tokens=context_tokens,
+            span_length=span.length,
+            max_sessions=max_sessions,
+        )
+
+    def choose_contextual(
+        self,
+        *,
+        offer: WorkerOffer,
+        manifest: ModelManifest,
+        leases: tuple[SpanLease, ...],
+        demand: ContextCapacityDemandMap,
+        qualified_context_limit_tokens: int,
+        kv_block_size: int,
+        current_span: LayerSpan | None = None,
+        current_context_tokens: int | None = None,
+        current_reservations: int = 0,
+        last_moved_at_ms: int | None = None,
+        serving_route_exists: bool = False,
+        serving_route_survives_movement: bool = False,
+        excluded_spans: frozenset[LayerSpan] = frozenset(),
+        now_ms: int,
+    ) -> tuple[PlacementDecision, ContextPlacementUtility]:
+        """Choose a real span *and* context from trusted cumulative demand.
+
+        The legacy single-context scorer remains a bounded first pass for each
+        demanded context.  This second pass compares those finalists across
+        the worker's memory frontier.  A READY worker is never moved because
+        advice disappeared: callers invoke this method only for a valid signed
+        snapshot and otherwise keep the last verified target.
+        """
+
+        demand.validate_for(manifest, now_ms=now_ms)
+        if qualified_context_limit_tokens <= 0:
+            raise ValueError("qualified context limit must be positive")
+        if (current_span is None) != (current_context_tokens is None):
+            raise ValueError("current span and context must be supplied together")
+
+        demanded_classes = tuple(
+            item
+            for item in demand.classes
+            if item.context_tokens <= qualified_context_limit_tokens
+            and (item.desired_independent_routes > 0 or item.desired_concurrent_slots > 0)
+        )
+        if not demanded_classes:
+            raise ValueError("context demand snapshot has no locally qualified demand")
+
+        frontier = self.memory_frontier(
+            offer=offer,
+            manifest=manifest,
+            qualified_context_limit_tokens=min(
+                qualified_context_limit_tokens,
+                manifest.model_max_context_tokens,
+            ),
+            kv_block_size=kv_block_size,
+            context_targets=tuple(item.context_tokens for item in demanded_classes),
+        )
+        finalists: list[tuple[PlacementDecision, ContextPlacementUtility]] = []
+        for point in frontier:
+            if point.span in excluded_spans:
+                continue
+            decision = PlacementDecision(
+                action=(PlacementAction.JOIN if current_span is None else PlacementAction.MOVE),
+                span=point.span,
+                required_memory_bytes=point.required_memory_bytes,
+                score=None,
+                reason="trusted_context_demand_frontier_candidate",
+                context_tokens=point.context_tokens,
+            )
+            utility = self._context_utility(
+                offer=offer,
+                manifest=manifest,
+                leases=leases,
+                demand=demand,
+                span=point.span,
+                context_tokens=point.context_tokens,
+                kv_block_size=kv_block_size,
+                maximum_sessions=point.max_sessions,
+            )
+            finalists.append((decision, utility))
+
+        if current_span is not None and current_context_tokens is not None:
+            current_lease = next(
+                (
+                    lease
+                    for lease in leases
+                    if lease.worker_id == offer.worker_id
+                    and lease.hosted_span == current_span
+                    and lease.state is SpanState.READY
+                ),
+                None,
+            )
+            current_utility = self._context_utility(
+                offer=offer,
+                manifest=manifest,
+                leases=leases,
+                demand=demand,
+                span=current_span,
+                context_tokens=current_context_tokens,
+                kv_block_size=kv_block_size,
+                maximum_sessions=(None if current_lease is None else current_lease.max_sessions),
+            )
+            finalists.append(
+                (
+                    PlacementDecision(
+                        action=PlacementAction.KEEP,
+                        span=current_span,
+                        required_memory_bytes=0,
+                        score=None,
+                        reason="current_verified_span_context_candidate",
+                        context_tokens=current_context_tokens,
+                    ),
+                    current_utility,
+                )
+            )
+
+        if not finalists:
+            raise ValueError("no demanded span/context target fits the stable memory envelope")
+
+        selected, selected_utility = max(
+            finalists,
+            key=lambda item: (
+                item[1].rank(),
+                -item[0].span.start if item[0].span is not None else 0,
+                self._tiebreaker(offer.worker_id, item[0].span) if item[0].span is not None else 0,
+            ),
+        )
+        if current_span is None:
+            return (
+                PlacementDecision(
+                    action=PlacementAction.JOIN,
+                    span=selected.span,
+                    required_memory_bytes=selected.required_memory_bytes,
+                    score=selected.score,
+                    reason="trusted_context_demand_selected_cold_target",
+                    context_tokens=selected.context_tokens,
+                ),
+                selected_utility,
+            )
+
+        assert current_context_tokens is not None
+        current_utility = next(
+            utility
+            for decision, utility in finalists
+            if decision.action is PlacementAction.KEEP
+            and decision.span == current_span
+            and decision.context_tokens == current_context_tokens
+        )
+        if selected.span == current_span and selected.context_tokens == current_context_tokens:
+            return (
+                PlacementDecision(
+                    action=PlacementAction.KEEP,
+                    span=current_span,
+                    required_memory_bytes=selected.required_memory_bytes,
+                    score=selected.score,
+                    reason="current_span_and_context_match_trusted_demand",
+                    context_tokens=current_context_tokens,
+                ),
+                current_utility,
+            )
+        for class_demand in demanded_classes:
+            if class_demand.context_tokens > current_context_tokens:
+                continue
+            ready_coverage = self._coverage(
+                manifest,
+                leases,
+                exclude_worker_id=offer.worker_id,
+                minimum_context_tokens=class_demand.context_tokens,
+            )
+            if any(
+                ready_coverage[layer] == 0 for layer in range(current_span.start, current_span.end)
+            ):
+                return (
+                    PlacementDecision(
+                        action=PlacementAction.KEEP,
+                        span=current_span,
+                        required_memory_bytes=0,
+                        score=None,
+                        reason="context_movement_would_remove_last_ready_layer_coverage",
+                        context_tokens=current_context_tokens,
+                    ),
+                    current_utility,
+                )
+        if current_reservations:
+            return (
+                PlacementDecision(
+                    action=PlacementAction.KEEP,
+                    span=current_span,
+                    required_memory_bytes=0,
+                    score=None,
+                    reason="active_reservations_must_drain_before_context_movement",
+                    context_tokens=current_context_tokens,
+                ),
+                current_utility,
+            )
+        if serving_route_exists and not serving_route_survives_movement:
+            return (
+                PlacementDecision(
+                    action=PlacementAction.KEEP,
+                    span=current_span,
+                    required_memory_bytes=0,
+                    score=None,
+                    reason="context_movement_would_remove_the_last_executable_route",
+                    context_tokens=current_context_tokens,
+                ),
+                current_utility,
+            )
+        if last_moved_at_ms is not None and now_ms - last_moved_at_ms < self.movement_cooldown_ms:
+            return (
+                PlacementDecision(
+                    action=PlacementAction.KEEP,
+                    span=current_span,
+                    required_memory_bytes=0,
+                    score=None,
+                    reason="context_movement_cooldown_has_not_elapsed",
+                    context_tokens=current_context_tokens,
+                ),
+                current_utility,
+            )
+        improvement = (selected_utility.value - current_utility.value) / max(
+            current_utility.value,
+            1.0,
+        )
+        if (
+            selected_utility.rank() <= current_utility.rank()
+            or improvement < self.minimum_improvement
+        ):
+            return (
+                PlacementDecision(
+                    action=PlacementAction.KEEP,
+                    span=current_span,
+                    required_memory_bytes=0,
+                    score=None,
+                    reason="context_demand_gain_is_below_the_movement_threshold",
+                    context_tokens=current_context_tokens,
+                ),
+                current_utility,
+            )
+        return (
+            PlacementDecision(
+                action=PlacementAction.MOVE,
+                span=selected.span,
+                required_memory_bytes=selected.required_memory_bytes,
+                score=selected.score,
+                reason="trusted_context_demand_selected_new_target",
+                context_tokens=selected.context_tokens,
+            ),
+            selected_utility,
         )

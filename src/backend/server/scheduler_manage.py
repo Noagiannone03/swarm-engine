@@ -550,17 +550,14 @@ class SchedulerManage:
         if self.context_demand_announcer is not None:
             self.context_demand_announcer.close()
             self.context_demand_announcer = None
-        demand_region = os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip()
-        catalog = (
-            getattr(self.iroh_transport, "catalog_discovery", None) if demand_region else None
-        )
-        if demand_region and catalog is None:
+        demand_region = os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip() or "global"
+        catalog = getattr(self.iroh_transport, "catalog_discovery", None)
+        if catalog is None:
             raise RuntimeError("context demand publication requires the active catalogue DHT")
-        if demand_region and catalog is not None:
-            self.context_demand_announcer = ContextDemandAnnouncer(
-                catalog,
-                demand_region,
-            )
+        self.context_demand_announcer = ContextDemandAnnouncer(
+            catalog,
+            demand_region,
+        )
         self.active_v3_routes = ActiveRouteRuntime(
             planner=planner,
             transport=self.iroh_transport,

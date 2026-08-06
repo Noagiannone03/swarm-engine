@@ -22,9 +22,21 @@ from swarm_protocol import (
     WorkerRole,
     cumulative_context_coverage,
 )
+from swarm_protocol.context_demand import build_context_histogram
 
 HASHES = tuple(character * 64 for character in "abcdef")
 SWARM_NOW = 1_000
+
+
+def _demand_map(**kwargs) -> ContextCapacityDemandMap:
+    classes = tuple(kwargs.pop("classes"))
+    return ContextCapacityDemandMap(
+        **kwargs,
+        classes=classes,
+        context_histogram=build_context_histogram(
+            tuple(item.context_tokens for item in classes)
+        ),
+    )
 
 
 def manifest() -> ModelManifest:
@@ -442,7 +454,7 @@ def test_disjoint_lab_topology_moves_redundant_head_to_uncovered_tail():
 
 
 def _context_demand(model: ModelManifest) -> ContextCapacityDemandMap:
-    return ContextCapacityDemandMap(
+    return _demand_map(
         model_swarm_id=model.model_swarm_id,
         region_id="eu-west",
         issued_at_ms=1_000,
@@ -459,11 +471,12 @@ def _context_demand(model: ModelManifest) -> ContextCapacityDemandMap:
     )
 
 
-def test_context_demand_is_versioned_expiring_and_matches_the_signed_ladder():
+def test_context_demand_is_versioned_expiring_and_bounded_by_the_model_contract():
     model = manifest()
     demand = _context_demand(model)
 
     demand.validate_for(model, now_ms=2_000)
+    assert demand.demand_version == 2
     assert demand.class_for(16_385).context_tokens == 32_768
     assert demand.class_for(16_384).layer_screen() == CapacityDemandMap.uniform(
         4, desired_replicas=1
@@ -475,7 +488,7 @@ def test_context_demand_is_versioned_expiring_and_matches_the_signed_ladder():
         demand.class_for(65_537)
 
 
-def test_context_demand_rejects_unsorted_or_wrong_model_classes():
+def test_context_demand_rejects_unsorted_or_out_of_contract_points():
     model = manifest()
     demand = _context_demand(model)
 
@@ -487,9 +500,35 @@ def test_context_demand_rejects_unsorted_or_wrong_model_classes():
             }
         )
 
-    missing_class = demand.model_copy(update={"classes": demand.classes[:-1]})
+    outside_contract = demand.model_copy(
+        update={
+            "classes": (
+                *demand.classes[:-1],
+                demand.classes[-1].model_copy(
+                    update={"context_tokens": model.model_max_context_tokens + 1}
+                ),
+            )
+        }
+    )
     with pytest.raises(ValueError, match="signed model contract"):
-        missing_class.validate_for(model, now_ms=2_000)
+        outside_contract.validate_for(model, now_ms=2_000)
+
+    with pytest.raises(ValueError, match="unsupported context demand version"):
+        ContextCapacityDemandMap.model_validate(
+            {**demand.model_dump(), "demand_version": 1}
+        )
+
+    assert demand.context_histogram is not None
+    with pytest.raises(ValueError, match="protobuf"):
+        ContextCapacityDemandMap.model_validate(
+            {
+                **demand.model_dump(),
+                "context_histogram": {
+                    **demand.context_histogram.model_dump(),
+                    "payload_base64": "AA==",
+                },
+            }
+        )
 
 
 def test_memory_frontier_exposes_exact_span_context_session_tradeoffs():
@@ -553,6 +592,154 @@ def test_memory_frontier_never_exceeds_the_qualified_backend_limit():
     assert all(point.context_tokens <= 20 for point in points)
 
 
+def test_trusted_long_context_demand_selects_fewer_layers_with_more_kv():
+    model = manifest().model_copy(
+        update={
+            "model_max_context_tokens": 40,
+            "context_classes": (10, 20, 40),
+        }
+    )
+    demand = _demand_map(
+        model_swarm_id=model.model_swarm_id,
+        region_id="eu-west",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+        classes=tuple(
+            ContextClassDemand(
+                context_tokens=tokens,
+                desired_independent_routes=1 if tokens == 20 else 0,
+                desired_concurrent_slots=1 if tokens == 20 else 0,
+                desired_replicas_by_layer=(
+                    (1,) * model.num_layers if tokens == 20 else (0,) * model.num_layers
+                ),
+                demand_weight_by_layer=(
+                    (1.0,) * model.num_layers if tokens == 20 else (0.0,) * model.num_layers
+                ),
+                confidence=1.0 if tokens == 20 else 0.0,
+            )
+            for tokens in model.context_classes
+        ),
+    )
+    policy = AutonomousPlacementPolicy()
+
+    widest_short_span = max(
+        span.length
+        for span, _ in policy.feasible_spans(
+            offer=offer(memory_bytes=700),
+            manifest=model,
+            context_tokens=10,
+            kv_block_size=1,
+        )
+    )
+    decision, utility = policy.choose_contextual(
+        offer=offer(memory_bytes=700),
+        manifest=model,
+        leases=(lease(model, "head", 0, 2, max_context_tokens=20),),
+        demand=demand,
+        qualified_context_limit_tokens=40,
+        kv_block_size=1,
+        now_ms=2_000,
+    )
+
+    assert widest_short_span == 3
+    assert decision.action is PlacementAction.JOIN
+    assert decision.span == LayerSpan(start=2, end=4)
+    assert decision.span.length < widest_short_span
+    assert decision.context_tokens == 20
+    assert utility.weighted_complete_routes > 0
+
+
+def test_adaptive_demand_can_select_an_exact_non_manifest_context_target():
+    model = manifest().model_copy(
+        update={
+            "model_max_context_tokens": 40,
+            "context_classes": (10, 20, 40),
+        }
+    )
+    exact_context = 21
+    demand = _demand_map(
+        model_swarm_id=model.model_swarm_id,
+        region_id="eu-west",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+        classes=(
+            ContextClassDemand(
+                context_tokens=exact_context,
+                desired_independent_routes=1,
+                desired_concurrent_slots=1,
+                desired_replicas_by_layer=(1,) * model.num_layers,
+                demand_weight_by_layer=(1.0,) * model.num_layers,
+            ),
+        ),
+    )
+
+    decision, utility = AutonomousPlacementPolicy().choose_contextual(
+        offer=offer(memory_bytes=740),
+        manifest=model,
+        leases=(lease(model, "head", 0, 2, max_context_tokens=exact_context),),
+        demand=demand,
+        qualified_context_limit_tokens=40,
+        kv_block_size=1,
+        now_ms=2_000,
+    )
+
+    assert exact_context not in model.context_classes
+    assert decision.action is PlacementAction.JOIN
+    assert decision.span == LayerSpan(start=2, end=4)
+    assert decision.context_tokens == exact_context
+    assert utility.weighted_complete_routes > 0
+
+
+def test_context_reconfiguration_waits_for_reservations_to_drain():
+    model = manifest().model_copy(
+        update={
+            "model_max_context_tokens": 40,
+            "context_classes": (10, 20, 40),
+        }
+    )
+    demand = _demand_map(
+        model_swarm_id=model.model_swarm_id,
+        region_id="eu-west",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+        classes=tuple(
+            ContextClassDemand(
+                context_tokens=tokens,
+                desired_independent_routes=2 if tokens == 20 else 0,
+                desired_concurrent_slots=1 if tokens == 20 else 0,
+                desired_replicas_by_layer=(
+                    (2,) * model.num_layers if tokens == 20 else (0,) * model.num_layers
+                ),
+                demand_weight_by_layer=(
+                    (1.0,) * model.num_layers if tokens == 20 else (0.0,) * model.num_layers
+                ),
+                confidence=1.0 if tokens == 20 else 0.0,
+            )
+            for tokens in model.context_classes
+        ),
+    )
+    decision, _ = AutonomousPlacementPolicy(movement_cooldown_ms=0).choose_contextual(
+        offer=offer("current", memory_bytes=700),
+        manifest=model,
+        leases=(
+            lease(model, "current", 0, 2, max_context_tokens=10),
+            lease(model, "head-copy", 0, 2, max_context_tokens=20),
+            lease(model, "tail", 2, 4, max_context_tokens=20),
+        ),
+        demand=demand,
+        qualified_context_limit_tokens=40,
+        kv_block_size=1,
+        current_span=LayerSpan(start=0, end=2),
+        current_context_tokens=10,
+        current_reservations=1,
+        now_ms=2_000,
+    )
+
+    assert decision.action is PlacementAction.KEEP
+    assert decision.context_tokens == 10
+    assert decision.reason == "active_reservations_must_drain_before_context_movement"
+
+
 def test_long_context_lease_counts_cumulatively_but_short_lease_does_not():
     model = manifest()
     long_lease = lease(model, "long", 0, 2).model_copy(update={"max_context_tokens": 65_536})
@@ -593,6 +780,7 @@ def move_decision(span: LayerSpan) -> PlacementDecision:
         required_memory_bytes=1,
         score=None,
         reason="test",
+        context_tokens=16,
     )
 
 
@@ -601,8 +789,9 @@ def test_materializer_drains_then_generation_fences_executor_reload():
     reloads = []
     materializer = PlacementMaterializer(
         drain=drain,
-        reload_target=lambda span, generation: reloads.append((span, generation)),
+        reload_target=lambda span, context, generation: reloads.append((span, context, generation)),
         current_span=LayerSpan(start=0, end=2),
+        current_context_tokens=8,
     )
 
     draining = materializer.reconcile(move_decision(LayerSpan(start=2, end=4)))
@@ -613,11 +802,11 @@ def test_materializer_drains_then_generation_fences_executor_reload():
     building = materializer.continue_after_drain()
     assert building.phase is MaterializationPhase.BUILDING
     assert building.current_span is None
-    assert reloads == [(LayerSpan(start=2, end=4), 1)]
+    assert reloads == [(LayerSpan(start=2, end=4), 16, 1)]
 
     with pytest.raises(RuntimeError, match="stale"):
-        materializer.mark_ready(span=LayerSpan(start=2, end=4), generation=0)
-    ready = materializer.mark_ready(span=LayerSpan(start=2, end=4), generation=1)
+        materializer.mark_ready(span=LayerSpan(start=2, end=4), context_tokens=16, generation=0)
+    ready = materializer.mark_ready(span=LayerSpan(start=2, end=4), context_tokens=16, generation=1)
     assert ready.phase is MaterializationPhase.READY
     assert ready.current_span == LayerSpan(start=2, end=4)
     assert not drain.draining
@@ -628,8 +817,9 @@ def test_materializer_rolls_back_failed_move_as_a_new_fenced_generation():
     reloads = []
     materializer = PlacementMaterializer(
         drain=drain,
-        reload_target=lambda span, generation: reloads.append((span, generation)),
+        reload_target=lambda span, context, generation: reloads.append((span, context, generation)),
         current_span=LayerSpan(start=0, end=2),
+        current_context_tokens=8,
     )
     materializer.reconcile(move_decision(LayerSpan(start=2, end=4)))
 
@@ -637,9 +827,10 @@ def test_materializer_rolls_back_failed_move_as_a_new_fenced_generation():
 
     assert rollback.phase is MaterializationPhase.BUILDING
     assert rollback.target_span == LayerSpan(start=0, end=2)
+    assert rollback.target_context_tokens == 8
     assert reloads == [
-        (LayerSpan(start=2, end=4), 1),
-        (LayerSpan(start=0, end=2), 2),
+        (LayerSpan(start=2, end=4), 16, 1),
+        (LayerSpan(start=0, end=2), 8, 2),
     ]
 
 
@@ -647,7 +838,7 @@ def test_cold_storage_rejection_returns_to_standby_without_a_fake_rollback():
     reloads = []
     materializer = PlacementMaterializer(
         drain=FakeDrain(),
-        reload_target=lambda span, generation: reloads.append((span, generation)),
+        reload_target=lambda span, context, generation: reloads.append((span, context, generation)),
     )
     materializer.reconcile(
         PlacementDecision(
@@ -656,6 +847,7 @@ def test_cold_storage_rejection_returns_to_standby_without_a_fake_rollback():
             required_memory_bytes=1,
             score=None,
             reason="test",
+            context_tokens=16,
         )
     )
 
@@ -667,4 +859,4 @@ def test_cold_storage_rejection_returns_to_standby_without_a_fake_rollback():
     assert standby.phase is MaterializationPhase.STANDBY
     assert standby.current_span is None
     assert standby.target_span is None
-    assert reloads == [(LayerSpan(start=0, end=2), 1)]
+    assert reloads == [(LayerSpan(start=0, end=2), 16, 1)]

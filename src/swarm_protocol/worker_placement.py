@@ -254,8 +254,9 @@ class AutonomousWorkerPlacement:
         catalog: PlacementCatalog,
         admission: WorkerExecutionAdmission,
         state_publisher: SpanStatePublisher,
-        reload_target: Callable[[LayerSpan, int], None],
+        reload_target: Callable[[LayerSpan, int, int], None],
         current_span: LayerSpan | None = None,
+        current_context_tokens: int | None = None,
         policy: AutonomousPlacementPolicy | None = None,
         topology_observer: Callable[[DiscoverySnapshot], None] | None = None,
         transition_refresh_interval_s: float = _TRANSITION_REFRESH_INTERVAL_SECONDS,
@@ -272,6 +273,7 @@ class AutonomousWorkerPlacement:
             drain=admission,
             reload_target=reload_target,
             current_span=current_span,
+            current_context_tokens=current_context_tokens,
         )
         self._snapshot: DiscoverySnapshot | None = None
         self._snapshot_model_id: str | None = None
@@ -289,10 +291,11 @@ class AutonomousWorkerPlacement:
         self._transition_publish_lock = threading.RLock()
         self._error: dict[str, str] | None = None
         self._context_tokens: int | None = None
+        self._qualified_context_limit_tokens: int | None = None
         self._demand_region_id = demand_region_id
         self._context_demand: ContextCapacityDemandMap | None = None
         self._context_demand_state = "off" if demand_region_id is None else "waiting"
-        self._context_demand_shadow: dict[str, object] | None = None
+        self._context_demand_status: dict[str, object] | None = None
         # Exact local materialization failures are hard constraints, never
         # placement preferences.  The normal score remains byte-for-byte
         # identical for every candidate that is physically feasible.
@@ -323,6 +326,10 @@ class AutonomousWorkerPlacement:
             raise ValueError("bootstrap intent must bind signed weight identities")
         with self._lock:
             self._context_tokens = context_tokens
+            self._qualified_context_limit_tokens = max(
+                context_tokens,
+                self._qualified_context_limit_tokens or 0,
+            )
 
         state = self._materializer.snapshot()
         if state.phase is not MaterializationPhase.STANDBY:
@@ -343,11 +350,14 @@ class AutonomousWorkerPlacement:
                 error={"code": "TrustError", "detail": "DHT manifest differs from registry"},
             )
 
-        decision = self._policy.choose(
+        baseline = self._policy.choose(
             offer=offer,
             manifest=manifest,
             leases=snapshot.leases,
-            demand=CapacityDemandMap.uniform(manifest.num_layers, desired_replicas=2),
+            # This is only the chicken-and-egg bootstrap needed before the
+            # first legitimate request can create signed demand.  It is not a
+            # steady-state replica policy.
+            demand=CapacityDemandMap.uniform(manifest.num_layers, desired_replicas=1),
             context_tokens=context_tokens,
             kv_block_size=kv_block_size,
             current_span=None,
@@ -355,8 +365,8 @@ class AutonomousWorkerPlacement:
             excluded_spans=self._storage_exclusions(),
             now_ms=time.time_ns() // 1_000_000,
         )
-        self._compare_context_demand(
-            baseline=decision,
+        decision = self._select_context_demand(
+            baseline=baseline,
             offer=offer,
             manifest=manifest,
             leases=snapshot.leases,
@@ -364,15 +374,23 @@ class AutonomousWorkerPlacement:
             kv_block_size=kv_block_size,
             current_span=None,
             current_reservations=0,
+            cold_start=True,
             now_ms=time.time_ns() // 1_000_000,
         )
         if decision.action is PlacementAction.STANDBY:
             return self._status(state, decision=decision.reason, error=read_error)
         if decision.action is not PlacementAction.JOIN or decision.span is None:
             raise RuntimeError("cold placement policy returned an invalid transition")
+        if decision.context_tokens is None:
+            raise RuntimeError("cold placement policy omitted its context target")
 
         span = decision.span
-        rounded_tokens = (context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
+        selected_context_tokens = decision.context_tokens
+        with self._lock:
+            self._context_tokens = selected_context_tokens
+        rounded_tokens = (
+            (selected_context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
+        )
         allocatable_kv_bytes = rounded_tokens * sum(
             manifest.kv_bytes_per_token_by_layer[span.start : span.end]
         )
@@ -386,7 +404,7 @@ class AutonomousWorkerPlacement:
                 effective_span_mode=EffectiveSpanMode.FIXED,
                 state=SpanState.BUILDING,
                 weight_hashes=weight_hashes,
-                max_context_tokens=context_tokens,
+                max_context_tokens=selected_context_tokens,
                 kv_geometry=KvGeometry(
                     block_size_tokens=kv_block_size,
                     bytes_per_token_by_layer=manifest.kv_bytes_per_token_by_layer,
@@ -422,6 +440,10 @@ class AutonomousWorkerPlacement:
             raise ValueError("placement context contract must be positive")
         with self._lock:
             self._context_tokens = context_tokens
+            self._qualified_context_limit_tokens = max(
+                context_tokens,
+                self._qualified_context_limit_tokens or 0,
+            )
 
         state = self._materializer.snapshot()
         if (
@@ -433,6 +455,7 @@ class AutonomousWorkerPlacement:
                 self._admission.configure(advertisement)
                 state = self._materializer.mark_ready(
                     span=advertisement.lease.hosted_span,
+                    context_tokens=advertisement.lease.max_context_tokens,
                     generation=state.generation,
                 )
                 self._last_moved_at_ms = time.time_ns() // 1_000_000
@@ -442,7 +465,7 @@ class AutonomousWorkerPlacement:
         elif state.phase is MaterializationPhase.DRAINING:
             with self._transition_publish_lock:
                 state = self._materializer.continue_after_drain()
-                self._announce_transition_once(advertisement, state)
+                self._announce_transition_once(advertisement, state, manifest)
         elif state.phase is MaterializationPhase.READY:
             self._admission.configure(advertisement)
 
@@ -455,7 +478,7 @@ class AutonomousWorkerPlacement:
 
         state = self._materializer.snapshot()
         if state.phase in {MaterializationPhase.DRAINING, MaterializationPhase.BUILDING}:
-            self._announce_transition_once(advertisement, state)
+            self._announce_transition_once(advertisement, state, manifest)
             return self._status(state, decision="materializing", error=read_error)
         if advertisement.lease.state is not SpanState.READY:
             return self._status(state, decision="waiting_executor_ready", error=read_error)
@@ -485,22 +508,15 @@ class AutonomousWorkerPlacement:
             context_tokens=context_tokens,
             exclude_worker_id=advertisement.offer.worker_id,
         )
-        decision = self._policy.choose(
-            offer=advertisement.offer,
-            manifest=manifest,
-            leases=snapshot.leases,
-            demand=CapacityDemandMap.uniform(manifest.num_layers, desired_replicas=2),
-            context_tokens=context_tokens,
-            kv_block_size=advertisement.lease.kv_geometry.block_size_tokens,
-            current_span=state.current_span,
-            current_reservations=active_reservations,
-            last_moved_at_ms=self._last_moved_at_ms,
-            serving_route_exists=serving_route_exists,
-            serving_route_survives_movement=serving_route_survives_movement,
-            excluded_spans=self._storage_exclusions(),
-            now_ms=time.time_ns() // 1_000_000,
+        decision = PlacementDecision(
+            action=PlacementAction.KEEP,
+            span=state.current_span,
+            required_memory_bytes=0,
+            score=None,
+            reason="holding_last_ready_target_without_valid_context_demand",
+            context_tokens=state.current_context_tokens,
         )
-        self._compare_context_demand(
+        decision = self._select_context_demand(
             baseline=decision,
             offer=advertisement.offer,
             manifest=manifest,
@@ -509,6 +525,7 @@ class AutonomousWorkerPlacement:
             kv_block_size=advertisement.lease.kv_geometry.block_size_tokens,
             current_span=state.current_span,
             current_reservations=active_reservations,
+            cold_start=False,
             last_moved_at_ms=self._last_moved_at_ms,
             serving_route_exists=serving_route_exists,
             serving_route_survives_movement=serving_route_survives_movement,
@@ -516,8 +533,12 @@ class AutonomousWorkerPlacement:
         )
         if decision.action in {PlacementAction.JOIN, PlacementAction.MOVE}:
             with self._transition_publish_lock:
+                if decision.context_tokens is None:
+                    raise RuntimeError("adaptive placement omitted its context target")
+                with self._lock:
+                    self._context_tokens = decision.context_tokens
                 state = self._materializer.reconcile(decision)
-                self._announce_transition_once(advertisement, state)
+                self._announce_transition_once(advertisement, state, manifest)
         return self._status(state, decision=decision.reason, error=read_error)
 
     def downgrade_building_context(self, context_tokens: int) -> dict[str, object]:
@@ -542,6 +563,8 @@ class AutonomousWorkerPlacement:
                 raise ValueError("context downgrade must reduce the current contract")
             if advertisement is None:
                 raise RuntimeError("BUILDING placement has no renewable advertisement")
+
+            state = self._materializer.downgrade_building_context(context_tokens)
 
             geometry = advertisement.lease.kv_geometry
             adjusted_geometry = geometry.model_copy(
@@ -671,14 +694,55 @@ class AutonomousWorkerPlacement:
         self,
         advertisement: ModelMemberAdvertisement,
         state,
+        manifest: ModelManifest,
     ) -> None:
-        key = (state.phase, state.generation, state.target_span)
+        key = (
+            state.phase,
+            state.generation,
+            state.target_span,
+            state.target_context_tokens,
+        )
         with self._transition_publish_lock:
             with self._lock:
                 if self._announced_transition == key:
                     return
             span_state = self._span_state_for_phase(state.phase)
-            transitioned = self._state_publisher.publish_span_state(advertisement, span_state)
+            transition_advertisement = advertisement
+            if state.phase is MaterializationPhase.BUILDING:
+                if state.target_span is None or state.target_context_tokens is None:
+                    raise RuntimeError("BUILDING placement has no complete target")
+                rounded_tokens = (
+                    (
+                        state.target_context_tokens
+                        + advertisement.lease.kv_geometry.block_size_tokens
+                        - 1
+                    )
+                    // advertisement.lease.kv_geometry.block_size_tokens
+                    * advertisement.lease.kv_geometry.block_size_tokens
+                )
+                allocatable_kv_bytes = rounded_tokens * sum(
+                    manifest.kv_bytes_per_token_by_layer[
+                        state.target_span.start : state.target_span.end
+                    ]
+                )
+                transition_advertisement = advertisement.model_copy(
+                    update={
+                        "lease": advertisement.lease.model_copy(
+                            update={
+                                "hosted_span": state.target_span,
+                                "weight_hashes": (manifest.weight_collection_hash,),
+                                "max_context_tokens": state.target_context_tokens,
+                                "kv_geometry": advertisement.lease.kv_geometry.model_copy(
+                                    update={"allocatable_bytes": allocatable_kv_bytes}
+                                ),
+                            }
+                        )
+                    }
+                )
+            transitioned = self._state_publisher.publish_span_state(
+                transition_advertisement,
+                span_state,
+            )
             self._track_transition(transitioned, state)
 
     @staticmethod
@@ -698,7 +762,12 @@ class AutonomousWorkerPlacement:
         executor heartbeat or a guessed loading deadline.
         """
 
-        key = (state.phase, state.generation, state.target_span)
+        key = (
+            state.phase,
+            state.generation,
+            state.target_span,
+            state.target_context_tokens,
+        )
         with self._lock:
             self._announced_transition = key
             self._transition_advertisement = advertisement
@@ -727,7 +796,12 @@ class AutonomousWorkerPlacement:
                     with self._lock:
                         self._transition_advertisement = None
                     continue
-                key = (state.phase, state.generation, state.target_span)
+                key = (
+                    state.phase,
+                    state.generation,
+                    state.target_span,
+                    state.target_context_tokens,
+                )
                 with self._lock:
                     advertisement = self._transition_advertisement
                     announced = self._announced_transition
@@ -804,7 +878,7 @@ class AutonomousWorkerPlacement:
                 # later refresh retries topology publication.
                 logger.warning("Autonomous topology projection failed", exc_info=True)
 
-    def _compare_context_demand(
+    def _select_context_demand(
         self,
         *,
         baseline: PlacementDecision,
@@ -815,46 +889,39 @@ class AutonomousWorkerPlacement:
         kv_block_size: int,
         current_span: LayerSpan | None,
         current_reservations: int,
+        cold_start: bool,
         now_ms: int,
         last_moved_at_ms: int | None = None,
         serving_route_exists: bool = False,
         serving_route_survives_movement: bool = False,
-    ) -> None:
-        """Compare trusted DHT advice without applying its placement decision."""
+    ) -> PlacementDecision:
+        """Apply trusted demand, or retain the sole cold-start/READY fallback."""
 
         with self._lock:
             demand = self._context_demand
             demand_state = self._context_demand_state
+            qualified_context_limit_tokens = self._qualified_context_limit_tokens
         if demand is None:
             with self._lock:
-                self._context_demand_shadow = {
+                self._context_demand_status = {
                     "state": demand_state,
                     "applied": False,
+                    "fallback": "cold_start" if cold_start else "hold_last_ready",
                 }
-            return
+            return baseline
         try:
             demand.validate_for(manifest, now_ms=now_ms)
-            demand_class = demand.class_for(context_tokens)
-            if (
-                demand_class.desired_independent_routes == 0
-                and demand_class.desired_concurrent_slots == 0
-            ):
-                with self._lock:
-                    self._context_demand_shadow = {
-                        "state": "no_demand",
-                        "applied": False,
-                        "region_id": demand.region_id,
-                        "context_class_tokens": demand_class.context_tokens,
-                    }
-                return
-            shadow = self._policy.choose(
+            if qualified_context_limit_tokens is None:
+                raise ValueError("worker has no qualified context limit")
+            selected, utility = self._policy.choose_contextual(
                 offer=offer,
                 manifest=manifest,
                 leases=leases,
-                demand=demand_class.layer_screen(),
-                context_tokens=context_tokens,
+                demand=demand,
+                qualified_context_limit_tokens=qualified_context_limit_tokens,
                 kv_block_size=kv_block_size,
                 current_span=current_span,
+                current_context_tokens=(None if cold_start else context_tokens),
                 current_reservations=current_reservations,
                 last_moved_at_ms=last_moved_at_ms,
                 serving_route_exists=serving_route_exists,
@@ -863,33 +930,32 @@ class AutonomousWorkerPlacement:
                 now_ms=now_ms,
             )
         except ValueError as exc:
-            comparison: dict[str, object] = {
-                "state": "invalid",
+            no_demand = str(exc) == "context demand snapshot has no locally qualified demand"
+            status: dict[str, object] = {
+                "state": "no_demand" if no_demand else "invalid",
                 "applied": False,
+                "fallback": "cold_start" if cold_start else "hold_last_ready",
                 "error": str(exc)[:256],
             }
         else:
-            comparison = {
-                "state": "compared",
-                "applied": False,
+            status = {
+                "state": "active",
+                "applied": True,
                 "region_id": demand.region_id,
                 "demand_issued_at_ms": demand.issued_at_ms,
-                "context_class_tokens": demand_class.context_tokens,
-                "baseline_action": baseline.action.value,
-                "baseline_span": (
-                    None if baseline.span is None else [baseline.span.start, baseline.span.end]
+                "selected_action": selected.action.value,
+                "selected_span": (
+                    None if selected.span is None else [selected.span.start, selected.span.end]
                 ),
-                "advised_action": shadow.action.value,
-                "advised_span": (
-                    None if shadow.span is None else [shadow.span.start, shadow.span.end]
-                ),
-                "decision_changed": (
-                    shadow.action != baseline.action or shadow.span != baseline.span
-                ),
-                "advised_reason": shadow.reason,
+                "selected_context_tokens": selected.context_tokens,
+                "weighted_complete_routes": utility.weighted_complete_routes,
+                "weighted_concurrent_slots": utility.weighted_concurrent_slots,
+                "weighted_layer_deficit_filled": utility.weighted_layer_deficit_filled,
+                "decision": selected.reason,
             }
         with self._lock:
-            self._context_demand_shadow = comparison
+            self._context_demand_status = status
+        return selected if status["applied"] else baseline
 
     def _status(self, state, *, decision: str, error) -> dict[str, object]:
         return {
@@ -907,8 +973,10 @@ class AutonomousWorkerPlacement:
                 if state.target_span is None
                 else [state.target_span.start, state.target_span.end]
             ),
+            "current_context_tokens": state.current_context_tokens,
+            "target_context_tokens": state.target_context_tokens,
             "decision": decision,
             "storage_rejected_spans": len(self._storage_exclusions()),
-            "context_demand_shadow": self._context_demand_shadow,
+            "context_demand": self._context_demand_status,
             "error": error,
         }

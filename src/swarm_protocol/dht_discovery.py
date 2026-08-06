@@ -210,9 +210,10 @@ class DhtDiscoveryStore:
         """Read one trusted region aggregate or return no advice.
 
         Missing, unreachable, stale or malformed advice is deliberately not a
-        placement failure: autonomous workers retain their safe deterministic
-        baseline. A valid record must be signed by the endpoint pinned for the
-        region and must exactly match the trusted model contract.
+        placement failure: a READY worker retains its last verified target and
+        only a cold worker may use the minimal route bootstrap. A valid record
+        must be signed by the endpoint pinned for the region and must exactly
+        match the trusted model contract.
         """
 
         captured_at = self._now_ms() if now_ms is None else now_ms

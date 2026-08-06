@@ -41,6 +41,9 @@ class FakeNode:
     def catalog_bootstrap(self):
         self.bootstrapped = True
 
+    def catalog_key(self, kind, model_swarm_id, worker_id, region_id, publisher=None):
+        return f"{kind}:{model_swarm_id}:{worker_id}:{region_id}:{publisher}"
+
     def stop_catalog_dht(self):
         self.stopped = True
 
@@ -68,6 +71,7 @@ def base_environment(monkeypatch):
     monkeypatch.setenv("FABI_RELAY_URL", "https://relay.invalid")
     monkeypatch.setenv("FABI_RELAY_TOKEN", "token")
     monkeypatch.delenv("FABI_RELAY_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("FABI_SWARM_V3_DEMAND_AUTHORITIES", raising=False)
 
 
 def test_catalogue_bootstrap_parser_accepts_json_or_newline_lists(monkeypatch):
@@ -129,6 +133,34 @@ def test_catalogue_server_starts_embedded_dht_and_closes_it(monkeypatch):
 
     assert runtime._node.stopped
     assert runtime.closed
+
+
+def test_connected_scheduler_is_the_default_signed_demand_authority(monkeypatch):
+    base_environment(monkeypatch)
+    monkeypatch.setenv("FABI_CATALOG_DHT_MODE", "client")
+    monkeypatch.setenv("FABI_CATALOG_DHT_BOOTSTRAPS", "/dns/bootstrap/tcp/4242")
+
+    transport = IrohTransport.from_environment(
+        "worker",
+        trusted_demand_publishers={"global": "scheduler-endpoint"},
+    )
+    try:
+        assert transport.catalog_discovery is not None
+        assert transport.catalog_discovery._trusted_demand_publishers == {
+            "global": "scheduler-endpoint"
+        }
+    finally:
+        transport.close()
+
+    monkeypatch.setenv(
+        "FABI_SWARM_V3_DEMAND_AUTHORITIES",
+        '{"global":"different-endpoint"}',
+    )
+    with pytest.raises(ValueError, match="conflicts with the connected scheduler"):
+        IrohTransport.from_environment(
+            "worker",
+            trusted_demand_publishers={"global": "scheduler-endpoint"},
+        )
 
 
 def test_catalogue_bootstrap_interval_is_configurable_and_positive(monkeypatch):

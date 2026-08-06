@@ -44,6 +44,9 @@ dependencies = [
   "dijkstar==2.6.0",
   "lattica==1.0.21",
   "orjson",
+  # Mergeable bounded context-demand histograms. The signed DHT payload uses
+  # the library's stable protobuf rather than a home-grown quantile sketch.
+  "ddsketch==3.0.1",
 ]
 
 [tool.poetry]

@@ -407,7 +407,14 @@ def test_active_v3_mode_wires_dht_liveness_and_product_readiness(monkeypatch):
     )
     manager = SchedulerManage()
     manager.scheduler = scheduler
-    manager.iroh_transport = SimpleNamespace()
+    catalog = object()
+    manager.iroh_transport = SimpleNamespace(catalog_discovery=catalog)
+    demand = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(
+        scheduler_manage_module,
+        "ContextDemandAnnouncer",
+        lambda store, region: demand if store is catalog and region == "global" else None,
+    )
     monkeypatch.setattr(
         scheduler_manage_module,
         "ActiveRouteRuntime",
@@ -419,6 +426,7 @@ def test_active_v3_mode_wires_dht_liveness_and_product_readiness(monkeypatch):
     assert scheduler.external_ready_worker_ids() == frozenset({"worker"})
     assert scheduler.external_serving_ready() is True
     assert scheduler.external_routes_active() is False
+    assert manager.context_demand_announcer is demand
 
 
 def test_scheduler_status_accepts_product_ready_v3_route():

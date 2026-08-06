@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import math
 from dataclasses import dataclass
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from ddsketch.pb.proto import DDSketchProto, pb
+from google.protobuf.message import DecodeError
 
 from swarm_protocol.contracts import LayerSpan, ModelManifest, SpanLease, SpanState
 
 
 class CapacityDemandMap(BaseModel):
-    """Legacy single-context layer demand used by the active V3 policy."""
+    """Single-context layer demand retained for cold bootstrap and baselines."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -107,21 +111,68 @@ class ContextClassDemand(BaseModel):
         )
 
 
+class ContextDemandHistogram(BaseModel):
+    """Bounded mergeable distribution of exact request context lengths.
+
+    Datadog's maintained DDSketch implementation supplies the relative-error
+    mapping, merge semantics and protobuf wire format.  The explicit summary
+    fields let workers inspect bounds without decoding an untrusted blob; the
+    blob remains signed by the pinned demand authority with the parent map.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    encoding: Literal["ddsketch.protobuf.v1"] = "ddsketch.protobuf.v1"
+    relative_accuracy: Annotated[float, Field(gt=0, le=0.05)]
+    count: Annotated[int, Field(gt=0, le=65_536)]
+    min_context_tokens: Annotated[int, Field(gt=0)]
+    max_context_tokens: Annotated[int, Field(gt=0)]
+    payload_base64: Annotated[str, Field(min_length=1, max_length=16_384)]
+
+    @model_validator(mode="after")
+    def validate_histogram(self) -> Self:
+        if self.max_context_tokens < self.min_context_tokens:
+            raise ValueError("context histogram maximum precedes its minimum")
+        try:
+            payload = base64.b64decode(self.payload_base64, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("context histogram payload is not canonical base64") from exc
+        if not payload or len(payload) > 12_288:
+            raise ValueError("context histogram protobuf exceeds its bounded wire budget")
+        try:
+            message = pb.DDSketch()
+            message.ParseFromString(payload)
+            sketch = DDSketchProto.from_proto(message)
+        except (DecodeError, TypeError, ValueError) as exc:
+            raise ValueError("context histogram protobuf is malformed") from exc
+        if not math.isclose(
+            sketch._relative_accuracy,
+            self.relative_accuracy,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("context histogram accuracy disagrees with its protobuf")
+        if not math.isclose(sketch.count, self.count, rel_tol=0, abs_tol=1e-9):
+            raise ValueError("context histogram count disagrees with its protobuf")
+        return self
+
+
 class ContextCapacityDemandMap(BaseModel):
     """Versioned, expiring demand advice for one model and network region."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    demand_version: int = 1
+    demand_version: int = 2
     model_swarm_id: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     region_id: Annotated[str, Field(min_length=1, max_length=128)]
     issued_at_ms: Annotated[int, Field(ge=0)]
     expires_at_ms: Annotated[int, Field(gt=0)]
-    classes: Annotated[tuple[ContextClassDemand, ...], Field(min_length=1, max_length=32)]
+    classes: Annotated[tuple[ContextClassDemand, ...], Field(max_length=32)]
+    context_histogram: ContextDemandHistogram | None = None
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
-        if self.demand_version != 1:
+        if self.demand_version != 2:
             raise ValueError("unsupported context demand version")
         if self.expires_at_ms <= self.issued_at_ms:
             raise ValueError("context demand snapshot must expire after issue")
@@ -129,8 +180,12 @@ class ContextCapacityDemandMap(BaseModel):
         if tokens != tuple(sorted(set(tokens))):
             raise ValueError("context demand classes must be strictly increasing and unique")
         widths = {len(item.desired_replicas_by_layer) for item in self.classes}
-        if len(widths) != 1:
+        if len(widths) > 1:
             raise ValueError("all context demand classes must describe the same model layers")
+        if self.classes and self.context_histogram is None:
+            raise ValueError("adaptive context demand requires its mergeable histogram")
+        if not self.classes and self.context_histogram is not None:
+            raise ValueError("an empty demand snapshot cannot carry a histogram")
         return self
 
     def validate_for(self, manifest: ModelManifest, *, now_ms: int) -> None:
@@ -140,10 +195,13 @@ class ContextCapacityDemandMap(BaseModel):
             raise ValueError("current time must be non-negative")
         if self.model_swarm_id != manifest.model_swarm_id:
             raise ValueError("context demand snapshot targets another model swarm")
-        if tuple(item.context_tokens for item in self.classes) != manifest.context_classes:
-            raise ValueError("context demand classes do not match the signed model contract")
-        if len(self.classes[0].desired_replicas_by_layer) != manifest.num_layers:
+        if any(item.context_tokens > manifest.model_max_context_tokens for item in self.classes):
+            raise ValueError("context demand exceeds the signed model contract")
+        if self.classes and len(self.classes[0].desired_replicas_by_layer) != manifest.num_layers:
             raise ValueError("context demand snapshot does not match the model layer count")
+        histogram = self.context_histogram
+        if histogram is not None and histogram.max_context_tokens > manifest.model_max_context_tokens:
+            raise ValueError("context histogram exceeds the signed model contract")
         if now_ms >= self.expires_at_ms:
             raise ValueError("context demand snapshot has expired")
 

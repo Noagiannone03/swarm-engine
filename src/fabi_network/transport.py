@@ -142,7 +142,12 @@ class IrohTransport:
         self.catalog_listen_address: str | None = None
 
     @classmethod
-    def from_environment(cls, role: str) -> IrohTransport:
+    def from_environment(
+        cls,
+        role: str,
+        *,
+        trusted_demand_publishers: dict[str, str] | None = None,
+    ) -> IrohTransport:
         relay_url = os.environ.get("FABI_RELAY_URL", "").strip()
         if not relay_url:
             raise ValueError("FABI_RELAY_URL is required for the Iroh transport")
@@ -166,7 +171,10 @@ class IrohTransport:
         try:
             if enrollment is not None and initial_lease is not None:
                 enrollment.start_refresh(initial_lease)
-            transport._start_catalog_from_environment(role)
+            transport._start_catalog_from_environment(
+                role,
+                trusted_demand_publishers=trusted_demand_publishers,
+            )
         except BaseException:
             if enrollment is not None:
                 enrollment.close()
@@ -174,7 +182,12 @@ class IrohTransport:
             raise
         return transport
 
-    def _start_catalog_from_environment(self, role: str) -> None:
+    def _start_catalog_from_environment(
+        self,
+        role: str,
+        *,
+        trusted_demand_publishers: dict[str, str] | None = None,
+    ) -> None:
         mode = os.environ.get("FABI_CATALOG_DHT_MODE", "off").strip().lower()
         if mode in {"", "off", "disabled"}:
             return
@@ -207,11 +220,19 @@ class IrohTransport:
             self.runtime._node.catalog_bootstrap()
         self.catalog_peer_id = str(peer_id)
         self.catalog_listen_address = str(bound_address)
-        trusted_demand_publishers = _trusted_demand_publishers()
+        configured_publishers = _trusted_demand_publishers()
+        trusted_publishers = dict(trusted_demand_publishers or {})
+        for region_id, publisher in configured_publishers.items():
+            existing = trusted_publishers.get(region_id)
+            if existing is not None and existing != publisher:
+                raise ValueError(
+                    "configured context demand authority conflicts with the connected scheduler"
+                )
+            trusted_publishers[region_id] = publisher
         # Parse every pinned Iroh identity through the native implementation at
         # startup. A typo must fail the runtime configuration once, not become
         # an endless stream of shadow lookup failures.
-        for region_id, publisher in trusted_demand_publishers.items():
+        for region_id, publisher in trusted_publishers.items():
             self.runtime._node.catalog_key(
                 "context_demand",
                 "0" * 64,
@@ -222,7 +243,7 @@ class IrohTransport:
         self.catalog_discovery = DhtDiscoveryStore(
             self.runtime._node,
             self.catalog_peer_id,
-            trusted_demand_publishers=trusted_demand_publishers,
+            trusted_demand_publishers=trusted_publishers,
         )
 
     def peer_id(self) -> str:

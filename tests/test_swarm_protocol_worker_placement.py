@@ -22,9 +22,21 @@ from swarm_protocol import (
     autonomous_peer_topology,
     reconciled_autonomous_context_limit,
 )
+from swarm_protocol.context_demand import build_context_histogram
 
 HASHES = tuple(character * 64 for character in "abcdef")
 NOW = 1_000
+
+
+def _demand_map(**kwargs) -> ContextCapacityDemandMap:
+    classes = tuple(kwargs.pop("classes"))
+    return ContextCapacityDemandMap(
+        **kwargs,
+        classes=classes,
+        context_histogram=build_context_histogram(
+            tuple(item.context_tokens for item in classes)
+        ),
+    )
 
 
 def test_autonomous_context_tiers_are_bounded_and_include_configured_floor():
@@ -133,8 +145,8 @@ def model() -> ModelManifest:
         quantization="bf16",
         dtype="bfloat16",
         num_layers=4,
-        model_max_context_tokens=65_536,
-        context_classes=(4_096, 8_192, 16_384, 32_768, 65_536),
+        model_max_context_tokens=160,
+        context_classes=(10, 20, 40, 80, 160),
         activation_bytes_per_token=128,
         kv_bytes_per_token_by_layer=(10,) * 4,
         weight_bytes_by_layer=(100,) * 4,
@@ -152,6 +164,8 @@ def advertisement(
     worker_id: str,
     start: int,
     end: int,
+    *,
+    context_tokens: int = 160,
 ) -> ModelMemberAdvertisement:
     return ModelMemberAdvertisement(
         offer=WorkerOffer(
@@ -173,7 +187,7 @@ def advertisement(
             effective_span_mode=EffectiveSpanMode.FIXED,
             state=SpanState.READY,
             weight_hashes=(HASHES[0],),
-            max_context_tokens=65_536,
+            max_context_tokens=context_tokens,
             kv_geometry=KvGeometry(
                 block_size_tokens=1,
                 bytes_per_token_by_layer=(10,) * 4,
@@ -245,8 +259,12 @@ class FakeCatalog:
         return self.demand
 
 
-def context_demand(manifest: ModelManifest) -> ContextCapacityDemandMap:
-    return ContextCapacityDemandMap(
+def context_demand(
+    manifest: ModelManifest,
+    *,
+    active_context_tokens: int | None = None,
+) -> ContextCapacityDemandMap:
+    return _demand_map(
         model_swarm_id=manifest.model_swarm_id,
         region_id="eu-west",
         issued_at_ms=500,
@@ -254,18 +272,26 @@ def context_demand(manifest: ModelManifest) -> ContextCapacityDemandMap:
         classes=tuple(
             ContextClassDemand(
                 context_tokens=tokens,
-                desired_independent_routes=2,
-                desired_concurrent_slots=2,
-                desired_replicas_by_layer=(2,) * manifest.num_layers,
-                demand_weight_by_layer=(1.0, 1.0, 4.0, 4.0),
-                confidence=0.9,
+                desired_independent_routes=(2 if active_context_tokens in {None, tokens} else 0),
+                desired_concurrent_slots=(2 if active_context_tokens in {None, tokens} else 0),
+                desired_replicas_by_layer=(
+                    (2,) * manifest.num_layers
+                    if active_context_tokens in {None, tokens}
+                    else (0,) * manifest.num_layers
+                ),
+                demand_weight_by_layer=(
+                    (1.0, 1.0, 4.0, 4.0)
+                    if active_context_tokens in {None, tokens}
+                    else (0.0,) * manifest.num_layers
+                ),
+                confidence=(0.9 if active_context_tokens in {None, tokens} else 0.0),
             )
             for tokens in manifest.context_classes
         ),
     )
 
 
-def test_worker_compares_signed_context_demand_without_applying_it():
+def test_worker_applies_signed_context_demand_to_the_real_policy():
     manifest = model()
     current = advertisement(manifest, "current", 0, 4)
     snapshot = DiscoverySnapshot(
@@ -276,32 +302,37 @@ def test_worker_compares_signed_context_demand_without_applying_it():
         links=(),
     )
     controller = AutonomousWorkerPlacement(
-        catalog=FakeCatalog(snapshot, context_demand(manifest)),
+        catalog=FakeCatalog(
+            snapshot,
+            context_demand(manifest, active_context_tokens=10),
+        ),
         admission=FakeAdmission(),
         state_publisher=FakePublisher(),
-        reload_target=lambda span, generation: None,
+        reload_target=lambda span, context, generation: None,
         current_span=current.lease.hosted_span,
+        current_context_tokens=current.lease.max_context_tokens,
         demand_region_id="eu-west",
     )
 
     deadline = time.monotonic() + 1
-    status = controller.observe(advertisement=current, manifest=manifest, context_tokens=4_096)
-    while (
-        (status["context_demand_shadow"] or {}).get("state") != "compared"
-        and time.monotonic() < deadline
-    ):
+    status = controller.observe(
+        advertisement=current,
+        manifest=manifest,
+        context_tokens=current.lease.max_context_tokens,
+    )
+    while (status["context_demand"] or {}).get("state") != "active" and time.monotonic() < deadline:
         time.sleep(0.01)
         status = controller.observe(
             advertisement=current,
             manifest=manifest,
-            context_tokens=4_096,
+            context_tokens=current.lease.max_context_tokens,
         )
 
-    comparison = status["context_demand_shadow"]
-    assert comparison["state"] == "compared"
-    assert comparison["applied"] is False
-    assert comparison["region_id"] == "eu-west"
-    assert comparison["context_class_tokens"] == 4_096
+    active = status["context_demand"]
+    assert active["state"] == "active"
+    assert active["applied"] is True
+    assert active["region_id"] == "eu-west"
+    assert active["selected_context_tokens"] in manifest.context_classes
 
 
 def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():
@@ -327,12 +358,17 @@ def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():
     publisher = FakePublisher()
     reloads = []
     controller = AutonomousWorkerPlacement(
-        catalog=FakeCatalog(snapshot),
+        catalog=FakeCatalog(
+            snapshot,
+            context_demand(manifest, active_context_tokens=10),
+        ),
         admission=admission,
         state_publisher=publisher,
-        reload_target=lambda span, generation: reloads.append((span, generation)),
+        reload_target=lambda span, context, generation: reloads.append((span, context, generation)),
         current_span=current.lease.hosted_span,
+        current_context_tokens=10,
         policy=AutonomousPlacementPolicy(movement_cooldown_ms=0),
+        demand_region_id="eu-west",
     )
 
     first = controller.observe(
@@ -342,8 +378,7 @@ def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():
     )
     assert first["decision"] in {
         "waiting_catalog",
-        "fills_the_highest_verified_capacity_deficit",
-        "coverage_preserved_and_verified_gain_exceeds_hysteresis",
+        "trusted_context_demand_selected_new_target",
     }
     deadline = time.monotonic() + 1
     while not reloads and time.monotonic() < deadline:
@@ -354,12 +389,22 @@ def test_worker_placement_reads_dht_off_thread_and_drives_real_reload_fence():
             context_tokens=10,
         )
 
-    assert reloads == [(LayerSpan(start=2, end=4), 1)]
+    assert reloads == [(LayerSpan(start=2, end=4), 10, 1)]
     assert publisher.states == [SpanState.BUILDING]
+    transition = publisher.publications[-1]
+    assert transition.lease.hosted_span == LayerSpan(start=2, end=4)
+    assert transition.lease.max_context_tokens == 10
+    assert transition.lease.weight_hashes == (manifest.weight_collection_hash,)
     assert admission.draining
 
     ready = controller.observe(
-        advertisement=advertisement(manifest, "current", 2, 4),
+        advertisement=advertisement(
+            manifest,
+            "current",
+            2,
+            4,
+            context_tokens=10,
+        ),
         manifest=manifest,
         context_tokens=10,
     )
@@ -380,11 +425,12 @@ def test_worker_placement_delivers_verified_snapshots_to_topology_observer():
     )
     observed = []
     controller = AutonomousWorkerPlacement(
-        catalog=FakeCatalog(snapshot),
+        catalog=FakeCatalog(snapshot, context_demand(manifest)),
         admission=FakeAdmission(),
         state_publisher=FakePublisher(),
-        reload_target=lambda span, generation: None,
+        reload_target=lambda span, context, generation: None,
         current_span=current.lease.hosted_span,
+        current_context_tokens=10,
         topology_observer=observed.append,
     )
 
@@ -394,6 +440,49 @@ def test_worker_placement_delivers_verified_snapshots_to_topology_observer():
         time.sleep(0.01)
 
     assert observed == [snapshot]
+
+
+def test_ready_worker_holds_last_verified_target_when_demand_is_missing():
+    manifest = model()
+    current = advertisement(manifest, "current", 0, 2, context_tokens=10)
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(current.offer,),
+        leases=(current.lease,),
+        links=(),
+    )
+    reloads = []
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot),
+        admission=FakeAdmission(),
+        state_publisher=FakePublisher(),
+        reload_target=lambda span, context, generation: reloads.append((span, context, generation)),
+        current_span=current.lease.hosted_span,
+        current_context_tokens=10,
+        policy=AutonomousPlacementPolicy(movement_cooldown_ms=0),
+        demand_region_id="eu-west",
+    )
+
+    deadline = time.monotonic() + 1
+    status = controller.observe(advertisement=current, manifest=manifest, context_tokens=10)
+    while (status["context_demand"] or {}).get(
+        "state"
+    ) != "missing" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = controller.observe(
+            advertisement=current,
+            manifest=manifest,
+            context_tokens=10,
+        )
+
+    assert reloads == []
+    assert status["decision"] == "holding_last_ready_target_without_valid_context_demand"
+    assert status["context_demand"] == {
+        "state": "missing",
+        "applied": False,
+        "fallback": "hold_last_ready",
+    }
 
 
 def test_worker_placement_repairs_disconnected_coverage_from_a_redundant_span():
@@ -409,12 +498,17 @@ def test_worker_placement_repairs_disconnected_coverage_from_a_redundant_span():
     )
     reloads = []
     controller = AutonomousWorkerPlacement(
-        catalog=FakeCatalog(snapshot),
+        catalog=FakeCatalog(
+            snapshot,
+            context_demand(manifest, active_context_tokens=10),
+        ),
         admission=FakeAdmission(),
         state_publisher=FakePublisher(),
-        reload_target=lambda span, generation: reloads.append((span, generation)),
+        reload_target=lambda span, context, generation: reloads.append((span, context, generation)),
         current_span=current.lease.hosted_span,
+        current_context_tokens=10,
         policy=AutonomousPlacementPolicy(movement_cooldown_ms=0),
+        demand_region_id="eu-west",
     )
 
     deadline = time.monotonic() + 1
@@ -431,10 +525,10 @@ def test_worker_placement_repairs_disconnected_coverage_from_a_redundant_span():
             context_tokens=10,
         )
 
-    assert status["decision"] == "coverage_preserved_and_verified_gain_exceeds_hysteresis"
+    assert status["decision"] == "trusted_context_demand_selected_new_target"
     assert status["phase"] == "building"
     assert status["target_span"] == [2, 4]
-    assert reloads == [(LayerSpan(start=2, end=4), 1)]
+    assert reloads == [(LayerSpan(start=2, end=4), 10, 1)]
 
 
 def test_cold_worker_announces_building_before_executor_reload():
@@ -453,7 +547,9 @@ def test_cold_worker_announces_building_before_executor_reload():
         catalog=FakeCatalog(snapshot),
         admission=admission,
         state_publisher=publisher,
-        reload_target=lambda span, generation: events.append(("reload", span, generation)),
+        reload_target=lambda span, context, generation: events.append(
+            ("reload", span, context, generation)
+        ),
         current_span=None,
     )
     joining = advertisement(manifest, "cold", 0, 1)
@@ -484,7 +580,7 @@ def test_cold_worker_announces_building_before_executor_reload():
     intent = publisher.bootstrap[0]
     assert intent.lease.state is SpanState.BUILDING
     assert intent.lease.available_kv_bytes_snapshot == 0
-    assert events == [("reload", intent.lease.hosted_span, 1)]
+    assert events == [("reload", intent.lease.hosted_span, 10, 1)]
 
 
 def test_cold_worker_rejects_only_the_proven_storage_target_then_uses_next_score():
@@ -502,7 +598,7 @@ def test_cold_worker_rejects_only_the_proven_storage_target_then_uses_next_score
         catalog=FakeCatalog(snapshot),
         admission=FakeAdmission(),
         state_publisher=publisher,
-        reload_target=lambda span, generation: reloads.append((span, generation)),
+        reload_target=lambda span, context, generation: reloads.append((span, context, generation)),
     )
     joining = advertisement(manifest, "cold-storage", 0, 1)
 
@@ -545,12 +641,13 @@ def test_cold_worker_rejects_only_the_proven_storage_target_then_uses_next_score
     assert replacement["generation"] == status["generation"] + 1
     assert replacement["target_span"] != [first_target.start, first_target.end]
     assert reloads == [
-        (first_target, status["generation"]),
+        (first_target, 10, status["generation"]),
         (
             LayerSpan(
                 start=replacement["target_span"][0],
                 end=replacement["target_span"][1],
             ),
+            10,
             replacement["generation"],
         ),
     ]
@@ -570,7 +667,7 @@ def test_cold_worker_republishes_measured_lower_context_without_moving_layers():
         catalog=FakeCatalog(snapshot),
         admission=FakeAdmission(),
         state_publisher=publisher,
-        reload_target=lambda span, generation: None,
+        reload_target=lambda span, context, generation: None,
     )
     joining = advertisement(manifest, "cold-context", 0, 1)
 
@@ -625,7 +722,7 @@ def test_cold_worker_renews_building_intent_until_executor_is_ready():
         catalog=FakeCatalog(snapshot),
         admission=FakeAdmission(),
         state_publisher=publisher,
-        reload_target=lambda span, generation: None,
+        reload_target=lambda span, context, generation: None,
         transition_refresh_interval_s=0.01,
     )
     joining = advertisement(manifest, "cold-renewed", 0, 1)
@@ -654,7 +751,13 @@ def test_cold_worker_renews_building_intent_until_executor_is_ready():
 
     assert publisher.states[:2] == [SpanState.BUILDING, SpanState.BUILDING]
     target = publisher.bootstrap[0].lease.hosted_span
-    ready = advertisement(manifest, "cold-renewed", target.start, target.end)
+    ready = advertisement(
+        manifest,
+        "cold-renewed",
+        target.start,
+        target.end,
+        context_tokens=10,
+    )
     result = controller.observe(
         advertisement=ready,
         manifest=manifest,

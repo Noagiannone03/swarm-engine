@@ -7,6 +7,7 @@ from swarm_protocol import (
     ModelManifest,
 )
 from swarm_protocol.context_placement import MemoryPlacementPoint
+from swarm_protocol.context_demand import build_context_histogram
 from swarm_protocol.placement_simulator import (
     SimulatedPlacement,
     SyntheticWorkerEnvelope,
@@ -21,6 +22,17 @@ from swarm_protocol.placement_simulator import (
 )
 
 HASHES = tuple(character * 64 for character in "abcdef")
+
+
+def _demand_map(**kwargs) -> ContextCapacityDemandMap:
+    classes = tuple(kwargs.pop("classes"))
+    return ContextCapacityDemandMap(
+        **kwargs,
+        classes=classes,
+        context_histogram=build_context_histogram(
+            tuple(item.context_tokens for item in classes)
+        ),
+    )
 
 
 def _manifest() -> ModelManifest:
@@ -106,7 +118,7 @@ def test_coding_demand_prior_can_prefer_long_route_progress_over_short_route_tra
             "context_classes": (10, 20),
         }
     )
-    demand = ContextCapacityDemandMap(
+    demand = _demand_map(
         model_swarm_id=model.model_swarm_id,
         region_id="eu-west",
         issued_at_ms=1_000,
@@ -150,7 +162,7 @@ def test_oracle_scenario_is_deterministic_and_uses_aggregated_demand_only():
             "context_classes": (10, 20),
         }
     )
-    demand = ContextCapacityDemandMap(
+    demand = _demand_map(
         model_swarm_id=model.model_swarm_id,
         region_id="eu-west",
         issued_at_ms=1_000,
@@ -205,7 +217,7 @@ def test_two_pass_greedy_bootstraps_the_weighted_agentic_route():
             "context_classes": (10, 20),
         }
     )
-    demand = ContextCapacityDemandMap(
+    demand = _demand_map(
         model_swarm_id=model.model_swarm_id,
         region_id="eu-west",
         issued_at_ms=1_000,
@@ -283,7 +295,7 @@ def test_agentic_policy_spreads_an_explicit_8_16g_class_population_for_context()
     assert all(point.required_memory_bytes <= 4 * gib for point in small)
     assert all(point.required_memory_bytes <= 10 * gib for point in large)
 
-    demand = ContextCapacityDemandMap(
+    demand = _demand_map(
         model_swarm_id=model.model_swarm_id,
         region_id="synthetic-eu",
         issued_at_ms=1_000,
@@ -375,7 +387,7 @@ def test_context_policy_beats_maximum_span_trap_for_agentic_demand():
             "context_classes": (10, 20),
         }
     )
-    demand = ContextCapacityDemandMap(
+    demand = _demand_map(
         model_swarm_id=model.model_swarm_id,
         region_id="eu-west",
         issued_at_ms=1_000,

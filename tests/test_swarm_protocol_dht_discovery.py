@@ -24,6 +24,7 @@ from swarm_protocol import (
     WorkerRole,
 )
 from swarm_protocol.discovery import DiscoveryError
+from swarm_protocol.context_demand import build_context_histogram
 
 HASHES = tuple(character * 64 for character in "abcdef")
 GIB = 1024**3
@@ -110,6 +111,9 @@ def demand(model: ModelManifest, *, region_id: str = "eu-west") -> ContextCapaci
         issued_at_ms=2_000,
         expires_at_ms=62_000,
         classes=classes,
+        context_histogram=build_context_histogram(
+            tuple(item.context_tokens for item in classes)
+        ),
     )
 
 

@@ -32,11 +32,16 @@ from swarm_protocol.contracts import (
     WorkerOffer,
     WorkerRole,
 )
-from swarm_protocol.context_demand import ContextDemandAnnouncer, ContextDemandWindow
+from swarm_protocol.context_demand import (
+    ContextDemandAnnouncer,
+    ContextDemandWindow,
+    build_context_histogram,
+)
 from swarm_protocol.context_placement import (
     CapacityDemandMap,
     ContextCapacityDemandMap,
     ContextClassDemand,
+    ContextDemandHistogram,
     MemoryPlacementPoint,
     cumulative_context_coverage,
 )
@@ -143,7 +148,9 @@ __all__ = [
     "ContextCapacityDemandMap",
     "ContextClassDemand",
     "ContextDemandAnnouncer",
+    "ContextDemandHistogram",
     "ContextDemandWindow",
+    "build_context_histogram",
     "MaterializationPhase",
     "MaterializationSnapshot",
     "MemoryPlacementPoint",

@@ -1025,8 +1025,13 @@ class GradientServer:
                 _layer_allocation_changed=self._layer_allocation_changed,
             )
 
-    def _apply_v3_span_reload(self, span: LayerSpan, generation: int) -> None:
-        """Fence ingress and hand one autonomous span generation to launch.py."""
+    def _apply_v3_span_reload(
+        self,
+        span: LayerSpan,
+        context_tokens: int,
+        generation: int,
+    ) -> None:
+        """Fence ingress and hand one atomic span/context target to launch.py."""
 
         if self._shared_state is None:
             raise RuntimeError("autonomous placement requires shared executor state")
@@ -1038,6 +1043,7 @@ class GradientServer:
         had_verified_previous = placement_phase in {"ready", "draining"}
         self.block_start_index = span.start
         self.block_end_index = span.end
+        self.planned_context_tokens = context_tokens
         if self.connection_handler is not None:
             self.connection_handler.update_serving_span(span.start, span.end)
         self._layer_allocation_changed = True
@@ -1060,10 +1066,11 @@ class GradientServer:
             frontend_alive=False,
         )
         logger.warning(
-            "Protocol-v3 placement generation %d is reloading layers [%d, %d)",
+            "Protocol-v3 placement generation %d is reloading layers [%d, %d) at %d tokens",
             generation,
             span.start,
             span.end,
+            context_tokens,
         )
 
     def _start_autonomous_bootstrap(self) -> None:
@@ -1101,7 +1108,8 @@ class GradientServer:
                     current_span=None,
                     topology_observer=self._observe_autonomous_topology,
                     demand_region_id=(
-                        os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip() or None
+                        os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip()
+                        or "global"
                     ),
                 )
                 self.swarm_v3_placement_controller = controller
@@ -1334,9 +1342,15 @@ class GradientServer:
             raise ValueError("Iroh workers require an explicit scheduler endpoint ID")
         if str(self.scheduler_addr).startswith("/"):
             raise ValueError("Iroh workers require an endpoint ID, not a Lattica multiaddress")
-        self.iroh_transport = IrohTransport.from_environment("worker")
-        self.lattica = self.iroh_transport
         self.scheduler_peer_id = str(self.scheduler_addr)
+        demand_region = (
+            os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip() or "global"
+        )
+        self.iroh_transport = IrohTransport.from_environment(
+            "worker",
+            trusted_demand_publishers={demand_region: self.scheduler_peer_id},
+        )
+        self.lattica = self.iroh_transport
         if (
             getattr(self, "swarm_v3_reporter", None) is not None
             and getattr(self.iroh_transport, "catalog_discovery", None) is not None
@@ -2907,12 +2921,15 @@ class GradientServer:
                                         state_publisher=self.swarm_v3_reporter,
                                         reload_target=self._apply_v3_span_reload,
                                         current_span=advertisement.lease.hosted_span,
+                                        current_context_tokens=(
+                                            advertisement.lease.max_context_tokens
+                                        ),
                                         topology_observer=self._observe_autonomous_topology,
                                         demand_region_id=(
                                             os.environ.get(
                                                 "FABI_SWARM_V3_DEMAND_REGION", ""
                                             ).strip()
-                                            or None
+                                            or "global"
                                         ),
                                     )
                                 placement = self.swarm_v3_placement_controller.observe(

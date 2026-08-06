@@ -7,6 +7,7 @@ request IDs never leave this process. Workers remain placement authorities.
 
 from __future__ import annotations
 
+import base64
 import math
 import threading
 import time
@@ -15,7 +16,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
-from swarm_protocol.context_placement import ContextCapacityDemandMap, ContextClassDemand
+from ddsketch import DDSketch
+from ddsketch.pb.proto import DDSketchProto
+
+from swarm_protocol.context_placement import (
+    ContextCapacityDemandMap,
+    ContextClassDemand,
+    ContextDemandHistogram,
+)
 from swarm_protocol.contracts import ModelManifest
 
 
@@ -23,12 +31,47 @@ def _system_clock_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+def _serialize_context_histogram(
+    sketch: DDSketch,
+    values: tuple[int, ...],
+    *,
+    relative_accuracy: float,
+) -> ContextDemandHistogram:
+    proto = DDSketchProto.to_proto(sketch).SerializeToString()
+    return ContextDemandHistogram(
+        relative_accuracy=relative_accuracy,
+        count=len(values),
+        min_context_tokens=min(values),
+        max_context_tokens=max(values),
+        payload_base64=base64.b64encode(proto).decode("ascii"),
+    )
+
+
+def build_context_histogram(
+    values: tuple[int, ...],
+    *,
+    relative_accuracy: float = 0.01,
+) -> ContextDemandHistogram:
+    """Build the bounded official DDSketch wire summary used by demand v2."""
+
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("context histogram values must be positive")
+    sketch = DDSketch(relative_accuracy=relative_accuracy)
+    for value in values:
+        sketch.add(float(value))
+    return _serialize_context_histogram(
+        sketch,
+        values,
+        relative_accuracy=relative_accuracy,
+    )
+
+
 class ContextDemandStore(Protocol):
     def publish_context_demand(self, demand: ContextCapacityDemandMap) -> None: ...
 
 
 @dataclass(frozen=True)
-class _TimedClass:
+class _TimedContext:
     at_ms: int
     context_tokens: int
 
@@ -71,23 +114,22 @@ class ContextDemandWindow:
         self.target_independent_routes = target_independent_routes
         self.maximum_concurrent_slots = maximum_concurrent_slots
         self.maximum_events = maximum_events
-        self._admissions: deque[_TimedClass] = deque(maxlen=maximum_events)
+        self._admissions: deque[_TimedContext] = deque(maxlen=maximum_events)
         # Rejections are keyed by the private coordinator request id so HTTP,
         # route-reservation, or client retries cannot manufacture placement
         # pressure. Request ids never leave this process: snapshots contain
         # only per-class aggregates.
-        self._rejections: OrderedDict[str, _TimedClass] = OrderedDict()
+        self._rejections: OrderedDict[str, _TimedContext] = OrderedDict()
         self._completed: deque[_CompletedRequest] = deque(maxlen=maximum_events)
         self._inflight: OrderedDict[str, tuple[int, int]] = OrderedDict()
         self._lock = threading.RLock()
 
-    def _class_for(self, required_context_tokens: int) -> int:
+    def _context_for(self, required_context_tokens: int) -> int:
         if required_context_tokens <= 0:
             raise ValueError("required context tokens must be positive")
-        for context_tokens in self.manifest.context_classes:
-            if required_context_tokens <= context_tokens:
-                return context_tokens
-        raise ValueError("required context exceeds the signed model contract")
+        if required_context_tokens > self.manifest.model_max_context_tokens:
+            raise ValueError("required context exceeds the signed model contract")
+        return required_context_tokens
 
     def _prune_locked(self, now_ms: int) -> None:
         cutoff = now_ms - self.window_ms
@@ -109,12 +151,12 @@ class ContextDemandWindow:
     ) -> None:
         if not request_id or now_ms < 0:
             raise ValueError("admitted request identity and time must be valid")
-        context_tokens = self._class_for(required_context_tokens)
+        context_tokens = self._context_for(required_context_tokens)
         with self._lock:
             self._prune_locked(now_ms)
             if request_id in self._inflight:
                 return
-            self._admissions.append(_TimedClass(now_ms, context_tokens))
+            self._admissions.append(_TimedContext(now_ms, context_tokens))
             self._inflight[request_id] = (context_tokens, now_ms)
             while len(self._inflight) > self.maximum_events:
                 self._inflight.popitem(last=False)
@@ -128,12 +170,12 @@ class ContextDemandWindow:
     ) -> None:
         if not request_id or now_ms < 0:
             raise ValueError("rejected request identity and time must be valid")
-        context_tokens = self._class_for(required_context_tokens)
+        context_tokens = self._context_for(required_context_tokens)
         with self._lock:
             self._prune_locked(now_ms)
             if request_id in self._rejections:
                 return
-            self._rejections[request_id] = _TimedClass(now_ms, context_tokens)
+            self._rejections[request_id] = _TimedContext(now_ms, context_tokens)
             while len(self._rejections) > self.maximum_events:
                 self._rejections.popitem(last=False)
 
@@ -162,6 +204,70 @@ class ContextDemandWindow:
         index = max(0, math.ceil(0.95 * len(ordered)) - 1)
         return float(ordered[index])
 
+    def _adaptive_points(
+        self,
+        *,
+        admissions: tuple[_TimedContext, ...],
+        rejections: tuple[_TimedContext, ...],
+        completed: tuple[_CompletedRequest, ...],
+        inflight: tuple[tuple[int, int], ...],
+    ) -> tuple[tuple[int, ...], ContextDemandHistogram | None]:
+        """Compress exact lengths while retaining active long-tail ceilings.
+
+        Quantiles come from the maintained DDSketch implementation.  The
+        returned value is corrected upward by the sketch's relative-error
+        guarantee, and the exact maximum plus the largest rejected/in-flight
+        requirements are always retained.  Placement can therefore compress
+        a large population without ever turning an observed request into a
+        context target smaller than that request.
+        """
+
+        samples = [item.context_tokens for item in admissions]
+        samples.extend(item.context_tokens for item in rejections)
+        samples.extend(item.context_tokens for item in completed)
+        samples.extend(item[0] for item in inflight)
+        if not samples:
+            return (), None
+
+        relative_accuracy = 0.01
+        sketch = DDSketch(relative_accuracy=relative_accuracy)
+        for value in samples:
+            sketch.add(float(value))
+
+        points: set[int] = set()
+        for quantile in (0.0, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0):
+            approximate = sketch.get_quantile_value(quantile)
+            if approximate is not None:
+                # DDSketch guarantees estimate >= actual * (1-alpha).  Divide
+                # by that lower factor so the capacity target is never below
+                # the represented quantile solely because of sketch error.
+                points.add(math.ceil(approximate / (1.0 - relative_accuracy)))
+
+        critical = sorted(
+            {
+                *(item.context_tokens for item in rejections),
+                *(item[0] for item in inflight),
+            },
+            reverse=True,
+        )[:4]
+        points.update(critical)
+        points.add(max(samples))
+        observed_max = max(samples)
+        bounded_points = tuple(
+            sorted(
+                min(observed_max, value)
+                for value in points
+                if value > 0
+            )
+        )
+
+        histogram = _serialize_context_histogram(
+            sketch,
+            tuple(samples),
+            relative_accuracy=relative_accuracy,
+        )
+        return tuple(dict.fromkeys(bounded_points)), histogram
+
     def snapshot(self, *, now_ms: int, ttl_ms: int = 2 * 60 * 1_000) -> ContextCapacityDemandMap:
         if now_ms < 0 or ttl_ms <= 0 or ttl_ms > 5 * 60 * 1_000:
             raise ValueError("demand snapshot time or TTL is invalid")
@@ -172,15 +278,25 @@ class ContextDemandWindow:
             completed = tuple(self._completed)
             inflight = tuple(self._inflight.values())
 
+        points, histogram = self._adaptive_points(
+            admissions=admissions,
+            rejections=rejections,
+            completed=completed,
+            inflight=inflight,
+        )
+
+        def point_for(value: int) -> int:
+            return next(point for point in points if point >= value)
+
         classes: list[ContextClassDemand] = []
-        for context_tokens in self.manifest.context_classes:
-            admitted = sum(item.context_tokens == context_tokens for item in admissions)
-            rejected = sum(item.context_tokens == context_tokens for item in rejections)
-            active = sum(item[0] == context_tokens for item in inflight)
+        for context_tokens in points:
+            admitted = sum(point_for(item.context_tokens) == context_tokens for item in admissions)
+            rejected = sum(point_for(item.context_tokens) == context_tokens for item in rejections)
+            active = sum(point_for(item[0]) == context_tokens for item in inflight)
             service_times = [
                 item.service_time_ms
                 for item in completed
-                if item.context_tokens == context_tokens
+                if point_for(item.context_tokens) == context_tokens
             ]
             p95_service_time_ms = self._p95(service_times)
             # A legitimate agentic turn may outlive the observation window.
@@ -228,6 +344,7 @@ class ContextDemandWindow:
             issued_at_ms=now_ms,
             expires_at_ms=now_ms + ttl_ms,
             classes=tuple(classes),
+            context_histogram=histogram,
         )
 
 

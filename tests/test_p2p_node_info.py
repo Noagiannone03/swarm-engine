@@ -175,10 +175,12 @@ def test_autonomous_span_reload_fences_ingress_and_updates_shared_generation():
 
     server._apply_v3_span_reload(
         span=SimpleNamespace(start=2, end=4),
+        context_tokens=16_384,
         generation=7,
     )
 
     assert spans == [(2, 4)]
+    assert server.planned_context_tokens == 16_384
     assert server.block_start_index == 2
     assert server.block_end_index == 4
     assert server.status is ServerState.INITIALIZING
@@ -1148,9 +1150,10 @@ def test_worker_advertises_goodput_measured_after_reachability(monkeypatch):
 
 def test_worker_builds_iroh_with_explicit_scheduler_endpoint(monkeypatch):
     transport = SimpleNamespace(peer_id=lambda: "worker-endpoint")
+    captured = {}
     monkeypatch.setattr(
         "parallax.p2p.server.IrohTransport.from_environment",
-        lambda role: transport,
+        lambda role, **kwargs: captured.update(role=role, **kwargs) or transport,
     )
     server = GradientServer.__new__(GradientServer)
     server.scheduler_addr = "scheduler-endpoint"
@@ -1159,6 +1162,10 @@ def test_worker_builds_iroh_with_explicit_scheduler_endpoint(monkeypatch):
     assert server.iroh_transport is transport
     assert server.lattica is transport
     assert server.scheduler_peer_id == "scheduler-endpoint"
+    assert captured == {
+        "role": "worker",
+        "trusted_demand_publishers": {"global": "scheduler-endpoint"},
+    }
 
 
 def test_active_v3_iroh_worker_always_uses_registry_capability_authority(monkeypatch, tmp_path):
@@ -1181,7 +1188,7 @@ def test_active_v3_iroh_worker_always_uses_registry_capability_authority(monkeyp
     monkeypatch.setenv("FABI_SWARM_V3_COORDINATION_MODE", "fixed")
     monkeypatch.setattr(
         "parallax.p2p.server.IrohTransport.from_environment",
-        lambda role: transport,
+        lambda role, **_kwargs: transport,
     )
     monkeypatch.setattr(
         "swarm_protocol.route_authority.CapabilityRouteAuthority.from_trusted_registry",

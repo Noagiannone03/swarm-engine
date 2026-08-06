@@ -37,16 +37,17 @@ def test_window_uses_exact_context_bucket_little_law_and_no_route_pressure():
     window.record_completion("request-1", now_ms=61_000)
 
     demand = window.snapshot(now_ms=61_000)
-    short, agentic, long = demand.classes
-    assert short.desired_concurrent_slots == 0
-    assert short.desired_replicas_by_layer == (0,) * model.num_layers
+    agentic = demand.class_for(12_220)
+    assert agentic.context_tokens == 12_220
     assert agentic.admitted_requests_per_minute == 0.2
     assert agentic.p95_service_time_ms == 60_000
     assert agentic.no_route_rejections == 1
     assert agentic.desired_independent_routes == 2
     assert agentic.desired_concurrent_slots == 2
     assert agentic.demand_weight_by_layer[0] > agentic.confidence
-    assert long.desired_concurrent_slots == 0
+    assert demand.context_histogram is not None
+    assert demand.context_histogram.min_context_tokens == 12_220
+    assert demand.context_histogram.max_context_tokens == 12_220
     demand.validate_for(model, now_ms=61_000)
 
 
@@ -57,6 +58,18 @@ def test_window_deduplicates_retried_no_route_request_ids():
     window.record_no_route("retry", required_context_tokens=60_000, now_ms=2_000)
 
     assert window.snapshot(now_ms=2_000).classes[-1].no_route_rejections == 1
+
+
+def test_window_keeps_an_exact_long_tail_ceiling_outside_manifest_display_classes():
+    model = manifest()
+    window = ContextDemandWindow(model, "eu-west")
+    window.record_no_route("exact", required_context_tokens=21_758, now_ms=1_000)
+
+    demand = window.snapshot(now_ms=1_000)
+
+    assert demand.class_for(21_758).context_tokens == 21_758
+    assert 21_758 not in model.context_classes
+    demand.validate_for(model, now_ms=1_000)
 
 
 def test_window_is_idempotent_for_duplicate_admission_and_tracks_live_long_request():
