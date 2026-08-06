@@ -58,6 +58,26 @@ tensor metadata and each signed tensor SHA-256. A locally altered pack and recei
 rejected even while offline. Bundles published before the tensor index remain compatible and use
 the older whole-shard path.
 
+Before the first range request, the worker reserves the exact net growth of all signed packs and
+runtime metadata plus a bounded 1 MiB atomic-transaction workspace. The default free-space floor is
+2% of the containing volume, bounded to 1–10 GiB; cleanup then targets an additional 0.5%, bounded
+to 256 MiB–2 GiB, so repeated reallocations do not oscillate at the threshold. Operators may set
+`FABI_MODEL_CACHE_MIN_FREE_BYTES`, `FABI_MODEL_CACHE_HYSTERESIS_BYTES`, or
+`FABI_MODEL_CACHE_MAX_BYTES` to non-negative byte counts when a managed volume has an explicit
+quota.
+
+Reservations and active packs are protected by durable process leases that bind both PID and
+process creation time, so PID reuse cannot preserve stale content. Concurrent downloads subtract
+their outstanding reservations before a new one is admitted. A SQLite journal records only
+successfully verified uses; eviction uses GreedyDual-Size-Frequency dynamic ageing and therefore
+retains spans that repeatedly avoid a download without feeding cache popularity back into placement.
+The selected span is always protected during its own cleanup. A worker either materializes that
+placement, reclaims unleased cold packs, or raises a typed storage error before network transfer.
+
+This garbage collector owns only Fabi's `model-fabi-*.safetensors` projections. Never delete files
+inside Hugging Face's shared blob cache manually: use the maintained `scan_cache_dir()` and
+`delete_revisions()` APIs so blobs referenced by another snapshot remain intact.
+
 Initialize a new staging repository. Existing keys, bootstrap roots, and non-empty repositories
 are never overwritten:
 

@@ -30,6 +30,10 @@ from filelock import FileLock
 from huggingface_hub import hf_hub_url
 from huggingface_hub.utils import build_hf_headers
 
+from parallax.utils.model_artifact_cache import (
+    CacheObjectRequirement,
+    ModelArtifactCache,
+)
 from parallax.utils.weight_filter_utils import (
     normalize_language_model_weight_key,
     should_include_weight_key,
@@ -183,7 +187,10 @@ def _copy_runtime_artifacts(
                 _verify_descriptor(destination, descriptor)
                 continue
             except ValueError:
-                pass
+                # Remove the invalid copy before creating the replacement.
+                # This makes the signed file size its exact net disk growth
+                # instead of temporarily requiring both copies.
+                destination.unlink(missing_ok=True)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
         try:
@@ -504,6 +511,20 @@ def _materialize_pack(
     }
 
 
+def _pack_requirement(
+    pack_name: str,
+    tensors: tuple[TensorArtifactDescriptor, ...],
+    *,
+    immutable_revision: str,
+) -> CacheObjectRequirement:
+    header, ordered = _safetensors_header(tensors, immutable_revision=immutable_revision)
+    return CacheObjectRequirement(
+        relative_path=pack_name,
+        size_bytes=len(header) + sum(tensor.length for tensor in ordered),
+        is_weight_pack=True,
+    )
+
+
 def materialize_tensor_span(
     *,
     repo_id: str,
@@ -557,6 +578,7 @@ def materialize_tensor_span(
     if cache_root is None:
         configured = os.environ.get(_CACHE_ENV)
         cache_root = Path(configured) if configured else Path.home() / ".cache" / "fabi" / "models"
+    cache_root = cache_root.expanduser().resolve()
     projection_root = cache_root / identity
     projection_root.mkdir(parents=True, exist_ok=True)
 
@@ -573,79 +595,134 @@ def materialize_tensor_span(
             raise ValueError(f"tensor source has no signed Xet descriptor: {tensor.source_path!r}")
         pack_tensors[pack_name].append(tensor)
 
-    lock = FileLock(str(projection_root.with_suffix(".lock")))
-    with lock:
-        _copy_runtime_artifacts(metadata_root, projection_root, artifact_index)
-        _atomic_write(projection_root / _SOURCE_INDEX_NAME, _generated_weight_index(artifact_index))
-        receipt_path = projection_root / _RECEIPT_NAME
-        receipt = _load_receipt(receipt_path, expected_identity=identity)
-        receipt.update(
-            {
-                "model_id": repo_id,
-                "immutable_revision": immutable_revision,
-            }
+    generated_index = _generated_weight_index(artifact_index)
+    requirements = [
+        CacheObjectRequirement(relative_path=descriptor.path, size_bytes=descriptor.size)
+        for descriptor in artifact_index.artifacts
+        if descriptor.role is not ArtifactRole.WEIGHT
+    ]
+    requirements.append(
+        CacheObjectRequirement(
+            relative_path=_SOURCE_INDEX_NAME,
+            size_bytes=len(generated_index),
         )
-        packs = receipt["packs"]
-        assert isinstance(packs, dict)
-        range_sources = _RangeSources(
-            repo_id=repo_id,
+    )
+    requirements.extend(
+        _pack_requirement(
+            pack_name,
+            tuple(values),
             immutable_revision=immutable_revision,
-            metadata_root=metadata_root,
-            sources=source_descriptors,
-            local_files_only=local_files_only,
-            token=token,
         )
-        for pack_name, values in sorted(pack_tensors.items()):
-            tensors = tuple(values)
-            spec_hash = _pack_spec_hash(
-                sorted(tensors, key=lambda item: (item.source_path, item.offset, item.name))
+        for pack_name, values in sorted(pack_tensors.items())
+    )
+
+    storage = ModelArtifactCache(cache_root)
+    reservation, storage_snapshot = storage.reserve(
+        artifact_identity=identity,
+        model_id=repo_id,
+        immutable_revision=immutable_revision,
+        required_objects=requirements,
+    )
+    logger.info(
+        "Reserved %d cache bytes for %s at %s (%d bytes reclaimed, %d bytes free)",
+        storage_snapshot.required_growth_bytes,
+        repo_id,
+        projection_root,
+        storage_snapshot.reclaimed_bytes,
+        storage_snapshot.free_bytes,
+    )
+    try:
+        lock = FileLock(str(projection_root.with_suffix(".lock")))
+        with lock:
+            _copy_runtime_artifacts(metadata_root, projection_root, artifact_index)
+            generated_index_path = projection_root / _SOURCE_INDEX_NAME
+            try:
+                index_is_current = generated_index_path.read_bytes() == generated_index
+            except OSError:
+                index_is_current = False
+            if not index_is_current:
+                generated_index_path.unlink(missing_ok=True)
+                _atomic_write(generated_index_path, generated_index)
+            receipt_path = projection_root / _RECEIPT_NAME
+            receipt = _load_receipt(receipt_path, expected_identity=identity)
+            receipt.update(
+                {
+                    "model_id": repo_id,
+                    "immutable_revision": immutable_revision,
+                }
             )
-            pack_path = projection_root / pack_name
-            if _valid_cached_pack(pack_path, packs.get(pack_name), spec_hash=spec_hash):
-                try:
-                    _verify_pack_contents(pack_path, tensors)
-                    continue
-                except ValueError:
-                    pass
-            if (
-                local_files_only
-                and not pack_path.exists()
-                and not all((metadata_root / tensor.source_path).is_file() for tensor in tensors)
-            ):
-                raise FileNotFoundError(f"selective pack is not available offline: {pack_name}")
-            entry = _materialize_pack(
-                pack_path,
-                tensors,
+            packs = receipt["packs"]
+            assert isinstance(packs, dict)
+            range_sources = _RangeSources(
+                repo_id=repo_id,
                 immutable_revision=immutable_revision,
-                sources=range_sources,
+                metadata_root=metadata_root,
+                sources=source_descriptors,
+                local_files_only=local_files_only,
+                token=token,
             )
-            packs[pack_name] = entry
-            logger.info(
-                "Materialized %s (%d tensor bytes: %d network, %d verified local)",
-                pack_name,
-                entry["source_bytes"],
-                entry["network_bytes"],
-                entry["local_bytes"],
-            )
-            _atomic_write(
-                receipt_path,
-                json.dumps(
-                    receipt,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("utf-8"),
-            )
-        if not receipt_path.exists():
-            _atomic_write(
-                receipt_path,
-                json.dumps(
-                    receipt,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("utf-8"),
-            )
+            for pack_name, values in sorted(pack_tensors.items()):
+                tensors = tuple(values)
+                spec_hash = _pack_spec_hash(
+                    sorted(tensors, key=lambda item: (item.source_path, item.offset, item.name))
+                )
+                pack_path = projection_root / pack_name
+                if _valid_cached_pack(pack_path, packs.get(pack_name), spec_hash=spec_hash):
+                    try:
+                        _verify_pack_contents(pack_path, tensors)
+                        continue
+                    except ValueError:
+                        pass
+                if (
+                    local_files_only
+                    and not pack_path.exists()
+                    and not all(
+                        (metadata_root / tensor.source_path).is_file() for tensor in tensors
+                    )
+                ):
+                    raise FileNotFoundError(
+                        f"selective pack is not available offline: {pack_name}"
+                    )
+                # A corrupt or truncated pack is not useful cache content.
+                # Removing it first preserves the exact net-growth reservation.
+                pack_path.unlink(missing_ok=True)
+                entry = _materialize_pack(
+                    pack_path,
+                    tensors,
+                    immutable_revision=immutable_revision,
+                    sources=range_sources,
+                )
+                packs[pack_name] = entry
+                logger.info(
+                    "Materialized %s (%d tensor bytes: %d network, %d verified local)",
+                    pack_name,
+                    entry["source_bytes"],
+                    entry["network_bytes"],
+                    entry["local_bytes"],
+                )
+                _atomic_write(
+                    receipt_path,
+                    json.dumps(
+                        receipt,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
+            if not receipt_path.exists():
+                _atomic_write(
+                    receipt_path,
+                    json.dumps(
+                        receipt,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
+        storage.commit(reservation)
+    except Exception:
+        storage.abort(reservation)
+        raise
     return projection_root
 
 
