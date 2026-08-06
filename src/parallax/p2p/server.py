@@ -2247,6 +2247,27 @@ class GradientServer:
                 logger.exception(f"Error in handle_request: {e}")
                 time.sleep(1)
 
+    def _abort_expired_v3_routes_best_effort(self) -> tuple[str, ...]:
+        """Run local lease cleanup without coupling it to worker liveness.
+
+        Heartbeats are the worker's control-plane lease.  An unexpected local
+        cleanup failure must be observable, but it must never terminate or
+        delay the next scheduler update.  The cleanup operation is idempotent,
+        so retrying it on the following heartbeat is safe.
+        """
+
+        if self.connection_handler is None:
+            return ()
+        try:
+            return self.connection_handler.abort_expired_v3_routes()
+        except Exception as exc:
+            logger.warning(
+                "Failed to clean expired V3 execution leases; heartbeat remains active: %s",
+                exc,
+                exc_info=True,
+            )
+            return ()
+
     def start_node_announcer(self):
         """Start a thread that regularly announces this module's presence on DHT"""
 
@@ -2261,13 +2282,6 @@ class GradientServer:
                     else None
                 )
                 while not self.stop_event.is_set():
-                    if self.connection_handler is not None:
-                        expired_requests = self.connection_handler.abort_expired_v3_routes()
-                        if expired_requests:
-                            logger.warning(
-                                "Aborted expired V3 execution leases: %s",
-                                list(expired_requests),
-                            )
                     # Announce the range ID
                     try:
                         if self.scheduler_peer_id is not None:
@@ -2427,6 +2441,16 @@ class GradientServer:
                         logger.warning(
                             f"Failed to announce {self.prefix_id}_{self.lattica.peer_id()}: {e}",
                             exc_info=True,
+                        )
+
+                    # Heartbeat first, local maintenance second.  Cleanup is
+                    # isolated so a bootstrap race or executor-side failure
+                    # cannot kill the control-plane liveness loop.
+                    expired_requests = self._abort_expired_v3_routes_best_effort()
+                    if expired_requests:
+                        logger.warning(
+                            "Aborted expired V3 execution leases: %s",
+                            list(expired_requests),
                         )
 
                     self.stop_event.wait(WORKER_HEARTBEAT_INTERVAL_SECONDS)

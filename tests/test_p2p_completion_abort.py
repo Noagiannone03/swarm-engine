@@ -193,6 +193,19 @@ def test_expired_v3_route_is_aborted_locally_exactly_once():
     assert request.reqs[0].route_epoch == 9
 
 
+def test_expiry_cleanup_failure_does_not_escape_into_heartbeat(caplog):
+    class BrokenHandler:
+        @staticmethod
+        def abort_expired_v3_routes():
+            raise RuntimeError("cleanup failed")
+
+    server = p2p_server.GradientServer.__new__(p2p_server.GradientServer)
+    server.connection_handler = BrokenHandler()
+
+    assert server._abort_expired_v3_routes_best_effort() == ()
+    assert "heartbeat remains active" in caplog.text
+
+
 def test_chat_tokenization_is_route_fenced_and_uses_official_frontend(monkeypatch):
     admission = FakeAdmission()
     handler = make_handler(admission)

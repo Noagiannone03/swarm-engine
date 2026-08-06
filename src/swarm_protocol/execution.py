@@ -430,11 +430,18 @@ class WorkerExecutionAdmission:
         Request Agent cannot leave model state resident indefinitely.
         """
 
-        table = self._configured_table()
+        # The maintenance loop starts with the worker heartbeat, before the
+        # first signed serving contract can exist.  No contract implies no
+        # reservation and is therefore a valid empty state, not an admission
+        # failure.  Keep command/data-plane entry points strict through
+        # ``_configured_table``; only this idempotent cleanup probe is a no-op
+        # during bootstrap and between fenced serving generations.
+        with self._lock:
+            table = self._reservations
+        if table is None:
+            return ()
         expired_route_ids = {
-            lease.route_id
-            for lease in table.snapshot()
-            if lease.state == ReservationState.EXPIRED
+            lease.route_id for lease in table.snapshot() if lease.state == ReservationState.EXPIRED
         }
         if not expired_route_ids:
             return ()

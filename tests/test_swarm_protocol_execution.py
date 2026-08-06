@@ -283,6 +283,19 @@ def test_expired_committed_route_is_consumed_once_for_executor_abort():
     assert admission.consume_expired_routes() == ()
 
 
+def test_expired_route_cleanup_is_empty_before_first_serving_contract():
+    admission = WorkerExecutionAdmission(
+        worker_id="worker",
+        endpoint_id=WORKER_ENDPOINT,
+        coordinator_endpoint_id=COORDINATOR_ENDPOINT,
+        crypto=FakeCrypto(WORKER_ENDPOINT),
+        clock_ms=lambda: 1_000,
+    )
+
+    assert admission.snapshot() == ()
+    assert admission.consume_expired_routes() == ()
+
+
 def test_admission_rejects_wrong_caller_tampering_and_impossible_kv():
     now = [1_000]
     admission = controller(now)
