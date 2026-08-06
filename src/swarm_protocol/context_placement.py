@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from ddsketch.mapping import LogarithmicMapping
 from ddsketch.pb.proto import DDSketchProto, pb
 from google.protobuf.message import DecodeError
 
@@ -145,11 +146,15 @@ class ContextDemandHistogram(BaseModel):
             sketch = DDSketchProto.from_proto(message)
         except (DecodeError, TypeError, ValueError) as exc:
             raise ValueError("context histogram protobuf is malformed") from exc
-        if not math.isclose(
-            sketch._relative_accuracy,
-            self.relative_accuracy,
-            rel_tol=1e-9,
-            abs_tol=1e-12,
+        expected_mapping = LogarithmicMapping(self.relative_accuracy)
+        if (
+            message.mapping.interpolation != pb.IndexMapping.NONE
+            or not math.isclose(
+                message.mapping.gamma,
+                expected_mapping.gamma,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
         ):
             raise ValueError("context histogram accuracy disagrees with its protobuf")
         if not math.isclose(sketch.count, self.count, rel_tol=0, abs_tol=1e-9):
