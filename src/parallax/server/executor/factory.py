@@ -7,6 +7,7 @@ import os
 from typing import Any, List, Optional
 
 from parallax.server.memory_contract import MemoryContractError
+from parallax.utils.model_artifact_cache import ModelArtifactStorageError
 from parallax.utils.shared_state import SharedState
 from parallax.utils.utils import get_current_device
 from parallax_utils.logging_config import get_logger, set_log_level
@@ -138,6 +139,22 @@ def run_executor_process(args, shared_state=None, conn=None):
                 ),
             )
         logger.error("Executor rejected its runtime memory contract: %s", exc)
+        raise
+    except ModelArtifactStorageError as exc:
+        if shared_state is not None:
+            state = SharedState(shared_state)
+            state.update(
+                status="initializing",
+                kv_cache_token_capacity=None,
+                kv_cache_block_size=None,
+                storage_contract_failure=exc.as_report(
+                    allocation_epoch=state.get("allocation_epoch"),
+                    placement_generation=state.get("swarm_v3_placement_generation"),
+                    start_layer=getattr(args, "start_layer", None),
+                    end_layer=getattr(args, "end_layer", None),
+                ),
+            )
+        logger.error("Executor rejected its artifact storage contract: %s", exc)
         raise
     except Exception:
         logger.exception("Executor subprocess failed")

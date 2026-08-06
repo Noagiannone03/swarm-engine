@@ -13,3 +13,13 @@ def test_memory_contract_failure_requests_a_generation_reload():
 
 def test_unclassified_executor_failure_remains_terminal():
     assert failed_executor_outcome(has_memory_contract_failure=False) is None
+
+
+def test_storage_contract_failure_keeps_worker_alive_for_local_replan():
+    assert (
+        failed_executor_outcome(
+            has_memory_contract_failure=False,
+            has_storage_contract_failure=True,
+        )
+        is ExecutorSupervisionOutcome.STORAGE_BLOCKED
+    )

@@ -247,7 +247,10 @@ def _wait_executors_check_layer_change(
             failure_outcome = failed_executor_outcome(
                 has_memory_contract_failure=(
                     shared_state.get("memory_contract_failure") is not None
-                )
+                ),
+                has_storage_contract_failure=(
+                    shared_state.get("storage_contract_failure") is not None
+                ),
             )
             if failure_outcome is not None:
                 return failure_outcome
@@ -354,6 +357,8 @@ def _wait_executors_check_layer_change(
         )
         if shared_state.get("memory_contract_failure") is not None:
             return ExecutorSupervisionOutcome.RELOAD_REQUESTED
+        if shared_state.get("storage_contract_failure") is not None:
+            return ExecutorSupervisionOutcome.STORAGE_BLOCKED
         raise RuntimeError(f"Executor subprocess exited unexpectedly: {failed}")
     if shared_state.get_layer_allocation_changed():
         return ExecutorSupervisionOutcome.RELOAD_REQUESTED
@@ -439,6 +444,21 @@ def _wait_for_contract_replan(
         raise RuntimeError(
             f"Memory-contract replan was not fenced by a newer epoch: {failed_epoch} -> {new_epoch}"
         )
+
+
+def _wait_for_storage_replan(shared_state: SharedState, p2p_server_process) -> None:
+    """Wait for an exact local-storage rejection to produce another span.
+
+    There is intentionally no failure deadline.  A full disk is an observed
+    resource state, not evidence that the worker or network is dead.  If every
+    candidate is impossible the worker remains discoverable in STANDBY until
+    the operator changes storage or stops it.
+    """
+
+    while not shared_state.get_layer_allocation_changed():
+        if p2p_server_process is not None and not p2p_server_process.is_alive():
+            raise RuntimeError("P2P heartbeat exited while waiting for storage replan")
+        time.sleep(0.25)
 
 
 def _configured_initial_allocation_timeout_seconds() -> float:
@@ -845,6 +865,33 @@ if __name__ == "__main__":
                             "a supervisor may restart it with a smaller live-memory envelope"
                         )
                         break
+
+                    if supervision_outcome is ExecutorSupervisionOutcome.STORAGE_BLOCKED:
+                        failure = shared_state.get("storage_contract_failure") or {}
+                        logger.warning(
+                            "Selected span cannot satisfy its exact artifact-storage contract "
+                            "(%s bytes missing); keeping P2P alive for a local replan",
+                            failure.get("missing_bytes", "unknown"),
+                        )
+                        if frontend_process is not None:
+                            stop_vllm_rust_frontend(frontend_process)
+                            frontend_process = None
+                        _stop_executor_processes(executor_subprocs)
+                        _cleanup_engine_core_generation(args)
+                        _wait_for_storage_replan(shared_state, p2p_server_process)
+                        shared_state.update(
+                            _layer_allocation_changed=False,
+                            storage_contract_failure=None,
+                            status=ServerState.INITIALIZING.value,
+                            frontend_alive=False,
+                        )
+                        _update_args_from_shared_state(args, shared_state, force_update=True)
+                        logger.info(
+                            "Retrying storage-feasible layers [%d, %d)",
+                            args.start_layer,
+                            args.end_layer,
+                        )
+                        continue
 
                     # All processes exited normally
                     break

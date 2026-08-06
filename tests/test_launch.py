@@ -15,6 +15,7 @@ from parallax.launch import (
     _wait_executors_check_layer_change,
     _wait_for_contract_replan,
     _wait_for_initial_layer_allocation,
+    _wait_for_storage_replan,
     _wait_for_v3_placement_rollback,
 )
 from parallax.p2p.server import ServerState
@@ -507,6 +508,26 @@ def test_autonomous_contract_replan_surfaces_terminal_local_capacity_failure():
             _ProcessState(),
             require_newer_scheduler_epoch=False,
         )
+
+
+def test_storage_replan_waits_for_a_real_fenced_layer_change():
+    shared_state = SharedState({"_layer_allocation_changed": False})
+
+    def publish_replacement():
+        time.sleep(0.01)
+        shared_state.set("_layer_allocation_changed", True)
+
+    thread = threading.Thread(target=publish_replacement)
+    thread.start()
+    _wait_for_storage_replan(shared_state, _ProcessState())
+    thread.join()
+
+
+def test_storage_replan_fails_if_its_p2p_owner_exits():
+    shared_state = SharedState({"_layer_allocation_changed": False})
+
+    with pytest.raises(RuntimeError, match="P2P heartbeat exited"):
+        _wait_for_storage_replan(shared_state, _ProcessState(alive=False))
 
 
 def test_v3_load_failure_waits_for_a_new_fenced_rollback_generation():

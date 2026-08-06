@@ -1035,6 +1035,7 @@ class GradientServer:
         previous_start = self.block_start_index
         previous_end = self.block_end_index
         placement_phase = self._shared_state.get("swarm_v3_placement_phase", "legacy")
+        had_verified_previous = placement_phase in {"ready", "draining"}
         self.block_start_index = span.start
         self.block_end_index = span.end
         if self.connection_handler is not None:
@@ -1048,12 +1049,12 @@ class GradientServer:
             swarm_v3_placement_error=None,
             swarm_v3_previous_start_layer=(
                 previous_start
-                if placement_phase != "building"
+                if had_verified_previous
                 else self._shared_state.get("swarm_v3_previous_start_layer")
             ),
             swarm_v3_previous_end_layer=(
                 previous_end
-                if placement_phase != "building"
+                if had_verified_previous
                 else self._shared_state.get("swarm_v3_previous_end_layer")
             ),
             frontend_alive=False,
@@ -1182,11 +1183,28 @@ class GradientServer:
                             break
                     assert placement is not None
                     if self._shared_state is not None:
+                        storage_status = self._shared_state.get("swarm_v3_storage_status")
+                        if placement["decision"] == "no_exact_span_fits_local_artifact_storage":
+                            storage_status = {
+                                **(storage_status if isinstance(storage_status, dict) else {}),
+                                "state": "insufficient",
+                                "rejected_spans": placement.get("storage_rejected_spans", 0),
+                            }
+                        elif (
+                            placement["phase"] == "building"
+                            and placement.get("storage_rejected_spans", 0) > 0
+                        ):
+                            storage_status = {
+                                **(storage_status if isinstance(storage_status, dict) else {}),
+                                "state": "replanning",
+                                "rejected_spans": placement["storage_rejected_spans"],
+                            }
                         self._shared_state.update(
                             planned_context_tokens=self.planned_context_tokens,
                             swarm_v3_placement_generation=placement["generation"],
                             swarm_v3_placement_phase=placement["phase"],
                             swarm_v3_placement_decision=placement["decision"],
+                            swarm_v3_storage_status=storage_status,
                             capacity_hardware=hardware,
                         )
                     if placement["phase"] == "building":
@@ -1194,7 +1212,28 @@ class GradientServer:
                             "Autonomous v3 cold join selected layers %s",
                             placement["target_span"],
                         )
-                        return
+                        # Keep the bootstrap owner alive.  A backend may prove
+                        # that this exact target cannot fit on disk; the P2P
+                        # heartbeat then fences that generation back to
+                        # STANDBY and this same loop selects the next normally
+                        # scored candidate without restarting the worker.
+                        generation = int(placement["generation"])
+                        while not self.stop_event.is_set():
+                            if self._shared_state is None:
+                                return
+                            phase = self._shared_state.get("swarm_v3_placement_phase")
+                            current_generation = int(
+                                self._shared_state.get("swarm_v3_placement_generation", 0)
+                                or 0
+                            )
+                            if phase != "building" or current_generation != generation:
+                                break
+                            self.stop_event.wait(0.5)
+                        if self._shared_state is not None and self._shared_state.get(
+                            "swarm_v3_placement_phase"
+                        ) == "ready":
+                            return
+                        continue
                     self.stop_event.wait(0.5)
             except Exception as exc:  # noqa: BLE001 - worker bootstrap status boundary
                 self.swarm_v3_init_error = {
@@ -2595,6 +2634,64 @@ class GradientServer:
         )
         return True
 
+    def _reconcile_autonomous_storage_contract_failure(
+        self,
+        failure: dict[str, object],
+    ) -> bool:
+        """Turn one exact disk rejection into a fenced local replan."""
+
+        if self.swarm_v3_placement_mode != "autonomous":
+            return False
+        try:
+            kind = str(failure["kind"])
+            generation = int(failure["placement_generation"])
+            start_layer = int(failure["start_layer"])
+            end_layer = int(failure["end_layer"])
+            missing_bytes = int(failure["missing_bytes"])
+        except (KeyError, TypeError, ValueError):
+            logger.error("Autonomous executor returned a malformed storage contract: %s", failure)
+            return False
+        if kind != "artifact_storage" or self.swarm_v3_placement_controller is None:
+            return False
+        state = self.swarm_v3_placement_controller.reject_storage_target(
+            generation=generation,
+            error=RuntimeError(
+                f"layers [{start_layer}, {end_layer}) need {missing_bytes} more disk bytes"
+            ),
+        )
+        if self._shared_state is not None:
+            previous_storage = self._shared_state.get("swarm_v3_storage_status")
+            previous_missing = (
+                previous_storage.get("minimum_missing_bytes")
+                if isinstance(previous_storage, dict)
+                else None
+            )
+            minimum_missing = min(
+                missing_bytes,
+                previous_missing if isinstance(previous_missing, int) else missing_bytes,
+            )
+            self._shared_state.update(
+                status=ServerState.INITIALIZING.value,
+                frontend_alive=False,
+                storage_contract_failure=None,
+                swarm_v3_storage_status={
+                    "state": "rejected",
+                    **failure,
+                    "minimum_missing_bytes": minimum_missing,
+                },
+                swarm_v3_placement_generation=state["generation"],
+                swarm_v3_placement_phase=state["phase"],
+                swarm_v3_placement_decision=state["decision"],
+            )
+        logger.warning(
+            "Autonomous v3 rejected layers [%d, %d) for exact disk pressure "
+            "(%d bytes missing); replanning without changing placement scores",
+            start_layer,
+            end_layer,
+            missing_bytes,
+        )
+        return True
+
     def get_node_info(self, is_update: bool = False):
         # A dedicated topology thread owns network probes. Heartbeats only read
         # its last fail-closed result and therefore cannot be starved by probes.
@@ -2621,6 +2718,7 @@ class GradientServer:
         runtime_kv_capacity = None
         runtime_kv_block_size = None
         memory_contract_failure = None
+        storage_contract_failure = None
         if hasattr(self, "_shared_state") and self._shared_state is not None:
             measured_max_requests = self._shared_state.get("max_concurrent_requests")
             if measured_max_requests is not None:
@@ -2628,6 +2726,7 @@ class GradientServer:
             runtime_kv_capacity = self._shared_state.get("kv_cache_token_capacity")
             runtime_kv_block_size = self._shared_state.get("kv_cache_block_size")
             memory_contract_failure = self._shared_state.get("memory_contract_failure")
+            storage_contract_failure = self._shared_state.get("storage_contract_failure")
             if (
                 memory_contract_failure is not None
                 and self._reconcile_autonomous_memory_contract_failure(
@@ -2635,6 +2734,15 @@ class GradientServer:
                 )
             ):
                 memory_contract_failure = self._shared_state.get("memory_contract_failure")
+            if (
+                storage_contract_failure is not None
+                and self._reconcile_autonomous_storage_contract_failure(
+                    dict(storage_contract_failure)
+                )
+            ):
+                storage_contract_failure = self._shared_state.get(
+                    "storage_contract_failure"
+                )
             placement_error = self._shared_state.get("swarm_v3_placement_error")
             if placement_error is not None and self.swarm_v3_placement_controller is not None:
                 try:
@@ -2676,6 +2784,8 @@ class GradientServer:
             info["kv_cache_block_size"] = int(runtime_kv_block_size)
         if memory_contract_failure is not None:
             info["memory_contract_failure"] = dict(memory_contract_failure)
+        if storage_contract_failure is not None:
+            info["storage_contract_failure"] = dict(storage_contract_failure)
         if direct_peer_ids is not None:
             info["direct_peer_ids"] = direct_peer_ids
         if reachable_peer_ids is not None:
@@ -2819,6 +2929,7 @@ class GradientServer:
                                     if placement["phase"] == "ready":
                                         placement_state.update(
                                             swarm_v3_placement_error=None,
+                                            swarm_v3_storage_status=None,
                                             swarm_v3_previous_start_layer=None,
                                             swarm_v3_previous_end_layer=None,
                                         )
@@ -2868,6 +2979,11 @@ class GradientServer:
                         },
                         "capacity": capacity,
                     }
+
+        if isinstance(info.get("swarm_v3"), dict) and self._shared_state is not None:
+            storage_status = self._shared_state.get("swarm_v3_storage_status")
+            if isinstance(storage_status, dict):
+                info["swarm_v3"]["storage"] = dict(storage_status)
 
         return info
 

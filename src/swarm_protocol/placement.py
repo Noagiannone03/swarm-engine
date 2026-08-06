@@ -190,6 +190,40 @@ class PlacementMaterializer:
                     pass
             return self.snapshot()
 
+    def reject_unavailable_target(
+        self,
+        *,
+        generation: int,
+        error: Exception,
+    ) -> MaterializationSnapshot:
+        """Reject one locally impossible target without killing a cold worker.
+
+        A move still rolls back to its last verified span.  A cold join has no
+        generation to restore, so it returns to STANDBY and lets the unchanged
+        placement score select the best remaining physically feasible span.
+        """
+
+        with self._lock:
+            if generation != self._generation or self._phase is not MaterializationPhase.BUILDING:
+                raise RuntimeError("stale materialization failure")
+            rejected = self._target_span
+            if rejected is None:
+                raise RuntimeError("building materialization has no target")
+            self._error = f"{type(error).__name__}: {error}"[:256]
+            if self._previous_span is not None:
+                rollback_span = self._previous_span
+                self._target_span = rollback_span
+                try:
+                    self._start_reload_locked(rollback_span)
+                except Exception:
+                    pass
+            else:
+                self._phase = MaterializationPhase.STANDBY
+                self._target_span = None
+                self._current_span = None
+                self._previous_span = None
+            return self.snapshot()
+
 
 @dataclass(frozen=True)
 class PlacementScore:
@@ -519,6 +553,7 @@ class AutonomousPlacementPolicy:
         last_moved_at_ms: int | None = None,
         serving_route_exists: bool = False,
         serving_route_survives_movement: bool = False,
+        excluded_spans: frozenset[LayerSpan] = frozenset(),
         now_ms: int,
     ) -> PlacementDecision:
         if len(demand.desired_replicas_by_layer) != manifest.num_layers:
@@ -539,6 +574,16 @@ class AutonomousPlacementPolicy:
                 score=None,
                 reason="no_exact_span_fits_the_stable_memory_envelope",
             )
+        if excluded_spans:
+            feasible = tuple(item for item in feasible if item[0] not in excluded_spans)
+            if not feasible:
+                return PlacementDecision(
+                    action=PlacementAction.STANDBY,
+                    span=None,
+                    required_memory_bytes=0,
+                    score=None,
+                    reason="no_exact_span_fits_local_artifact_storage",
+                )
 
         # BUILDING/WARMING leases are demand intents, like Petals' JOINING
         # modules. They spread simultaneous joins but never make a route

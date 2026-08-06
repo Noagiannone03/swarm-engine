@@ -210,6 +210,36 @@ def test_gate_reports_account_scoped_memory_standby_without_peer_identity(monkey
     assert "autonomous-worker" not in str(status.public_payload(enabled=True))
 
 
+def test_gate_reports_terminal_local_storage_exhaustion_with_exact_shortfall(monkeypatch):
+    monkeypatch.setenv("FABI_GATE", "on")
+    gate = ContributionGate()
+    node = autonomous_worker(state="waiting_contract")
+    node.swarm_v3.update(
+        placement={
+            "phase": "standby",
+            "decision": "no_exact_span_fits_local_artifact_storage",
+        },
+        storage={
+            "state": "insufficient",
+            "minimum_missing_bytes": 734_003_200,
+            "rejected_spans": 7,
+        },
+    )
+    sched = SimpleNamespace(
+        node_manager=SimpleNamespace(nodes=[node], active_nodes=[]),
+        heartbeat_timeout=30,
+        external_ready_worker_ids=lambda: frozenset(),
+        product_serving_ready=lambda: True,
+        serving_ready=lambda: False,
+    )
+
+    status = gate.status(CREDENTIAL, sched)
+
+    assert status.worker_state == "insufficient_storage"
+    assert status.worker_storage_missing_bytes == 734_003_200
+    assert status.public_payload(enabled=True)["worker_storage_missing_bytes"] == 734_003_200
+
+
 def test_v3_membership_authority_never_accepts_legacy_scheduler_worker(monkeypatch):
     monkeypatch.setenv("FABI_GATE", "on")
     gate = ContributionGate()

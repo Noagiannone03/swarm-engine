@@ -10,12 +10,14 @@ class ExecutorSupervisionOutcome(str, Enum):
 
     EXITED = "exited"
     RELOAD_REQUESTED = "reload_requested"
+    STORAGE_BLOCKED = "storage_blocked"
     MEMORY_SHUTDOWN_REQUESTED = "memory_shutdown_requested"
 
 
 def failed_executor_outcome(
     *,
     has_memory_contract_failure: bool,
+    has_storage_contract_failure: bool = False,
 ) -> ExecutorSupervisionOutcome | None:
     """Classify a failed executor without importing any model backend.
 
@@ -26,4 +28,6 @@ def failed_executor_outcome(
 
     if has_memory_contract_failure:
         return ExecutorSupervisionOutcome.RELOAD_REQUESTED
+    if has_storage_contract_failure:
+        return ExecutorSupervisionOutcome.STORAGE_BLOCKED
     return None

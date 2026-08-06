@@ -8,7 +8,9 @@ import pytest
 from parallax.utils.model_artifact_cache import (
     CacheObjectRequirement,
     ModelArtifactCache,
+    ModelArtifactCachePool,
     ModelArtifactStorageError,
+    configured_model_artifact_cache_roots,
 )
 
 DiskUsage = namedtuple("DiskUsage", "total used free")
@@ -133,6 +135,38 @@ def test_active_process_lease_prevents_eviction(tmp_path):
             required_objects=(_requirement(),),
         )
     assert (tmp_path / active / _requirement().relative_path).is_file()
+
+
+def test_storage_failure_exposes_a_bounded_machine_readable_contract(tmp_path):
+    identity = _identity("a")
+    volume = SyntheticVolume(tmp_path, other_used=99 * MIB)
+    cache = ModelArtifactCache(
+        tmp_path,
+        minimum_free_bytes=MIB,
+        cleanup_hysteresis_bytes=0,
+        disk_usage=volume,
+    )
+
+    with pytest.raises(ModelArtifactStorageError) as raised:
+        cache.reserve(
+            artifact_identity=identity,
+            model_id="test/a",
+            immutable_revision=identity,
+            required_objects=(_requirement(),),
+        )
+
+    report = raised.value.as_report(
+        allocation_epoch=7,
+        placement_generation=3,
+        start_layer=2,
+        end_layer=4,
+    )
+    assert report["kind"] == "artifact_storage"
+    assert report["placement_generation"] == 3
+    assert report["start_layer"] == 2
+    assert report["end_layer"] == 4
+    assert report["required_growth_bytes"] == 3 * MIB
+    assert report["missing_bytes"] == 3 * MIB
 
 
 def test_pressure_evicts_less_frequently_used_pack_first(tmp_path):
@@ -285,3 +319,87 @@ def test_concurrent_downloads_cannot_overcommit_the_same_free_bytes(tmp_path):
             )
     finally:
         cache.abort(first)
+
+
+def test_configured_cache_roots_keep_primary_and_deduplicate_authorized_volumes(
+    tmp_path, monkeypatch
+):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    monkeypatch.setenv("FABI_MODEL_ARTIFACT_CACHE", str(primary))
+    monkeypatch.setenv(
+        "FABI_MODEL_ARTIFACT_CACHE_ROOTS",
+        json.dumps([str(primary), str(secondary)]),
+    )
+
+    assert configured_model_artifact_cache_roots() == (
+        primary.resolve(),
+        secondary.resolve(),
+    )
+
+
+def test_cache_pool_reuses_the_volume_with_the_exact_existing_projection(tmp_path):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    identity = _identity("a")
+    _projection(first_root, identity)
+    first = ModelArtifactCache(
+        first_root,
+        minimum_free_bytes=0,
+        cleanup_hysteresis_bytes=0,
+        disk_usage=SyntheticVolume(first_root),
+    )
+    second = ModelArtifactCache(
+        second_root,
+        minimum_free_bytes=0,
+        cleanup_hysteresis_bytes=0,
+        disk_usage=SyntheticVolume(second_root),
+    )
+
+    selected, reservation, snapshot = ModelArtifactCachePool((second, first)).reserve(
+        artifact_identity=identity,
+        model_id="test/a",
+        immutable_revision=identity,
+        required_objects=(_requirement(),),
+    )
+    try:
+        assert selected.cache_root == first_root.resolve()
+        assert snapshot.required_content_growth_bytes == 0
+    finally:
+        selected.abort(reservation)
+
+
+def test_cache_pool_skips_an_infeasible_volume_without_evicting_it(tmp_path):
+    constrained_root = tmp_path / "constrained"
+    roomy_root = tmp_path / "roomy"
+    constrained_root.mkdir()
+    roomy_root.mkdir()
+    cold_identity = _identity("a")
+    target_identity = _identity("b")
+    _projection(constrained_root, cold_identity)
+    constrained = ModelArtifactCache(
+        constrained_root,
+        minimum_free_bytes=MIB,
+        cleanup_hysteresis_bytes=0,
+        disk_usage=SyntheticVolume(constrained_root, other_used=99 * MIB),
+    )
+    roomy = ModelArtifactCache(
+        roomy_root,
+        minimum_free_bytes=MIB,
+        cleanup_hysteresis_bytes=0,
+        disk_usage=SyntheticVolume(roomy_root),
+    )
+
+    selected, reservation, _ = ModelArtifactCachePool((constrained, roomy)).reserve(
+        artifact_identity=target_identity,
+        model_id="test/b",
+        immutable_revision=target_identity,
+        required_objects=(_requirement(),),
+    )
+    try:
+        assert selected.cache_root == roomy_root.resolve()
+        assert (constrained_root / cold_identity / _requirement().relative_path).is_file()
+    finally:
+        selected.abort(reservation)

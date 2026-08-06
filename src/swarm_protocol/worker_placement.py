@@ -293,6 +293,10 @@ class AutonomousWorkerPlacement:
         self._context_demand: ContextCapacityDemandMap | None = None
         self._context_demand_state = "off" if demand_region_id is None else "waiting"
         self._context_demand_shadow: dict[str, object] | None = None
+        # Exact local materialization failures are hard constraints, never
+        # placement preferences.  The normal score remains byte-for-byte
+        # identical for every candidate that is physically feasible.
+        self._storage_rejected_spans: set[LayerSpan] = set()
         self._lock = threading.RLock()
 
     def bootstrap(
@@ -348,6 +352,7 @@ class AutonomousWorkerPlacement:
             kv_block_size=kv_block_size,
             current_span=None,
             current_reservations=0,
+            excluded_spans=self._storage_exclusions(),
             now_ms=time.time_ns() // 1_000_000,
         )
         self._compare_context_demand(
@@ -492,6 +497,7 @@ class AutonomousWorkerPlacement:
             last_moved_at_ms=self._last_moved_at_ms,
             serving_route_exists=serving_route_exists,
             serving_route_survives_movement=serving_route_survives_movement,
+            excluded_spans=self._storage_exclusions(),
             now_ms=time.time_ns() // 1_000_000,
         )
         self._compare_context_demand(
@@ -624,6 +630,42 @@ class AutonomousWorkerPlacement:
             decision="rolling_back_previous_span",
             error={"code": type(error).__name__, "detail": str(error)[:256]},
         )
+
+    def reject_storage_target(self, *, generation: int, error: Exception) -> dict[str, object]:
+        """Exclude one exactly measured local disk failure and replan.
+
+        Cache presence, download cost and popularity never enter the ranking.
+        This exclusion is added only after the cache transaction proves that
+        the selected span cannot fit even after safe garbage collection.
+        """
+
+        before = self._materializer.snapshot()
+        if before.target_span is None:
+            raise RuntimeError("storage failure has no materialization target")
+        rejected_span = before.target_span
+        state = self._materializer.reject_unavailable_target(
+            generation=generation,
+            error=error,
+        )
+        with self._lock:
+            self._storage_rejected_spans.add(rejected_span)
+            if state.phase is MaterializationPhase.STANDBY:
+                self._announced_transition = None
+                self._transition_advertisement = None
+        decision = (
+            "rolling_back_previous_span"
+            if state.phase is MaterializationPhase.BUILDING
+            else "replanning_after_storage_rejection"
+        )
+        return self._status(
+            state,
+            decision=decision,
+            error={"code": type(error).__name__, "detail": str(error)[:256]},
+        )
+
+    def _storage_exclusions(self) -> frozenset[LayerSpan]:
+        with self._lock:
+            return frozenset(self._storage_rejected_spans)
 
     def _announce_transition_once(
         self,
@@ -817,6 +859,7 @@ class AutonomousWorkerPlacement:
                 last_moved_at_ms=last_moved_at_ms,
                 serving_route_exists=serving_route_exists,
                 serving_route_survives_movement=serving_route_survives_movement,
+                excluded_spans=self._storage_exclusions(),
                 now_ms=now_ms,
             )
         except ValueError as exc:
@@ -865,6 +908,7 @@ class AutonomousWorkerPlacement:
                 else [state.target_span.start, state.target_span.end]
             ),
             "decision": decision,
+            "storage_rejected_spans": len(self._storage_exclusions()),
             "context_demand_shadow": self._context_demand_shadow,
             "error": error,
         }

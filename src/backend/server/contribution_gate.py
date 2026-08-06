@@ -105,6 +105,7 @@ class ContributionStatus:
     account_id: Optional[str] = None
     worker_state: Optional[str] = None
     worker_usable_memory_bytes: Optional[int] = None
+    worker_storage_missing_bytes: Optional[int] = None
 
     def public_payload(self, *, enabled: bool) -> dict:
         payload = {
@@ -119,6 +120,8 @@ class ContributionStatus:
             payload["worker_state"] = self.worker_state
         if self.worker_usable_memory_bytes is not None:
             payload["worker_usable_memory_bytes"] = self.worker_usable_memory_bytes
+        if self.worker_storage_missing_bytes is not None:
+            payload["worker_storage_missing_bytes"] = self.worker_storage_missing_bytes
         return payload
 
 
@@ -256,7 +259,9 @@ class ContributionGate:
         return workers
 
     @staticmethod
-    def _account_worker_diagnostic(scheduler, identity: str) -> tuple[str | None, int | None]:
+    def _account_worker_diagnostic(
+        scheduler, identity: str
+    ) -> tuple[str | None, int | None, int | None]:
         """Return an account-scoped lifecycle summary without exposing peer IDs."""
 
         if scheduler is None:
@@ -265,6 +270,7 @@ class ContributionGate:
         nodes = getattr(manager, "nodes", getattr(manager, "active_nodes", ()))
         states: list[str] = []
         usable: list[int] = []
+        storage_missing: list[int] = []
         for node in nodes:
             if getattr(node, "account_hash", None) != identity:
                 continue
@@ -277,6 +283,11 @@ class ContributionGate:
                 value = capacity.get("usable_memory_bytes")
                 if isinstance(value, int) and value >= 0:
                     usable.append(value)
+            storage = report.get("storage")
+            if isinstance(storage, dict):
+                missing = storage.get("minimum_missing_bytes", storage.get("missing_bytes"))
+                if isinstance(missing, int) and missing >= 0:
+                    storage_missing.append(missing)
             if report.get("state") == "ready":
                 states.append("ready")
                 continue
@@ -290,6 +301,8 @@ class ContributionGate:
                 "no_exact_span_fits_the_stable_memory_envelope",
             }:
                 states.append("insufficient_memory")
+            elif decision == "no_exact_span_fits_local_artifact_storage":
+                states.append("insufficient_storage")
             elif decision == "waiting_catalog":
                 states.append("waiting_catalog")
             else:
@@ -299,12 +312,17 @@ class ContributionGate:
             "building",
             "waiting_catalog",
             "standby",
+            "insufficient_storage",
             "insufficient_memory",
             "connected",
         ):
             if preferred in states:
-                return preferred, max(usable) if usable else None
-        return None, None
+                return (
+                    preferred,
+                    max(usable) if usable else None,
+                    min(storage_missing) if storage_missing else None,
+                )
+        return None, None, None
 
     def status(self, credential: object, scheduler) -> ContributionStatus:
         if not self.enabled:
@@ -343,8 +361,10 @@ class ContributionGate:
         maximum = eligible * self.requests_per_worker
 
         if eligible == 0:
-            worker_state, worker_usable_memory = self._account_worker_diagnostic(
+            worker_state, worker_usable_memory, worker_storage_missing = (
+                self._account_worker_diagnostic(
                 scheduler, identity
+                )
             )
             return ContributionStatus(
                 False,
@@ -353,6 +373,7 @@ class ContributionGate:
                 account_id=identity,
                 worker_state=worker_state,
                 worker_usable_memory_bytes=worker_usable_memory,
+                worker_storage_missing_bytes=worker_storage_missing,
             )
         if active >= maximum:
             return ContributionStatus(

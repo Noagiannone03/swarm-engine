@@ -51,12 +51,23 @@ the signed byte ranges; an existing complete Hub shard is reused only after its 
 SHA-256 pass verification. A generated SafeTensors weight map makes those packs consumable by the
 existing MLX, vLLM and SGLang loaders.
 
-Packs live in the shared content-specific cache selected by `FABI_MODEL_ARTIFACT_CACHE` (default
-`~/.cache/fabi/models`). Reallocation is incremental: already verified packs are reused and only
-new layers are fetched. Every READY admission rechecks the deterministic weight map, pack digest,
-tensor metadata and each signed tensor SHA-256. A locally altered pack and receipt are therefore
-rejected even while offline. Bundles published before the tensor index remain compatible and use
-the older whole-shard path.
+Packs live in Fabi-owned content-specific caches. `FABI_MODEL_ARTIFACT_CACHE` selects the primary
+cache (default `~/.cache/fabi/models`). `FABI_MODEL_ARTIFACT_CACHE_ROOTS` may add explicitly
+authorized writable volumes as a JSON string array; JSON is required on Windows because drive
+letters contain colons. Missing extra roots are treated as unmounted and are never recreated, which
+prevents an unplugged `/Volumes/...` path from silently becoming a directory on the system disk.
+The product UI must obtain extra roots through a native directory grant; it must not write to every
+enumerated removable or network volume.
+
+The worker performs a non-destructive exact plan on every authorized volume after layer placement.
+It first minimizes missing content bytes (reuse), then required eviction, then chooses the largest
+remaining safe headroom. An infeasible volume is not cleaned merely because it was inspected. One
+projection remains wholly on one volume; Fabi does not assemble model directories with privileged
+Windows links or cross-volume symlink farms. Reallocation is incremental on the selected volume:
+already verified packs are reused and only new layers are fetched. Every READY admission rechecks
+the deterministic weight map, pack digest, tensor metadata and each signed tensor SHA-256. A locally
+altered pack and receipt is therefore rejected even while offline. Bundles published before the
+tensor index remain compatible and use the older whole-shard path.
 
 Before the first range request, the worker reserves the exact net growth of all signed packs and
 runtime metadata plus a bounded 1 MiB atomic-transaction workspace. The default free-space floor is
@@ -73,6 +84,11 @@ successfully verified uses; eviction uses GreedyDual-Size-Frequency dynamic agei
 retains spans that repeatedly avoid a download without feeding cache popularity back into placement.
 The selected span is always protected during its own cleanup. A worker either materializes that
 placement, reclaims unleased cold packs, or raises a typed storage error before network transfer.
+That typed failure carries the exact missing bytes and fenced placement generation. The P2P
+controller excludes only the proven-impossible span, keeps the worker heartbeat alive, and applies
+the unchanged placement score to the remaining spans. Only after every locally feasible span has
+failed does contribution report `insufficient_storage`; the IDE must show that terminal condition
+instead of an indefinite model-loading animation.
 
 This garbage collector owns only Fabi's `model-fabi-*.safetensors` projections. Never delete files
 inside Hugging Face's shared blob cache manually: use the maintained `scan_cache_dir()` and

@@ -280,6 +280,52 @@ def test_autonomous_worker_reconciles_live_kv_limit_without_scheduler(monkeypatc
     assert values["swarm_v3_placement_generation"] == 7
 
 
+def test_autonomous_worker_rejects_exact_storage_target_without_exiting():
+    server = GradientServer(
+        recv_from_peer_addr="",
+        send_to_peer_addr="",
+        scheduler_addr="scheduler-peer",
+    )
+    values = {"swarm_v3_storage_status": None}
+
+    class State:
+        def get(self, key, default=None):
+            return values.get(key, default)
+
+        def update(self, **changes):
+            values.update(changes)
+
+    calls = []
+    server._shared_state = State()
+    server.swarm_v3_placement_mode = "autonomous"
+    server.swarm_v3_placement_controller = SimpleNamespace(
+        reject_storage_target=lambda **value: (
+            calls.append(value)
+            or {
+                "generation": 4,
+                "phase": "standby",
+                "decision": "replanning_after_storage_rejection",
+            }
+        )
+    )
+
+    failure = {
+        "kind": "artifact_storage",
+        "placement_generation": 4,
+        "start_layer": 2,
+        "end_layer": 5,
+        "missing_bytes": 123_456,
+    }
+    reconciled = server._reconcile_autonomous_storage_contract_failure(failure)
+
+    assert reconciled is True
+    assert calls[0]["generation"] == 4
+    assert values["storage_contract_failure"] is None
+    assert values["swarm_v3_storage_status"]["minimum_missing_bytes"] == 123_456
+    assert values["swarm_v3_placement_phase"] == "standby"
+    assert values["status"] == ServerState.INITIALIZING.value
+
+
 def test_empty_legacy_topology_cannot_erase_autonomous_dht_peers():
     server = GradientServer(
         recv_from_peer_addr="",

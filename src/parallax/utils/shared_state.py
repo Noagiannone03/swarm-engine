@@ -199,6 +199,8 @@ class SharedState:
         shared_dict["memory_pressure"] = "normal"
         shared_dict["memory_pressure_resources"] = {}
         shared_dict["memory_contract_failure"] = None
+        shared_dict["storage_contract_failure"] = None
+        shared_dict["swarm_v3_storage_status"] = None
         shared_dict["swarm_v3_context_failure"] = None
         shared_dict["status"] = None
 

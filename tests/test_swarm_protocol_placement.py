@@ -641,3 +641,30 @@ def test_materializer_rolls_back_failed_move_as_a_new_fenced_generation():
         (LayerSpan(start=2, end=4), 1),
         (LayerSpan(start=0, end=2), 2),
     ]
+
+
+def test_cold_storage_rejection_returns_to_standby_without_a_fake_rollback():
+    reloads = []
+    materializer = PlacementMaterializer(
+        drain=FakeDrain(),
+        reload_target=lambda span, generation: reloads.append((span, generation)),
+    )
+    materializer.reconcile(
+        PlacementDecision(
+            action=PlacementAction.JOIN,
+            span=LayerSpan(start=0, end=2),
+            required_memory_bytes=1,
+            score=None,
+            reason="test",
+        )
+    )
+
+    standby = materializer.reject_unavailable_target(
+        generation=1,
+        error=RuntimeError("disk full"),
+    )
+
+    assert standby.phase is MaterializationPhase.STANDBY
+    assert standby.current_span is None
+    assert standby.target_span is None
+    assert reloads == [(LayerSpan(start=0, end=2), 1)]

@@ -33,6 +33,7 @@ from huggingface_hub.utils import build_hf_headers
 from parallax.utils.model_artifact_cache import (
     CacheObjectRequirement,
     ModelArtifactCache,
+    ModelArtifactCachePool,
 )
 from parallax.utils.weight_filter_utils import (
     normalize_language_model_weight_key,
@@ -53,7 +54,6 @@ from swarm_protocol.xet_transport import (
 _HASH_CHUNK_BYTES = 8 * 1024 * 1024
 _RECEIPT_NAME = ".fabi-selective-artifacts.json"
 _SOURCE_INDEX_NAME = "model.safetensors.index.json"
-_CACHE_ENV = "FABI_MODEL_ARTIFACT_CACHE"
 
 logger = logging.getLogger(__name__)
 
@@ -575,12 +575,6 @@ def materialize_tensor_span(
     )
 
     identity = artifact_index_identity(artifact_index)
-    if cache_root is None:
-        configured = os.environ.get(_CACHE_ENV)
-        cache_root = Path(configured) if configured else Path.home() / ".cache" / "fabi" / "models"
-    cache_root = cache_root.expanduser().resolve()
-    projection_root = cache_root / identity
-    projection_root.mkdir(parents=True, exist_ok=True)
 
     source_descriptors = {
         descriptor.path: descriptor
@@ -616,13 +610,19 @@ def materialize_tensor_span(
         for pack_name, values in sorted(pack_tensors.items())
     )
 
-    storage = ModelArtifactCache(cache_root)
-    reservation, storage_snapshot = storage.reserve(
+    storage_pool = (
+        ModelArtifactCachePool((ModelArtifactCache(cache_root),))
+        if cache_root is not None
+        else ModelArtifactCachePool.configured()
+    )
+    storage, reservation, storage_snapshot = storage_pool.reserve(
         artifact_identity=identity,
         model_id=repo_id,
         immutable_revision=immutable_revision,
         required_objects=requirements,
     )
+    projection_root = storage.cache_root / identity
+    projection_root.mkdir(parents=True, exist_ok=True)
     logger.info(
         "Reserved %d cache bytes for %s at %s (%d bytes reclaimed, %d bytes free)",
         storage_snapshot.required_growth_bytes,

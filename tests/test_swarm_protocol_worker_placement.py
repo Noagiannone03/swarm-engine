@@ -486,6 +486,75 @@ def test_cold_worker_announces_building_before_executor_reload():
     assert events == [("reload", intent.lease.hosted_span, 1)]
 
 
+def test_cold_worker_rejects_only_the_proven_storage_target_then_uses_next_score():
+    manifest = model()
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(),
+        leases=(),
+        links=(),
+    )
+    publisher = FakePublisher()
+    reloads = []
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot),
+        admission=FakeAdmission(),
+        state_publisher=publisher,
+        reload_target=lambda span, generation: reloads.append((span, generation)),
+    )
+    joining = advertisement(manifest, "cold-storage", 0, 1)
+
+    status = controller.bootstrap(
+        offer=joining.offer,
+        manifest=manifest,
+        context_tokens=10,
+        kv_block_size=1,
+        max_sessions=1,
+        weight_hashes=(HASHES[0],),
+    )
+    deadline = time.monotonic() + 1
+    while status["phase"] != "building" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = controller.bootstrap(
+            offer=joining.offer,
+            manifest=manifest,
+            context_tokens=10,
+            kv_block_size=1,
+            max_sessions=1,
+            weight_hashes=(HASHES[0],),
+        )
+    first_target = LayerSpan(start=status["target_span"][0], end=status["target_span"][1])
+
+    rejected = controller.reject_storage_target(
+        generation=status["generation"],
+        error=RuntimeError("exact disk contract rejected"),
+    )
+    assert rejected["phase"] == "standby"
+
+    replacement = controller.bootstrap(
+        offer=joining.offer,
+        manifest=manifest,
+        context_tokens=10,
+        kv_block_size=1,
+        max_sessions=1,
+        weight_hashes=(HASHES[0],),
+    )
+    assert replacement["phase"] == "building"
+    assert replacement["generation"] == status["generation"] + 1
+    assert replacement["target_span"] != [first_target.start, first_target.end]
+    assert reloads == [
+        (first_target, status["generation"]),
+        (
+            LayerSpan(
+                start=replacement["target_span"][0],
+                end=replacement["target_span"][1],
+            ),
+            replacement["generation"],
+        ),
+    ]
+
+
 def test_cold_worker_republishes_measured_lower_context_without_moving_layers():
     manifest = model()
     snapshot = DiscoverySnapshot(

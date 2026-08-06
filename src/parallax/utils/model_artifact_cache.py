@@ -49,10 +49,111 @@ _DEFAULT_MIN_FREE_FLOOR_BYTES = 1024**3
 _DEFAULT_MIN_FREE_CAP_BYTES = 10 * 1024**3
 _DEFAULT_HYSTERESIS_FLOOR_BYTES = 256 * 1024**2
 _DEFAULT_HYSTERESIS_CAP_BYTES = 2 * 1024**3
+_CACHE_ROOT_ENV = "FABI_MODEL_ARTIFACT_CACHE"
+_CACHE_ROOTS_ENV = "FABI_MODEL_ARTIFACT_CACHE_ROOTS"
+
+
+def default_model_artifact_cache_root() -> Path:
+    """Return the backward-compatible primary Fabi projection cache."""
+
+    configured = os.environ.get(_CACHE_ROOT_ENV)
+    return (
+        Path(configured).expanduser().resolve()
+        if configured and configured.strip()
+        else (Path.home() / ".cache" / "fabi" / "models").resolve()
+    )
+
+
+def configured_model_artifact_cache_roots() -> tuple[Path, ...]:
+    """Return the primary cache plus explicitly authorized extra volumes.
+
+    The multi-root value is a JSON string array so Windows drive-letter colons
+    are never confused with a path separator.  A POSIX path-separated value is
+    accepted for operator compatibility, but JSON is the product contract.
+    """
+
+    raw = os.environ.get(_CACHE_ROOTS_ENV, "").strip()
+    extras: list[str] = []
+    if raw:
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            if os.name == "nt":
+                raise ValueError(f"{_CACHE_ROOTS_ENV} must be a JSON string array on Windows")
+            decoded = raw.split(os.pathsep)
+        if not isinstance(decoded, list) or not all(
+            isinstance(item, str) and item.strip() for item in decoded
+        ):
+            raise ValueError(f"{_CACHE_ROOTS_ENV} must be a JSON string array")
+        extras = decoded
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in (default_model_artifact_cache_root(), *(Path(item) for item in extras)):
+        resolved = path.expanduser().resolve()
+        key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(resolved)
+    return tuple(result)
 
 
 class ModelArtifactStorageError(RuntimeError):
-    """The selected span cannot be stored without violating disk safety."""
+    """The selected span cannot be stored without violating disk safety.
+
+    The fields are deliberately machine-readable.  Executor subprocesses use
+    them to report a recoverable placement constraint to the always-on P2P
+    controller instead of turning disk pressure into a generic worker crash.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        artifact_identity: str,
+        model_id: str,
+        immutable_revision: str,
+        snapshot: "CacheStorageSnapshot",
+        missing_bytes: int,
+    ) -> None:
+        super().__init__(message)
+        self.artifact_identity = artifact_identity
+        self.model_id = model_id
+        self.immutable_revision = immutable_revision
+        self.snapshot = snapshot
+        self.missing_bytes = missing_bytes
+
+    def as_report(
+        self,
+        *,
+        allocation_epoch: int | None,
+        placement_generation: int | None,
+        start_layer: int | None,
+        end_layer: int | None,
+    ) -> dict[str, object]:
+        """Return the bounded cross-process failure contract."""
+
+        snapshot = self.snapshot
+        return {
+            "kind": "artifact_storage",
+            "allocation_epoch": allocation_epoch,
+            "placement_generation": placement_generation,
+            "start_layer": start_layer,
+            "end_layer": end_layer,
+            "artifact_identity": self.artifact_identity,
+            "model_id": self.model_id,
+            "immutable_revision": self.immutable_revision,
+            "required_content_growth_bytes": snapshot.required_content_growth_bytes,
+            "required_growth_bytes": snapshot.required_growth_bytes,
+            "missing_bytes": self.missing_bytes,
+            "free_bytes": snapshot.free_bytes,
+            "minimum_free_bytes": snapshot.minimum_free_bytes,
+            "cleanup_hysteresis_bytes": snapshot.cleanup_hysteresis_bytes,
+            "cache_bytes": snapshot.cache_bytes,
+            "reserved_bytes": snapshot.reserved_bytes,
+            "reclaimed_bytes": snapshot.reclaimed_bytes,
+        }
 
 
 class DiskUsage(Protocol):
@@ -106,6 +207,21 @@ class CacheStorageSnapshot:
     required_content_growth_bytes: int
     required_growth_bytes: int
     reclaimed_bytes: int
+
+
+@dataclass(frozen=True)
+class CacheReservationPlan:
+    """Non-destructive exact admission plan for one cache volume."""
+
+    cache_root: Path
+    snapshot: CacheStorageSnapshot
+    reclaim_target_bytes: int
+    reclaimable_bytes: int
+    missing_bytes: int
+
+    @property
+    def can_reserve(self) -> bool:
+        return self.missing_bytes == 0
 
 
 def _parse_non_negative_bytes(name: str) -> int | None:
@@ -214,6 +330,94 @@ class ModelArtifactCache:
         self._leases_root = self.cache_root / _LEASES_NAME
         self._leases_root.mkdir(parents=True, exist_ok=True)
 
+    def plan(
+        self,
+        *,
+        artifact_identity: str,
+        required_objects: Iterable[CacheObjectRequirement],
+    ) -> CacheReservationPlan:
+        """Prove volume feasibility without deleting cached model content."""
+
+        if not _IDENTITY_PATTERN.fullmatch(artifact_identity):
+            raise ValueError("artifact identity must be a lowercase SHA-256")
+        requirements = tuple(required_objects)
+        if not requirements:
+            raise ValueError("a cache reservation requires at least one object")
+        if len({item.relative_path for item in requirements}) != len(requirements):
+            raise ValueError("cache reservation contains duplicate object paths")
+        with self._lock:
+            return self._plan_locked(
+                artifact_identity=artifact_identity,
+                requirements=requirements,
+            )
+
+    def _plan_locked(
+        self,
+        *,
+        artifact_identity: str,
+        requirements: tuple[CacheObjectRequirement, ...],
+    ) -> CacheReservationPlan:
+        leases = self._live_leases_locked()
+        reserved_bytes = sum(int(item.get("reserved_growth_bytes", 0)) for item in leases)
+        reserved_content_bytes = sum(
+            int(item.get("reserved_content_growth_bytes", 0)) for item in leases
+        )
+        projection_root = self.cache_root / artifact_identity
+        content_growth = self._content_growth(projection_root, requirements)
+        required_growth = content_growth + _CONTROL_WORKSPACE_BYTES
+        usage = self._disk_usage(self.cache_root)
+        cache_bytes = self._cache_size()
+        reclaim_target = 0
+        if usage.free - reserved_bytes - required_growth < self.minimum_free_bytes:
+            reclaim_target = max(
+                reclaim_target,
+                self.minimum_free_bytes
+                + self.cleanup_hysteresis_bytes
+                + reserved_bytes
+                + required_growth
+                - usage.free,
+            )
+        if (
+            self.maximum_cache_bytes is not None
+            and cache_bytes + reserved_content_bytes + content_growth
+            > self.maximum_cache_bytes
+        ):
+            quota_low_watermark = max(
+                0,
+                self.maximum_cache_bytes - self.cleanup_hysteresis_bytes,
+            )
+            reclaim_target = max(
+                reclaim_target,
+                cache_bytes
+                + reserved_content_bytes
+                + content_growth
+                - quota_low_watermark,
+            )
+        protected = self._protected_objects(leases) | frozenset(
+            (artifact_identity, item.relative_path)
+            for item in requirements
+            if item.is_weight_pack
+        )
+        reclaimable = self._reclaimable_bytes_locked(protected=protected)
+        missing = max(reclaim_target - reclaimable, 0)
+        return CacheReservationPlan(
+            cache_root=self.cache_root,
+            snapshot=CacheStorageSnapshot(
+                total_bytes=usage.total,
+                free_bytes=usage.free,
+                minimum_free_bytes=self.minimum_free_bytes,
+                cleanup_hysteresis_bytes=self.cleanup_hysteresis_bytes,
+                cache_bytes=cache_bytes,
+                reserved_bytes=reserved_bytes,
+                required_content_growth_bytes=content_growth,
+                required_growth_bytes=required_growth,
+                reclaimed_bytes=0,
+            ),
+            reclaim_target_bytes=reclaim_target,
+            reclaimable_bytes=reclaimable,
+            missing_bytes=missing,
+        )
+
     def reserve(
         self,
         *,
@@ -293,10 +497,26 @@ class ModelArtifactCache:
                 missing = max(self.minimum_free_bytes - remaining_free, 0)
                 if self.maximum_cache_bytes is not None:
                     missing = max(missing, remaining_cache - self.maximum_cache_bytes)
+                failure_snapshot = CacheStorageSnapshot(
+                    total_bytes=usage_after.total,
+                    free_bytes=usage_after.free,
+                    minimum_free_bytes=self.minimum_free_bytes,
+                    cleanup_hysteresis_bytes=self.cleanup_hysteresis_bytes,
+                    cache_bytes=cache_after,
+                    reserved_bytes=reserved_bytes,
+                    required_content_growth_bytes=content_growth,
+                    required_growth_bytes=required_growth,
+                    reclaimed_bytes=reclaimed,
+                )
                 raise ModelArtifactStorageError(
                     "selected layer span needs "
                     f"{required_growth} additional bytes, but {missing} bytes cannot be "
-                    "reclaimed without deleting active or frequently retained model packs"
+                    "reclaimed without deleting active model packs or violating the disk reserve",
+                    artifact_identity=artifact_identity,
+                    model_id=model_id,
+                    immutable_revision=immutable_revision,
+                    snapshot=failure_snapshot,
+                    missing_bytes=missing,
                 )
 
             lease_id = uuid.uuid4().hex
@@ -597,6 +817,34 @@ class ModelArtifactCache:
         )
         return inventory
 
+    def _reclaimable_bytes_locked(
+        self,
+        *,
+        protected: frozenset[tuple[str, str]],
+    ) -> int:
+        """Conservatively count bytes GC may remove on this volume.
+
+        When every pack in a projection is unleased, eviction removes the
+        complete Fabi-owned projection and its metadata.  For a partially
+        protected projection only the exact unprotected pack sizes count; we
+        deliberately do not guess how much a rewritten JSON receipt may save.
+        """
+
+        with self._database() as database:
+            inventory = self._inventory(database)
+        by_identity: dict[str, list[tuple[str, int]]] = {}
+        for _, _, identity, name, size in inventory:
+            by_identity.setdefault(identity, []).append((name, size))
+        reclaimable = 0
+        for identity, packs in by_identity.items():
+            if any((identity, name) in protected for name, _ in packs):
+                reclaimable += sum(
+                    size for name, size in packs if (identity, name) not in protected
+                )
+            else:
+                reclaimable += _tree_size(self.cache_root / identity)
+        return reclaimable
+
     @staticmethod
     def _read_receipt(path: Path) -> dict[str, object] | None:
         try:
@@ -645,3 +893,101 @@ class ModelArtifactCache:
                 if reclaimed >= target_bytes:
                     break
         return max(self._disk_usage(self.cache_root).free - before_free, 0)
+
+
+class ModelArtifactCachePool:
+    """Select one authorized volume after placement, before materialization."""
+
+    def __init__(self, caches: Iterable[ModelArtifactCache]) -> None:
+        self.caches = tuple(caches)
+        if not self.caches:
+            raise ValueError("a model artifact cache pool requires at least one volume")
+
+    @classmethod
+    def configured(cls) -> "ModelArtifactCachePool":
+        caches: list[ModelArtifactCache] = []
+        failures: list[str] = []
+        for index, root in enumerate(configured_model_artifact_cache_roots()):
+            # Extra roots come from an explicit directory grant.  If a
+            # removable volume is absent, never recreate its mount path on the
+            # system disk; simply leave that volume out of this transaction.
+            if index > 0 and not root.is_dir():
+                failures.append(f"{root}: authorized volume is not mounted")
+                continue
+            try:
+                caches.append(ModelArtifactCache(root))
+            except OSError as exc:
+                failures.append(f"{root}: {exc}")
+        if not caches:
+            detail = "; ".join(failures) or "no configured cache root"
+            raise OSError(f"none of Fabi's authorized cache volumes is writable: {detail}")
+        return cls(caches)
+
+    def reserve(
+        self,
+        *,
+        artifact_identity: str,
+        model_id: str,
+        immutable_revision: str,
+        required_objects: Iterable[CacheObjectRequirement],
+    ) -> tuple[ModelArtifactCache, CacheReservation, CacheStorageSnapshot]:
+        """Reserve the best exact feasible volume without changing span rank."""
+
+        requirements = tuple(required_objects)
+        plans = tuple(
+            cache.plan(
+                artifact_identity=artifact_identity,
+                required_objects=requirements,
+            )
+            for cache in self.caches
+        )
+        feasible = sorted(
+            (
+                (cache, plan)
+                for cache, plan in zip(self.caches, plans)
+                if plan.can_reserve
+            ),
+            key=lambda item: (
+                item[1].snapshot.required_content_growth_bytes,
+                item[1].reclaim_target_bytes,
+                -(
+                    item[1].snapshot.free_bytes
+                    - item[1].snapshot.minimum_free_bytes
+                    - item[1].snapshot.reserved_bytes
+                ),
+                str(item[0].cache_root),
+            ),
+        )
+        raced_failures: list[ModelArtifactStorageError] = []
+        for cache, _ in feasible:
+            try:
+                reservation, snapshot = cache.reserve(
+                    artifact_identity=artifact_identity,
+                    model_id=model_id,
+                    immutable_revision=immutable_revision,
+                    required_objects=requirements,
+                )
+            except ModelArtifactStorageError as exc:
+                raced_failures.append(exc)
+                continue
+            return cache, reservation, snapshot
+
+        if raced_failures:
+            raise min(raced_failures, key=lambda error: error.missing_bytes)
+        closest = min(
+            plans,
+            key=lambda plan: (
+                plan.missing_bytes,
+                plan.snapshot.required_content_growth_bytes,
+                str(plan.cache_root),
+            ),
+        )
+        raise ModelArtifactStorageError(
+            "selected layer span cannot fit on any authorized Fabi cache volume; "
+            f"the closest volume {closest.cache_root} is missing {closest.missing_bytes} bytes",
+            artifact_identity=artifact_identity,
+            model_id=model_id,
+            immutable_revision=immutable_revision,
+            snapshot=closest.snapshot,
+            missing_bytes=closest.missing_bytes,
+        )
