@@ -29,7 +29,8 @@ services:
       FABI_RELAY_TOKEN_FILE: "/run/secrets/fabi-iroh-relay-token"
       FABI_NETWORK_IDENTITY_PATH: ${FABI_QWEN3_0_6B_NETWORK_IDENTITY_PATH:-/opt/parallax-runtime/network/scheduler.key}
       FABI_CATALOG_DHT_MODE: "server"
-      FABI_CATALOG_DHT_LISTEN_ADDRESS: /ip4/0.0.0.0/tcp/19192
+      FABI_CATALOG_DHT_LISTEN_ADDRESS: /ip4/0.0.0.0/tcp/19193
+      FABI_CATALOG_DHT_BOOTSTRAPS: '["/ip4/37.59.98.16/tcp/19191/p2p/12D3KooWB1VciohMDGP6qC5m1tDRbCMfjQ14LWx12FsWyJtnWEsn","/ip4/37.59.98.16/tcp/19192/p2p/12D3KooWMQrc1rWXwaeQcshtANiw9FyyGWmfqAnVsStGRqsJ54Yi"]'
       FABI_CATALOG_DHT_IDENTITY_PATH: /opt/parallax-runtime/network/scheduler-catalog.key
       FABI_MODEL_REGISTRY_ROOT: /run/fabi-registry/bootstrap-root.json
       FABI_MODEL_REGISTRY_METADATA_URL: https://server.undefinedstudio.fr/fabi-swarm-registry-v3/metadata/

@@ -93,7 +93,7 @@ docker compose \
   up -d --no-deps parallax-scheduler-qwen3-0-6b
 ```
 
-It owns HTTP `3026`, transport `18161`, catalogue `19192`, a dedicated state
+It owns HTTP `3026`, transport `18161`, catalogue `19193`, a dedicated state
 volume and a distinct persistent Iroh identity. The public TUF catalogue must
 already contain the exact Qwen3-0.6B execution plan before this service is
 started; Compose never injects or weakens model trust metadata.
