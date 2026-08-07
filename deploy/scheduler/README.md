@@ -98,6 +98,14 @@ volume and a distinct persistent Iroh identity. The public TUF catalogue must
 already contain the exact Qwen3-0.6B execution plan before this service is
 started; Compose never injects or weakens model trust metadata.
 
+Every scheduler identity is an infrastructure endpoint. After the state volume
+has created `network/scheduler.key`, derive its public EndpointId with the
+bundled native network module and add that public ID to the registry service's
+`FABI_RELAY_INFRA_ENDPOINTS` allow-list before restarting the scheduler. Do not
+reuse another scheduler's authorization: relay access is intentionally bound to
+the persistent identity. User workers follow the separate account-owned
+`/v1/network/enroll` flow automatically and never need this operator step.
+
 Product scheduler context tiers can be configured without changing worker
 ratios:
 
