@@ -46,11 +46,19 @@ def _runtime_search_roots() -> tuple[Path, ...]:
         return (Path(explicit).expanduser(),)
     executable = Path(sys.executable).resolve()
     package_root = Path(__file__).resolve().parents[3]
-    candidates = (
+    candidates = [
         executable.parent / "native-runtimes",
         executable.parent.parent / "native-runtimes",
         package_root / "native-runtimes",
-    )
+    ]
+    # Release archives install the engine as <runtime>/{python-base,
+    # parallax-venv, parallax-src} with the audited bundle at
+    # <runtime>/native-runtimes. Seen from the interpreter that root is one
+    # level further up on POSIX (bin/ adds a level); seen from the sources it
+    # is the parallax-src sibling.
+    if len(executable.parents) > 2:
+        candidates.append(executable.parents[2] / "native-runtimes")
+    candidates.append(package_root.parent / "native-runtimes")
     return tuple(dict.fromkeys(candidates))
 
 

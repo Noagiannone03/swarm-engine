@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -271,6 +272,46 @@ def test_runtime_discovery_is_exact_and_ambiguous_installations_fail(tmp_path, m
             runtime_abi="0.1.32",
             backend="vulkan",
         )
+
+
+def test_runtime_discovery_covers_installed_product_layout(tmp_path, monkeypatch):
+    # release-build.sh installs <runtime>/{python-base,parallax-venv,
+    # parallax-src} next to <runtime>/native-runtimes; on POSIX the resolved
+    # interpreter lives one bin/ level below its environment root.
+    interpreter = tmp_path / "runtime" / "python-base" / "bin" / "python3.12"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    bundle = (
+        tmp_path
+        / "runtime"
+        / "native-runtimes"
+        / "meshllm-native-runtime-darwin-aarch64-metal"
+    )
+    bundle.mkdir(parents=True)
+    (bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "runtime": {
+                    "mesh_version": "0.74.0",
+                    "skippy_abi": "0.1.32",
+                    "backend": {"kind": "metal"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("FABI_SKIPPY_NATIVE_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+
+    assert (
+        discover_skippy_native_runtime(
+            mesh_release="0.74.0",
+            runtime_abi="0.1.32",
+            backend="metal",
+        )
+        == bundle.resolve()
+    )
 
 
 @pytest.mark.parametrize(
