@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -359,7 +360,8 @@ def test_worker_key_path_is_persistent_and_private(monkeypatch, tmp_path):
 
     assert _resolve_worker_key_path() == str(key_path)
     assert key_path.is_dir()
-    assert key_path.stat().st_mode & 0o777 == 0o700
+    if os.name != "nt":
+        assert key_path.stat().st_mode & 0o777 == 0o700
 
 
 def test_shutdown_notifies_scheduler_when_shared_state_is_already_closed(monkeypatch):
