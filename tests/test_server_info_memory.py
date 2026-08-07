@@ -1,4 +1,5 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 from parallax.server import server_info
 
@@ -42,7 +43,8 @@ def test_cuda_node_advertises_aggregate_live_capacity_for_visible_devices(monkey
         ),
     }
     monkeypatch.setattr(server_info.HardwareInfo, "detect", lambda: hardware)
-    monkeypatch.setattr(server_info.torch.cuda, "device_count", lambda: 2)
+    fake_torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 2))
+    monkeypatch.setattr(server_info, "torch", fake_torch)
     monkeypatch.setattr(
         server_info,
         "current_cuda_memory_budget",
@@ -70,6 +72,11 @@ def test_mlx_node_advertises_only_memory_additional_to_initialized_runtime(monke
         system_reserve_bytes=2_000,
     )
     monkeypatch.setattr(server_info.HardwareInfo, "detect", lambda: hardware)
+    fake_mlx = ModuleType("mlx")
+    fake_mlx_core = ModuleType("mlx.core")
+    fake_mlx.core = fake_mlx_core
+    monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_mlx_core)
     monkeypatch.setattr(server_info, "current_mlx_memory_budget", lambda *_args, **_kwargs: budget)
 
     info = server_info.detect_node_hardware("node-1")
@@ -100,12 +107,8 @@ def test_xpu_node_advertises_aggregate_live_capacity_without_invented_performanc
         ),
     }
     monkeypatch.setattr(server_info.HardwareInfo, "detect", lambda: hardware)
-    monkeypatch.setattr(
-        server_info.torch,
-        "xpu",
-        SimpleNamespace(device_count=lambda: 2),
-        raising=False,
-    )
+    fake_torch = SimpleNamespace(xpu=SimpleNamespace(device_count=lambda: 2))
+    monkeypatch.setattr(server_info, "torch", fake_torch)
     monkeypatch.setattr(
         server_info,
         "current_xpu_memory_budget",
@@ -164,9 +167,7 @@ def test_directml_node_uses_dxgi_budget_and_host_cap_for_uma(monkeypatch):
     monkeypatch.setattr(
         server_info,
         "psutil",
-        SimpleNamespace(
-            virtual_memory=lambda: SimpleNamespace(total=16_000, available=4_000)
-        ),
+        SimpleNamespace(virtual_memory=lambda: SimpleNamespace(total=16_000, available=4_000)),
     )
     monkeypatch.setattr(server_info, "configured_directml_reserve_bytes", lambda _total: 500)
 

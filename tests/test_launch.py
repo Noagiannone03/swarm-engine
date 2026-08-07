@@ -1,7 +1,8 @@
+import sys
 import threading
 import time
 from argparse import Namespace
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -740,13 +741,15 @@ def test_transient_sensor_failure_keeps_last_stable_state(monkeypatch):
 
 
 def test_cuda_guard_is_created_for_every_visible_device(monkeypatch):
-    import torch
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
     free = {0: 8 * GIB, 1: 12 * GIB}
     total = {0: 16 * GIB, 1: 24 * GIB}
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free[device], total[device]))
+    fake_torch = ModuleType("torch")
+    fake_torch.cuda = SimpleNamespace(
+        is_available=lambda: True,
+        device_count=lambda: 2,
+        mem_get_info=lambda device: (free[device], total[device]),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
     guards = _build_memory_pressure_guards()
     cuda_guards = [guard for guard in guards if guard.name.startswith("cuda:")]
@@ -757,13 +760,14 @@ def test_cuda_guard_is_created_for_every_visible_device(monkeypatch):
 
 def test_apple_unified_memory_guard_uses_same_ollama_overhead_as_admission(monkeypatch):
     import psutil
-    import torch
 
     memory = SimpleNamespace(total=16 * GIB, available=3 * GIB)
     monkeypatch.setattr(psutil, "virtual_memory", lambda: memory)
     monkeypatch.setattr("parallax.launch.platform.system", lambda: "Darwin")
     monkeypatch.setattr("parallax.launch.platform.machine", lambda: "arm64")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    fake_torch = ModuleType("torch")
+    fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
     host = next(guard for guard in _build_memory_pressure_guards() if guard.name == "host")
 
