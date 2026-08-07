@@ -83,6 +83,21 @@ Fresh laboratories may omit those two state overrides and receive a new named
 volume and scheduler identity. Private relay and route-authority bytes remain
 root-owned bind mounts; they are never placed in Compose environment values.
 
+The direct-GGUF/Skippy product qualification uses a separate Qwen3-0.6B swarm
+so it cannot mutate the qualified Qwen3-4B control state:
+
+```shell
+FABI_QWEN3_0_6B_SCHEDULER_IMAGE=local/parallax-scheduler:<short-commit-sha> \
+docker compose \
+  -f docker-compose.lab-iroh-qwen3-0.6b.yml \
+  up -d --no-deps parallax-scheduler-qwen3-0-6b
+```
+
+It owns HTTP `3026`, transport `18161`, catalogue `19192`, a dedicated state
+volume and a distinct persistent Iroh identity. The public TUF catalogue must
+already contain the exact Qwen3-0.6B execution plan before this service is
+started; Compose never injects or weakens model trust metadata.
+
 Product scheduler context tiers can be configured without changing worker
 ratios:
 
