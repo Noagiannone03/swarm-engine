@@ -113,7 +113,10 @@ def _backend_device(device: str) -> str:
     prefixes = {
         DeviceKind.CPU: "CPU",
         DeviceKind.CUDA: "CUDA",
-        DeviceKind.METAL: "Metal",
+        # llama.cpp/Skippy exposes Apple GPUs as MTL0, MTL1, ... . Keep the
+        # execution identifier exact: the human-facing "metal:0" spelling is
+        # not accepted by the native runtime's strict device selector.
+        DeviceKind.METAL: "MTL",
         DeviceKind.ROCM: "HIP",
         DeviceKind.VULKAN: "Vulkan",
     }

@@ -278,7 +278,7 @@ def test_runtime_discovery_is_exact_and_ambiguous_installations_fail(tmp_path, m
     [
         ("cuda:2", "CUDA2"),
         ("rocm:1", "HIP1"),
-        ("metal", "Metal0"),
+        ("metal", "MTL0"),
         ("vulkan:3", "Vulkan3"),
         ("cpu", "CPU"),
     ],
