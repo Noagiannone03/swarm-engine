@@ -19,10 +19,9 @@ import hashlib
 import json
 import os
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 _BUILDER_FORMAT_VERSION = 1
 
@@ -83,6 +82,19 @@ def _canonical_hash(domain: str, payload: object) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def portable_build_inventory_hash(inventory: Mapping[str, object]) -> str:
+    """Return the canonical identity of one portable builder inventory.
+
+    The stored digest is excluded from its own preimage. Keeping this helper in
+    the builder module gives registry tooling one implementation of the exact
+    domain-separated identity emitted at export time.
+    """
+
+    payload = dict(inventory)
+    payload.pop("inventory_hash", None)
+    return _canonical_hash("fabi/portable-onnx-build-inventory/v1", payload)
 
 
 def _external_metadata(tensor) -> dict[str, str]:
@@ -257,18 +269,12 @@ def _export_target_and_rotary_initializers(model, gqa_nodes: Sequence[Any]):
     _, helper, _ = _onnx_modules()
     graph_inputs = {value.name for value in model.graph.input}
     initializers = {tensor.name for tensor in model.graph.initializer}
-    producers = {
-        output: node
-        for node in model.graph.node
-        for output in node.output
-        if output
-    }
+    producers = {output: node for node in model.graph.node for output in node.output if output}
     modes: set[int] = set()
     rotary_names: set[str] = set()
     for node in gqa_nodes:
         attributes = {
-            attribute.name: helper.get_attribute_value(attribute)
-            for attribute in node.attribute
+            attribute.name: helper.get_attribute_value(attribute) for attribute in node.attribute
         }
         mode = int(attributes.get("do_rotary", 0))
         modes.add(mode)
@@ -285,7 +291,9 @@ def _export_target_and_rotary_initializers(model, gqa_nodes: Sequence[Any]):
                 or rotary.op_type != "RotaryEmbedding"
                 or len(rotary.input) < 4
             ):
-                raise ValueError(f"DML GQA input is not produced by RotaryEmbedding: {input_name!r}")
+                raise ValueError(
+                    f"DML GQA input is not produced by RotaryEmbedding: {input_name!r}"
+                )
             rotary_names.update(rotary.input[2:4])
     if len(modes) != 1:
         raise ValueError("decoder layers mix incompatible GQA rotary modes")
@@ -325,9 +333,7 @@ def normalize_pipeline_boundaries(model):
         raise ValueError("GroupQueryAttention layers must be unique and contiguous from zero")
     num_layers = len(layer_indices)
 
-    layer_zero_norm = _single_node(
-        nodes_by_name, "/model/layers.0/input_layernorm/LayerNorm"
-    )
+    layer_zero_norm = _single_node(nodes_by_name, "/model/layers.0/input_layernorm/LayerNorm")
     if layer_zero_norm.op_type != "SimplifiedLayerNormalization" or len(layer_zero_norm.input) < 2:
         raise ValueError("layer zero does not expose the expected RMS normalization")
     embedding_output = layer_zero_norm.input[0]
@@ -385,7 +391,11 @@ def normalize_pipeline_boundaries(model):
     ):
         raise ValueError("unsupported fused final normalization contract")
     epsilon = next(
-        (helper.get_attribute_value(attr) for attr in final_node.attribute if attr.name == "epsilon"),
+        (
+            helper.get_attribute_value(attr)
+            for attr in final_node.attribute
+            if attr.name == "epsilon"
+        ),
         None,
     )
     if epsilon is None:
@@ -471,12 +481,8 @@ def _write_external_data(
                 aligned = _aligned(offset)
                 if aligned > offset:
                     destination.write(b"\0" * (aligned - offset))
-                length = _copy_external_tensor(
-                    source_model, tensor, destination, offset=aligned
-                )
-                _set_external_metadata(
-                    tensor, location=local_name, offset=aligned, length=length
-                )
+                length = _copy_external_tensor(source_model, tensor, destination, offset=aligned)
+                _set_external_metadata(tensor, location=local_name, offset=aligned, length=length)
                 offset = aligned + length
         external_paths.add(local_name)
 
@@ -487,9 +493,7 @@ def _write_external_data(
             offset, length = shared_offsets[tensor.name]
         except KeyError as exc:
             raise ValueError(f"missing shared tensor bytes for {tensor.name!r}") from exc
-        _set_external_metadata(
-            tensor, location="shared.data", offset=offset, length=length
-        )
+        _set_external_metadata(tensor, location="shared.data", offset=offset, length=length)
         external_paths.add("shared.data")
     return tuple(sorted(external_paths))
 
@@ -581,9 +585,7 @@ def build_portable_onnx_stages(
     normalized, num_layers, boundaries, shared_names = normalize_pipeline_boundaries(source)
     execution_geometry = _execution_geometry(source)
     if expected_num_layers is not None and num_layers != expected_num_layers:
-        raise ValueError(
-            f"export contains {num_layers} layers, expected {expected_num_layers}"
-        )
+        raise ValueError(f"export contains {num_layers} layers, expected {expected_num_layers}")
     shared_offsets = _write_shared_data(
         source_model=source_path,
         model=normalized,
@@ -635,9 +637,7 @@ def build_portable_onnx_stages(
         )
         graph_path = execution_dir / f"{stage_id}.onnx"
         onnx.save_model(stage_model, graph_path, save_as_external_data=False)
-        _validate_graph_structure(
-            onnx.load(graph_path, load_external_data=False), graph_path
-        )
+        _validate_graph_structure(onnx.load(graph_path, load_external_data=False), graph_path)
         stages.append(
             StageBuild(
                 stage_id=stage_id,
@@ -646,8 +646,7 @@ def build_portable_onnx_stages(
                 end_layer=end_layer,
                 graph_path=graph_path.relative_to(root).as_posix(),
                 external_data_paths=tuple(
-                    (execution_dir / name).relative_to(root).as_posix()
-                    for name in external_names
+                    (execution_dir / name).relative_to(root).as_posix() for name in external_names
                 ),
                 io_contract_hash=_io_contract(
                     stage_model,
@@ -734,9 +733,7 @@ def build_portable_onnx_stages(
             for stage in stages
         ],
     }
-    inventory["inventory_hash"] = _canonical_hash(
-        "fabi/portable-onnx-build-inventory/v1", inventory
-    )
+    inventory["inventory_hash"] = portable_build_inventory_hash(inventory)
     inventory_path = root / "portable-build.json"
     inventory_path.write_text(
         json.dumps(inventory, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -771,8 +768,7 @@ def _attention_symbolic_dimensions(model_path: Path) -> dict[str, int]:
         if node.op_type != "GroupQueryAttention" or node.domain != "com.microsoft":
             continue
         attributes = {
-            attribute.name: helper.get_attribute_value(attribute)
-            for attribute in node.attribute
+            attribute.name: helper.get_attribute_value(attribute) for attribute in node.attribute
         }
         num_heads = int(attributes.get("num_heads", 0))
         kv_heads = int(attributes.get("kv_num_heads", 0))
@@ -809,8 +805,7 @@ def _execution_geometry(model) -> dict[str, object]:
         if node.domain != "com.microsoft" or node.op_type != "GroupQueryAttention":
             continue
         attributes = {
-            attribute.name: helper.get_attribute_value(attribute)
-            for attribute in node.attribute
+            attribute.name: helper.get_attribute_value(attribute) for attribute in node.attribute
         }
         kv_heads = int(attributes.get("kv_num_heads", 0))
         key = values.get(node.input[1])
@@ -917,9 +912,7 @@ def verify_stage_parity(
         source_inputs["position_ids"] = position_ids
     for meta in source_session.get_inputs():
         if meta.name.startswith("past_key_values."):
-            source_inputs[meta.name] = _empty_past(
-                source_session, meta.name, symbolic_dimensions
-            )
+            source_inputs[meta.name] = _empty_past(source_session, meta.name, symbolic_dimensions)
     source_output_names = ["logits"] + [
         output.name for output in source_session.get_outputs() if output.name.startswith("present.")
     ]
@@ -963,8 +956,11 @@ def verify_stage_parity(
 
     metrics: dict[str, float] = {
         "prefill_logits_max_abs_error": _assert_close(
-            "prefill logits", source_prefill["logits"], composed_prefill_logits,
-            atol=atol, rtol=rtol
+            "prefill logits",
+            source_prefill["logits"],
+            composed_prefill_logits,
+            atol=atol,
+            rtol=rtol,
         )
     }
     if int(np.argmax(source_prefill["logits"][0, -1])) != int(
@@ -976,15 +972,11 @@ def verify_stage_parity(
     for name, actual in composed_prefill_cache.items():
         cache_error = max(
             cache_error,
-            _assert_close(
-                f"prefill {name}", source_prefill[name], actual, atol=atol, rtol=rtol
-            ),
+            _assert_close(f"prefill {name}", source_prefill[name], actual, atol=atol, rtol=rtol),
         )
     metrics["prefill_kv_max_abs_error"] = cache_error
 
-    next_token = np.asarray(
-        [[int(np.argmax(source_prefill["logits"][0, -1]))]], dtype=np.int64
-    )
+    next_token = np.asarray([[int(np.argmax(source_prefill["logits"][0, -1]))]], dtype=np.int64)
     decode_mask = np.ones((1, input_ids.shape[1] + 1), dtype=np.int64)
     source_decode_inputs: dict[str, Any] = {
         "input_ids": next_token,
@@ -1011,12 +1003,8 @@ def verify_stage_parity(
         stage_inputs = {
             stage["inputs"][0]: hidden,
             "attention_mask": decode_mask,
-            f"past_key_values.{layer}.key": composed_prefill_cache[
-                f"present.{layer}.key"
-            ],
-            f"past_key_values.{layer}.value": composed_prefill_cache[
-                f"present.{layer}.value"
-            ],
+            f"past_key_values.{layer}.key": composed_prefill_cache[f"present.{layer}.key"],
+            f"past_key_values.{layer}.value": composed_prefill_cache[f"present.{layer}.value"],
         }
         if "position_ids" in stage["inputs"]:
             stage_inputs["position_ids"] = decode_position_ids
@@ -1031,8 +1019,7 @@ def verify_stage_parity(
         ["logits"], {output_stage["inputs"][0]: hidden}
     )[0]
     metrics["decode_logits_max_abs_error"] = _assert_close(
-        "decode logits", source_decode["logits"], composed_decode_logits,
-        atol=atol, rtol=rtol
+        "decode logits", source_decode["logits"], composed_decode_logits, atol=atol, rtol=rtol
     )
     if int(np.argmax(source_decode["logits"][0, -1])) != int(
         np.argmax(composed_decode_logits[0, -1])

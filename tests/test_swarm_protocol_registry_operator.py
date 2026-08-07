@@ -1,5 +1,6 @@
 import functools
 import hashlib
+import json
 import os
 import stat
 import threading
@@ -12,6 +13,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from swarm_protocol import (
     ArtifactDescriptor,
     ArtifactRole,
+    ExecutionProviderKind,
     ModelArtifactIndex,
     ModelManifest,
     ModelRegistryBundle,
@@ -20,8 +22,12 @@ from swarm_protocol import (
     TrustedModelRegistry,
     artifact_collection_hash,
 )
+from swarm_protocol.model_manifest import execution_plan_hash
+from swarm_protocol.onnx_stage_builder import portable_build_inventory_hash
 from swarm_protocol.registry_operator import (
     _bundle_summary,
+    attach_portable_execution,
+    attach_portable_execution_file,
     generate_passphrase_file,
     generate_route_authority,
     generate_staging_keys,
@@ -84,11 +90,215 @@ def _write_bundle(path, bundle):
     path.write_bytes(bundle.canonical_bytes())
 
 
+def _portable_inventory(root):
+    contents = {
+        "execution/decoder-000.data": b"decoder-zero-data",
+        "execution/decoder-000.onnx": b"decoder-zero",
+        "execution/decoder-001.data": b"decoder-one-data",
+        "execution/decoder-001.onnx": b"decoder-one",
+        "execution/input.onnx": b"input",
+        "execution/output.onnx": b"output",
+    }
+    for relative_path, payload in contents.items():
+        path = root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    artifacts = []
+    for relative_path, payload in sorted(contents.items()):
+        graph = relative_path.endswith(".onnx")
+        artifacts.append(
+            {
+                "path": relative_path,
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "media_type": "application/onnx" if graph else "application/octet-stream",
+                "role": "execution_graph" if graph else "execution_data",
+            }
+        )
+    stages = [
+        {
+            "stage_id": "input",
+            "kind": "input",
+            "start_layer": 0,
+            "end_layer": 0,
+            "graph_path": "execution/input.onnx",
+            "external_data_paths": [],
+            "io_contract_hash": "a" * 64,
+            "inputs": ["input_ids"],
+            "outputs": ["hidden.0"],
+        },
+        {
+            "stage_id": "decoder-000",
+            "kind": "decoder",
+            "start_layer": 0,
+            "end_layer": 1,
+            "graph_path": "execution/decoder-000.onnx",
+            "external_data_paths": ["execution/decoder-000.data"],
+            "io_contract_hash": "b" * 64,
+            "inputs": ["hidden.0"],
+            "outputs": ["hidden.1"],
+        },
+        {
+            "stage_id": "decoder-001",
+            "kind": "decoder",
+            "start_layer": 1,
+            "end_layer": 2,
+            "graph_path": "execution/decoder-001.onnx",
+            "external_data_paths": ["execution/decoder-001.data"],
+            "io_contract_hash": "c" * 64,
+            "inputs": ["hidden.1"],
+            "outputs": ["hidden.2"],
+        },
+        {
+            "stage_id": "output",
+            "kind": "output",
+            "start_layer": 2,
+            "end_layer": 2,
+            "graph_path": "execution/output.onnx",
+            "external_data_paths": [],
+            "io_contract_hash": "d" * 64,
+            "inputs": ["hidden.2"],
+            "outputs": ["logits"],
+        },
+    ]
+    inventory = {
+        "format_version": 1,
+        "builder": "fabi/swarm-engine/portable-onnx-stage-builder",
+        "source_model_id": "test/operator",
+        "source_model_revision": REVISION,
+        "exporter": "microsoft/onnxruntime-genai",
+        "exporter_revision": "e" * 40,
+        "target_execution_provider": "dml",
+        "execution_geometry": {
+            "activation_dtype": "float16",
+            "activation_hidden_size": 128,
+            "kv_num_heads": 2,
+            "kv_head_dim": 64,
+        },
+        "provider_assignment_policy": {
+            "allowed_cpu_fallback_nodes": ["/mask/Gather"],
+            "allowed_cpu_only_stages": ["input"],
+            "require_profiled_assignment": True,
+        },
+        "num_layers": 2,
+        "shared_initializers": [],
+        "source_artifacts": [
+            {
+                "path": "model.onnx",
+                "size": len(b"source-model"),
+                "sha256": hashlib.sha256(b"source-model").hexdigest(),
+            }
+        ],
+        "artifacts": artifacts,
+        "stages": stages,
+    }
+    inventory["inventory_hash"] = portable_build_inventory_hash(inventory)
+    return inventory
+
+
+def _attach_portable(bundle, inventory, artifact_root, *, source_root=None):
+    if source_root is None:
+        source_root = artifact_root.parent / f"{artifact_root.name}-source"
+        source_root.mkdir(parents=True, exist_ok=True)
+        (source_root / "model.onnx").write_bytes(b"source-model")
+    return attach_portable_execution(
+        bundle,
+        inventory,
+        artifact_root=artifact_root,
+        source_root=source_root,
+        artifact_repository_id="fabi-ai/test-operator-onnx",
+        artifact_revision="f" * 40,
+        plan_id="onnx-dml-int4-v1",
+        precision="int4",
+        quantization="rtn-block-32",
+    )
+
+
 def test_bundle_summary_exposes_signed_context_contract():
     summary = _bundle_summary(_bundle())
 
     assert summary["model_max_context_tokens"] == 65_536
     assert summary["context_classes"] == [4_096, 8_192, 16_384, 32_768, 65_536]
+
+
+def test_attach_portable_execution_verifies_bytes_and_binds_plan(tmp_path):
+    artifact_root = tmp_path / "portable"
+    inventory = _portable_inventory(artifact_root)
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "model.onnx").write_bytes(b"source-model")
+
+    bundle = _attach_portable(_bundle(), inventory, artifact_root, source_root=source_root)
+
+    assert bundle.manifest.execution_plan_hash == execution_plan_hash(bundle.artifact_index)
+    plan = bundle.artifact_index.execution_plans[0]
+    assert plan.providers == (ExecutionProviderKind.DIRECTML,)
+    assert plan.execution_granularity_layers == 1
+    assert plan.artifact_revision == "f" * 40
+    assert _bundle_summary(bundle)["signed_execution_bytes"] == sum(
+        artifact["size"] for artifact in inventory["artifacts"]
+    )
+
+
+def test_attach_portable_execution_file_is_atomic_and_never_replaces_inputs(tmp_path):
+    artifact_root = tmp_path / "portable"
+    inventory = _portable_inventory(artifact_root)
+    inventory_path = artifact_root / "portable-build.json"
+    inventory_path.write_text(json.dumps(inventory))
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / "model.onnx").write_bytes(b"source-model")
+    bundle_path = tmp_path / "base.json"
+    _write_bundle(bundle_path, _bundle())
+    output = tmp_path / "portable-bundle.json"
+
+    result = attach_portable_execution_file(
+        output,
+        bundle_path=bundle_path,
+        inventory_path=inventory_path,
+        artifact_root=artifact_root,
+        source_root=source_root,
+        artifact_repository_id="fabi-ai/test-operator-onnx",
+        artifact_revision="f" * 40,
+        plan_id="onnx-dml-int4-v1",
+        precision="int4",
+        quantization="rtn-block-32",
+    )
+
+    assert ModelRegistryBundle.model_validate_json(output.read_bytes()) == result
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        attach_portable_execution_file(
+            output,
+            bundle_path=bundle_path,
+            inventory_path=inventory_path,
+            artifact_root=artifact_root,
+            source_root=source_root,
+            artifact_repository_id="fabi-ai/test-operator-onnx",
+            artifact_revision="f" * 40,
+            plan_id="onnx-dml-int4-v1",
+            precision="int4",
+            quantization="rtn-block-32",
+        )
+
+
+def test_attach_portable_execution_rejects_tampering_and_wrong_provenance(tmp_path):
+    artifact_root = tmp_path / "portable"
+    inventory = _portable_inventory(artifact_root)
+    (artifact_root / "execution/decoder-000.onnx").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="size mismatch|digest mismatch"):
+        _attach_portable(_bundle(), inventory, artifact_root)
+
+    clean_root = tmp_path / "clean"
+    inventory = _portable_inventory(clean_root)
+    inventory["source_model_id"] = "other/model"
+    inventory["inventory_hash"] = portable_build_inventory_hash(inventory)
+    with pytest.raises(ValueError, match="different models"):
+        _attach_portable(_bundle(), inventory, clean_root)
+
+    inventory = _portable_inventory(tmp_path / "hash-mismatch")
+    inventory["inventory_hash"] = "0" * 64
+    with pytest.raises(ValueError, match="inventory hash"):
+        _attach_portable(_bundle(), inventory, tmp_path / "hash-mismatch")
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):

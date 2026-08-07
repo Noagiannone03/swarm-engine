@@ -13,13 +13,14 @@ import getpass
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import stat
 import sys
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
@@ -31,7 +32,23 @@ from cryptography.hazmat.primitives.serialization import (
 from securesystemslib.signer import CryptoSigner
 
 from fabi_network.capability import capability_public_key
-from swarm_protocol.model_manifest import build_hub_model_bundle
+from swarm_protocol.contracts import (
+    ArtifactDescriptor,
+    ArtifactRole,
+    BackendKind,
+    ExecutionProviderKind,
+    ExecutionStageDescriptor,
+    ExecutionStageKind,
+    ModelArtifactIndex,
+    ModelExecutionPlan,
+    ModelManifest,
+    OnnxExportTarget,
+)
+from swarm_protocol.model_manifest import (
+    build_hub_model_bundle,
+    execution_plan_hash,
+)
+from swarm_protocol.onnx_stage_builder import portable_build_inventory_hash
 from swarm_protocol.registry import (
     ModelRegistryBundle,
     RouteAuthorityKey,
@@ -45,6 +62,7 @@ from swarm_protocol.registry import (
 _KEY_ROLES = ("root", "targets", "snapshot", "timestamp")
 _MAX_SECRET_BYTES = 4096
 _MAX_BUNDLE_BYTES = 32 * 1024 * 1024
+_MAX_PORTABLE_INVENTORY_BYTES = 32 * 1024 * 1024
 _MAX_ROUTE_AUTHORITY_BYTES = 1024 * 1024
 _DEFAULT_ROUTE_AUTHORITY_VALIDITY_DAYS = 90
 _DEFAULT_ROUTE_AUTHORITY_CLOCK_SKEW_SECONDS = 300
@@ -347,6 +365,373 @@ def build_hub_bundle_file(
     return bundle
 
 
+def _expect_exact_fields(
+    value: Mapping[str, object],
+    expected: set[str],
+    *,
+    description: str,
+) -> None:
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        raise ValueError(
+            f"{description} has an incompatible schema (missing={missing}, unknown={unknown})"
+        )
+
+
+def _mapping(value: object, *, description: str) -> Mapping[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{description} must be an object")
+    return value
+
+
+def _sequence(value: object, *, description: str) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError(f"{description} must be an array")
+    return value
+
+
+def _verify_local_artifact(root: Path, descriptor: ArtifactDescriptor) -> None:
+    """Verify one regular, root-confined publisher artifact from an open handle."""
+
+    root = root.resolve(strict=True)
+    candidate = root.joinpath(*descriptor.path.split("/"))
+    cursor = root
+    for part in descriptor.path.split("/"):
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"portable artifact must not traverse a symlink: {descriptor.path}")
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"portable artifact escapes its root: {descriptor.path}") from exc
+    if not resolved.is_file():
+        raise ValueError(f"portable artifact is not a regular file: {descriptor.path}")
+
+    digest = hashlib.sha256()
+    with resolved.open("rb") as source:
+        before = os.fstat(source.fileno())
+        while chunk := source.read(8 * 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(source.fileno())
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError(f"portable artifact changed while hashing: {descriptor.path}")
+    if after.st_size != descriptor.size:
+        raise ValueError(f"portable artifact size mismatch: {descriptor.path}")
+    if digest.hexdigest() != descriptor.sha256:
+        raise ValueError(f"portable artifact digest mismatch: {descriptor.path}")
+
+
+def _portable_inventory_descriptors(
+    inventory: Mapping[str, object],
+) -> tuple[ArtifactDescriptor, ...]:
+    descriptors: list[ArtifactDescriptor] = []
+    for position, raw in enumerate(
+        _sequence(inventory["artifacts"], description="portable inventory artifacts")
+    ):
+        artifact = _mapping(raw, description=f"portable artifact {position}")
+        _expect_exact_fields(
+            artifact,
+            {"path", "size", "sha256", "media_type", "role"},
+            description=f"portable artifact {position}",
+        )
+        descriptor = ArtifactDescriptor.model_validate(artifact)
+        if descriptor.role not in {
+            ArtifactRole.EXECUTION_GRAPH,
+            ArtifactRole.EXECUTION_DATA,
+        }:
+            raise ValueError("portable inventory may contain only execution artifacts")
+        if descriptor.role is ArtifactRole.EXECUTION_GRAPH and (
+            descriptor.media_type != "application/onnx" or not descriptor.path.endswith(".onnx")
+        ):
+            raise ValueError("portable execution graph must be an application/onnx file")
+        descriptors.append(descriptor)
+    if tuple(item.path for item in descriptors) != tuple(sorted(item.path for item in descriptors)):
+        raise ValueError("portable inventory artifacts must be sorted by path")
+    return tuple(descriptors)
+
+
+def _portable_inventory_stages(
+    inventory: Mapping[str, object],
+) -> tuple[ExecutionStageDescriptor, ...]:
+    stages: list[ExecutionStageDescriptor] = []
+    expected = {
+        "stage_id",
+        "kind",
+        "start_layer",
+        "end_layer",
+        "graph_path",
+        "external_data_paths",
+        "io_contract_hash",
+        "inputs",
+        "outputs",
+    }
+    for position, raw in enumerate(
+        _sequence(inventory["stages"], description="portable inventory stages")
+    ):
+        stage = _mapping(raw, description=f"portable stage {position}")
+        _expect_exact_fields(stage, expected, description=f"portable stage {position}")
+        for field in ("inputs", "outputs"):
+            values = _sequence(stage[field], description=f"portable stage {field}")
+            if not values or any(not isinstance(value, str) or not value for value in values):
+                raise ValueError(f"portable stage {field} must contain non-empty names")
+        stages.append(
+            ExecutionStageDescriptor.model_validate(
+                {key: stage[key] for key in expected - {"inputs", "outputs"}}
+            )
+        )
+    return tuple(stages)
+
+
+def _validate_source_artifacts(
+    inventory: Mapping[str, object],
+    source_root: Path,
+) -> int:
+    descriptors: list[ArtifactDescriptor] = []
+    for position, raw in enumerate(
+        _sequence(
+            inventory["source_artifacts"],
+            description="portable source artifacts",
+        )
+    ):
+        artifact = _mapping(raw, description=f"portable source artifact {position}")
+        _expect_exact_fields(
+            artifact,
+            {"path", "size", "sha256"},
+            description=f"portable source artifact {position}",
+        )
+        descriptors.append(
+            ArtifactDescriptor.model_validate(
+                {
+                    **artifact,
+                    "media_type": "application/octet-stream",
+                    "role": ArtifactRole.EXECUTION_DATA,
+                }
+            )
+        )
+    if tuple(item.path for item in descriptors) != tuple(sorted(item.path for item in descriptors)):
+        raise ValueError("portable source artifacts must be sorted by path")
+    if not descriptors:
+        raise ValueError("portable build inventory has no source artifacts")
+    for descriptor in descriptors:
+        _verify_local_artifact(source_root, descriptor)
+    return len(descriptors)
+
+
+def attach_portable_execution(
+    base_bundle: ModelRegistryBundle,
+    inventory: Mapping[str, object],
+    *,
+    artifact_root: Path,
+    source_root: Path,
+    artifact_repository_id: str,
+    artifact_revision: str,
+    plan_id: str,
+    precision: str,
+    quantization: str,
+    providers: tuple[ExecutionProviderKind, ...] | None = None,
+) -> ModelRegistryBundle:
+    """Bind a locally verified portable build to one immutable model bundle."""
+
+    expected_inventory_fields = {
+        "format_version",
+        "builder",
+        "source_model_id",
+        "source_model_revision",
+        "exporter",
+        "exporter_revision",
+        "target_execution_provider",
+        "execution_geometry",
+        "provider_assignment_policy",
+        "num_layers",
+        "shared_initializers",
+        "source_artifacts",
+        "artifacts",
+        "stages",
+        "inventory_hash",
+    }
+    _expect_exact_fields(
+        inventory,
+        expected_inventory_fields,
+        description="portable build inventory",
+    )
+    if inventory["format_version"] != 1:
+        raise ValueError("unsupported portable build inventory format")
+    if inventory["builder"] != "fabi/swarm-engine/portable-onnx-stage-builder":
+        raise ValueError("portable build inventory has an unknown builder")
+    if inventory["inventory_hash"] != portable_build_inventory_hash(inventory):
+        raise ValueError("portable build inventory hash does not match its contents")
+    if inventory["source_model_id"] != base_bundle.manifest.model_id:
+        raise ValueError("portable build and base bundle identify different models")
+    if inventory["source_model_revision"] != base_bundle.manifest.immutable_revision:
+        raise ValueError("portable build and base bundle use different source revisions")
+    if inventory["num_layers"] != base_bundle.manifest.num_layers:
+        raise ValueError("portable build and base bundle have different layer counts")
+
+    shared = _sequence(
+        inventory["shared_initializers"],
+        description="portable shared initializers",
+    )
+    if any(not isinstance(value, str) or not value for value in shared):
+        raise ValueError("portable shared initializer names must be non-empty")
+    if shared != sorted(set(shared)):
+        raise ValueError("portable shared initializers must be sorted and unique")
+
+    artifacts = _portable_inventory_descriptors(inventory)
+    stages = _portable_inventory_stages(inventory)
+    referenced_paths = {
+        path for stage in stages for path in (stage.graph_path, *stage.external_data_paths)
+    }
+    if referenced_paths != {artifact.path for artifact in artifacts}:
+        raise ValueError("portable inventory contains missing or unreferenced execution artifacts")
+    for descriptor in artifacts:
+        _verify_local_artifact(artifact_root, descriptor)
+    _validate_source_artifacts(inventory, source_root)
+
+    geometry = _mapping(
+        inventory["execution_geometry"],
+        description="portable execution geometry",
+    )
+    _expect_exact_fields(
+        geometry,
+        {
+            "activation_dtype",
+            "activation_hidden_size",
+            "kv_num_heads",
+            "kv_head_dim",
+        },
+        description="portable execution geometry",
+    )
+    policy = _mapping(
+        inventory["provider_assignment_policy"],
+        description="portable provider policy",
+    )
+    _expect_exact_fields(
+        policy,
+        {
+            "allowed_cpu_fallback_nodes",
+            "allowed_cpu_only_stages",
+            "require_profiled_assignment",
+        },
+        description="portable provider policy",
+    )
+    allowed_nodes = tuple(
+        _sequence(
+            policy["allowed_cpu_fallback_nodes"],
+            description="allowed CPU fallback nodes",
+        )
+    )
+    allowed_stages = tuple(
+        _sequence(
+            policy["allowed_cpu_only_stages"],
+            description="allowed CPU-only stages",
+        )
+    )
+
+    target = inventory["target_execution_provider"]
+    if target == "dml":
+        export_target = OnnxExportTarget.ORT_GENAI_DML
+        default_providers = (ExecutionProviderKind.DIRECTML,)
+        if policy["require_profiled_assignment"] is not True:
+            raise ValueError("DirectML inventory must require profiled provider assignment")
+    elif target == "cpu":
+        export_target = OnnxExportTarget.ORT_GENAI_CPU
+        default_providers = (ExecutionProviderKind.CPU,)
+        if policy["require_profiled_assignment"] is not False or allowed_nodes or allowed_stages:
+            raise ValueError("CPU inventory cannot declare provider fallback exceptions")
+    else:
+        raise ValueError(f"unsupported portable execution target: {target!r}")
+
+    decoder_lengths = [
+        stage.end_layer - stage.start_layer
+        for stage in stages
+        if stage.kind is ExecutionStageKind.DECODER
+    ]
+    granularity = math.gcd(*decoder_lengths) if decoder_lengths else 1
+    plan = ModelExecutionPlan(
+        plan_id=plan_id,
+        backend=BackendKind.ONNXRUNTIME,
+        precision=precision,
+        quantization=quantization,
+        exporter=inventory["exporter"],
+        exporter_revision=inventory["exporter_revision"],
+        artifact_repository_id=artifact_repository_id,
+        artifact_revision=artifact_revision,
+        export_target=export_target,
+        activation_dtype=geometry["activation_dtype"],
+        activation_hidden_size=geometry["activation_hidden_size"],
+        kv_num_heads=geometry["kv_num_heads"],
+        kv_head_dim=geometry["kv_head_dim"],
+        allowed_cpu_fallback_nodes=allowed_nodes,
+        allowed_cpu_only_stages=allowed_stages,
+        execution_granularity_layers=granularity,
+        providers=providers or default_providers,
+        stages=stages,
+    )
+
+    index = ModelArtifactIndex(
+        model_id=base_bundle.artifact_index.model_id,
+        immutable_revision=base_bundle.artifact_index.immutable_revision,
+        artifacts=tuple(
+            sorted((*base_bundle.artifact_index.artifacts, *artifacts), key=lambda x: x.path)
+        ),
+        tensors=base_bundle.artifact_index.tensors,
+        execution_plans=tuple(
+            sorted((*base_bundle.artifact_index.execution_plans, plan), key=lambda x: x.plan_id)
+        ),
+    )
+    manifest = ModelManifest.model_validate(
+        {
+            **base_bundle.manifest.model_dump(mode="json"),
+            "execution_plan_hash": execution_plan_hash(index),
+        }
+    )
+    return ModelRegistryBundle(manifest=manifest, artifact_index=index)
+
+
+def attach_portable_execution_file(
+    output: Path,
+    *,
+    bundle_path: Path,
+    inventory_path: Path,
+    artifact_root: Path,
+    source_root: Path,
+    artifact_repository_id: str,
+    artifact_revision: str,
+    plan_id: str,
+    precision: str,
+    quantization: str,
+    providers: tuple[ExecutionProviderKind, ...] | None = None,
+) -> ModelRegistryBundle:
+    """Read, verify and atomically emit a portable execution bundle."""
+
+    resolved_output = output.resolve()
+    if resolved_output in {bundle_path.resolve(), inventory_path.resolve()}:
+        raise ValueError("portable bundle output must not replace an input")
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite portable bundle: {output}")
+    if inventory_path.stat().st_size > _MAX_PORTABLE_INVENTORY_BYTES:
+        raise ValueError("portable build inventory exceeds 32 MiB")
+    raw = json.loads(inventory_path.read_bytes())
+    inventory = _mapping(raw, description="portable build inventory")
+    bundle = attach_portable_execution(
+        load_bundles((bundle_path,))[0],
+        inventory,
+        artifact_root=artifact_root,
+        artifact_repository_id=artifact_repository_id,
+        artifact_revision=artifact_revision,
+        plan_id=plan_id,
+        precision=precision,
+        quantization=quantization,
+        providers=providers,
+        source_root=source_root,
+    )
+    _atomic_create_public(output, bundle.canonical_bytes() + b"\n")
+    return bundle
+
+
 def initialize_staging_registry(
     repository_dir: Path,
     key_dir: Path,
@@ -415,7 +800,13 @@ def _bundle_summary(bundle: ModelRegistryBundle) -> dict[str, object]:
         "context_classes": list(bundle.manifest.context_classes),
         "artifacts": len(bundle.artifact_index.artifacts),
         "tensors": len(bundle.artifact_index.tensors),
+        "execution_plans": [plan.plan_id for plan in bundle.artifact_index.execution_plans],
         "signed_tensor_bytes": sum(tensor.length for tensor in bundle.artifact_index.tensors),
+        "signed_execution_bytes": sum(
+            artifact.size
+            for artifact in bundle.artifact_index.artifacts
+            if artifact.role in {ArtifactRole.EXECUTION_GRAPH, ArtifactRole.EXECUTION_DATA}
+        ),
     }
 
 
@@ -455,6 +846,24 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use the token from the normal Hugging Face credential store",
     )
+
+    attach = commands.add_parser("attach-portable-execution")
+    attach.add_argument("--bundle", type=Path, required=True)
+    attach.add_argument("--inventory", type=Path, required=True)
+    attach.add_argument("--artifact-root", type=Path, required=True)
+    attach.add_argument("--source-root", type=Path, required=True)
+    attach.add_argument("--artifact-repository-id", required=True)
+    attach.add_argument("--artifact-revision", required=True)
+    attach.add_argument("--plan-id", required=True)
+    attach.add_argument("--precision", required=True)
+    attach.add_argument("--quantization", required=True)
+    attach.add_argument(
+        "--provider",
+        action="append",
+        choices=[provider.value for provider in ExecutionProviderKind],
+        help="qualified provider; repeat only when the same graph was verified on each provider",
+    )
+    attach.add_argument("--output", type=Path, required=True)
 
     initialize = commands.add_parser("init-staging")
     initialize.add_argument("--repository-dir", type=Path, required=True)
@@ -524,6 +933,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             token=True if args.use_hf_token else None,
         )
         result = {"status": "built", **_bundle_summary(bundle), "output": str(args.output)}
+    elif args.command == "attach-portable-execution":
+        providers = (
+            tuple(ExecutionProviderKind(value) for value in args.provider)
+            if args.provider
+            else None
+        )
+        bundle = attach_portable_execution_file(
+            args.output,
+            bundle_path=args.bundle,
+            inventory_path=args.inventory,
+            artifact_root=args.artifact_root,
+            source_root=args.source_root,
+            artifact_repository_id=args.artifact_repository_id,
+            artifact_revision=args.artifact_revision,
+            plan_id=args.plan_id,
+            precision=args.precision,
+            quantization=args.quantization,
+            providers=providers,
+        )
+        result = {
+            "status": "portable_execution_attached",
+            **_bundle_summary(bundle),
+            "output": str(args.output),
+        }
     elif args.command == "init-staging":
         bundles = initialize_staging_registry(
             args.repository_dir,

@@ -42,6 +42,37 @@ The command retries only transient Hub transport failures with bounded exponenti
 metadata mismatch, invalid SafeTensors layout, missing Xet identity, short reconstruction, or
 digest mismatch fails closed and no bundle is published.
 
+### Attach a portable execution plan
+
+Publisher-built ONNX stages live in a separate immutable Hub repository. Upload the complete
+`execution/` directory, resolve that repository to a 40-character commit, then bind the local
+builder inventory to the source-model bundle:
+
+```console
+fabi-swarm-registry attach-portable-execution \
+  --bundle /private/operator/bundles/qwen3-600m.json \
+  --inventory /private/operator/portable/qwen3-600m/portable-build.json \
+  --artifact-root /private/operator/portable/qwen3-600m \
+  --source-root /private/operator/exports/qwen3-600m \
+  --artifact-repository-id fabi-ai/Qwen3-0.6B-onnx-stages \
+  --artifact-revision 0123456789abcdef0123456789abcdef01234567 \
+  --plan-id onnx-dml-int4-v1 \
+  --precision int4 \
+  --quantization rtn-block-32 \
+  --provider directml \
+  --output /private/operator/bundles/qwen3-600m-portable.json
+```
+
+This operation never edits either input and refuses to replace an existing output. It recomputes
+the domain-separated inventory identity; verifies the source export and every graph/data file by
+size and SHA-256 from stable, root-confined regular files; rejects unreferenced bytes and layer
+gaps; pins the artifact repository and revision; and recomputes the manifest execution-plan hash.
+The resulting bundle is still only an unsigned operator artifact until `init-staging` or `publish`
+places it under TUF targets metadata. A worker downloads only the stages for its assigned span and
+rechecks the same signed descriptors before announcing READY. Omit `--provider` only to select the
+builder target's exact default; list an additional provider only after the same graph set has been
+qualified on that provider.
+
 ## Selective worker materialization
 
 For a bundle carrying the signed tensor index, a worker materializes deterministic
