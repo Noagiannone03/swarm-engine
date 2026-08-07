@@ -5,6 +5,7 @@ import httpx
 from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stream_iter
 
 from backend.server.contribution_gate import account_hash
+from backend.server.openai_compat import chat_request_log_summary
 from parallax_utils.logging_config import get_logger
 from scheduling.node import Node, NodeHardwareInfo
 from scheduling.scheduler import Scheduler
@@ -255,7 +256,7 @@ class RPCConnectionHandler(ConnectionHandler):
         request,
     ):
         """Handle chat completion request"""
-        logger.debug(f"Chat completion request: {request}, type: {type(request)}")
+        logger.debug("Chat completion request metadata: %s", chat_request_log_summary(request))
         try:
             with httpx.Client(
                 timeout=_INFERENCE_HTTP_TIMEOUT,

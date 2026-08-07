@@ -415,8 +415,8 @@ def test_chat_completion_debug_log_never_contains_request_content(monkeypatch, c
     assert secret not in caplog.text
     assert "read_private_file" not in caplog.text
     assert "request-safe-id" in caplog.text
-    assert "messages=1" in caplog.text
-    assert "tools=1" in caplog.text
+    assert "'message_count': 1" in caplog.text
+    assert "'tool_count': 1" in caplog.text
     assert FakeHttpClient.instances[0].posts[0][1] == request
 
 

@@ -26,7 +26,7 @@ import httpx
 import zmq
 from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stream_iter
 
-from backend.server.openai_compat import encode_http_response_envelope
+from backend.server.openai_compat import chat_request_log_summary, encode_http_response_envelope
 from backend.server.rpc_connection_handler import RPCConnectionHandler
 from fabi_network.rpc import authenticated_rpc_peer_id
 from fabi_network.transport import IrohTransport, using_iroh
@@ -687,15 +687,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         # A chat request contains source code, tool schemas and credentials in
         # addition to the user prompt.  Never stringify it into worker logs,
         # even at DEBUG: community workers are not a content trust boundary.
-        messages = request.get("messages")
-        tools = request.get("tools")
-        logger.debug(
-            "Chat completion request metadata: request_id=%s stream=%s messages=%d tools=%d",
-            request.get("request_id"),
-            bool(request.get("stream", False)),
-            len(messages) if isinstance(messages, (list, tuple)) else 0,
-            len(tools) if isinstance(tools, (list, tuple)) else 0,
-        )
+        logger.debug("Chat completion request metadata: %s", chat_request_log_summary(request))
         try:
             if getattr(self, "execution_admission", None) is not None:
                 self._authorize_frontend_request(

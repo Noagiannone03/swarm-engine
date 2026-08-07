@@ -25,3 +25,16 @@ def test_evict_reclaims_all_colliding_sibling_blocks():
     assert set(freed_blocks) == {10, 11, 12}
     assert cache.num_cached_blocks == 0
     assert cache.root.children == {}
+
+
+def test_existing_block_debug_log_does_not_expose_token_ids(caplog):
+    cache = BlockRadixCache(block_size=2)
+    token_ids = [987654321, 123456789]
+    cache.insert_block(token_ids, block_id=10)
+
+    with caplog.at_level("DEBUG"):
+        cache.insert_block(token_ids, block_id=11)
+
+    assert "987654321" not in caplog.text
+    assert "123456789" not in caplog.text
+    assert "token_count=2" in caplog.text

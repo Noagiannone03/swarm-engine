@@ -196,7 +196,11 @@ class BlockRadixCache:
         if block_key in parent_node.children:
             existing_node = parent_node.children[block_key]
             if existing_node.token_ids == token_ids:
-                logger.debug(f"Block already exists in cache: {token_ids[:5]}...")
+                logger.debug(
+                    "Block already exists in cache: token_count=%d prefix_length=%d",
+                    len(token_ids),
+                    existing_node.prefix_len,
+                )
                 if lock:
                     existing_node.lock_ref += 1
                     existing_node.last_access_time = time.monotonic()

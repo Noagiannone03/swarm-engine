@@ -7,6 +7,21 @@ from fastapi.responses import JSONResponse
 PARALLAX_HTTP_RESPONSE_ENVELOPE = "__parallax_http_response__"
 
 
+def chat_request_log_summary(request: object) -> Dict[str, Any]:
+    """Return operational chat metadata without prompt, tools or token content."""
+
+    if not isinstance(request, dict):
+        return {"request_type": type(request).__name__}
+    messages = request.get("messages")
+    tools = request.get("tools")
+    return {
+        "request_id": request.get("request_id"),
+        "stream": bool(request.get("stream", False)),
+        "message_count": len(messages) if isinstance(messages, (list, tuple)) else 0,
+        "tool_count": len(tools) if isinstance(tools, (list, tuple)) else 0,
+    }
+
+
 def openai_error_payload(
     message: str,
     *,
