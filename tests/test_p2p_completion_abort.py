@@ -397,6 +397,29 @@ def test_streaming_chat_preserves_local_http_error_in_transport_envelope(monkeyp
     assert FakeHttpClient.instances[0].kwargs["timeout"].read is None
 
 
+def test_chat_completion_debug_log_never_contains_request_content(monkeypatch, caplog):
+    handler = make_handler()
+    FakeHttpClient.instances.clear()
+    monkeypatch.setattr(p2p_server.httpx, "Client", FakeHttpClient)
+    secret = "private-source-code-that-must-not-enter-worker-logs"
+    request = {
+        "request_id": "request-safe-id",
+        "messages": [{"role": "user", "content": secret}],
+        "tools": [{"type": "function", "function": {"name": "read_private_file"}}],
+        "stream": False,
+    }
+
+    with caplog.at_level("DEBUG"):
+        list(handler.chat_completion(request))
+
+    assert secret not in caplog.text
+    assert "read_private_file" not in caplog.text
+    assert "request-safe-id" in caplog.text
+    assert "messages=1" in caplog.text
+    assert "tools=1" in caplog.text
+    assert FakeHttpClient.instances[0].posts[0][1] == request
+
+
 def test_active_v3_frontend_enables_local_vllm_abort_route(monkeypatch):
     listener = SimpleNamespace(
         fileno=lambda: 12,

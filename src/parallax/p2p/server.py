@@ -684,7 +684,18 @@ class TransformerConnectionHandler(ConnectionHandler):
         request,
     ):
         """Handle chat completion request"""
-        logger.debug(f"Chat completion request: {request}, type: {type(request)}")
+        # A chat request contains source code, tool schemas and credentials in
+        # addition to the user prompt.  Never stringify it into worker logs,
+        # even at DEBUG: community workers are not a content trust boundary.
+        messages = request.get("messages")
+        tools = request.get("tools")
+        logger.debug(
+            "Chat completion request metadata: request_id=%s stream=%s messages=%d tools=%d",
+            request.get("request_id"),
+            bool(request.get("stream", False)),
+            len(messages) if isinstance(messages, (list, tuple)) else 0,
+            len(tools) if isinstance(tools, (list, tuple)) else 0,
+        )
         try:
             if getattr(self, "execution_admission", None) is not None:
                 self._authorize_frontend_request(
