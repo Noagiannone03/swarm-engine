@@ -498,6 +498,7 @@ fn py_inspect_skippy_source_geometry(
     cache_type_k: &str,
     cache_type_v: &str,
 ) -> PyResult<PySkippyPackageGeometry> {
+    let source_paths = source_paths.into_boxed_slice();
     inspect_source_geometry(&source_paths, cache_type_k, cache_type_v)
         .map(Into::into)
         .map_err(py_error)
