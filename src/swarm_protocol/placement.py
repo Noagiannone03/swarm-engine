@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
@@ -21,6 +22,8 @@ from swarm_protocol.contracts import (
     WorkerOffer,
     WorkerRole,
 )
+
+SpanStaticBytes = Callable[[LayerSpan], int | None]
 
 
 class PlacementAction(str, Enum):
@@ -381,18 +384,47 @@ class AutonomousPlacementPolicy:
         self.maximum_candidates = maximum_candidates
 
     @staticmethod
+    def _static_bytes(
+        manifest: ModelManifest,
+        span: LayerSpan,
+        span_static_bytes: SpanStaticBytes | None,
+    ) -> int | None:
+        """Return signed static bytes, or ``None`` for an unsupported boundary.
+
+        SafeTensors-backed executors use the manifest's exact resident weight
+        geometry. Portable executors supply a plan-specific resolver whose
+        result is the de-duplicated size of signed ONNX graph/external-data
+        files. Runtime workspaces remain covered by the independently measured
+        stable memory envelope and backend reserve.
+        """
+
+        value = (
+            manifest.weight_bytes(span) if span_static_bytes is None else span_static_bytes(span)
+        )
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("span static byte geometry must be a positive integer")
+        return value
+
+    @classmethod
     def _required_memory_bytes(
+        cls,
         manifest: ModelManifest,
         span: LayerSpan,
         *,
         context_tokens: int,
         kv_block_size: int,
-    ) -> int:
+        span_static_bytes: SpanStaticBytes | None = None,
+    ) -> int | None:
         if context_tokens <= 0 or kv_block_size <= 0:
             raise ValueError("context and KV block size must be positive")
+        static_bytes = cls._static_bytes(manifest, span, span_static_bytes)
+        if static_bytes is None:
+            return None
         rounded_tokens = (context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
         kv_bytes = rounded_tokens * sum(manifest.kv_bytes_per_token_by_layer[span.start : span.end])
-        return manifest.weight_bytes(span) + kv_bytes
+        return static_bytes + kv_bytes
 
     def feasible_spans(
         self,
@@ -401,10 +433,11 @@ class AutonomousPlacementPolicy:
         manifest: ModelManifest,
         context_tokens: int,
         kv_block_size: int,
+        span_static_bytes: SpanStaticBytes | None = None,
     ) -> tuple[tuple[LayerSpan, int], ...]:
         """Enumerate every exact contiguous span this worker can materialize."""
 
-        if not manifest.weight_bytes_by_layer:
+        if span_static_bytes is None and not manifest.weight_bytes_by_layer:
             raise ValueError("autonomous placement requires exact weight byte geometry")
         granularity = offer.execution_granularity_layers
         result: list[tuple[LayerSpan, int]] = []
@@ -426,7 +459,10 @@ class AutonomousPlacementPolicy:
                     span,
                     context_tokens=context_tokens,
                     kv_block_size=kv_block_size,
+                    span_static_bytes=span_static_bytes,
                 )
+                if required is None:
+                    continue
                 if required <= offer.stable_memory_envelope_bytes:
                     result.append((span, required))
                 # Every additional layer is positive, except that endpoint
@@ -443,6 +479,7 @@ class AutonomousPlacementPolicy:
         kv_block_size: int,
         context_targets: tuple[int, ...] | None = None,
         maximum_sessions: int = 32,
+        span_static_bytes: SpanStaticBytes | None = None,
     ) -> tuple[MemoryPlacementPoint, ...]:
         """Return non-dominated exact memory choices across signed classes.
 
@@ -475,8 +512,11 @@ class AutonomousPlacementPolicy:
                 manifest=manifest,
                 context_tokens=context_tokens,
                 kv_block_size=kv_block_size,
+                span_static_bytes=span_static_bytes,
             ):
-                weight_bytes = manifest.weight_bytes(span)
+                weight_bytes = self._static_bytes(manifest, span, span_static_bytes)
+                if weight_bytes is None:
+                    continue
                 rounded_tokens = (
                     (context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
                 )
@@ -660,6 +700,7 @@ class AutonomousPlacementPolicy:
         serving_route_exists: bool = False,
         serving_route_survives_movement: bool = False,
         excluded_spans: frozenset[LayerSpan] = frozenset(),
+        span_static_bytes: SpanStaticBytes | None = None,
         now_ms: int,
     ) -> PlacementDecision:
         if len(demand.desired_replicas_by_layer) != manifest.num_layers:
@@ -671,6 +712,7 @@ class AutonomousPlacementPolicy:
             manifest=manifest,
             context_tokens=context_tokens,
             kv_block_size=kv_block_size,
+            span_static_bytes=span_static_bytes,
         )
         if not feasible:
             return PlacementDecision(
@@ -744,7 +786,10 @@ class AutonomousPlacementPolicy:
                     current_span,
                     context_tokens=context_tokens,
                     kv_block_size=kv_block_size,
+                    span_static_bytes=span_static_bytes,
                 )
+                if current_required is None:
+                    raise ValueError("current span is unsupported by the execution geometry")
                 return PlacementDecision(
                     action=PlacementAction.KEEP,
                     span=current_span,
@@ -794,7 +839,10 @@ class AutonomousPlacementPolicy:
                 current_span,
                 context_tokens=context_tokens,
                 kv_block_size=kv_block_size,
+                span_static_bytes=span_static_bytes,
             )
+            if current_required is None:
+                raise ValueError("current span is unsupported by the execution geometry")
             current_score = self._score(
                 worker_id=offer.worker_id,
                 span=current_span,
@@ -889,6 +937,7 @@ class AutonomousPlacementPolicy:
         context_tokens: int,
         kv_block_size: int,
         maximum_sessions: int | None = None,
+        span_static_bytes: SpanStaticBytes | None = None,
     ) -> ContextPlacementUtility:
         """Score one exact target across all cumulative demand classes."""
 
@@ -896,9 +945,9 @@ class AutonomousPlacementPolicy:
         kv_bytes_per_session = rounded_tokens * sum(
             manifest.kv_bytes_per_token_by_layer[span.start : span.end]
         )
-        available_kv_bytes = max(
-            0,
-            offer.stable_memory_envelope_bytes - manifest.weight_bytes(span),
+        static_bytes = self._static_bytes(manifest, span, span_static_bytes)
+        available_kv_bytes = (
+            0 if static_bytes is None else max(0, offer.stable_memory_envelope_bytes - static_bytes)
         )
         max_sessions = available_kv_bytes // kv_bytes_per_session if kv_bytes_per_session > 0 else 0
         if maximum_sessions is not None:
@@ -980,6 +1029,7 @@ class AutonomousPlacementPolicy:
         serving_route_exists: bool = False,
         serving_route_survives_movement: bool = False,
         excluded_spans: frozenset[LayerSpan] = frozenset(),
+        span_static_bytes: SpanStaticBytes | None = None,
         now_ms: int,
     ) -> tuple[PlacementDecision, ContextPlacementUtility]:
         """Choose a real span *and* context from trusted cumulative demand.
@@ -1015,6 +1065,7 @@ class AutonomousPlacementPolicy:
             ),
             kv_block_size=kv_block_size,
             context_targets=tuple(item.context_tokens for item in demanded_classes),
+            span_static_bytes=span_static_bytes,
         )
         finalists: list[tuple[PlacementDecision, ContextPlacementUtility]] = []
         for point in frontier:
@@ -1037,6 +1088,7 @@ class AutonomousPlacementPolicy:
                 context_tokens=point.context_tokens,
                 kv_block_size=kv_block_size,
                 maximum_sessions=point.max_sessions,
+                span_static_bytes=span_static_bytes,
             )
             finalists.append((decision, utility))
 
@@ -1060,6 +1112,7 @@ class AutonomousPlacementPolicy:
                 context_tokens=current_context_tokens,
                 kv_block_size=kv_block_size,
                 maximum_sessions=(None if current_lease is None else current_lease.max_sessions),
+                span_static_bytes=span_static_bytes,
             )
             finalists.append(
                 (

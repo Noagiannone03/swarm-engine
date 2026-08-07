@@ -33,9 +33,7 @@ def _demand_map(**kwargs) -> ContextCapacityDemandMap:
     return ContextCapacityDemandMap(
         **kwargs,
         classes=classes,
-        context_histogram=build_context_histogram(
-            tuple(item.context_tokens for item in classes)
-        ),
+        context_histogram=build_context_histogram(tuple(item.context_tokens for item in classes)),
     )
 
 
@@ -70,6 +68,7 @@ def offer(
     *,
     memory_bytes: int = 500,
     frontend: bool = True,
+    execution_granularity_layers: int = 1,
 ) -> WorkerOffer:
     roles = {WorkerRole.EXECUTOR}
     if frontend:
@@ -81,10 +80,59 @@ def offer(
         platform="test",
         backend=BackendKind.MLX,
         stable_memory_envelope_bytes=memory_bytes,
+        execution_granularity_layers=execution_granularity_layers,
         supported_roles=roles,
         offer_seq=1,
         issued_at_ms=SWARM_NOW,
         expires_at_ms=SWARM_NOW + 60_000,
+    )
+
+
+def test_portable_static_geometry_filters_boundaries_and_replaces_weight_bytes():
+    model = manifest()
+    worker = offer(memory_bytes=500)
+
+    def portable_bytes(span: LayerSpan) -> int | None:
+        if span.start % 2 or span.end % 2:
+            return None
+        return 50
+
+    portable = AutonomousPlacementPolicy().feasible_spans(
+        offer=worker,
+        manifest=model,
+        context_tokens=10,
+        kv_block_size=1,
+        span_static_bytes=portable_bytes,
+    )
+
+    assert portable == (
+        (LayerSpan(start=0, end=2), 250),
+        (LayerSpan(start=0, end=4), 450),
+        (LayerSpan(start=2, end=4), 250),
+    )
+    assert (LayerSpan(start=0, end=4), 450) not in (
+        AutonomousPlacementPolicy().feasible_spans(
+            offer=worker,
+            manifest=model,
+            context_tokens=10,
+            kv_block_size=1,
+        )
+    )
+
+
+def test_default_static_geometry_is_unchanged_when_explicitly_supplied():
+    model = manifest()
+    policy = AutonomousPlacementPolicy()
+    arguments = {
+        "offer": offer(memory_bytes=900),
+        "manifest": model,
+        "context_tokens": 10,
+        "kv_block_size": 1,
+    }
+
+    assert policy.feasible_spans(**arguments) == policy.feasible_spans(
+        **arguments,
+        span_static_bytes=model.weight_bytes,
     )
 
 
@@ -514,9 +562,7 @@ def test_context_demand_rejects_unsorted_or_out_of_contract_points():
         outside_contract.validate_for(model, now_ms=2_000)
 
     with pytest.raises(ValueError, match="unsupported context demand version"):
-        ContextCapacityDemandMap.model_validate(
-            {**demand.model_dump(), "demand_version": 1}
-        )
+        ContextCapacityDemandMap.model_validate({**demand.model_dump(), "demand_version": 1})
 
     assert demand.context_histogram is not None
     with pytest.raises(ValueError, match="protobuf"):

@@ -34,6 +34,7 @@ from swarm_protocol.placement import (
     PlacementAction,
     PlacementDecision,
     PlacementMaterializer,
+    SpanStaticBytes,
 )
 from swarm_protocol.routing import ExactRoutePlanner, RoutePlanningError
 
@@ -261,6 +262,8 @@ class AutonomousWorkerPlacement:
         topology_observer: Callable[[DiscoverySnapshot], None] | None = None,
         transition_refresh_interval_s: float = _TRANSITION_REFRESH_INTERVAL_SECONDS,
         demand_region_id: str | None = None,
+        span_static_bytes: SpanStaticBytes | None = None,
+        materialization_identity_hashes: tuple[str, ...] | None = None,
     ) -> None:
         if transition_refresh_interval_s <= 0:
             raise ValueError("transition refresh interval must be positive")
@@ -293,6 +296,8 @@ class AutonomousWorkerPlacement:
         self._context_tokens: int | None = None
         self._qualified_context_limit_tokens: int | None = None
         self._demand_region_id = demand_region_id
+        self._span_static_bytes = span_static_bytes
+        self._materialization_identity_hashes = materialization_identity_hashes
         self._context_demand: ContextCapacityDemandMap | None = None
         self._context_demand_state = "off" if demand_region_id is None else "waiting"
         self._context_demand_status: dict[str, object] | None = None
@@ -325,6 +330,10 @@ class AutonomousWorkerPlacement:
         if not weight_hashes:
             raise ValueError("bootstrap intent must bind signed weight identities")
         with self._lock:
+            if self._materialization_identity_hashes is None:
+                self._materialization_identity_hashes = weight_hashes
+            elif self._materialization_identity_hashes != weight_hashes:
+                raise ValueError("bootstrap identity differs from the execution contract")
             self._context_tokens = context_tokens
             self._qualified_context_limit_tokens = max(
                 context_tokens,
@@ -363,6 +372,7 @@ class AutonomousWorkerPlacement:
             current_span=None,
             current_reservations=0,
             excluded_spans=self._storage_exclusions(),
+            span_static_bytes=self._span_static_bytes,
             now_ms=time.time_ns() // 1_000_000,
         )
         decision = self._select_context_demand(
@@ -730,7 +740,7 @@ class AutonomousWorkerPlacement:
                         "lease": advertisement.lease.model_copy(
                             update={
                                 "hosted_span": state.target_span,
-                                "weight_hashes": (manifest.weight_collection_hash,),
+                                "weight_hashes": self._transition_hashes(manifest),
                                 "max_context_tokens": state.target_context_tokens,
                                 "kv_geometry": advertisement.lease.kv_geometry.model_copy(
                                     update={"allocatable_bytes": allocatable_kv_bytes}
@@ -927,6 +937,7 @@ class AutonomousWorkerPlacement:
                 serving_route_exists=serving_route_exists,
                 serving_route_survives_movement=serving_route_survives_movement,
                 excluded_spans=self._storage_exclusions(),
+                span_static_bytes=self._span_static_bytes,
                 now_ms=now_ms,
             )
         except ValueError as exc:
@@ -956,6 +967,13 @@ class AutonomousWorkerPlacement:
         with self._lock:
             self._context_demand_status = status
         return selected if status["applied"] else baseline
+
+    def _transition_hashes(self, manifest: ModelManifest) -> tuple[str, ...]:
+        """Return the compact signed identity for the executor being built."""
+
+        with self._lock:
+            hashes = self._materialization_identity_hashes
+        return hashes or (manifest.weight_collection_hash,)
 
     def _status(self, state, *, decision: str, error) -> dict[str, object]:
         return {

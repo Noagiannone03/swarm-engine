@@ -17,6 +17,7 @@ import random
 import shutil
 import threading
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
@@ -61,6 +62,10 @@ from swarm_protocol.contracts import (
 )
 from swarm_protocol.execution import WorkerExecutionAdmission
 from swarm_protocol.execution_rpc import WorkerExecutionControlService
+from swarm_protocol.portable_execution import (
+    portable_span_static_bytes,
+    select_execution_plan,
+)
 from swarm_protocol.worker_integration import (
     WorkerProtocolV3Reporter,
     WorkerServingSnapshot,
@@ -1100,6 +1105,47 @@ class GradientServer:
                     immutable_revision=str(self.model_revision),
                 )
                 manifest = bundle.manifest
+                initial_hardware = self._stable_capacity_hardware()
+                backend = (
+                    BackendKind.MLX
+                    if initial_hardware.get("device") == "mlx"
+                    else (
+                        BackendKind.VLLM
+                        if self.gpu_backend == "vllm"
+                        else (
+                            BackendKind.ONNXRUNTIME
+                            if self.gpu_backend == "onnxruntime"
+                            else BackendKind.SGLANG
+                        )
+                    )
+                )
+                span_static_bytes = None
+                materialization_identity_hashes = (manifest.weight_collection_hash,)
+                execution_granularity_layers = 1
+                execution_device = None
+                if backend is BackendKind.ONNXRUNTIME:
+                    execution_device = str(initial_hardware.get("device") or "").strip()
+                    if not execution_device:
+                        raise RuntimeError("portable bootstrap has no qualified execution device")
+                    execution_plan = select_execution_plan(
+                        bundle.artifact_index,
+                        device=execution_device,
+                    )
+                    if manifest.execution_plan_hash is None:
+                        raise RuntimeError("portable bootstrap plan is not bound by the manifest")
+                    span_static_bytes = partial(
+                        portable_span_static_bytes,
+                        bundle.artifact_index,
+                        execution_plan,
+                        manifest,
+                    )
+                    materialization_identity_hashes = (manifest.execution_plan_hash,)
+                    execution_granularity_layers = execution_plan.execution_granularity_layers
+                    if self._shared_state is not None:
+                        self._shared_state.update(
+                            execution_plan_id=execution_plan.plan_id,
+                            execution_device=execution_device,
+                        )
                 controller = AutonomousWorkerPlacement(
                     catalog=self.iroh_transport.catalog_discovery,
                     admission=self.swarm_v3_execution_admission,
@@ -1111,6 +1157,8 @@ class GradientServer:
                         os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip()
                         or "global"
                     ),
+                    span_static_bytes=span_static_bytes,
+                    materialization_identity_hashes=materialization_identity_hashes,
                 )
                 self.swarm_v3_placement_controller = controller
                 offer = None
@@ -1135,19 +1183,10 @@ class GradientServer:
                         manifest_published = True
                     hardware = self._stable_capacity_hardware()
                     capacity_sequence = hardware.get("capacity_sequence")
-                    backend = (
-                        BackendKind.MLX
-                        if hardware.get("device") == "mlx"
-                        else (
-                            BackendKind.VLLM
-                            if self.gpu_backend == "vllm"
-                            else (
-                                BackendKind.ONNXRUNTIME
-                                if self.gpu_backend == "onnxruntime"
-                                else BackendKind.SGLANG
-                            )
+                    if execution_device is not None and hardware.get("device") != execution_device:
+                        raise RuntimeError(
+                            "portable capacity probe changed execution device during bootstrap"
                         )
-                    )
                     stable_memory_bytes = int(hardware.get("usable_memory_bytes") or 0)
                     if stable_memory_bytes <= 0:
                         if self._shared_state is not None:
@@ -1171,6 +1210,7 @@ class GradientServer:
                             backend=backend,
                             stable_memory_envelope_bytes=stable_memory_bytes,
                             supports_frontend=self.supports_frontend,
+                            execution_granularity_layers=execution_granularity_layers,
                         )
                         offer_capacity_sequence = capacity_sequence
                     placement = None
@@ -1182,10 +1222,10 @@ class GradientServer:
                             context_tokens=context_tokens,
                             kv_block_size=self.kv_block_size,
                             max_sessions=max(1, int(self.max_batch_size or 1)),
-                            # BUILDING binds the signed collection identity without
-                            # expanding a potentially huge shard list into the DHT.
-                            # READY later contains the exact locally verified files.
-                            weight_hashes=(manifest.weight_collection_hash,),
+                            # BUILDING binds the compact signed execution
+                            # collection. READY later contains the exact locally
+                            # verified files for the selected span.
+                            weight_hashes=materialization_identity_hashes,
                             outgoing_links=self._v3_outgoing_link_metrics(),
                         )
                         if placement["decision"] == "waiting_catalog":
@@ -2938,6 +2978,39 @@ class GradientServer:
                                         "autonomous placement trust or catalogue is not ready"
                                     )
                                 if self.swarm_v3_placement_controller is None:
+                                    span_static_bytes = None
+                                    materialization_identity_hashes = (
+                                        manifest.weight_collection_hash,
+                                    )
+                                    if runtime_backend == "onnxruntime":
+                                        serving_device = str(
+                                            self._shared_state.get("execution_device")
+                                        )
+                                        serving_plan_id = str(
+                                            self._shared_state.get("execution_plan_id")
+                                        )
+                                        bundle = self.swarm_v3_reporter.resolve_trusted_bundle(
+                                            str(self.model_name),
+                                            immutable_revision=str(self.model_revision),
+                                        )
+                                        execution_plan = select_execution_plan(
+                                            bundle.artifact_index,
+                                            device=serving_device,
+                                            plan_id=serving_plan_id,
+                                        )
+                                        if manifest.execution_plan_hash is None:
+                                            raise RuntimeError(
+                                                "portable serving plan is not bound by the manifest"
+                                            )
+                                        span_static_bytes = partial(
+                                            portable_span_static_bytes,
+                                            bundle.artifact_index,
+                                            execution_plan,
+                                            manifest,
+                                        )
+                                        materialization_identity_hashes = (
+                                            manifest.execution_plan_hash,
+                                        )
                                     self.swarm_v3_placement_controller = AutonomousWorkerPlacement(
                                         catalog=catalog,
                                         admission=self.swarm_v3_execution_admission,
@@ -2953,6 +3026,10 @@ class GradientServer:
                                                 "FABI_SWARM_V3_DEMAND_REGION", ""
                                             ).strip()
                                             or "global"
+                                        ),
+                                        span_static_bytes=span_static_bytes,
+                                        materialization_identity_hashes=(
+                                            materialization_identity_hashes
                                         ),
                                     )
                                 placement = self.swarm_v3_placement_controller.observe(

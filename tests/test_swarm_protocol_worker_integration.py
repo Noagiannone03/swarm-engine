@@ -110,6 +110,21 @@ def _wait_report(reporter, serving):
     return report
 
 
+def test_cold_offer_carries_the_signed_executor_granularity(tmp_path):
+    reporter = WorkerProtocolV3Reporter(_Registry(_bundle(tmp_path)))
+
+    offer = reporter.bootstrap_offer(
+        worker_id="worker",
+        endpoint_id="endpoint",
+        backend=BackendKind.ONNXRUNTIME,
+        stable_memory_envelope_bytes=1024,
+        supports_frontend=True,
+        execution_granularity_layers=4,
+    )
+
+    assert offer.execution_granularity_layers == 4
+
+
 def test_large_artifact_verification_never_blocks_heartbeat(monkeypatch, tmp_path):
     bundle = _bundle(tmp_path)
     monkeypatch.setattr(

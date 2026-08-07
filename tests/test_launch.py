@@ -172,6 +172,32 @@ def test_local_model_path_survives_scheduler_reallocation():
     assert (args.start_layer, args.end_layer) == (3, 12)
 
 
+def test_portable_execution_contract_follows_autonomous_shared_state():
+    args = Namespace(
+        model_path=None,
+        execution_device=None,
+        execution_plan_id=None,
+        tp_size=1,
+        enable_weight_refit=False,
+        weight_refit_mode=None,
+    )
+    shared_state = SharedState(
+        {
+            "model_name": "Qwen/Qwen3-0.6B",
+            "model_revision": "a" * 40,
+            "block_start_index": 0,
+            "block_end_index": 4,
+            "execution_device": "directml:1",
+            "execution_plan_id": "qwen3-onnx-int4-dml-v1",
+        }
+    )
+
+    _update_args_from_shared_state(args, shared_state, force_update=False)
+
+    assert args.execution_device == "directml:1"
+    assert args.execution_plan_id == "qwen3-onnx-int4-dml-v1"
+
+
 def test_worker_without_local_model_path_tracks_scheduler_model():
     args = Namespace(
         model_path=None,

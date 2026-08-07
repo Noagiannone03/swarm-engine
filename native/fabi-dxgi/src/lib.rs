@@ -136,7 +136,9 @@ pub fn query_video_memory(adapter_index: u32) -> Result<VideoMemoryInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VideoMemorySegment, query_video_memory};
+    use super::VideoMemorySegment;
+    #[cfg(windows)]
+    use super::query_video_memory;
 
     #[test]
     fn headroom_saturates_when_usage_exceeds_budget() {

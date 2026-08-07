@@ -21,6 +21,7 @@ from swarm_protocol.contracts import LayerSpan
 from swarm_protocol.portable_execution import (
     execution_provider_for_device,
     materialize_execution_span,
+    portable_span_static_bytes,
     required_execution_storage_bytes,
     select_execution_plan,
     stages_for_span,
@@ -156,6 +157,33 @@ def test_signed_portable_plan_tiles_layers_and_validates():
     )
 
 
+def test_portable_static_bytes_reject_stage_cuts_without_hiding_contract_errors():
+    index = portable_index(decoder_ranges=((0, 2),))
+    model = manifest(index)
+    plan = index.execution_plans[0]
+
+    assert (
+        portable_span_static_bytes(
+            index,
+            plan,
+            model,
+            LayerSpan(start=0, end=1),
+        )
+        is None
+    )
+    assert portable_span_static_bytes(
+        index,
+        plan,
+        model,
+        LayerSpan(start=0, end=2),
+    ) == required_execution_storage_bytes(
+        index,
+        plan,
+        model,
+        LayerSpan(start=0, end=2),
+    )
+
+
 def test_execution_plan_cpu_fallback_policy_is_signed_and_stage_exact():
     base = portable_index().execution_plans[0]
     plan = base.model_copy(
@@ -209,9 +237,11 @@ def test_portable_plan_rejects_layer_gaps():
 def test_portable_plan_hash_binds_referenced_graph_bytes():
     index = portable_index()
     changed_artifacts = tuple(
-        item.model_copy(update={"sha256": digest("tampered")})
-        if item.path == "execution/input.onnx"
-        else item
+        (
+            item.model_copy(update={"sha256": digest("tampered")})
+            if item.path == "execution/input.onnx"
+            else item
+        )
         for item in index.artifacts
     )
     changed = ModelArtifactIndex(

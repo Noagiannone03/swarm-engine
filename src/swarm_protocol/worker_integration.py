@@ -177,11 +177,14 @@ class WorkerProtocolV3Reporter:
         backend: BackendKind,
         stable_memory_envelope_bytes: int,
         supports_frontend: bool,
+        execution_granularity_layers: int = 1,
     ) -> WorkerOffer:
         """Build a fresh signed-endpoint offer before any executor is loaded."""
 
         if stable_memory_envelope_bytes <= 0:
             raise ValueError("worker has no positive stable memory envelope")
+        if execution_granularity_layers <= 0:
+            raise ValueError("execution granularity must be positive")
         now_ms = time.time_ns() // 1_000_000
         with self._lock:
             self._offer_seq += 1
@@ -196,6 +199,7 @@ class WorkerProtocolV3Reporter:
             platform=f"{platform.system().lower()}-{platform.machine().lower()}",
             backend=backend,
             stable_memory_envelope_bytes=stable_memory_envelope_bytes,
+            execution_granularity_layers=execution_granularity_layers,
             supported_roles=frozenset(roles),
             offer_seq=offer_seq,
             issued_at_ms=now_ms,
@@ -460,6 +464,11 @@ class WorkerProtocolV3Reporter:
         roles = {WorkerRole.EXECUTOR}
         if serving.supports_frontend:
             roles.add(WorkerRole.FRONTEND)
+        execution_granularity_layers = (
+            verified.artifacts.plan.execution_granularity_layers
+            if isinstance(verified.artifacts, VerifiedExecutionSpan)
+            else 1
+        )
         offer = WorkerOffer(
             worker_id=serving.worker_id,
             endpoint_id=serving.endpoint_id,
@@ -467,6 +476,7 @@ class WorkerProtocolV3Reporter:
             platform=f"{platform.system().lower()}-{platform.machine().lower()}",
             backend=serving.backend,
             stable_memory_envelope_bytes=serving.stable_memory_envelope_bytes,
+            execution_granularity_layers=execution_granularity_layers,
             supported_roles=frozenset(roles),
             offer_seq=self._offer_seq,
             issued_at_ms=now_ms,

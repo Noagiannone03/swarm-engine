@@ -33,9 +33,7 @@ def _demand_map(**kwargs) -> ContextCapacityDemandMap:
     return ContextCapacityDemandMap(
         **kwargs,
         classes=classes,
-        context_histogram=build_context_histogram(
-            tuple(item.context_tokens for item in classes)
-        ),
+        context_histogram=build_context_histogram(tuple(item.context_tokens for item in classes)),
     )
 
 
@@ -551,6 +549,7 @@ def test_cold_worker_announces_building_before_executor_reload():
             ("reload", span, context, generation)
         ),
         current_span=None,
+        materialization_identity_hashes=(HASHES[4],),
     )
     joining = advertisement(manifest, "cold", 0, 1)
 
@@ -560,7 +559,7 @@ def test_cold_worker_announces_building_before_executor_reload():
         context_tokens=10,
         kv_block_size=1,
         max_sessions=1,
-        weight_hashes=(HASHES[0],),
+        weight_hashes=(HASHES[4],),
     )
     deadline = time.monotonic() + 1
     while status["phase"] != "building" and time.monotonic() < deadline:
@@ -571,7 +570,7 @@ def test_cold_worker_announces_building_before_executor_reload():
             context_tokens=10,
             kv_block_size=1,
             max_sessions=1,
-            weight_hashes=(HASHES[0],),
+            weight_hashes=(HASHES[4],),
         )
 
     assert status["phase"] == "building"
@@ -579,6 +578,7 @@ def test_cold_worker_announces_building_before_executor_reload():
     assert len(publisher.bootstrap) == 1
     intent = publisher.bootstrap[0]
     assert intent.lease.state is SpanState.BUILDING
+    assert intent.lease.weight_hashes == (HASHES[4],)
     assert intent.lease.available_kv_bytes_snapshot == 0
     assert events == [("reload", intent.lease.hosted_span, 10, 1)]
 

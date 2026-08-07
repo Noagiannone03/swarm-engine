@@ -87,6 +87,9 @@ def _update_args_from_shared_state(args, shared_state: SharedState, force_update
     selected_execution_device = shared_state.get("execution_device")
     if selected_execution_device:
         args.execution_device = selected_execution_device
+    selected_execution_plan = shared_state.get("execution_plan_id")
+    if selected_execution_plan:
+        args.execution_plan_id = selected_execution_plan
 
     # A worker may load an optimized local artifact (for example an MLX model on
     # macOS) while serving the scheduler's public model name. Preserve that

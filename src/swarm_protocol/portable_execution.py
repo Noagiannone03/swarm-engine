@@ -104,9 +104,7 @@ def stages_for_span(
         if stage.end_layer <= span.start or stage.start_layer >= span.end:
             continue
         if stage.start_layer != cursor or stage.end_layer > span.end:
-            raise ValueError(
-                "worker span is not aligned to signed execution-stage boundaries"
-            )
+            raise ValueError("worker span is not aligned to signed execution-stage boundaries")
         selected.append(stage)
         cursor = stage.end_layer
     if cursor != span.end:
@@ -124,14 +122,14 @@ def required_execution_descriptors(
 
     artifacts = {artifact.path: artifact for artifact in artifact_index.artifacts}
     required_paths = {
-        path
-        for stage in stages
-        for path in (stage.graph_path, *stage.external_data_paths)
+        path for stage in stages for path in (stage.graph_path, *stage.external_data_paths)
     }
     try:
         return tuple(artifacts[path] for path in sorted(required_paths))
     except KeyError as exc:  # Defensive: ModelArtifactIndex normally rejects this first.
-        raise ValueError(f"portable execution stage references unsigned artifact {exc.args[0]!r}") from exc
+        raise ValueError(
+            f"portable execution stage references unsigned artifact {exc.args[0]!r}"
+        ) from exc
 
 
 def required_execution_storage_bytes(
@@ -142,9 +140,31 @@ def required_execution_storage_bytes(
 ) -> int:
     stages = stages_for_span(plan, manifest, span)
     return sum(
-        descriptor.size
-        for descriptor in required_execution_descriptors(artifact_index, stages)
+        descriptor.size for descriptor in required_execution_descriptors(artifact_index, stages)
     )
+
+
+def portable_span_static_bytes(
+    artifact_index: ModelArtifactIndex,
+    plan: ModelExecutionPlan,
+    manifest: ModelManifest,
+    span: LayerSpan,
+) -> int | None:
+    """Return exact signed static bytes for one executable plan boundary.
+
+    ``None`` is a normal placement result: the candidate cuts through an ONNX
+    stage and therefore cannot be materialized. Any other contract error still
+    propagates fail-closed instead of being mistaken for insufficient memory.
+    """
+
+    boundaries = {0, manifest.num_layers}
+    for stage in plan.stages:
+        if stage.kind is ExecutionStageKind.DECODER:
+            boundaries.add(stage.start_layer)
+            boundaries.add(stage.end_layer)
+    if span.start not in boundaries or span.end not in boundaries:
+        return None
+    return required_execution_storage_bytes(artifact_index, plan, manifest, span)
 
 
 def verify_execution_span(
@@ -161,9 +181,7 @@ def verify_execution_span(
     plan = select_execution_plan(artifact_index, device=device, plan_id=plan_id)
     stages = stages_for_span(plan, manifest, span)
     required = required_execution_descriptors(artifact_index, stages)
-    verified_paths = {
-        descriptor.path: verify_artifact(root, descriptor) for descriptor in required
-    }
+    verified_paths = {descriptor.path: verify_artifact(root, descriptor) for descriptor in required}
     verified: list[VerifiedExecutionStage] = []
     for stage in stages:
         verified.append(
@@ -175,9 +193,7 @@ def verify_execution_span(
                 ),
             )
         )
-    artifact_bytes = required_execution_storage_bytes(
-        artifact_index, plan, manifest, span
-    )
+    artifact_bytes = required_execution_storage_bytes(artifact_index, plan, manifest, span)
     return VerifiedExecutionSpan(
         plan=plan,
         span=span,
