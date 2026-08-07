@@ -179,7 +179,39 @@ class ModelRegistryBundle(ContractModel):
         for role, digest in expected.items():
             if artifact_collection_hash(self.artifact_index, role) != digest:
                 raise ValueError(f"manifest {role.value} collection hash does not match its index")
+        from swarm_protocol.model_manifest import execution_plan_hash
+
+        if self.artifact_index.execution_plans:
+            if self.manifest.execution_plan_hash is None:
+                raise ValueError("portable execution plans are not bound by the model manifest")
+            if execution_plan_hash(self.artifact_index) != self.manifest.execution_plan_hash:
+                raise ValueError("manifest execution plan hash does not match its index")
+            for plan in self.artifact_index.execution_plans:
+                self._validate_execution_plan_layers(plan)
+        elif self.manifest.execution_plan_hash is not None:
+            raise ValueError("manifest binds an execution plan missing from its artifact index")
         return self
+
+    def _validate_execution_plan_layers(self, plan) -> None:
+        from swarm_protocol.contracts import ExecutionStageKind
+
+        inputs = [stage for stage in plan.stages if stage.kind is ExecutionStageKind.INPUT]
+        outputs = [stage for stage in plan.stages if stage.kind is ExecutionStageKind.OUTPUT]
+        decoders = sorted(
+            (stage for stage in plan.stages if stage.kind is ExecutionStageKind.DECODER),
+            key=lambda stage: (stage.start_layer, stage.end_layer),
+        )
+        if len(inputs) != 1 or inputs[0].start_layer != 0:
+            raise ValueError("execution plan requires exactly one layer-zero input endpoint")
+        if len(outputs) != 1 or outputs[0].start_layer != self.manifest.num_layers:
+            raise ValueError("execution plan requires exactly one final output endpoint")
+        cursor = 0
+        for stage in decoders:
+            if stage.start_layer != cursor or stage.end_layer > self.manifest.num_layers:
+                raise ValueError("decoder execution stages must tile model layers exactly")
+            cursor = stage.end_layer
+        if cursor != self.manifest.num_layers:
+            raise ValueError("decoder execution stages do not cover every model layer")
 
     @property
     def model_swarm_id(self) -> str:

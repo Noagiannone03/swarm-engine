@@ -24,8 +24,13 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from parallax.server.server_info import detect_node_hardware
+from parallax.server.backend_capabilities import (
+    DeviceKind,
+    canonical_device_for_rank,
+    device_kind,
+    require_executor_backend,
+)
 from parallax.utils.shared_state import SharedState
-from parallax.utils.utils import get_current_device
 from parallax_utils.logging_config import get_logger, set_log_level
 
 logger = get_logger(__name__)
@@ -110,11 +115,24 @@ def _configured_rise_samples() -> int:
     return value
 
 
-def _initialize_backend_runtime(gpu_backend: str) -> str:
+def _initialize_backend_runtime(
+    gpu_backend: str, execution_device: str | None = None
+) -> str:
     """Initialize the same device runtime imported by the future executor."""
 
-    device = get_current_device()
-    if device == "mlx":
+    if execution_device is None:
+        # Keep heavyweight Torch/MLX device discovery out of scheduler and
+        # contract-only imports. The capacity subprocess needs it only when the
+        # installer did not pin an execution provider explicitly.
+        from parallax.utils.utils import get_current_device
+
+        device = get_current_device()
+    else:
+        device = execution_device
+    kind = device_kind(device)
+    device = canonical_device_for_rank(device, 0)
+    require_executor_backend(device, gpu_backend)
+    if kind is DeviceKind.MLX:
         import mlx.core as mx
 
         # Importing the executor pulls in the actual MLX model/cache stack.
@@ -122,21 +140,35 @@ def _initialize_backend_runtime(gpu_backend: str) -> str:
         mx.distributed.init()
         mx.eval(mx.zeros(1))
         return device
-    if device.startswith("cuda"):
+    if kind in {DeviceKind.CUDA, DeviceKind.XPU}:
         import torch
 
-        torch.cuda.init()
+        runtime = torch.cuda if kind is DeviceKind.CUDA else torch.xpu
+        runtime.init()
         module = (
             "parallax.server.executor.vllm_executor"
             if gpu_backend == "vllm"
             else "parallax.server.executor.sglang_executor"
         )
         importlib.import_module(module)
-        # Materialize a context on every visible device before cudaMemGetInfo.
-        for index in range(torch.cuda.device_count()):
-            with torch.cuda.device(index):
-                torch.empty(1, device=f"cuda:{index}")
-        return "cuda"
+        # Materialize a context on every visible device before mem_get_info.
+        for index in range(runtime.device_count()):
+            with runtime.device(index):
+                torch.empty(1, device=f"{kind.value}:{index}")
+        return kind.value
+    if kind is DeviceKind.DIRECTML:
+        try:
+            import onnxruntime as ort
+        except (ImportError, OSError) as exc:
+            raise RuntimeError("ONNX Runtime DirectML is not installed") from exc
+        if "DmlExecutionProvider" not in tuple(ort.get_available_providers()):
+            raise RuntimeError("ONNX Runtime did not expose DmlExecutionProvider")
+        # Import the real executor/runner stack before the first measurement.
+        # The live DXGI query performed by the detector then observes this
+        # process, while the later immutable placement subtracts exact signed
+        # stage and KV geometry.
+        importlib.import_module("parallax.server.executor.onnx_executor")
+        return device
     raise RuntimeError(f"Unsupported inference device for capacity probe: {device}")
 
 
@@ -144,27 +176,29 @@ def run_runtime_capacity_probe(
     gpu_backend: str,
     shared_state_dict: dict,
     log_level: str = "INFO",
+    execution_device: str | None = None,
     *,
-    detector: Callable[[str | None], dict[str, Any]] = detect_node_hardware,
+    detector: Callable[[str | None, str | None], dict[str, Any]] = detect_node_hardware,
 ) -> None:
     """Publish stable live capacity until placement freezes the contract."""
 
     set_log_level(log_level)
     state = SharedState(shared_state_dict)
     try:
-        device = _initialize_backend_runtime(gpu_backend)
+        device = _initialize_backend_runtime(gpu_backend, execution_device)
         tracker = StableCapacityTracker(rise_samples=_configured_rise_samples())
         sequence = 0
         state.update(
             capacity_probe_state="sampling",
             capacity_probe_error=None,
             capacity_probe_device=device,
+            execution_device=device,
         )
         sample_seconds = _configured_sample_seconds()
         while not state.get("capacity_contract_frozen", False) and not state.get(
             "capacity_probe_stop", False
         ):
-            hardware = detector(None)
+            hardware = detector(None, device)
             advertised = hardware.get("usable_memory_bytes")
             if advertised is None:
                 raise RuntimeError("backend did not expose a usable-memory envelope")
@@ -209,7 +243,12 @@ def launch_runtime_capacity_probe(args, shared_state: SharedState) -> multiproce
     )
     process = multiprocessing.Process(
         target=run_runtime_capacity_probe,
-        args=(args.gpu_backend, shared_state.dict, args.log_level),
+        args=(
+            args.gpu_backend,
+            shared_state.dict,
+            args.log_level,
+            getattr(args, "execution_device", None),
+        ),
     )
     process.start()
     return process

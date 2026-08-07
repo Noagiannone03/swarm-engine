@@ -140,6 +140,23 @@ def artifact_collection_hash(index: ModelArtifactIndex, role: ArtifactRole) -> s
     return _canonical_hash(f"fabi/model-artifacts/{role.value}/v1", descriptors)
 
 
+def execution_plan_hash(index: ModelArtifactIndex) -> str:
+    """Bind portable graph topology and every referenced byte descriptor."""
+
+    if not index.execution_plans:
+        raise ValueError("model artifact index has no execution plans")
+    portable_roles = {ArtifactRole.EXECUTION_GRAPH, ArtifactRole.EXECUTION_DATA}
+    payload = {
+        "plans": [plan.model_dump(mode="json") for plan in index.execution_plans],
+        "artifacts": [
+            artifact.model_dump(mode="json", exclude_none=True)
+            for artifact in index.artifacts
+            if artifact.role in portable_roles
+        ],
+    }
+    return _canonical_hash("fabi/model-execution-plans/v1", payload)
+
+
 def _media_type(path: str) -> str:
     lower = path.lower()
     if lower.endswith(".safetensors"):

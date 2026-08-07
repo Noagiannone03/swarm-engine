@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils.common import SUPPORTED_LORA_TARGET_MODULES
 
 from parallax.server.executor.base_executor import BaseExecutor
+from parallax.server.backend_capabilities import canonical_device_for_rank, device_kind
 from parallax.server.request import (
     InitialRequest,
     IntermediateRequest,
@@ -145,6 +146,7 @@ class SGLExecutor(BaseExecutor):
             "lora_backend": self.lora_backend,
             "max_lora_chunk_size": self.max_lora_chunk_size,
             "minimum_kv_tokens": planned_context_tokens,
+            "device": device,
         }
         logger.debug(
             f"Initializing SGLang model runner for repo={model_repo}, layers=[{start_layer}, {end_layer})"
@@ -156,10 +158,12 @@ class SGLExecutor(BaseExecutor):
             f"SGLang model runner initialized. num_layers={self.config.get('num_hidden_layers')}"
         )
 
-        # Set device to specific CUDA device based on tp_rank
-        # This ensures tensors are moved to the correct GPU
-        if device is None or device == "cuda":
-            device = f"cuda:{tp_rank}"
+        # Keep the selected accelerator identical across SGLang and Parallax.
+        # SGLang receives the base kind while tensors use the ranked device.
+        if device is None:
+            raise ValueError("SGLang executor requires an explicit execution device")
+        device_kind(device)
+        device = canonical_device_for_rank(device, int(tp_rank or 0))
 
         self.chunked_prefill_size = self._normalize_chunked_prefill_size(
             chunked_prefill_size, self.model_runner.page_size

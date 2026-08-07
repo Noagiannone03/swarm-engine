@@ -83,6 +83,24 @@ def test_vllm_backend_preserves_explicit_logging_override(monkeypatch):
     assert os.environ["VLLM_CONFIGURE_LOGGING"] == "1"
 
 
+def test_sglang_backend_receives_explicit_xpu_device(monkeypatch):
+    class FakeExecutor:
+        def __init__(self, **config):
+            self.config = config
+
+    fake_module = types.ModuleType("parallax.server.executor.sglang_executor")
+    fake_module.SGLExecutor = FakeExecutor
+    monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
+    monkeypatch.setattr(factory, "create_executor_config", lambda *_args: {})
+
+    executor = factory.create_from_args(
+        SimpleNamespace(gpu_backend="sglang"),
+        device="xpu",
+    )
+
+    assert executor.config["device"] == "xpu"
+
+
 def test_executor_process_propagates_initialization_failure(monkeypatch):
     monkeypatch.setattr(factory, "set_log_level", lambda _level: None)
     monkeypatch.setattr(

@@ -38,6 +38,7 @@ from parallax.server.memory_budget import (
     MemoryPressureLevel,
     MemoryPressureObservation,
     configured_cuda_reserve_bytes,
+    configured_xpu_reserve_bytes,
     configured_system_admission_floor_bytes,
     configured_system_reserve_bytes,
 )
@@ -83,6 +84,9 @@ def _update_args_from_shared_state(args, shared_state: SharedState, force_update
     args.planned_context_tokens = model_info.get("planned_context_tokens")
     args.allocation_epoch = model_info.get("allocation_epoch")
     args.model_revision = model_info.get("model_revision")
+    selected_execution_device = shared_state.get("execution_device")
+    if selected_execution_device:
+        args.execution_device = selected_execution_device
 
     # A worker may load an optimized local artifact (for example an MLX model on
     # macOS) while serving the scheduler's public model name. Preserve that
@@ -539,7 +543,7 @@ def _consume_initial_autonomous_reload(shared_state: SharedState) -> bool:
 
 
 def _build_memory_pressure_guards():
-    """Create host-RAM and CUDA-VRAM guards from maintained OS/runtime APIs."""
+    """Create host-RAM and accelerator-memory guards from maintained runtime APIs."""
 
     guards = []
     try:
@@ -584,8 +588,23 @@ def _build_memory_pressure_guards():
                         ),
                     )
                 )
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and xpu.is_available():
+            for device in range(xpu.device_count()):
+                _, total = xpu.mem_get_info(device)
+                guards.append(
+                    MemoryPressureGuard(
+                        name=f"xpu:{device}",
+                        controller=MemoryPressureController(
+                            system_reserve_bytes=configured_xpu_reserve_bytes(total)
+                        ),
+                        available_reader=lambda device=device: int(
+                            xpu.mem_get_info(device)[0]
+                        ),
+                    )
+                )
     except Exception:
-        logger.warning("Could not initialize the CUDA memory-pressure guard", exc_info=True)
+        logger.warning("Could not initialize accelerator memory-pressure guards", exc_info=True)
     return guards
 
 

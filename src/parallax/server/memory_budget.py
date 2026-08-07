@@ -22,6 +22,8 @@ logger = get_logger(__name__)
 GIB = 1024**3
 MIB = 1024**2
 DEFAULT_CUDA_RUNTIME_OVERHEAD_MB = 512.0
+DEFAULT_XPU_RUNTIME_OVERHEAD_MB = 512.0
+DEFAULT_DIRECTML_RUNTIME_OVERHEAD_MB = 512.0
 DEFAULT_MLX_CACHE_LIMIT_MB = 256.0
 DEFAULT_MLX_RUNTIME_OVERHEAD_MB = 512.0
 DEFAULT_PRESSURE_POLL_SECONDS = 1.0
@@ -44,11 +46,18 @@ class MlxMemoryBudget:
 
 
 @dataclass(frozen=True)
-class CudaMemoryBudget:
+class DeviceMemoryBudget:
     total_bytes: int
     available_bytes: int
     device_reserve_bytes: int
     usable_bytes: int
+
+
+# Compatibility names keep the public CUDA helper stable while making the
+# identical free/total/reserve contract available to other discrete devices.
+CudaMemoryBudget = DeviceMemoryBudget
+XpuMemoryBudget = DeviceMemoryBudget
+DirectMlMemoryBudget = DeviceMemoryBudget
 
 
 class MemoryPressureLevel(str, Enum):
@@ -284,6 +293,36 @@ def configured_cuda_reserve_bytes(total_bytes: int) -> int:
     return min(max(0, reserve), max(0, int(total_bytes)))
 
 
+def configured_xpu_reserve_bytes(total_bytes: int) -> int:
+    """Return memory kept for the Intel XPU runtime and desktop compositor."""
+
+    configured = _positive_env_bytes("PARALLAX_XPU_SYSTEM_RESERVE_GB", GIB)
+    reserve = (
+        configured
+        if configured is not None
+        else int(DEFAULT_XPU_RUNTIME_OVERHEAD_MB * MIB)
+    )
+    return min(max(0, reserve), max(0, int(total_bytes)))
+
+
+def configured_directml_reserve_bytes(total_bytes: int) -> int:
+    """Return a small runtime/workspace reserve inside the live DXGI budget.
+
+    Windows already adjusts the process budget for competing applications.
+    This reserve is therefore not a guessed replacement for live telemetry;
+    it only leaves room for DirectML command queues and graph workspaces that
+    are created after cold placement. Operators may override it explicitly.
+    """
+
+    configured = _positive_env_bytes("PARALLAX_DIRECTML_RUNTIME_RESERVE_GB", GIB)
+    reserve = (
+        configured
+        if configured is not None
+        else int(DEFAULT_DIRECTML_RUNTIME_OVERHEAD_MB * MIB)
+    )
+    return min(max(0, reserve), max(0, int(total_bytes)))
+
+
 def calculate_cuda_memory_budget(
     *, total_bytes: int, available_bytes: int, device_reserve_bytes: int
 ) -> CudaMemoryBudget:
@@ -308,6 +347,58 @@ def current_cuda_memory_budget(torch_module, device=None) -> CudaMemoryBudget:
         total_bytes=total,
         available_bytes=available,
         device_reserve_bytes=configured_cuda_reserve_bytes(total),
+    )
+
+
+def current_xpu_memory_budget(torch_module, device=None) -> XpuMemoryBudget:
+    """Read global Intel-device availability through ``torch.xpu.mem_get_info``."""
+
+    available, total = torch_module.xpu.mem_get_info(device)
+    total = max(0, int(total))
+    available = min(total, max(0, int(available)))
+    reserve = configured_xpu_reserve_bytes(total)
+    return XpuMemoryBudget(
+        total_bytes=total,
+        available_bytes=available,
+        device_reserve_bytes=reserve,
+        usable_bytes=max(0, available - reserve),
+    )
+
+
+def calculate_directml_memory_budget(
+    *,
+    total_bytes: int,
+    local_budget_bytes: int,
+    local_current_usage_bytes: int,
+    device_reserve_bytes: int,
+    unified_memory: bool,
+    host_available_bytes: Optional[int] = None,
+) -> DirectMlMemoryBudget:
+    """Build a DirectML capacity envelope from live DXGI process counters.
+
+    The local segment is the target working set documented by Microsoft.  A
+    discrete adapter must not count the non-local/pageable segment as usable
+    model capacity because doing so can freeze the desktop.  On UMA hardware,
+    the same local segment shares physical RAM with the host, so the current
+    OS-available signal is an additional hard ceiling.
+    """
+
+    total = max(0, int(total_bytes))
+    budget = max(0, int(local_budget_bytes))
+    usage = max(0, int(local_current_usage_bytes))
+    available = budget - usage if usage < budget else 0
+    if total > 0:
+        available = min(total, available)
+    if unified_memory:
+        if host_available_bytes is None:
+            raise ValueError("UMA DirectML budgeting requires live host availability")
+        available = min(available, max(0, int(host_available_bytes)))
+    reserve = min(max(0, int(device_reserve_bytes)), total or available)
+    return DirectMlMemoryBudget(
+        total_bytes=total,
+        available_bytes=available,
+        device_reserve_bytes=reserve,
+        usable_bytes=max(0, available - reserve),
     )
 
 

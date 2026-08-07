@@ -1,5 +1,7 @@
+import sys
 from types import SimpleNamespace
 
+from parallax.server import runtime_capacity
 from parallax.server.executor.base_executor import BaseExecutor
 
 
@@ -54,3 +56,29 @@ def test_runtime_capacity_publication_uses_initialized_backend_values():
         "kv_cache_block_size": 32,
         "max_concurrent_requests": 6,
     }
+
+
+def test_directml_capacity_probe_honors_explicit_device(monkeypatch):
+    imported = []
+    monkeypatch.setitem(
+        sys.modules,
+        "onnxruntime",
+        SimpleNamespace(
+            get_available_providers=lambda: (
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_capacity.importlib,
+        "import_module",
+        lambda name: imported.append(name),
+    )
+
+    selected = runtime_capacity._initialize_backend_runtime(
+        "onnxruntime", "directml:2"
+    )
+
+    assert selected == "directml:2"
+    assert imported == ["parallax.server.executor.onnx_executor"]

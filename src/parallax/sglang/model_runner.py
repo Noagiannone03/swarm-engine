@@ -39,6 +39,7 @@ from sglang.srt.utils import (
 
 from parallax.sglang.monkey_patch import apply_parallax_sglang_monkey_patch
 from parallax.server.memory_contract import MemoryContractError
+from parallax.server.backend_capabilities import device_kind
 from parallax.sglang.monkey_patch_utils.weight_loader_filter import (
     set_layer_range_for_filtering,
 )
@@ -239,8 +240,14 @@ def form_sgl_server_args(
     lora_backend: Optional[str] = "triton",
     max_lora_chunk_size: Optional[int] = 128,
     max_num_tokens_per_batch: int = 16384,
+    device: str = "cuda",
 ):
     """Creates a SGL ServerArgs object"""
+    runtime_device = device_kind(device).value
+    if runtime_device == "xpu" and attention_backend == "flashinfer":
+        attention_backend = "intel_xpu"
+    elif runtime_device == "cpu" and attention_backend == "flashinfer":
+        attention_backend = "torch_native"
     sgl_server_args = ServerArgs(
         model_path=model_path,
         dtype=dtype,
@@ -266,6 +273,7 @@ def form_sgl_server_args(
         # the caller validates that measured pool against the scheduler tier.
         max_total_tokens=None,
         max_prefill_tokens=max_num_tokens_per_batch,
+        device=runtime_device,
     )
     return sgl_server_args
 
@@ -362,6 +370,7 @@ def initialize_sgl_model_runner(
         lora_backend,
         max_lora_chunk_size,
         max_num_tokens_per_batch=max_num_tokens_per_batch,
+        device=kwargs.get("device") or "cuda",
     )
     initialize_moe_config(server_args)
     quant_method = None

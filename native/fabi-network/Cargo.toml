@@ -22,6 +22,7 @@ blake3 = "1.8"
 clap = { version = "4.5", features = ["derive", "env"] }
 data-encoding = "2.9"
 futures = "0.3"
+fabi-dxgi = { path = "../fabi-dxgi" }
 iroh = { version = "=1.0.3", default-features = true }
 libp2p = { version = "=0.56.0", default-features = false, features = ["dns", "ed25519", "identify", "kad", "macros", "noise", "tcp", "tokio", "yamux"] }
 n0-future = "0.3"

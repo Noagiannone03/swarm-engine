@@ -1179,6 +1179,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabi-dxgi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "windows",
+]
+
+[[package]]
 name = "fabi-network"
 version = "0.1.0"
 dependencies = [
@@ -1188,6 +1196,7 @@ dependencies = [
  "blake3",
  "clap",
  "data-encoding",
+ "fabi-dxgi",
  "futures",
  "iroh",
  "libp2p",

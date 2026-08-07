@@ -224,6 +224,17 @@ class TestMessageUtil:
             np.array(original_tensor.tolist()),
         )
 
+    @pytest.mark.parametrize("device", ["winml", "directml", "openvino", "qnn"])
+    def test_numpy_tensor_serialization_for_onnx_providers(self, device):
+        original = np.arange(24, dtype=np.float16).reshape(2, 3, 4)
+
+        serialized = tensor_to_bytes(original, device=device)
+        restored = bytes_to_tensor(serialized, device=device)
+
+        assert isinstance(restored, np.ndarray)
+        assert restored.dtype == original.dtype
+        np.testing.assert_array_equal(restored, original)
+
     def test_sampling_params_conversion(self):
         """Test SamplingParams conversion to and from proto."""
         params = SamplingParams(

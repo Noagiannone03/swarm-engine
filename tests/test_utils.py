@@ -29,6 +29,7 @@ def test_is_metal_available_returns_false_when_metal_api_missing(monkeypatch):
 def test_get_current_device_prefers_mlx_when_metal_available(monkeypatch):
     monkeypatch.setattr(utils, "is_cuda_available", lambda: False)
     monkeypatch.setattr(utils, "is_metal_available", lambda: True)
+    monkeypatch.setattr(utils, "available_ort_execution_providers", lambda: ())
 
     assert utils.get_current_device() == "mlx"
 
@@ -36,8 +37,33 @@ def test_get_current_device_prefers_mlx_when_metal_available(monkeypatch):
 def test_get_current_device_prefers_mlx_when_both_backends_report_available(monkeypatch):
     monkeypatch.setattr(utils, "is_cuda_available", lambda: True)
     monkeypatch.setattr(utils, "is_metal_available", lambda: True)
+    monkeypatch.setattr(utils, "available_ort_execution_providers", lambda: ())
 
     assert utils.get_current_device() == "mlx"
+
+
+def test_get_current_device_uses_xpu_when_cuda_and_mlx_are_unavailable(monkeypatch):
+    monkeypatch.setattr(utils, "is_metal_available", lambda: False)
+    monkeypatch.setattr(utils, "available_ort_execution_providers", lambda: ())
+    monkeypatch.setattr(utils.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        utils.torch,
+        "xpu",
+        SimpleNamespace(is_available=lambda: True),
+        raising=False,
+    )
+
+    assert utils.get_current_device() == "xpu"
+
+
+def test_get_device_dtype_uses_torch_for_xpu_and_cpu():
+    assert utils.get_device_dtype("bfloat16", "xpu:0") is utils.torch.bfloat16
+    assert utils.get_device_dtype("float32", "cpu") is utils.torch.float32
+
+
+def test_get_device_dtype_uses_numpy_for_onnx_execution_providers():
+    assert utils.get_device_dtype("float16", "directml") is utils.np.float16
+    assert utils.get_device_dtype("bfloat16", "openvino") is utils.np.float32
 
 
 def test_load_config_only_reads_local_config(tmp_path):

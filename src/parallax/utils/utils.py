@@ -16,6 +16,12 @@ import psutil
 import torch
 import zmq
 
+from parallax.server.backend_capabilities import (
+    TensorRuntime,
+    detect_best_device,
+    tensor_runtime_for_device,
+)
+
 try:
     import mlx.core as mx
 except ImportError:  # MLX is not available in native Windows CUDA runtimes.
@@ -60,31 +66,55 @@ def is_metal_available():
 
 def get_current_device():
     """
-    Returns the backend device name.
-    Parallax currently supports cuda, mlx, cpu
+    Returns the best locally available execution device.
     """
-    device = "cpu"
-    if is_cuda_available():
-        device = "cuda"
-    if is_metal_available():
-        device = "mlx"
-    return device
+    return detect_best_device(
+        torch_module=torch,
+        metal_available=is_metal_available(),
+        ort_providers=available_ort_execution_providers(),
+    )
+
+
+def available_ort_execution_providers() -> tuple[str, ...]:
+    """Return providers reported by the installed ONNX Runtime, if any.
+
+    Importing ONNX Runtime is optional and can fail when a wheel is present but
+    one of its native dependencies is unavailable.  Such a host must remain a
+    non-accelerated CPU candidate instead of advertising a broken executor.
+    """
+
+    try:
+        import onnxruntime as ort
+
+        return tuple(str(provider) for provider in ort.get_available_providers())
+    except (ImportError, OSError, RuntimeError, AttributeError):
+        return ()
 
 
 def get_device_dtype(dtype_str: str, device: str):
     """Gets the real data type according to current device"""
-    if device is not None and device.startswith("cuda"):
+    tensor_runtime = tensor_runtime_for_device(device)
+    if tensor_runtime is TensorRuntime.TORCH:
         dtype_map = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
             "float32": torch.float32,
         }
-    else:
+    elif tensor_runtime is TensorRuntime.MLX:
         mlx = _require_mlx()
         dtype_map = {
             "float16": mlx.float16,
             "bfloat16": mlx.bfloat16,
             "float32": mlx.float32,
+        }
+    else:
+        dtype_map = {
+            "float16": np.float16,
+            # NumPy has no portable native bfloat16. ONNX Runtime receives the
+            # graph's declared dtype and provider-owned values; host boundary
+            # tensors use float32 until ml_dtypes is explicitly qualified.
+            "bfloat16": np.float32,
+            "float32": np.float32,
         }
     return dtype_map[dtype_str]
 

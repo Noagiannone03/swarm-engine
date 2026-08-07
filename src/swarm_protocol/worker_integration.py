@@ -30,6 +30,10 @@ from swarm_protocol.contracts import (
     WorkerRole,
 )
 from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
+from swarm_protocol.portable_execution import (
+    VerifiedExecutionSpan,
+    materialize_execution_span,
+)
 
 _REPORT_TTL_MS = 45_000
 _VERIFICATION_RETRY_SECONDS = 30.0
@@ -64,22 +68,27 @@ class WorkerServingSnapshot:
     outgoing_links: tuple[LinkMetric, ...] = ()
     measured_prefill_tokens_per_second: float | None = None
     measured_decode_tokens_per_second: float | None = None
+    execution_plan_id: str | None = None
+    execution_device: str | None = None
 
     @property
-    def verification_key(self) -> tuple[str, str, int, int]:
+    def verification_key(self) -> tuple[str, str, int, int, str, str | None, str | None]:
         return (
             self.model_id,
             self.immutable_revision,
             self.span.start,
             self.span.end,
+            self.backend.value,
+            self.execution_plan_id,
+            self.execution_device,
         )
 
 
 @dataclass(frozen=True)
 class _VerifiedServingContract:
-    key: tuple[str, str, int, int]
+    key: tuple[str, str, int, int, str, str | None, str | None]
     bundle: ModelRegistryBundle
-    artifacts: VerifiedSpanArtifacts
+    artifacts: VerifiedSpanArtifacts | VerifiedExecutionSpan
 
 
 def _runtime_version() -> str:
@@ -118,11 +127,11 @@ class WorkerProtocolV3Reporter:
         self.registry = registry
         self.mode = mode
         self._lock = threading.RLock()
-        self._pending_key: tuple[str, str, int, int] | None = None
+        self._pending_key: tuple[str, str, int, int, str, str | None, str | None] | None = None
         self._verification_active = False
         self._verified: _VerifiedServingContract | None = None
         self._error: dict[str, str] | None = None
-        self._error_key: tuple[str, str, int, int] | None = None
+        self._error_key: tuple[str, str, int, int, str, str | None, str | None] | None = None
         self._retry_after = 0.0
         self._offer_seq = 0
         self._lease_seq = 0
@@ -376,19 +385,33 @@ class WorkerProtocolV3Reporter:
                 serving.model_id,
                 immutable_revision=serving.immutable_revision,
             )
-            model_root = _local_model_root(
-                serving.model_id,
-                serving.immutable_revision,
-                serving.span,
-                bundle.artifact_index,
-            )
-            artifacts = verify_worker_span(
-                model_root,
-                bundle.artifact_index,
-                bundle.manifest,
-                serving.span,
-                include_tokenizer=serving.supports_frontend,
-            )
+            if serving.backend is BackendKind.ONNXRUNTIME:
+                if not serving.execution_plan_id or not serving.execution_device:
+                    raise ValueError(
+                        "portable worker snapshot lacks execution plan or device identity"
+                    )
+                artifacts = materialize_execution_span(
+                    bundle.artifact_index,
+                    bundle.manifest,
+                    serving.span,
+                    device=serving.execution_device,
+                    plan_id=serving.execution_plan_id,
+                    local_files_only=True,
+                )
+            else:
+                model_root = _local_model_root(
+                    serving.model_id,
+                    serving.immutable_revision,
+                    serving.span,
+                    bundle.artifact_index,
+                )
+                artifacts = verify_worker_span(
+                    model_root,
+                    bundle.artifact_index,
+                    bundle.manifest,
+                    serving.span,
+                    include_tokenizer=serving.supports_frontend,
+                )
             result = _VerifiedServingContract(key=key, bundle=bundle, artifacts=artifacts)
         except Exception as exc:  # noqa: BLE001 - converted to a fail-closed status boundary
             logger.warning(

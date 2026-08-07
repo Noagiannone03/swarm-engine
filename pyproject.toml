@@ -65,6 +65,7 @@ parallax = "parallax.cli:main"
 fabi-swarm-registry = "swarm_protocol.registry_operator:main"
 fabi-catalog-router = "swarm_protocol.catalog_router:main"
 fabi-request-agent = "backend.server.request_agent_frontend:main"
+fabi-build-onnx-stages = "swarm_protocol.onnx_stage_builder:main"
 
 [project.optional-dependencies]
 
@@ -100,6 +101,14 @@ simulation = [
   # The offline lab uses the maintained max-flow implementation. It is not
   # installed on production workers and is never part of placement authority.
   "networkx>=3.4,<4",
+]
+
+portable-builder = [
+  # Keep graph construction out of the worker's mandatory environment.  The
+  # publisher pins Microsoft's exporter revision separately in every signed
+  # execution plan.
+  "onnx==1.22.0",
+  "onnxruntime>=1.23,<2",
 ]
 
 dev = [

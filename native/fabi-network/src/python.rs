@@ -118,6 +118,68 @@ const STREAM_CANCEL_CODE: u32 = 0xFAB1;
 type RpcResponse = std::result::Result<Vec<u8>, String>;
 type ConnectionCache = Arc<tokio::sync::Mutex<HashMap<EndpointId, Connection>>>;
 
+#[pyclass(frozen, name = "DxgiVideoMemoryInfo")]
+struct PyDxgiVideoMemoryInfo {
+    #[pyo3(get)]
+    adapter_index: u32,
+    #[pyo3(get)]
+    description: String,
+    #[pyo3(get)]
+    vendor_id: u32,
+    #[pyo3(get)]
+    device_id: u32,
+    #[pyo3(get)]
+    dedicated_video_memory: u64,
+    #[pyo3(get)]
+    dedicated_system_memory: u64,
+    #[pyo3(get)]
+    shared_system_memory: u64,
+    #[pyo3(get)]
+    local_budget: u64,
+    #[pyo3(get)]
+    local_current_usage: u64,
+    #[pyo3(get)]
+    local_available_for_reservation: u64,
+    #[pyo3(get)]
+    local_current_reservation: u64,
+    #[pyo3(get)]
+    local_headroom: u64,
+    #[pyo3(get)]
+    non_local_budget: u64,
+    #[pyo3(get)]
+    non_local_current_usage: u64,
+    #[pyo3(get)]
+    non_local_available_for_reservation: u64,
+    #[pyo3(get)]
+    non_local_current_reservation: u64,
+    #[pyo3(get)]
+    non_local_headroom: u64,
+}
+
+#[pyfunction]
+fn query_dxgi_video_memory(adapter_index: u32) -> PyResult<PyDxgiVideoMemoryInfo> {
+    let info = fabi_dxgi::query_video_memory(adapter_index).map_err(py_error)?;
+    Ok(PyDxgiVideoMemoryInfo {
+        adapter_index: info.adapter_index,
+        description: info.description,
+        vendor_id: info.vendor_id,
+        device_id: info.device_id,
+        dedicated_video_memory: info.dedicated_video_memory,
+        dedicated_system_memory: info.dedicated_system_memory,
+        shared_system_memory: info.shared_system_memory,
+        local_budget: info.local.budget,
+        local_current_usage: info.local.current_usage,
+        local_available_for_reservation: info.local.available_for_reservation,
+        local_current_reservation: info.local.current_reservation,
+        local_headroom: info.local.headroom(),
+        non_local_budget: info.non_local.budget,
+        non_local_current_usage: info.non_local.current_usage,
+        non_local_available_for_reservation: info.non_local.available_for_reservation,
+        non_local_current_reservation: info.non_local.current_reservation,
+        non_local_headroom: info.non_local.headroom(),
+    })
+}
+
 #[pyclass(name = "CatalogRecord", frozen)]
 struct PyCatalogRecord {
     #[pyo3(get)]
@@ -1524,6 +1586,7 @@ async fn get_connection(
 
 #[pymodule(gil_used = false)]
 fn fabi_network_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(query_dxgi_video_memory, module)?)?;
     module.add_function(wrap_pyfunction!(py_capability_public_key, module)?)?;
     module.add_function(wrap_pyfunction!(py_issue_route_capability, module)?)?;
     module.add_function(wrap_pyfunction!(py_verify_route_capability, module)?)?;
@@ -1533,6 +1596,7 @@ fn fabi_network_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(create_relay_enrollment_proof, module)?)?;
     module.add_class::<PyNetworkNode>()?;
+    module.add_class::<PyDxgiVideoMemoryInfo>()?;
     module.add_class::<PyCatalogRecord>()?;
     module.add_class::<PyRpcRequest>()?;
     module.add_class::<PyRpcStream>()?;

@@ -8,6 +8,7 @@ and performance tuning.
 
 import argparse
 
+from parallax.server.backend_capabilities import device_kind
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -180,7 +181,7 @@ def parse_args() -> argparse.Namespace:
         "--attention-backend",
         type=str,
         default="flashinfer",
-        choices=["torch_native", "flashinfer", "triton", "fa3"],
+        choices=["torch_native", "flashinfer", "triton", "fa3", "intel_xpu"],
         help="Choose the GPU attention kernels",
     )
 
@@ -307,8 +308,20 @@ def parse_args() -> argparse.Namespace:
         "--gpu-backend",
         type=str,
         default="sglang",
-        choices=["sglang", "vllm"],
+        choices=["sglang", "vllm", "onnxruntime"],
         help="GPU backend to use",
+    )
+    parser.add_argument(
+        "--execution-plan-id",
+        type=str,
+        default=None,
+        help="Signed portable execution plan id (auto-selected when unique)",
+    )
+    parser.add_argument(
+        "--execution-device",
+        type=str,
+        default=None,
+        help="Explicit execution device such as directml:0; normally auto-detected",
     )
 
     parser.add_argument(
@@ -342,6 +355,14 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.end_layer is not None and args.end_layer <= args.start_layer:
         raise ValueError("end_layer must be greater than start_layer")
+
+    if getattr(args, "execution_device", None) is not None:
+        device_kind(args.execution_device)
+    if (
+        getattr(args, "gpu_backend", None) == "onnxruntime"
+        and args.enable_weight_refit
+    ):
+        raise ValueError("onnxruntime does not support weight refit")
 
     # Validate memory fraction
     if not 0.0 <= args.kv_cache_memory_fraction <= 1.0:

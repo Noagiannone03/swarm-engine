@@ -1,0 +1,23 @@
+[package]
+name = "fabi-dxgi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Small safe wrapper around the Windows DXGI video-memory budget API"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Graphics_Dxgi",
+] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

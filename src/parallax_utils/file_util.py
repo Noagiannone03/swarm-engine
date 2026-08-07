@@ -14,11 +14,13 @@ def get_project_root():
         return root
 
     # Search for the project root by looking for pyproject.toml in parent directories
-    current_dir = Path(__file__).parent
+    # Resolve macOS' /tmp -> /private/tmp alias (and source-tree symlinks) before
+    # walking parents so every caller receives one canonical project identity.
+    current_dir = Path(__file__).resolve().parent
     while current_dir != current_dir.parent:
         if (current_dir / "pyproject.toml").exists():
-            return current_dir
+            return current_dir.resolve()
         current_dir = current_dir.parent
 
     # If not found, fallback to current working directory
-    return Path.cwd()
+    return Path.cwd().resolve()

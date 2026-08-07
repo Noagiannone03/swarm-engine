@@ -8,9 +8,13 @@ from parallax.server.memory_budget import (
     MemoryPressureLevel,
     adaptive_system_reserve_bytes,
     calculate_cuda_memory_budget,
+    calculate_directml_memory_budget,
     calculate_mlx_memory_budget,
     configure_mlx_memory_limits,
     configured_cuda_reserve_bytes,
+    configured_directml_reserve_bytes,
+    configured_xpu_reserve_bytes,
+    current_xpu_memory_budget,
     configured_system_admission_floor_bytes,
     current_mlx_memory_budget,
 )
@@ -74,6 +78,64 @@ def test_default_cuda_reserve_matches_cross_platform_runtime_overhead(monkeypatc
 
     assert configured_cuda_reserve_bytes(gb(8)) == gb(0.5)
     assert configured_cuda_reserve_bytes(gb(80)) == gb(0.5)
+
+
+def test_xpu_budget_uses_runtime_free_memory_and_explicit_reserve(monkeypatch):
+    monkeypatch.setenv("PARALLAX_XPU_SYSTEM_RESERVE_GB", "1")
+    torch_module = SimpleNamespace(
+        xpu=SimpleNamespace(mem_get_info=lambda _device: (gb(6), gb(8)))
+    )
+
+    budget = current_xpu_memory_budget(torch_module, 0)
+
+    assert budget.total_bytes == gb(8)
+    assert budget.available_bytes == gb(6)
+    assert budget.device_reserve_bytes == gb(1)
+    assert budget.usable_bytes == gb(5)
+    assert configured_xpu_reserve_bytes(gb(8)) == gb(1)
+
+
+def test_directml_discrete_budget_uses_only_live_local_dxgi_headroom(monkeypatch):
+    monkeypatch.delenv("PARALLAX_DIRECTML_RUNTIME_RESERVE_GB", raising=False)
+
+    budget = calculate_directml_memory_budget(
+        total_bytes=gb(16),
+        local_budget_bytes=gb(14),
+        local_current_usage_bytes=gb(2),
+        device_reserve_bytes=configured_directml_reserve_bytes(gb(16)),
+        unified_memory=False,
+        # Pageable shared memory is deliberately not accepted for a discrete GPU.
+        host_available_bytes=gb(64),
+    )
+
+    assert budget.available_bytes == gb(12)
+    assert budget.device_reserve_bytes == gb(0.5)
+    assert budget.usable_bytes == gb(11.5)
+
+
+def test_directml_uma_budget_is_capped_by_live_host_availability():
+    budget = calculate_directml_memory_budget(
+        total_bytes=gb(8),
+        local_budget_bytes=gb(7),
+        local_current_usage_bytes=gb(1),
+        device_reserve_bytes=gb(0.5),
+        unified_memory=True,
+        host_available_bytes=gb(3),
+    )
+
+    assert budget.available_bytes == gb(3)
+    assert budget.usable_bytes == gb(2.5)
+
+
+def test_directml_uma_budget_requires_live_host_signal():
+    with pytest.raises(ValueError, match="live host availability"):
+        calculate_directml_memory_budget(
+            total_bytes=gb(8),
+            local_budget_bytes=gb(6),
+            local_current_usage_bytes=0,
+            device_reserve_bytes=gb(0.5),
+            unified_memory=True,
+        )
 
 
 def test_cuda_budget_refuses_capacity_when_other_apps_consume_the_reserve():

@@ -29,6 +29,7 @@ from parallax.p2p.message_util import (
     proto_to_request,
     request_to_proto,
 )
+from parallax.server.backend_capabilities import is_torch_device
 from parallax.p2p.proto import forward_pb2
 from parallax.p2p.server import ServerState
 from parallax.server.engine_core_protocol import (
@@ -548,9 +549,7 @@ class BaseExecutor:
                                         logger.debug(
                                             f"Converting hidden_states dtype from {req.hidden_states.dtype} to {self.dtype} for request {req.request_id}"
                                         )
-                                        if self.device is not None and self.device.startswith(
-                                            "cuda"
-                                        ):
+                                        if is_torch_device(self.device):
                                             req.hidden_states = req.hidden_states.to(self.dtype)
                                         elif self.device == "mlx":
                                             req.hidden_states = req.hidden_states.astype(self.dtype)

@@ -7,6 +7,7 @@ import os
 from typing import Any, List, Optional
 
 from parallax.server.memory_contract import MemoryContractError
+from parallax.server.backend_capabilities import require_executor_backend
 from parallax.utils.model_artifact_cache import ModelArtifactStorageError
 from parallax.utils.shared_state import SharedState
 from parallax.utils.utils import get_current_device
@@ -59,6 +60,9 @@ def create_executor_config(args: argparse.Namespace, shared_state=None, conn=Non
         "planned_context_tokens": getattr(args, "planned_context_tokens", None),
     }
 
+    if args.gpu_backend == "onnxruntime":
+        config["execution_plan_id"] = getattr(args, "execution_plan_id", None)
+
     if args.gpu_backend == "sglang":
         config.update(
             {
@@ -93,13 +97,15 @@ def create_from_args(
     """
     config = create_executor_config(args, shared_state, conn)
     if device is None:
-        device = get_current_device()
-    if device is not None and device.startswith("cuda"):
-        if args.gpu_backend == "sglang":
+        device = getattr(args, "execution_device", None) or get_current_device()
+    backend = require_executor_backend(device, args.gpu_backend)
+    config["device"] = device
+    if backend in {"sglang", "vllm"}:
+        if backend == "sglang":
             from parallax.server.executor.sglang_executor import SGLExecutor
 
             executor = SGLExecutor(**config)
-        elif args.gpu_backend == "vllm":
+        elif backend == "vllm":
             # Parallax owns the process-wide logging configuration. vLLM otherwise
             # installs its own handlers at import time, which can hide executor
             # exceptions after a Windows ``spawn``. Keep user overrides available.
@@ -107,14 +113,14 @@ def create_from_args(
             from parallax.server.executor.vllm_executor import VLLMExecutor
 
             executor = VLLMExecutor(**config)
-        else:
-            raise ValueError(f"Unsupported GPU backend type: {args.gpu_backend}")
-    elif device == "mlx":
+    elif backend == "mlx":
         from parallax.server.executor.mlx_executor import MLXExecutor
 
         executor = MLXExecutor(**config)
-    else:
-        raise ValueError(f"Unsupported device type: {device}")
+    elif backend == "onnxruntime":
+        from parallax.server.executor.onnx_executor import OnnxExecutor
+
+        executor = OnnxExecutor(**config)
     return executor
 
 

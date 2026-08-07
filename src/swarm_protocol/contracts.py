@@ -21,6 +21,7 @@ NonEmpty = Annotated[str, Field(min_length=1)]
 PositiveInt = Annotated[int, Field(gt=0)]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 HashHex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+CommitHex = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 
 
 class ContractModel(BaseModel):
@@ -33,6 +34,7 @@ class BackendKind(str, Enum):
     MLX = "mlx"
     VLLM = "vllm"
     SGLANG = "sglang"
+    ONNXRUNTIME = "onnxruntime"
 
 
 class WorkerRole(str, Enum):
@@ -65,6 +67,29 @@ class ArtifactRole(str, Enum):
     ARCHITECTURE = "architecture"
     TOKENIZER = "tokenizer"
     WEIGHT = "weight"
+    EXECUTION_GRAPH = "execution_graph"
+    EXECUTION_DATA = "execution_data"
+
+
+class ExecutionProviderKind(str, Enum):
+    """Portable ONNX Runtime targets qualified by a published plan."""
+
+    WINML = "winml"
+    DIRECTML = "directml"
+    OPENVINO = "openvino"
+    QNN = "qnn"
+    CPU = "cpu"
+
+
+class OnnxExportTarget(str, Enum):
+    ORT_GENAI_CPU = "ort_genai_cpu"
+    ORT_GENAI_DML = "ort_genai_dml"
+
+
+class ExecutionStageKind(str, Enum):
+    INPUT = "input"
+    DECODER = "decoder"
+    OUTPUT = "output"
 
 
 class ArtifactDescriptor(ContractModel):
@@ -116,6 +141,115 @@ class TensorArtifactDescriptor(ContractModel):
         return self
 
 
+class ExecutionStageDescriptor(ContractModel):
+    """One composable, content-addressed graph in a portable execution plan.
+
+    Decoder stages tile the model layer range. Input and output endpoints are
+    separate graphs, so a worker downloads only the endpoint it owns and the
+    decoder chunks in its assigned span instead of a complete model copy.
+    """
+
+    stage_id: Annotated[str, Field(min_length=1, max_length=255)]
+    kind: ExecutionStageKind
+    start_layer: NonNegativeInt
+    end_layer: NonNegativeInt
+    graph_path: Annotated[str, Field(min_length=1, max_length=1024)]
+    external_data_paths: Annotated[tuple[str, ...], Field(max_length=100_000)] = ()
+    io_contract_hash: HashHex
+
+    @model_validator(mode="after")
+    def validate_stage(self) -> Self:
+        paths = (self.graph_path, *self.external_data_paths)
+        for path in paths:
+            parts = path.split("/")
+            if path.startswith("/") or "\\" in path or any(
+                part in {"", ".", ".."} for part in parts
+            ):
+                raise ValueError("execution artifact path must be normalized relative POSIX")
+        if tuple(sorted(set(self.external_data_paths))) != self.external_data_paths:
+            raise ValueError("execution external-data paths must be sorted and unique")
+        if self.kind is ExecutionStageKind.DECODER:
+            if self.end_layer <= self.start_layer:
+                raise ValueError("decoder execution stage must contain at least one layer")
+        elif self.end_layer != self.start_layer:
+            raise ValueError("endpoint execution stages cannot claim decoder layers")
+        return self
+
+
+class ModelExecutionPlan(ContractModel):
+    """Publisher-built ONNX graph set for one provider-compatible precision."""
+
+    protocol_version: int = PROTOCOL_VERSION
+    plan_id: Annotated[str, Field(min_length=1, max_length=255)]
+    backend: BackendKind = BackendKind.ONNXRUNTIME
+    format: Annotated[str, Field(pattern=r"^onnx$")] = "onnx"
+    precision: Annotated[str, Field(min_length=1, max_length=64)]
+    quantization: Annotated[str, Field(min_length=1, max_length=128)]
+    exporter: Annotated[str, Field(min_length=1, max_length=255)]
+    exporter_revision: CommitHex
+    # Portable graphs are publisher-built artifacts and generally live in a
+    # different repository than the immutable source checkpoint.  Keep that
+    # origin explicit and pinned: artifact hashes authenticate bytes, while the
+    # repository plus commit tells a fresh worker where those bytes are found.
+    artifact_repository_id: Annotated[str, Field(min_length=1, max_length=255)]
+    artifact_revision: CommitHex
+    export_target: OnnxExportTarget
+    activation_dtype: Annotated[str, Field(pattern=r"^(float16|float32)$")]
+    activation_hidden_size: PositiveInt
+    kv_num_heads: PositiveInt
+    kv_head_dim: PositiveInt
+    # Some accelerator EPs deliberately retain tiny shape/control nodes on the
+    # host.  Keep the exception list signed and node-exact: a worker profiles a
+    # warm-up and refuses READY if any other node falls back to CPU.  This is
+    # materially different from silently accepting arbitrary CPU fallback.
+    allowed_cpu_fallback_nodes: Annotated[
+        tuple[NonEmpty, ...], Field(max_length=256)
+    ] = ()
+    allowed_cpu_only_stages: Annotated[
+        tuple[NonEmpty, ...], Field(max_length=16)
+    ] = ()
+    execution_granularity_layers: PositiveInt = 1
+    providers: Annotated[
+        tuple[ExecutionProviderKind, ...], Field(min_length=1, max_length=16)
+    ]
+    stages: Annotated[tuple[ExecutionStageDescriptor, ...], Field(min_length=3, max_length=100_000)]
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> Self:
+        if self.protocol_version != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version: {self.protocol_version}")
+        if self.backend is not BackendKind.ONNXRUNTIME:
+            raise ValueError("portable execution plans currently require onnxruntime")
+        provider_values = tuple(provider.value for provider in self.providers)
+        if tuple(sorted(set(provider_values))) != provider_values:
+            raise ValueError("execution providers must be sorted and unique")
+        if tuple(sorted(set(self.allowed_cpu_fallback_nodes))) != self.allowed_cpu_fallback_nodes:
+            raise ValueError("allowed CPU fallback nodes must be sorted and unique")
+        if tuple(sorted(set(self.allowed_cpu_only_stages))) != self.allowed_cpu_only_stages:
+            raise ValueError("allowed CPU-only stages must be sorted and unique")
+        stage_ids = tuple(stage.stage_id for stage in self.stages)
+        if len(stage_ids) != len(set(stage_ids)):
+            raise ValueError("execution stage ids must be unique")
+        unknown_cpu_stages = sorted(set(self.allowed_cpu_only_stages) - set(stage_ids))
+        if unknown_cpu_stages:
+            raise ValueError(f"CPU-only policy references unknown stages {unknown_cpu_stages}")
+        provider_set = set(self.providers)
+        if self.export_target is OnnxExportTarget.ORT_GENAI_DML:
+            allowed = {ExecutionProviderKind.DIRECTML, ExecutionProviderKind.WINML}
+        else:
+            allowed = {ExecutionProviderKind.CPU}
+        if not provider_set <= allowed:
+            raise ValueError(
+                f"{self.export_target.value} graph cannot claim providers "
+                f"{sorted(provider.value for provider in provider_set - allowed)}"
+            )
+        if self.export_target is OnnxExportTarget.ORT_GENAI_CPU and (
+            self.allowed_cpu_fallback_nodes or self.allowed_cpu_only_stages
+        ):
+            raise ValueError("a CPU execution plan cannot declare CPU fallback exceptions")
+        return self
+
+
 class ModelArtifactIndex(ContractModel):
     """Persistent artifact index referenced by the compact DHT model manifest."""
 
@@ -124,6 +258,7 @@ class ModelArtifactIndex(ContractModel):
     immutable_revision: NonEmpty
     artifacts: Annotated[tuple[ArtifactDescriptor, ...], Field(min_length=1, max_length=100_000)]
     tensors: Annotated[tuple[TensorArtifactDescriptor, ...], Field(max_length=1_000_000)] = ()
+    execution_plans: Annotated[tuple[ModelExecutionPlan, ...], Field(max_length=128)] = ()
 
     @model_validator(mode="after")
     def validate_index(self) -> Self:
@@ -150,6 +285,20 @@ class ModelArtifactIndex(ContractModel):
                 raise ValueError("selective tensor source must have a signed Xet file hash")
             if tensor.offset + tensor.length > source.size:
                 raise ValueError("tensor byte range exceeds its signed source artifact")
+        plan_ids = tuple(plan.plan_id for plan in self.execution_plans)
+        if tuple(sorted(set(plan_ids))) != plan_ids:
+            raise ValueError("execution plans must be sorted by unique plan id")
+        for plan in self.execution_plans:
+            for stage in plan.stages:
+                graph = artifacts.get(stage.graph_path)
+                if graph is None or graph.role is not ArtifactRole.EXECUTION_GRAPH:
+                    raise ValueError("execution graph must reference a signed graph artifact")
+                for path in stage.external_data_paths:
+                    data = artifacts.get(path)
+                    if data is None or data.role is not ArtifactRole.EXECUTION_DATA:
+                        raise ValueError(
+                            "execution external data must reference a signed data artifact"
+                        )
         return self
 
 
@@ -285,6 +434,9 @@ class ModelManifest(ContractModel):
     attention_kv_contract_hash: HashHex
     prefill_contract_hash: HashHex
     wire_protocol_version: PositiveInt
+    # Optional for compatibility with v3 bundles published before portable
+    # graph plans existed. New plans are rejected unless this hash binds them.
+    execution_plan_hash: HashHex | None = None
 
     @model_validator(mode="after")
     def require_protocol_version(self) -> Self:
@@ -336,7 +488,7 @@ class ModelManifest(ContractModel):
     @property
     def model_swarm_id(self) -> str:
         payload = json.dumps(
-            self.model_dump(mode="json"),
+            self.model_dump(mode="json", exclude_none=True),
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,

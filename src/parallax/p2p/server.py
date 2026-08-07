@@ -1141,7 +1141,11 @@ class GradientServer:
                         else (
                             BackendKind.VLLM
                             if self.gpu_backend == "vllm"
-                            else BackendKind.SGLANG
+                            else (
+                                BackendKind.ONNXRUNTIME
+                                if self.gpu_backend == "onnxruntime"
+                                else BackendKind.SGLANG
+                            )
                         )
                     )
                     stable_memory_bytes = int(hardware.get("usable_memory_bytes") or 0)
@@ -2857,6 +2861,11 @@ class GradientServer:
                         else 1
                     ),
                 )
+                if runtime_backend == "onnxruntime":
+                    required_contract += (
+                        self._shared_state.get("execution_plan_id"),
+                        self._shared_state.get("execution_device"),
+                    )
                 if all(value is not None for value in required_contract):
                     serving_context_ceiling = (
                         int(self.planned_context_tokens)
@@ -2866,7 +2875,15 @@ class GradientServer:
                     backend = (
                         BackendKind.MLX
                         if runtime_backend == "mlx"
-                        else (BackendKind.VLLM if runtime_backend == "vllm" else BackendKind.SGLANG)
+                        else (
+                            BackendKind.VLLM
+                            if runtime_backend == "vllm"
+                            else (
+                                BackendKind.ONNXRUNTIME
+                                if runtime_backend == "onnxruntime"
+                                else BackendKind.SGLANG
+                            )
+                        )
                     )
                     report = self.swarm_v3_reporter.snapshot(
                         WorkerServingSnapshot(
@@ -2893,6 +2910,12 @@ class GradientServer:
                             ),
                             measured_decode_tokens_per_second=metrics.get(
                                 "decode_tokens_per_second"
+                            ),
+                            execution_plan_id=self._shared_state.get(
+                                "execution_plan_id"
+                            ),
+                            execution_device=self._shared_state.get(
+                                "execution_device"
                             ),
                         )
                     )

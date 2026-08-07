@@ -14,6 +14,7 @@ except ImportError:  # MLX is not available in native Windows CUDA runtimes.
     mx = None
 
 from parallax.p2p.proto import forward_pb2
+from parallax.server.backend_capabilities import TensorRuntime, tensor_runtime_for_device
 from parallax.server.request import IntermediateRequest, Request, RequestStatus
 from parallax.server.sampling.sampling_params import SamplingParams
 
@@ -227,7 +228,8 @@ def sampling_params_to_proto(params: SamplingParams) -> forward_pb2.SamplingPara
 
 def tensor_to_bytes(tensor: Any, device: Optional[str] = "mlx") -> bytes:
     """Convert tensor to protobuf Tensor using safetensor serialization."""
-    if device is not None and device.startswith("cuda"):
+    tensor_runtime = tensor_runtime_for_device(device)
+    if tensor_runtime is TensorRuntime.TORCH:
         from safetensors.torch import save
 
         # Convert tensor to CPU
@@ -238,6 +240,14 @@ def tensor_to_bytes(tensor: Any, device: Optional[str] = "mlx") -> bytes:
         # Store buffer using safetensor (dtype and size are automatically preserved)
         serialized_data = save({"tensor": cpu_tensor.contiguous()})
         return serialized_data
+    elif tensor_runtime is TensorRuntime.NUMPY:
+        import numpy as np
+        from safetensors.numpy import save
+
+        array = np.ascontiguousarray(tensor)
+        if array.size == 0:
+            raise ValueError("Tensor must have size > 0")
+        return save({"tensor": array})
     else:
         mlx = _require_mlx()
         assert tensor.size > 0, "Tensor must have size > 0"
@@ -251,11 +261,16 @@ def bytes_to_tensor(
     device: Optional[str] = "mlx",
 ) -> Any:
     """Convert bytes (safetensor format) to tensor."""
-    if device is not None and device.startswith("cuda"):
+    tensor_runtime = tensor_runtime_for_device(device)
+    if tensor_runtime is TensorRuntime.TORCH:
         from safetensors.torch import load
 
         tensor_dict = load(tensor)
         tensor = tensor_dict["tensor"].to(device)
+    elif tensor_runtime is TensorRuntime.NUMPY:
+        from safetensors.numpy import load
+
+        return load(tensor)["tensor"]
     else:
         mlx = _require_mlx()
         buffer = io.BytesIO(tensor)

@@ -9,7 +9,14 @@ import subprocess
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional
 
-from parallax.server.memory_budget import current_cuda_memory_budget, current_mlx_memory_budget
+from parallax.server.backend_capabilities import DeviceKind, device_kind, torch_xpu_is_available
+from parallax.server.memory_budget import (
+    calculate_directml_memory_budget,
+    configured_directml_reserve_bytes,
+    current_cuda_memory_budget,
+    current_mlx_memory_budget,
+    current_xpu_memory_budget,
+)
 
 if TYPE_CHECKING:
     from mlx import nn
@@ -44,13 +51,28 @@ class HardwareInfo:
         return cls(**obj)
 
     @staticmethod
-    def detect() -> "HardwareInfo":
+    def detect(execution_device: str | None = None) -> "HardwareInfo":
         """Dispatch to the correct subclass for the current machine.
 
         Prefers CUDA when available; falls back to Apple silicon on macOS.
         """
+        requested_kind = device_kind(execution_device) if execution_device else None
+        if requested_kind is DeviceKind.DIRECTML:
+            return DirectMlHardwareInfo.detect(_execution_device_index(execution_device))
+        if requested_kind is DeviceKind.CUDA:
+            return NvidiaHardwareInfo.detect()
+        if requested_kind is DeviceKind.XPU:
+            return IntelXpuHardwareInfo.detect()
+        if requested_kind is DeviceKind.MLX:
+            return AppleSiliconHardwareInfo.detect()
+        if requested_kind is not None:
+            raise NotImplementedError(
+                f"No qualified hardware probe for {requested_kind.value}"
+            )
         if torch is not None and torch.cuda.is_available():
             return NvidiaHardwareInfo.detect()
+        if torch is not None and torch_xpu_is_available(torch):
+            return IntelXpuHardwareInfo.detect()
         if platform.system() == "Darwin" and platform.machine().startswith("arm"):
             return AppleSiliconHardwareInfo.detect()
         raise NotImplementedError("Unsupported hardware; add a subclass.")
@@ -172,7 +194,148 @@ class NvidiaHardwareInfo(HardwareInfo):
         )
 
 
-def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
+@dataclass
+class IntelXpuHardwareInfo(HardwareInfo):
+    """Hardware summary backed only by PyTorch's maintained XPU APIs."""
+
+    device_memory_gb: float = 0.0
+    memory_bandwidth_gbps: float = 0.0
+
+    @classmethod
+    def detect(cls) -> "IntelXpuHardwareInfo":
+        if torch is None or not torch_xpu_is_available(torch):
+            raise RuntimeError("Intel XPU not available")
+        device_count = int(torch.xpu.device_count())
+        device_index = int(torch.xpu.current_device())
+        props = torch.xpu.get_device_properties(device_index)
+        name = getattr(props, "name", f"xpu:{device_index}")
+        total_memory = int(getattr(props, "total_memory", 0))
+        if total_memory <= 0:
+            _, total_memory = torch.xpu.mem_get_info(device_index)
+        host_total = psutil.virtual_memory().total / 2**30 if psutil else 0.0
+        # PyTorch does not expose a portable peak-FP16 or bandwidth contract for
+        # Arc/Core Ultra. Leave telemetry unknown instead of inventing a SKU
+        # estimate; V3 routing learns execution throughput from live leases.
+        return cls(
+            num_gpus=device_count,
+            total_ram_gb=round(host_total, 1),
+            chip=str(name),
+            tflops_fp16=0.0,
+            device_memory_gb=round(total_memory / 2**30, 1),
+            memory_bandwidth_gbps=0.0,
+        )
+
+
+def _execution_device_index(execution_device: str | None) -> int:
+    normalized = str(execution_device or "").strip().lower()
+    _, separator, raw_index = normalized.partition(":")
+    return int(raw_index) if separator else 0
+
+
+def _directml_ep_device(device_index: int, ort_module=None):
+    """Resolve a DirectML provider id to its authoritative DXGI adapter id."""
+
+    if ort_module is None:
+        try:
+            import onnxruntime as ort_module
+        except (ImportError, OSError) as exc:
+            raise RuntimeError("ONNX Runtime DirectML is not installed") from exc
+    try:
+        devices = tuple(ort_module.get_ep_devices())
+    except (AttributeError, RuntimeError) as exc:
+        raise RuntimeError(
+            "ONNX Runtime does not expose execution-provider device metadata"
+        ) from exc
+    matches = []
+    for candidate in devices:
+        if str(getattr(candidate, "ep_name", "")) != "DmlExecutionProvider":
+            continue
+        options = dict(getattr(candidate, "ep_options", {}) or {})
+        try:
+            provider_device_id = int(options["device_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if provider_device_id == int(device_index):
+            matches.append(candidate)
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"DirectML device {device_index} has no unique ONNX Runtime metadata entry"
+        )
+    metadata = dict(getattr(matches[0].device, "metadata", {}) or {})
+    try:
+        dxgi_adapter_index = int(metadata["DxgiAdapterNumber"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("DirectML device metadata has no DXGI adapter number") from exc
+    return matches[0], dxgi_adapter_index
+
+
+def _query_dxgi_video_memory(adapter_index: int):
+    try:
+        import fabi_network_native
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "the qualified Fabi native wheel is required for DirectML memory telemetry"
+        ) from exc
+    try:
+        return fabi_network_native.query_dxgi_video_memory(int(adapter_index))
+    except (AttributeError, RuntimeError) as exc:
+        raise RuntimeError("DXGI video-memory budget query failed") from exc
+
+
+@dataclass
+class DirectMlHardwareInfo(HardwareInfo):
+    """DirectML adapter identity backed by ORT metadata and live DXGI APIs."""
+
+    execution_device_index: int = 0
+    dxgi_adapter_index: int = 0
+    vendor_id: int = 0
+    device_id: int = 0
+    dedicated_video_memory_bytes: int = 0
+    dedicated_system_memory_bytes: int = 0
+    shared_system_memory_bytes: int = 0
+    unified_memory: bool = False
+    device_memory_gb: float = 0.0
+
+    @classmethod
+    def detect(cls, execution_device_index: int = 0) -> "DirectMlHardwareInfo":
+        ep_device, dxgi_adapter_index = _directml_ep_device(execution_device_index)
+        dxgi = _query_dxgi_video_memory(dxgi_adapter_index)
+        hardware = ep_device.device
+        metadata = dict(getattr(hardware, "metadata", {}) or {})
+        if int(getattr(hardware, "vendor_id", -1)) != int(dxgi.vendor_id):
+            raise RuntimeError("ONNX Runtime and DXGI disagree on DirectML vendor id")
+        if int(getattr(hardware, "device_id", -1)) != int(dxgi.device_id):
+            raise RuntimeError("ONNX Runtime and DXGI disagree on DirectML device id")
+        ort_description = str(metadata.get("Description", "")).strip()
+        if ort_description and ort_description != str(dxgi.description).strip():
+            raise RuntimeError("ONNX Runtime and DXGI disagree on DirectML adapter")
+        host_total = int(psutil.virtual_memory().total) if psutil else 0
+        dedicated = int(dxgi.dedicated_video_memory)
+        shared = int(dxgi.shared_system_memory)
+        unified = dedicated <= 0
+        device_total = dedicated if dedicated > 0 else int(dxgi.local_budget)
+        return cls(
+            total_ram_gb=round(host_total / 2**30, 1),
+            chip=str(dxgi.description),
+            # No maintained cross-vendor API reports a comparable peak FP16
+            # value. V3 routing learns measured throughput from live leases.
+            tflops_fp16=0.0,
+            num_gpus=1,
+            execution_device_index=int(execution_device_index),
+            dxgi_adapter_index=int(dxgi_adapter_index),
+            vendor_id=int(dxgi.vendor_id),
+            device_id=int(dxgi.device_id),
+            dedicated_video_memory_bytes=dedicated,
+            dedicated_system_memory_bytes=int(dxgi.dedicated_system_memory),
+            shared_system_memory_bytes=shared,
+            unified_memory=unified,
+            device_memory_gb=round(device_total / 2**30, 1),
+        )
+
+
+def detect_node_hardware(
+    node_id: Optional[str], execution_device: str | None = None
+) -> Dict[str, Any]:
     """Detect local hardware and return a dict for scheduling.
 
     Returns a dictionary with keys compatible with `NodeHardwareInfo` builder:
@@ -182,17 +345,23 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
     - memory_bandwidth_gbps: Estimated memory bandwidth in GB/s
     """
     try:
-        hw = HardwareInfo.detect()
+        hw = (
+            HardwareInfo.detect()
+            if execution_device is None
+            else HardwareInfo.detect(execution_device)
+        )
     except NotImplementedError:
-        # Fallback to a conservative default
+        # Unsupported runtimes must not gain an invented accelerator or memory
+        # envelope. They remain visible but cannot enter autonomous placement.
         return {
             "node_id": node_id,
-            "num_gpus": 1,
-            "tflops_fp16": 50.0,
-            "gpu_name": "Unknown",
-            "memory_gb": 16.0,
-            "memory_bandwidth_gbps": 100.0,
-            "device": "Unknown",
+            "num_gpus": 0,
+            "tflops_fp16": 0.0,
+            "gpu_name": "Unsupported",
+            "memory_gb": 0.0,
+            "usable_memory_bytes": 0,
+            "memory_bandwidth_gbps": 0.0,
+            "device": execution_device or "unsupported",
         }
 
     if isinstance(hw, NvidiaHardwareInfo):
@@ -222,6 +391,27 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
             "device_reserve_bytes": device_reserve_bytes,
             "memory_bandwidth_gbps": hw.memory_bandwidth_gbps,
             "device": "cuda",
+        }
+    if isinstance(hw, IntelXpuHardwareInfo):
+        budgets = [
+            current_xpu_memory_budget(torch, device)
+            for device in range(torch.xpu.device_count())
+        ]
+        return {
+            "node_id": node_id,
+            "num_gpus": hw.num_gpus,
+            "tflops_fp16": hw.tflops_fp16,
+            "gpu_name": hw.chip,
+            "memory_gb": hw.device_memory_gb,
+            "usable_memory_bytes": sum(budget.usable_bytes for budget in budgets),
+            "device_available_memory_bytes": sum(
+                budget.available_bytes for budget in budgets
+            ),
+            "device_reserve_bytes": sum(
+                budget.device_reserve_bytes for budget in budgets
+            ),
+            "memory_bandwidth_gbps": hw.memory_bandwidth_gbps,
+            "device": "xpu",
         }
     if isinstance(hw, AppleSiliconHardwareInfo):
         # Use unified memory size as memory_gb; bandwidth rough estimate per family
@@ -258,15 +448,56 @@ def detect_node_hardware(node_id: Optional[str]) -> Dict[str, Any]:
             "memory_bandwidth_gbps": est_bandwidth,
             "device": "mlx",
         }
+    if isinstance(hw, DirectMlHardwareInfo):
+        dxgi = _query_dxgi_video_memory(hw.dxgi_adapter_index)
+        if int(dxgi.vendor_id) != hw.vendor_id or int(dxgi.device_id) != hw.device_id:
+            raise RuntimeError("DirectML adapter changed during capacity sampling")
+        host_available = (
+            int(psutil.virtual_memory().available)
+            if hw.unified_memory and psutil
+            else None
+        )
+        total = (
+            hw.dedicated_video_memory_bytes
+            if not hw.unified_memory
+            else int(dxgi.local_budget)
+        )
+        budget = calculate_directml_memory_budget(
+            total_bytes=total,
+            local_budget_bytes=int(dxgi.local_budget),
+            local_current_usage_bytes=int(dxgi.local_current_usage),
+            device_reserve_bytes=configured_directml_reserve_bytes(total),
+            unified_memory=hw.unified_memory,
+            host_available_bytes=host_available,
+        )
+        return {
+            "node_id": node_id,
+            "num_gpus": 1,
+            "tflops_fp16": 0.0,
+            "gpu_name": hw.chip,
+            "memory_gb": hw.device_memory_gb,
+            "usable_memory_bytes": budget.usable_bytes,
+            "device_available_memory_bytes": budget.available_bytes,
+            "device_reserve_bytes": budget.device_reserve_bytes,
+            "dxgi_local_budget_bytes": int(dxgi.local_budget),
+            "dxgi_local_current_usage_bytes": int(dxgi.local_current_usage),
+            "dxgi_non_local_budget_bytes": int(dxgi.non_local_budget),
+            "dxgi_non_local_current_usage_bytes": int(dxgi.non_local_current_usage),
+            "dxgi_adapter_index": hw.dxgi_adapter_index,
+            "directml_unified_memory": hw.unified_memory,
+            "memory_bandwidth_gbps": 0.0,
+            "device": f"directml:{hw.execution_device_index}",
+        }
     # Generic fallback
     return {
         "node_id": node_id,
         "num_gpus": hw.num_gpus,
         "tflops_fp16": hw.tflops_fp16,
-        "gpu_name": "Unknown",
-        "memory_gb": 16.0,
-        "memory_bandwidth_gbps": 100.0,
-        "device": "Unknown",
+        "gpu_name": hw.chip,
+        "memory_gb": hw.total_ram_gb,
+        "usable_memory_bytes": 0,
+        "memory_bandwidth_gbps": 0.0,
+        "device": execution_device or "unsupported",
     }
 
 
