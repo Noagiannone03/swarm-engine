@@ -13,8 +13,12 @@ from typing import List, Optional
 
 import numpy as np
 import psutil
-import torch
 import zmq
+
+try:
+    import torch
+except ImportError:  # Portable ONNX Runtime workers deliberately omit PyTorch.
+    torch = None
 
 from parallax.server.backend_capabilities import (
     TensorRuntime,
@@ -44,14 +48,20 @@ def _require_mlx():
     return mx
 
 
+def _require_torch():
+    if torch is None:
+        raise RuntimeError("This operation requires the PyTorch runtime")
+    return torch
+
+
 def is_cuda_available():
     """Check backend supports cuda"""
-    return torch.cuda.is_available()
+    return bool(torch is not None and torch.cuda.is_available())
 
 
 def is_mps_available():
     """Check backend supports mps"""
-    return torch.mps.is_available()
+    return bool(torch is not None and torch.mps.is_available())
 
 
 def is_metal_available():
@@ -95,10 +105,11 @@ def get_device_dtype(dtype_str: str, device: str):
     """Gets the real data type according to current device"""
     tensor_runtime = tensor_runtime_for_device(device)
     if tensor_runtime is TensorRuntime.TORCH:
+        torch_runtime = _require_torch()
         dtype_map = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
+            "float16": torch_runtime.float16,
+            "bfloat16": torch_runtime.bfloat16,
+            "float32": torch_runtime.float32,
         }
     elif tensor_runtime is TensorRuntime.MLX:
         mlx = _require_mlx()

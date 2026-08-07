@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import glob
 import hashlib
@@ -5,16 +7,24 @@ import json
 import os
 import shutil
 import struct
-from typing import Dict
+from typing import Any, Dict
 
-import torch
-from safetensors.torch import save_file
+try:
+    import torch
+except ImportError:  # Portable ONNX Runtime workers do not support weight refit.
+    torch = None
 
 # CID constants
 CIDV1 = 0x01
 RAW_CODEC = 0x55
 SHA2_256_CODE = 0x12
 SHA2_256_SIZE = 0x20  # 32 bytes
+
+
+def _require_torch():
+    if torch is None:
+        raise RuntimeError("Weight refit requires the PyTorch runtime")
+    return torch
 
 
 def calculate_cid_manual(data: bytes) -> str:
@@ -42,6 +52,7 @@ def concat_weight_partition(original_tensors, save_directory=None):
     If save_directory is None, use direct mode to update weight from tensor in host memory.
     Otherwise save tensors to disk and update weights from disk.
     """
+    torch_runtime = _require_torch()
     sorted_keys = sorted(original_tensors.keys())
     tensors = {}
     res_tensors = {}
@@ -65,7 +76,7 @@ def concat_weight_partition(original_tensors, save_directory=None):
             if prev_name_list == cur_name_list:
                 inplace_insert_value_with_idx(concate_list, val, cur_idx)
             else:
-                concate_result = torch.cat(concate_list, 0)
+                concate_result = torch_runtime.cat(concate_list, 0)
                 cur_name_list.append("weight")
                 final_key = ".".join(cur_name_list)
                 tensors[final_key] = concate_result
@@ -76,7 +87,7 @@ def concat_weight_partition(original_tensors, save_directory=None):
             prev_key = key
 
     if concate_list:
-        concate_result = torch.cat(concate_list, 0)
+        concate_result = torch_runtime.cat(concate_list, 0)
         cur_name_list = prev_key.split(".")[:-1]
         cur_name_list.append("weight")
         final_key = ".".join(cur_name_list)
@@ -86,6 +97,8 @@ def concat_weight_partition(original_tensors, save_directory=None):
         res_tensors.update(tensors)
         return res_tensors
     else:
+        from safetensors.torch import save_file
+
         save_file_name = save_directory + "/adapter_model.safetensors"
         save_file(tensors, save_file_name)
         return {}
@@ -155,10 +168,11 @@ def release_disk_storage():
     remove_list_dirs(dht_dirs)
 
 
-def parse_safetensors_from_memory(raw_data: bytes) -> Dict[str, torch.Tensor]:
+def parse_safetensors_from_memory(raw_data: bytes) -> Dict[str, Any]:
     """
     Convert binary in memory to safetensors
     """
+    torch_runtime = _require_torch()
     header_size = struct.unpack("<Q", raw_data[:8])[0]
 
     header_data = raw_data[8 : 8 + header_size]
@@ -179,16 +193,16 @@ def parse_safetensors_from_memory(raw_data: bytes) -> Dict[str, torch.Tensor]:
         begin, end = info["data_offsets"]
 
         dtype_map = {
-            "F16": (torch.float16, 2),
-            "BF16": (torch.bfloat16, 2),
-            "F32": (torch.float32, 4),
-            "F64": (torch.float64, 8),
-            "I8": (torch.int8, 1),
-            "I16": (torch.int16, 2),
-            "I32": (torch.int32, 4),
-            "I64": (torch.int64, 8),
-            "U8": (torch.uint8, 1),
-            "BOOL": (torch.bool, 1),
+            "F16": (torch_runtime.float16, 2),
+            "BF16": (torch_runtime.bfloat16, 2),
+            "F32": (torch_runtime.float32, 4),
+            "F64": (torch_runtime.float64, 8),
+            "I8": (torch_runtime.int8, 1),
+            "I16": (torch_runtime.int16, 2),
+            "I32": (torch_runtime.int32, 4),
+            "I64": (torch_runtime.int64, 8),
+            "U8": (torch_runtime.uint8, 1),
+            "BOOL": (torch_runtime.bool, 1),
         }
         torch_dtype, item_size = dtype_map[dtype]
 
@@ -198,7 +212,7 @@ def parse_safetensors_from_memory(raw_data: bytes) -> Dict[str, torch.Tensor]:
         total_bytes = num_elements * item_size
 
         tensor_data = buffer[begin : begin + total_bytes]
-        tensor = torch.frombuffer(tensor_data, dtype=torch_dtype).clone()
+        tensor = torch_runtime.frombuffer(tensor_data, dtype=torch_dtype).clone()
         tensor = tensor.reshape(shape)
 
         tensors[name] = tensor

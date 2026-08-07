@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from parallax.server.backend_capabilities import (
@@ -13,6 +14,7 @@ from parallax.server.backend_capabilities import (
     normalize_ort_provider,
     tensor_runtime_for_device,
 )
+from parallax.utils import utils, weight_refit_utils
 
 
 def fake_torch(*, cuda: bool = False, xpu: bool = False):
@@ -56,8 +58,14 @@ def test_executor_registry_accepts_only_real_device_engine_pairs():
 
 
 def test_best_device_preserves_mlx_priority_then_cuda_xpu_cpu():
-    assert detect_best_device(torch_module=fake_torch(cuda=True, xpu=True), metal_available=True) == "mlx"
-    assert detect_best_device(torch_module=fake_torch(cuda=True, xpu=True), metal_available=False) == "cuda"
+    assert (
+        detect_best_device(torch_module=fake_torch(cuda=True, xpu=True), metal_available=True)
+        == "mlx"
+    )
+    assert (
+        detect_best_device(torch_module=fake_torch(cuda=True, xpu=True), metal_available=False)
+        == "cuda"
+    )
     assert detect_best_device(torch_module=fake_torch(xpu=True), metal_available=False) == "xpu"
     assert (
         detect_best_device(
@@ -82,3 +90,30 @@ def test_ort_provider_names_are_normalized_without_guessing_unknown_plugins():
     assert normalize_ort_provider("WindowsML") is DeviceKind.WINML
     assert normalize_ort_provider("QNNExecutionProvider") is DeviceKind.QNN
     assert normalize_ort_provider("SomeExperimentalExecutionProvider") is None
+
+
+def test_portable_device_detection_does_not_require_torch(monkeypatch):
+    monkeypatch.setattr(utils, "torch", None)
+    monkeypatch.setattr(
+        utils,
+        "available_ort_execution_providers",
+        lambda: ("DmlExecutionProvider", "CPUExecutionProvider"),
+    )
+    monkeypatch.setattr(utils, "is_metal_available", lambda: False)
+
+    assert utils.is_cuda_available() is False
+    assert utils.is_mps_available() is False
+    assert utils.get_current_device() == "directml"
+    assert utils.get_device_dtype("float16", "directml") is np.float16
+    with pytest.raises(RuntimeError, match="PyTorch runtime"):
+        utils.get_device_dtype("float16", "cpu")
+
+
+def test_portable_server_keeps_torch_weight_refit_optional(monkeypatch):
+    monkeypatch.setattr(weight_refit_utils, "torch", None)
+
+    assert weight_refit_utils.calculate_cid_manual(b"fabi").startswith("b")
+    with pytest.raises(RuntimeError, match="Weight refit requires"):
+        weight_refit_utils.concat_weight_partition({})
+    with pytest.raises(RuntimeError, match="Weight refit requires"):
+        weight_refit_utils.parse_safetensors_from_memory(b"")
