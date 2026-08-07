@@ -15,8 +15,10 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use mesh_llm_native_runtime::{NativeRuntimeBackendKind, NativeRuntimeManifest};
+use model_artifact::gguf::{GgufKvCacheQuant, scan_gguf_compact_meta};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use skippy_ffi::TensorRole;
 use skippy_runtime::{
     ActivationFrame, BackendDeviceType, FlashAttentionType, RuntimeConfig, RuntimeLoadMode,
     SamplingConfig, StageModel, StageSession, backend_devices, parse_cache_type,
@@ -150,6 +152,140 @@ pub struct NativeDeviceInfo {
     pub memory_total: u64,
     pub kind: String,
     pub caps: u64,
+}
+
+/// Structural and KV geometry read by Mesh's audited GGUF parser.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippyPackageGeometry {
+    pub architecture: String,
+    pub context_length: u32,
+    pub activation_width: u32,
+    pub layer_count: u32,
+    pub kv_bytes_per_token: u64,
+    pub static_bytes_by_layer: Vec<u64>,
+}
+
+fn direct_static_bytes_by_layer(paths: &[PathBuf], layer_count: u32) -> Result<Vec<u64>> {
+    let layer_count = usize::try_from(layer_count).context("GGUF layer count exceeds usize")?;
+    let mut bytes_by_layer = vec![0_u64; layer_count];
+    let mut shared_bytes = 0_u64;
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
+        let model = skippy_runtime::ModelInfo::open(path)
+            .with_context(|| format!("open GGUF tensor index {}", path.display()))?;
+        let tensors = model
+            .tensors()
+            .with_context(|| format!("read GGUF tensor index {}", path.display()))?;
+        for tensor in tensors {
+            if !seen.insert(tensor.name) {
+                continue;
+            }
+            match tensor
+                .layer_index
+                .and_then(|index| usize::try_from(index).ok())
+            {
+                Some(index) if index < layer_count => {
+                    bytes_by_layer[index] = bytes_by_layer[index].saturating_add(tensor.byte_size);
+                }
+                Some(_) => {
+                    let last = bytes_by_layer
+                        .last_mut()
+                        .context("GGUF has tensors but no transformer layers")?;
+                    *last = last.saturating_add(tensor.byte_size);
+                }
+                None => match tensor.role {
+                    TensorRole::Embedding => {
+                        bytes_by_layer[0] = bytes_by_layer[0].saturating_add(tensor.byte_size);
+                    }
+                    TensorRole::FinalNorm | TensorRole::Output => {
+                        let last = bytes_by_layer
+                            .last_mut()
+                            .context("GGUF has endpoint tensors but no transformer layers")?;
+                        *last = last.saturating_add(tensor.byte_size);
+                    }
+                    TensorRole::Unknown
+                    | TensorRole::Metadata
+                    | TensorRole::Tokenizer
+                    | TensorRole::Layer => {
+                        shared_bytes = shared_bytes.saturating_add(tensor.byte_size);
+                    }
+                },
+            }
+        }
+    }
+    ensure!(
+        bytes_by_layer.iter().all(|bytes| *bytes > 0),
+        "GGUF tensor index does not account for every transformer layer"
+    );
+    bytes_by_layer[0] = bytes_by_layer[0].saturating_add(shared_bytes.div_ceil(2));
+    let last = bytes_by_layer
+        .last_mut()
+        .context("GGUF has no transformer layers")?;
+    *last = last.saturating_add(shared_bytes / 2);
+    Ok(bytes_by_layer)
+}
+
+/// Inspect the already-authenticated metadata-only GGUF without loading model tensors.
+pub fn inspect_package_geometry(
+    metadata_path: &Path,
+    cache_type_k: &str,
+    cache_type_v: &str,
+) -> Result<SkippyPackageGeometry> {
+    inspect_compact_geometry(metadata_path, cache_type_k, cache_type_v, Vec::new())
+}
+
+/// Inspect one direct GGUF or an ordered split-GGUF set without loading tensors.
+pub fn inspect_source_geometry(
+    source_paths: &[PathBuf],
+    cache_type_k: &str,
+    cache_type_v: &str,
+) -> Result<SkippyPackageGeometry> {
+    ensure!(
+        skippy_runtime::native_runtime_loaded(),
+        "load a verified Skippy native runtime before inspecting direct GGUF tensors"
+    );
+    let metadata_path = source_paths
+        .first()
+        .context("Skippy source has no GGUF files")?;
+    let metadata = scan_gguf_compact_meta(metadata_path)
+        .with_context(|| format!("scan Skippy metadata {}", metadata_path.display()))?;
+    let static_bytes_by_layer = direct_static_bytes_by_layer(source_paths, metadata.layer_count)?;
+    inspect_compact_geometry(
+        metadata_path,
+        cache_type_k,
+        cache_type_v,
+        static_bytes_by_layer,
+    )
+}
+
+fn inspect_compact_geometry(
+    metadata_path: &Path,
+    cache_type_k: &str,
+    cache_type_v: &str,
+    static_bytes_by_layer: Vec<u64>,
+) -> Result<SkippyPackageGeometry> {
+    let metadata = scan_gguf_compact_meta(metadata_path)
+        .with_context(|| format!("scan Skippy metadata {}", metadata_path.display()))?;
+    ensure!(
+        !metadata.architecture.is_empty()
+            && metadata.context_length > 0
+            && metadata.embedding_size > 0
+            && metadata.layer_count > 0,
+        "Skippy package has incomplete GGUF architecture metadata"
+    );
+    let quant = GgufKvCacheQuant::from_llama_args(cache_type_k, cache_type_v)
+        .context("unsupported signed Skippy KV cache type")?;
+    let kv_bytes_per_token = quant
+        .kv_cache_bytes_per_token(&metadata)
+        .context("Skippy package has incomplete GGUF KV geometry")?;
+    Ok(SkippyPackageGeometry {
+        architecture: metadata.architecture,
+        context_length: metadata.context_length,
+        activation_width: metadata.embedding_size,
+        layer_count: metadata.layer_count,
+        kv_bytes_per_token,
+        static_bytes_by_layer,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -304,6 +440,29 @@ pub struct StageForwardOutput {
     pub activation: StageActivationFrame,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageLoadMode {
+    LayerPackage,
+    RuntimeSlice,
+}
+
+impl StageLoadMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "layer_package" => Ok(Self::LayerPackage),
+            "runtime_slice" => Ok(Self::RuntimeSlice),
+            value => bail!("unsupported Skippy stage load mode {value}"),
+        }
+    }
+
+    const fn native(self) -> RuntimeLoadMode {
+        match self {
+            Self::LayerPackage => RuntimeLoadMode::LayerPackage,
+            Self::RuntimeSlice => RuntimeLoadMode::RuntimeSlice,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StageOpenOptions {
     pub stage_index: u32,
@@ -321,6 +480,7 @@ pub struct StageOpenOptions {
     pub cache_type_v: String,
     pub use_mmap: Option<bool>,
     pub use_mlock: bool,
+    pub load_mode: StageLoadMode,
 }
 
 /// Load an already-installed native bundle after Mesh's manifest contract and
@@ -465,14 +625,14 @@ impl SkippyStage {
             cache_type_k: parse_cache_type(&options.cache_type_k)?,
             cache_type_v: parse_cache_type(&options.cache_type_v)?,
             flash_attn_type: FlashAttentionType::Auto,
-            load_mode: RuntimeLoadMode::LayerPackage,
+            load_mode: options.load_mode.native(),
             projector_path: None,
             include_embeddings: options.layer_start == 0,
             include_output: options.layer_end == options.model_layer_count,
             filter_tensors_on_load: true,
         };
         let model = StageModel::open_from_parts(parts, &config)
-            .context("open verified Skippy layer package parts")?;
+            .context("open verified Skippy stage source")?;
         Ok(Self {
             model,
             sessions: HashMap::new(),
@@ -603,6 +763,39 @@ mod tests {
 
     use super::*;
 
+    fn push_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn push_string_kv(bytes: &mut Vec<u8>, key: &str, value: &str) {
+        push_string(bytes, key);
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        push_string(bytes, value);
+    }
+
+    fn push_u32_kv(bytes: &mut Vec<u8>, key: &str, value: u32) {
+        push_string(bytes, key);
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_qwen_metadata(path: &Path) {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&8_u64.to_le_bytes());
+        push_string_kv(&mut bytes, "general.architecture", "qwen3");
+        push_u32_kv(&mut bytes, "qwen3.context_length", 40_960);
+        push_u32_kv(&mut bytes, "qwen3.embedding_length", 1_024);
+        push_u32_kv(&mut bytes, "qwen3.attention.head_count", 16);
+        push_u32_kv(&mut bytes, "qwen3.attention.head_count_kv", 8);
+        push_u32_kv(&mut bytes, "qwen3.block_count", 28);
+        push_u32_kv(&mut bytes, "qwen3.attention.key_length", 128);
+        push_u32_kv(&mut bytes, "qwen3.attention.value_length", 128);
+        fs::write(path, bytes).unwrap();
+    }
+
     fn write_integrity(root: &Path) {
         let manifest_hash = file_sha256(&root.join("manifest.json")).unwrap();
         let library_hash = file_sha256(&root.join("lib/runtime.bin")).unwrap();
@@ -666,5 +859,33 @@ mod tests {
 
         assert!(checked_runtime_file(&root, "../escape").is_err());
         assert!(checked_runtime_file(&root, "/absolute").is_err());
+    }
+
+    #[test]
+    fn package_geometry_uses_mesh_gguf_parser_and_exact_f16_kv_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = temp.path().join("metadata.gguf");
+        write_qwen_metadata(&metadata);
+
+        let geometry = inspect_package_geometry(&metadata, "f16", "f16").unwrap();
+
+        assert_eq!(geometry.architecture, "qwen3");
+        assert_eq!(geometry.context_length, 40_960);
+        assert_eq!(geometry.activation_width, 1_024);
+        assert_eq!(geometry.layer_count, 28);
+        assert_eq!(geometry.kv_bytes_per_token, 28 * 4_096);
+    }
+
+    #[test]
+    fn stage_load_mode_accepts_only_official_skippy_modes() {
+        assert_eq!(
+            StageLoadMode::parse("runtime-slice").unwrap(),
+            StageLoadMode::RuntimeSlice
+        );
+        assert_eq!(
+            StageLoadMode::parse("layer_package").unwrap(),
+            StageLoadMode::LayerPackage
+        );
+        assert!(StageLoadMode::parse("automatic").is_err());
     }
 }

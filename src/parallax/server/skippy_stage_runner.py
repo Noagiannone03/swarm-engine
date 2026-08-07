@@ -199,7 +199,6 @@ class SkippyRuntimeStageRunner:
         self.verified = verified
         self.device = device
         self.max_context_tokens = int(max_context_tokens)
-        self.max_sessions = int(max_sessions)
         kind = device_kind(device)
         try:
             backend = _BACKEND_BY_DEVICE[kind]
@@ -217,6 +216,31 @@ class SkippyRuntimeStageRunner:
             verified.plan.runtime_abi_version,
             backend,
         )
+        if verified.plan.format == "gguf-direct":
+            geometry = native_module.inspect_skippy_source_geometry(
+                list(verified.part_paths),
+                verified.plan.cache_type_k,
+                verified.plan.cache_type_v,
+            )
+        else:
+            geometry = native_module.inspect_skippy_package_geometry(
+                verified.geometry_path,
+                verified.plan.cache_type_k,
+                verified.plan.cache_type_v,
+            )
+        if geometry.layer_count != model_layer_count:
+            raise RuntimeError("Skippy GGUF layer count differs from the signed plan")
+        if geometry.activation_width != verified.plan.activation_width:
+            raise RuntimeError("Skippy GGUF activation width differs from the signed plan")
+        if geometry.context_length < verified.plan.model_max_context_tokens:
+            raise RuntimeError("Skippy GGUF context is smaller than the signed plan")
+        if geometry.kv_bytes_per_token != sum(verified.plan.kv_bytes_per_token_by_layer):
+            raise RuntimeError("Skippy GGUF KV geometry differs from the signed plan")
+        if verified.plan.format == "gguf-direct" and tuple(
+            int(value) for value in geometry.static_bytes_by_layer
+        ) != verified.plan.direct_static_bytes_by_layer:
+            raise RuntimeError("Skippy GGUF tensor geometry differs from the signed plan")
+        self.max_sessions = int(max_sessions)
         selected_backend_device = _backend_device(device)
         identifiers = {
             value
@@ -238,8 +262,13 @@ class SkippyRuntimeStageRunner:
             context_tokens=max_context_tokens,
             lane_count=max_sessions,
             selected_backend_device=selected_backend_device,
-            cache_type_k="f16",
-            cache_type_v="f16",
+            cache_type_k=verified.plan.cache_type_k,
+            cache_type_v=verified.plan.cache_type_v,
+            load_mode=(
+                "runtime_slice"
+                if verified.plan.format == "gguf-direct"
+                else "layer_package"
+            ),
         )
         self.runtime_root = runtime_root
         self.backend_device = selected_backend_device

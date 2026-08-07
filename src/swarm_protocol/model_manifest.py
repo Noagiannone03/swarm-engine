@@ -151,6 +151,7 @@ def execution_plan_hash(index: ModelArtifactIndex) -> str:
         ArtifactRole.EXECUTION_PACKAGE_MANIFEST,
         ArtifactRole.EXECUTION_LAYER,
         ArtifactRole.EXECUTION_SHARED,
+        ArtifactRole.EXECUTION_MODEL,
     }
     payload = {
         "plans": [plan.model_dump(mode="json") for plan in index.execution_plans],
@@ -161,6 +162,53 @@ def execution_plan_hash(index: ModelArtifactIndex) -> str:
         ],
     }
     return _canonical_hash("fabi/model-execution-plans/v1", payload)
+
+
+def execution_plan_identity_hash(index: ModelArtifactIndex, plan) -> str:
+    """Hash one executable plan and every byte descriptor it can load.
+
+    The aggregate ``execution_plan_hash`` binds the complete registry index.
+    Workers additionally advertise this per-plan identity so a request route
+    cannot accidentally splice incompatible engines, precisions or package
+    revisions that happen to serve the same logical model.
+    """
+
+    from swarm_protocol.contracts import ModelExecutionPlan, SkippyExecutionPlan
+
+    if isinstance(plan, ModelExecutionPlan):
+        paths = {
+            path for stage in plan.stages for path in (stage.graph_path, *stage.external_data_paths)
+        }
+    elif isinstance(plan, SkippyExecutionPlan):
+        if plan.format == "gguf-direct":
+            paths = set(plan.source_model_paths)
+        else:
+            paths = {
+                path
+                for path in (
+                    plan.package_manifest_path,
+                    plan.shared_metadata_path,
+                    plan.embeddings_path,
+                    plan.output_path,
+                    *plan.layer_paths,
+                )
+                if path is not None
+            }
+    else:  # pragma: no cover - guarded by the discriminated contract union
+        raise TypeError(f"unsupported execution plan {type(plan)!r}")
+    descriptors = {
+        artifact.path: artifact.model_dump(mode="json", exclude_none=True)
+        for artifact in index.artifacts
+        if artifact.path in paths
+    }
+    if descriptors.keys() != paths:
+        missing = sorted(paths - descriptors.keys())
+        raise ValueError(f"execution plan references missing artifacts: {missing}")
+    payload = {
+        "plan": plan.model_dump(mode="json"),
+        "artifacts": [descriptors[path] for path in sorted(descriptors)],
+    }
+    return _canonical_hash("fabi/model-execution-plan-identity/v1", payload)
 
 
 def _media_type(path: str) -> str:

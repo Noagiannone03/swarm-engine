@@ -4,8 +4,9 @@ use std::{
 };
 
 use fabi_skippy_runtime::{
-    NativeDeviceInfo, SkippyStage, StageActivationFrame, StageForwardOutput, StageOpenOptions,
-    StageSamplingConfig, load_verified_native_runtime,
+    NativeDeviceInfo, SkippyPackageGeometry, SkippyStage, StageActivationFrame, StageForwardOutput,
+    StageLoadMode, StageOpenOptions, StageSamplingConfig, inspect_package_geometry,
+    inspect_source_geometry, load_verified_native_runtime,
 };
 use pyo3::{
     exceptions::PyRuntimeError,
@@ -46,6 +47,36 @@ impl From<NativeDeviceInfo> for PySkippyNativeDevice {
             memory_total: value.memory_total,
             kind: value.kind,
             caps: value.caps,
+        }
+    }
+}
+
+#[pyclass(name = "SkippyPackageGeometry", frozen)]
+#[derive(Clone)]
+pub(crate) struct PySkippyPackageGeometry {
+    #[pyo3(get)]
+    architecture: String,
+    #[pyo3(get)]
+    context_length: u32,
+    #[pyo3(get)]
+    activation_width: u32,
+    #[pyo3(get)]
+    layer_count: u32,
+    #[pyo3(get)]
+    kv_bytes_per_token: u64,
+    #[pyo3(get)]
+    static_bytes_by_layer: Vec<u64>,
+}
+
+impl From<SkippyPackageGeometry> for PySkippyPackageGeometry {
+    fn from(value: SkippyPackageGeometry) -> Self {
+        Self {
+            architecture: value.architecture,
+            context_length: value.context_length,
+            activation_width: value.activation_width,
+            layer_count: value.layer_count,
+            kv_bytes_per_token: value.kv_bytes_per_token,
+            static_bytes_by_layer: value.static_bytes_by_layer,
         }
     }
 }
@@ -204,6 +235,7 @@ impl PySkippyStage {
         cache_type_v="f16",
         use_mmap=None,
         use_mlock=false,
+        load_mode="layer_package",
     ))]
     #[allow(clippy::similar_names, clippy::too_many_arguments)]
     fn new(
@@ -224,6 +256,7 @@ impl PySkippyStage {
         cache_type_v: &str,
         use_mmap: Option<bool>,
         use_mlock: bool,
+        load_mode: &str,
     ) -> PyResult<Self> {
         let options = StageOpenOptions {
             stage_index,
@@ -241,6 +274,7 @@ impl PySkippyStage {
             cache_type_v: cache_type_v.to_string(),
             use_mmap,
             use_mlock,
+            load_mode: StageLoadMode::parse(load_mode).map_err(py_error)?,
         };
         let stage = py
             .detach(move || SkippyStage::open(&part_paths, &options))
@@ -446,9 +480,38 @@ fn py_load_skippy_native_runtime(
     .map_err(py_error)
 }
 
+#[pyfunction(name = "inspect_skippy_package_geometry")]
+#[allow(clippy::needless_pass_by_value)] // PyO3 extracts Python path objects into owned PathBufs.
+fn py_inspect_skippy_package_geometry(
+    metadata_path: PathBuf,
+    cache_type_k: &str,
+    cache_type_v: &str,
+) -> PyResult<PySkippyPackageGeometry> {
+    inspect_package_geometry(&metadata_path, cache_type_k, cache_type_v)
+        .map(Into::into)
+        .map_err(py_error)
+}
+
+#[pyfunction(name = "inspect_skippy_source_geometry")]
+fn py_inspect_skippy_source_geometry(
+    source_paths: Vec<PathBuf>,
+    cache_type_k: &str,
+    cache_type_v: &str,
+) -> PyResult<PySkippyPackageGeometry> {
+    inspect_source_geometry(&source_paths, cache_type_k, cache_type_v)
+        .map(Into::into)
+        .map_err(py_error)
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(py_load_skippy_native_runtime, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        py_inspect_skippy_package_geometry,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(py_inspect_skippy_source_geometry, module)?)?;
     module.add_class::<PySkippyNativeDevice>()?;
+    module.add_class::<PySkippyPackageGeometry>()?;
     module.add_class::<PySkippyActivationFrame>()?;
     module.add_class::<PySkippyForwardOutput>()?;
     module.add_class::<PySkippyStage>()?;

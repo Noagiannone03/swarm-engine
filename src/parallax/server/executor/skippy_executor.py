@@ -101,6 +101,8 @@ class SkippyExecutor(BaseExecutor):
             plan_id=execution_plan_id,
             local_files_only=use_hfcache,
         )
+        if context_limit > verified.plan.model_max_context_tokens:
+            raise ValueError("Skippy context exceeds the signed execution-plan limit")
 
         from transformers import AutoConfig, AutoTokenizer
 

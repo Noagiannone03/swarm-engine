@@ -164,6 +164,8 @@ def advertisement(
     end: int,
     *,
     context_tokens: int = 160,
+    backend: BackendKind = BackendKind.MLX,
+    execution_plan_identity_hash: str | None = None,
 ) -> ModelMemberAdvertisement:
     return ModelMemberAdvertisement(
         offer=WorkerOffer(
@@ -171,7 +173,7 @@ def advertisement(
             endpoint_id=f"{worker_id}-endpoint",
             runtime_version="test",
             platform="test",
-            backend=BackendKind.MLX,
+            backend=backend,
             stable_memory_envelope_bytes=500,
             supported_roles={WorkerRole.EXECUTOR, WorkerRole.FRONTEND},
             offer_seq=1,
@@ -185,6 +187,8 @@ def advertisement(
             effective_span_mode=EffectiveSpanMode.FIXED,
             state=SpanState.READY,
             weight_hashes=(HASHES[0],),
+            execution_plan_identity_hash=execution_plan_identity_hash,
+            activation_bytes_per_token=128,
             max_context_tokens=context_tokens,
             kv_geometry=KvGeometry(
                 block_size_tokens=1,
@@ -255,6 +259,43 @@ class FakeCatalog:
         assert manifest == self.value.manifests[0]
         assert region_id == "eu-west"
         return self.demand
+
+
+def test_placement_deficits_ignore_other_backends_and_execution_plans():
+    manifest = model()
+    matching = advertisement(
+        manifest,
+        "matching",
+        0,
+        2,
+        backend=BackendKind.SKIPPY,
+        execution_plan_identity_hash="1" * 64,
+    )
+    other_plan = advertisement(
+        manifest,
+        "other-plan",
+        2,
+        4,
+        backend=BackendKind.SKIPPY,
+        execution_plan_identity_hash="2" * 64,
+    )
+    other_backend = advertisement(manifest, "mlx", 2, 4)
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(matching.offer, other_plan.offer, other_backend.offer),
+        leases=(matching.lease, other_plan.lease, other_backend.lease),
+        links=(),
+    )
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot),
+        admission=FakeAdmission(),
+        state_publisher=FakePublisher(),
+        reload_target=lambda *_args: None,
+        execution_plan_identity_hash="1" * 64,
+    )
+
+    assert controller._compatible_placement_leases(snapshot, matching.offer) == (matching.lease,)
 
 
 def context_demand(

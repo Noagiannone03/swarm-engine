@@ -114,7 +114,10 @@ class ExactRoutePlanner:
         )
 
     def _link_cost(
-        self, metric: LinkMetric, manifest: ModelManifest, request: RequestContract
+        self,
+        metric: LinkMetric,
+        request: RequestContract,
+        activation_bytes_per_token: int,
     ) -> RouteEstimate:
         multiplier = self.relay_penalty if metric.path_kind == PathKind.RELAY else 1.0
         # LinkMetric.rtt_ms is a round-trip observation. Each directed route
@@ -135,14 +138,12 @@ class ExactRoutePlanner:
                 complete=False,
             )
         prefill_transfer_ms = (
-            manifest.activation_bytes_per_token
+            activation_bytes_per_token
             * request.prompt_tokens
             / metric.throughput_bytes_per_second
             * 1000
         )
-        decode_transfer_ms = (
-            manifest.activation_bytes_per_token / metric.throughput_bytes_per_second * 1000
-        )
+        decode_transfer_ms = activation_bytes_per_token / metric.throughput_bytes_per_second * 1000
         return RouteEstimate(
             ttft_ms=(one_way_latency_ms + prefill_transfer_ms) * multiplier * reliability_penalty,
             inter_token_ms=(one_way_latency_ms + decode_transfer_ms)
@@ -156,15 +157,38 @@ class ExactRoutePlanner:
         snapshot_time_ms: int,
         manifest: ModelManifest,
         request: RequestContract,
+        candidates: tuple[RouteCandidate, ...],
     ) -> dict[tuple[str, str], LinkMetric]:
         result: dict[tuple[str, str], LinkMetric] = {}
+        activation_bytes_by_worker: dict[str, int] = {}
+        for candidate in candidates:
+            activation_bytes_by_worker[candidate.offer.worker_id] = max(
+                activation_bytes_by_worker.get(candidate.offer.worker_id, 0),
+                candidate.lease.activation_bytes_per_token or manifest.activation_bytes_per_token,
+            )
         for metric in links:
             if metric.expires_at_ms <= snapshot_time_ms:
                 continue
             key = (metric.from_worker_id, metric.to_worker_id)
             previous = result.get(key)
-            metric_cost = self._link_cost(metric, manifest, request)
-            previous_cost = self._link_cost(previous, manifest, request) if previous else None
+            activation_bytes_per_token = activation_bytes_by_worker.get(
+                metric.from_worker_id,
+                manifest.activation_bytes_per_token,
+            )
+            metric_cost = self._link_cost(
+                metric,
+                request,
+                activation_bytes_per_token,
+            )
+            previous_cost = (
+                self._link_cost(
+                    previous,
+                    request,
+                    activation_bytes_per_token,
+                )
+                if previous
+                else None
+            )
             if previous_cost is None or (
                 int(not metric_cost.complete),
                 metric_cost.projected_total_ms(request.reserved_output_tokens),
@@ -200,6 +224,13 @@ class ExactRoutePlanner:
                 or lease.state != SpanState.READY
                 or lease.expires_at_ms <= snapshot_time_ms
                 or request.required_context_tokens > lease.max_context_tokens
+                or (
+                    offer.backend.value in {"onnxruntime", "skippy"}
+                    and (
+                        lease.execution_plan_identity_hash is None
+                        or lease.activation_bytes_per_token is None
+                    )
+                )
             ):
                 continue
             candidates.append(RouteCandidate(offer=offer, lease=lease))
@@ -260,6 +291,19 @@ class ExactRoutePlanner:
             and WorkerRole.FRONTEND in candidate.offer.supported_roles
         ]
         for head in heads:
+            compatibility = (
+                head.offer.backend,
+                head.lease.execution_plan_identity_hash,
+            )
+            compatible = tuple(
+                candidate
+                for candidate in eligible
+                if (
+                    candidate.offer.backend,
+                    candidate.lease.execution_plan_identity_hash,
+                )
+                == compatibility
+            )
             for head_span in self._stage_options(
                 head,
                 start_layer=0,
@@ -290,7 +334,12 @@ class ExactRoutePlanner:
                                 closure = link_map.get((tail.offer.worker_id, head.offer.worker_id))
                                 if closure is None:
                                     continue
-                                closure_cost = self._link_cost(closure, manifest, request)
+                                closure_cost = self._link_cost(
+                                    closure,
+                                    request,
+                                    tail.lease.activation_bytes_per_token
+                                    or manifest.activation_bytes_per_token,
+                                )
                             complete = _PartialPath(
                                 partial.segments,
                                 partial.ttft_ms,
@@ -303,7 +352,7 @@ class ExactRoutePlanner:
                                 best_complete = complete
                             continue
 
-                        for candidate in eligible:
+                        for candidate in compatible:
                             if candidate.offer.worker_id == previous_worker:
                                 continue
                             link = link_map.get((previous_worker, candidate.offer.worker_id))
@@ -316,7 +365,12 @@ class ExactRoutePlanner:
                                 model_num_layers=manifest.num_layers,
                             ):
                                 compute = self._stage_compute_cost(candidate, span, request)
-                                network = self._link_cost(link, manifest, request)
+                                network = self._link_cost(
+                                    link,
+                                    request,
+                                    partial.segments[-1].candidate.lease.activation_bytes_per_token
+                                    or manifest.activation_bytes_per_token,
+                                )
                                 proposed = _PartialPath(
                                     partial.segments + (_Segment(candidate, span),),
                                     partial.ttft_ms + network.ttft_ms + compute.ttft_ms,
@@ -423,9 +477,7 @@ class ExactRoutePlanner:
         if request.model_swarm_id != manifest.model_swarm_id:
             raise NoFeasibleRoute("request and model manifest identify different swarms")
         if request.required_context_tokens > manifest.model_max_context_tokens:
-            raise NoFeasibleRoute(
-                "request context exceeds the signed model context limit"
-            )
+            raise NoFeasibleRoute("request context exceeds the signed model context limit")
 
         candidates = self._eligible_candidates(
             request=request,
@@ -433,7 +485,13 @@ class ExactRoutePlanner:
             leases=leases,
             snapshot_time_ms=snapshot_time_ms,
         )
-        link_map = self._link_map(links, snapshot_time_ms, manifest, request)
+        link_map = self._link_map(
+            links,
+            snapshot_time_ms,
+            manifest,
+            request,
+            candidates,
+        )
         best_complete = self._best_complete_path(
             manifest=manifest,
             request=request,

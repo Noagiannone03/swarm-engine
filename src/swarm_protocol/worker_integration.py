@@ -29,11 +29,12 @@ from swarm_protocol.contracts import (
     WorkerOffer,
     WorkerRole,
 )
-from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
+from swarm_protocol.model_manifest import execution_plan_identity_hash
 from swarm_protocol.portable_execution import (
     VerifiedExecutionSpan,
     materialize_execution_span,
 )
+from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
 from swarm_protocol.skippy_execution import (
     VerifiedSkippySpan,
     materialize_skippy_execution_span,
@@ -499,7 +500,30 @@ class WorkerProtocolV3Reporter:
             issued_at_ms=now_ms,
             expires_at_ms=now_ms + _REPORT_TTL_MS,
         )
-        per_layer = verified.bundle.manifest.kv_bytes_per_token_by_layer
+        if isinstance(verified.artifacts, VerifiedSkippySpan):
+            plan = verified.artifacts.plan
+            if serving.max_context_tokens > plan.model_max_context_tokens:
+                raise ValueError("Skippy worker exceeds its signed execution context")
+            per_layer = plan.kv_bytes_per_token_by_layer
+            activation_bytes_per_token = plan.activation_bytes_per_token
+            plan_identity = execution_plan_identity_hash(
+                verified.bundle.artifact_index,
+                plan,
+            )
+        elif isinstance(verified.artifacts, VerifiedExecutionSpan):
+            plan = verified.artifacts.plan
+            per_layer = verified.bundle.manifest.kv_bytes_per_token_by_layer
+            activation_bytes_per_token = plan.activation_hidden_size * (
+                2 if plan.activation_dtype == "float16" else 4
+            )
+            plan_identity = execution_plan_identity_hash(
+                verified.bundle.artifact_index,
+                plan,
+            )
+        else:
+            per_layer = verified.bundle.manifest.kv_bytes_per_token_by_layer
+            activation_bytes_per_token = verified.bundle.manifest.activation_bytes_per_token
+            plan_identity = None
         bytes_per_token_for_span = sum(per_layer[serving.span.start : serving.span.end])
         allocatable_bytes = serving.kv_cache_token_capacity * bytes_per_token_for_span
         # The legacy executor does not yet publish exact live token occupancy. While requests are
@@ -513,6 +537,8 @@ class WorkerProtocolV3Reporter:
             effective_span_mode=EffectiveSpanMode.FIXED,
             state=SpanState.READY if serving.is_ready else SpanState.WARMING,
             weight_hashes=verified.artifacts.weight_hashes,
+            execution_plan_identity_hash=plan_identity,
+            activation_bytes_per_token=activation_bytes_per_token,
             # Current metrics are valid for the qualified lab's one-session workers. Multi-session
             # routing needs load-conditioned distributions before these scalar fields can be used.
             measured_prefill_tokens_per_second=(

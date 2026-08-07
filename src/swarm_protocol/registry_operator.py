@@ -58,7 +58,10 @@ from swarm_protocol.registry import (
     TufRegistryPublisher,
     TufTimestampRefresher,
 )
-from swarm_protocol.skippy_package_import import attach_skippy_package
+from swarm_protocol.skippy_package_import import (
+    attach_skippy_direct_gguf,
+    attach_skippy_package,
+)
 
 _KEY_ROLES = ("root", "targets", "snapshot", "timestamp")
 _MAX_SECRET_BYTES = 4096
@@ -765,6 +768,59 @@ def attach_skippy_package_file(
     return bundle
 
 
+def attach_skippy_direct_file(
+    output: Path,
+    *,
+    bundle_path: Path,
+    repository_id: str,
+    revision: str | None,
+    source_paths: tuple[str, ...],
+    plan_id: str,
+    quantization: str,
+    runtime_release: str,
+    runtime_abi_version: str,
+    runtime_root: Path,
+    providers: tuple[ExecutionProviderKind, ...],
+    token: bool | str | None = None,
+) -> ModelRegistryBundle:
+    """Inspect an ordinary GGUF with the qualified runtime and bind it atomically."""
+
+    if output.resolve() == bundle_path.resolve():
+        raise ValueError("Skippy bundle output must not replace its input")
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite Skippy bundle: {output}")
+    try:
+        import fabi_network_native
+    except (ImportError, OSError) as exc:
+        raise RuntimeError("the qualified Fabi native wheel is required to inspect GGUF") from exc
+    raw_runtime = json.loads((runtime_root / "manifest.json").read_bytes())
+    runtime = _mapping(raw_runtime.get("runtime"), description="Skippy runtime manifest")
+    backend = runtime.get("backend")
+    if isinstance(backend, Mapping):
+        backend = backend.get("kind")
+    mesh_release = runtime_release.removeprefix("mesh-llm/").removeprefix("v")
+    fabi_network_native.load_skippy_native_runtime(
+        runtime_root,
+        mesh_release,
+        runtime_abi_version,
+        str(backend),
+    )
+    bundle = attach_skippy_direct_gguf(
+        load_bundles((bundle_path,))[0],
+        repository_id=repository_id,
+        revision=revision,
+        source_paths=source_paths,
+        plan_id=plan_id,
+        quantization=quantization,
+        runtime_release=runtime_release,
+        runtime_abi_version=runtime_abi_version,
+        providers=providers,
+        token=token,
+    )
+    _atomic_create_public(output, bundle.canonical_bytes() + b"\n")
+    return bundle
+
+
 def initialize_staging_registry(
     repository_dir: Path,
     key_dir: Path,
@@ -927,6 +983,36 @@ def _parser() -> argparse.ArgumentParser:
     attach_skippy.add_argument("--use-hf-token", action="store_true")
     attach_skippy.add_argument("--output", type=Path, required=True)
 
+    attach_skippy_direct = commands.add_parser("attach-skippy-direct")
+    attach_skippy_direct.add_argument("--bundle", type=Path, required=True)
+    attach_skippy_direct.add_argument("--repository-id", required=True)
+    attach_skippy_direct.add_argument("--revision")
+    attach_skippy_direct.add_argument(
+        "--source-path",
+        action="append",
+        required=True,
+        help="exact GGUF file; repeat for an ordered split-GGUF set",
+    )
+    attach_skippy_direct.add_argument("--plan-id", required=True)
+    attach_skippy_direct.add_argument("--quantization", required=True)
+    attach_skippy_direct.add_argument("--runtime-release", default="mesh-llm/v0.74.0")
+    attach_skippy_direct.add_argument("--runtime-abi-version", default="0.1.32")
+    attach_skippy_direct.add_argument("--runtime-root", type=Path, required=True)
+    attach_skippy_direct.add_argument(
+        "--provider",
+        action="append",
+        choices=[
+            ExecutionProviderKind.CPU.value,
+            ExecutionProviderKind.CUDA.value,
+            ExecutionProviderKind.METAL.value,
+            ExecutionProviderKind.ROCM.value,
+            ExecutionProviderKind.VULKAN.value,
+        ],
+        help="qualified native backend; repeat to restrict the release matrix",
+    )
+    attach_skippy_direct.add_argument("--use-hf-token", action="store_true")
+    attach_skippy_direct.add_argument("--output", type=Path, required=True)
+
     initialize = commands.add_parser("init-staging")
     initialize.add_argument("--repository-dir", type=Path, required=True)
     initialize.add_argument("--key-dir", type=Path, required=True)
@@ -1045,6 +1131,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         result = {
             "status": "skippy_execution_attached",
+            **_bundle_summary(bundle),
+            "output": str(args.output),
+        }
+    elif args.command == "attach-skippy-direct":
+        provider_values = args.provider or [
+            ExecutionProviderKind.CPU.value,
+            ExecutionProviderKind.CUDA.value,
+            ExecutionProviderKind.METAL.value,
+            ExecutionProviderKind.ROCM.value,
+            ExecutionProviderKind.VULKAN.value,
+        ]
+        bundle = attach_skippy_direct_file(
+            args.output,
+            bundle_path=args.bundle,
+            repository_id=args.repository_id,
+            revision=args.revision,
+            source_paths=tuple(sorted(set(args.source_path))),
+            plan_id=args.plan_id,
+            quantization=args.quantization,
+            runtime_release=args.runtime_release,
+            runtime_abi_version=args.runtime_abi_version,
+            runtime_root=args.runtime_root,
+            providers=tuple(
+                sorted(
+                    {ExecutionProviderKind(value) for value in provider_values},
+                    key=lambda provider: provider.value,
+                )
+            ),
+            token=True if args.use_hf_token else None,
+        )
+        result = {
+            "status": "skippy_direct_attached",
             **_bundle_summary(bundle),
             "output": str(args.output),
         }

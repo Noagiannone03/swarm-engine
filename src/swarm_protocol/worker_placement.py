@@ -264,6 +264,9 @@ class AutonomousWorkerPlacement:
         demand_region_id: str | None = None,
         span_static_bytes: SpanStaticBytes | None = None,
         materialization_identity_hashes: tuple[str, ...] | None = None,
+        execution_plan_identity_hash: str | None = None,
+        activation_bytes_per_token: int | None = None,
+        kv_bytes_per_token_by_layer: tuple[int, ...] | None = None,
     ) -> None:
         if transition_refresh_interval_s <= 0:
             raise ValueError("transition refresh interval must be positive")
@@ -298,6 +301,9 @@ class AutonomousWorkerPlacement:
         self._demand_region_id = demand_region_id
         self._span_static_bytes = span_static_bytes
         self._materialization_identity_hashes = materialization_identity_hashes
+        self._execution_plan_identity_hash = execution_plan_identity_hash
+        self._activation_bytes_per_token = activation_bytes_per_token
+        self._kv_bytes_per_token_by_layer = kv_bytes_per_token_by_layer
         self._context_demand: ContextCapacityDemandMap | None = None
         self._context_demand_state = "off" if demand_region_id is None else "waiting"
         self._context_demand_status: dict[str, object] | None = None
@@ -306,6 +312,21 @@ class AutonomousWorkerPlacement:
         # identical for every candidate that is physically feasible.
         self._storage_rejected_spans: set[LayerSpan] = set()
         self._lock = threading.RLock()
+
+    def _compatible_placement_leases(
+        self,
+        snapshot: DiscoverySnapshot,
+        offer: WorkerOffer,
+    ) -> tuple[SpanLease, ...]:
+        """Keep placement deficits scoped to one executable pipeline family."""
+
+        backends = {candidate.worker_id: candidate.backend for candidate in snapshot.offers}
+        return tuple(
+            lease
+            for lease in snapshot.leases
+            if backends.get(lease.worker_id) is offer.backend
+            and lease.execution_plan_identity_hash == self._execution_plan_identity_hash
+        )
 
     def bootstrap(
         self,
@@ -329,6 +350,12 @@ class AutonomousWorkerPlacement:
             raise ValueError("bootstrap context, KV block size and sessions must be positive")
         if not weight_hashes:
             raise ValueError("bootstrap intent must bind signed weight identities")
+        per_layer = self._kv_bytes_per_token_by_layer or manifest.kv_bytes_per_token_by_layer
+        if len(per_layer) != manifest.num_layers:
+            raise ValueError("bootstrap KV geometry does not cover every model layer")
+        activation_bytes_per_token = (
+            self._activation_bytes_per_token or manifest.activation_bytes_per_token
+        )
         with self._lock:
             if self._materialization_identity_hashes is None:
                 self._materialization_identity_hashes = weight_hashes
@@ -358,11 +385,12 @@ class AutonomousWorkerPlacement:
                 decision="catalog_manifest_mismatch",
                 error={"code": "TrustError", "detail": "DHT manifest differs from registry"},
             )
+        compatible_leases = self._compatible_placement_leases(snapshot, offer)
 
         baseline = self._policy.choose(
             offer=offer,
             manifest=manifest,
-            leases=snapshot.leases,
+            leases=compatible_leases,
             # This is only the chicken-and-egg bootstrap needed before the
             # first legitimate request can create signed demand.  It is not a
             # steady-state replica policy.
@@ -379,7 +407,7 @@ class AutonomousWorkerPlacement:
             baseline=baseline,
             offer=offer,
             manifest=manifest,
-            leases=snapshot.leases,
+            leases=compatible_leases,
             context_tokens=context_tokens,
             kv_block_size=kv_block_size,
             current_span=None,
@@ -401,9 +429,7 @@ class AutonomousWorkerPlacement:
         rounded_tokens = (
             (selected_context_tokens + kv_block_size - 1) // kv_block_size * kv_block_size
         )
-        allocatable_kv_bytes = rounded_tokens * sum(
-            manifest.kv_bytes_per_token_by_layer[span.start : span.end]
-        )
+        allocatable_kv_bytes = rounded_tokens * sum(per_layer[span.start : span.end])
         now_ms = time.time_ns() // 1_000_000
         building = ModelMemberAdvertisement(
             offer=offer,
@@ -414,10 +440,12 @@ class AutonomousWorkerPlacement:
                 effective_span_mode=EffectiveSpanMode.FIXED,
                 state=SpanState.BUILDING,
                 weight_hashes=weight_hashes,
+                execution_plan_identity_hash=self._execution_plan_identity_hash,
+                activation_bytes_per_token=activation_bytes_per_token,
                 max_context_tokens=selected_context_tokens,
                 kv_geometry=KvGeometry(
                     block_size_tokens=kv_block_size,
-                    bytes_per_token_by_layer=manifest.kv_bytes_per_token_by_layer,
+                    bytes_per_token_by_layer=per_layer,
                     allocatable_bytes=allocatable_kv_bytes,
                 ),
                 available_kv_bytes_snapshot=0,
@@ -500,6 +528,10 @@ class AutonomousWorkerPlacement:
                 decision="catalog_manifest_mismatch",
                 error={"code": "TrustError", "detail": "DHT manifest differs from registry"},
             )
+        compatible_leases = self._compatible_placement_leases(
+            snapshot,
+            advertisement.offer,
+        )
 
         active_reservations = sum(
             lease.state in {ReservationState.PREPARED, ReservationState.COMMITTED}
@@ -530,7 +562,7 @@ class AutonomousWorkerPlacement:
             baseline=decision,
             offer=advertisement.offer,
             manifest=manifest,
-            leases=snapshot.leases,
+            leases=compatible_leases,
             context_tokens=context_tokens,
             kv_block_size=advertisement.lease.kv_geometry.block_size_tokens,
             current_span=state.current_span,
@@ -730,10 +762,9 @@ class AutonomousWorkerPlacement:
                     // advertisement.lease.kv_geometry.block_size_tokens
                     * advertisement.lease.kv_geometry.block_size_tokens
                 )
+                per_layer = advertisement.lease.kv_geometry.bytes_per_token_by_layer
                 allocatable_kv_bytes = rounded_tokens * sum(
-                    manifest.kv_bytes_per_token_by_layer[
-                        state.target_span.start : state.target_span.end
-                    ]
+                    per_layer[state.target_span.start : state.target_span.end]
                 )
                 transition_advertisement = advertisement.model_copy(
                     update={

@@ -200,8 +200,15 @@ class ModelRegistryBundle(ContractModel):
         )
 
         if isinstance(plan, SkippyExecutionPlan):
-            if len(plan.layer_paths) != self.manifest.num_layers:
-                raise ValueError("Skippy execution layers do not cover every model layer")
+            geometry_layers = (
+                len(plan.direct_static_bytes_by_layer)
+                if plan.format == "gguf-direct"
+                else len(plan.layer_paths)
+            )
+            if geometry_layers != self.manifest.num_layers:
+                raise ValueError("Skippy execution geometry does not cover every model layer")
+            if plan.model_max_context_tokens > self.manifest.model_max_context_tokens:
+                raise ValueError("Skippy execution context exceeds the source model contract")
             return
         if not isinstance(plan, ModelExecutionPlan):
             raise TypeError(f"unsupported execution plan type: {type(plan).__name__}")

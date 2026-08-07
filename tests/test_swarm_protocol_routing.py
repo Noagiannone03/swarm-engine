@@ -43,7 +43,12 @@ def manifest(num_layers: int = 8) -> ModelManifest:
     )
 
 
-def offer(worker_id: str, *, frontend: bool = True) -> WorkerOffer:
+def offer(
+    worker_id: str,
+    *,
+    frontend: bool = True,
+    backend: BackendKind = BackendKind.MLX,
+) -> WorkerOffer:
     roles = {WorkerRole.EXECUTOR}
     if frontend:
         roles.add(WorkerRole.FRONTEND)
@@ -52,7 +57,7 @@ def offer(worker_id: str, *, frontend: bool = True) -> WorkerOffer:
         endpoint_id=f"{worker_id}-endpoint",
         runtime_version="3.0.0-dev",
         platform="test",
-        backend=BackendKind.MLX,
+        backend=backend,
         stable_memory_envelope_bytes=16 * 1024**3,
         supported_roles=roles,
         offer_seq=1,
@@ -73,6 +78,8 @@ def lease(
     decode_tps: float | None = 100,
     max_context_tokens: int = 65_536,
     expires_at_ms: int = 10_000,
+    execution_plan_identity_hash: str | None = None,
+    activation_bytes_per_token: int | None = None,
 ) -> SpanLease:
     return SpanLease(
         model_swarm_id=model.model_swarm_id,
@@ -81,6 +88,8 @@ def lease(
         effective_span_mode=mode,
         state=SpanState.READY,
         weight_hashes=(HASHES[0],),
+        execution_plan_identity_hash=execution_plan_identity_hash,
+        activation_bytes_per_token=activation_bytes_per_token,
         measured_prefill_tokens_per_second=prefill_tps,
         measured_decode_tokens_per_second=decode_tps,
         max_context_tokens=max_context_tokens,
@@ -418,3 +427,47 @@ def test_recoverable_route_fails_closed_without_disjoint_backup_coverage() -> No
             [lease(model, "head", 0, 4), lease(model, "tail", 4, 8)],
             [link("head", "tail"), link("tail", "head")],
         )
+
+
+def test_portable_route_rejects_mixed_execution_plan_identities() -> None:
+    model = manifest(num_layers=2)
+    with pytest.raises(NoFeasibleRoute, match="no complete route"):
+        plan(
+            model,
+            request(model),
+            [
+                offer("head", backend=BackendKind.SKIPPY),
+                offer("tail", frontend=False, backend=BackendKind.SKIPPY),
+            ],
+            [
+                lease(
+                    model,
+                    "head",
+                    0,
+                    1,
+                    execution_plan_identity_hash="a" * 64,
+                    activation_bytes_per_token=4096,
+                ),
+                lease(
+                    model,
+                    "tail",
+                    1,
+                    2,
+                    execution_plan_identity_hash="b" * 64,
+                    activation_bytes_per_token=4096,
+                ),
+            ],
+            [link("head", "tail"), link("tail", "head")],
+        )
+
+
+def test_portable_route_uses_signed_activation_wire_geometry() -> None:
+    model = manifest()
+    metric = link("head", "tail", rtt_ms=0, throughput=1024)
+    request_contract = request(model, prompt=10, output=1)
+
+    f32 = ExactRoutePlanner()._link_cost(metric, request_contract, 4096)
+    bf16 = ExactRoutePlanner()._link_cost(metric, request_contract, 2048)
+
+    assert f32.ttft_ms == pytest.approx(bf16.ttft_ms * 2)
+    assert f32.inter_token_ms == pytest.approx(bf16.inter_token_ms * 2)

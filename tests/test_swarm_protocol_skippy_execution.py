@@ -14,14 +14,19 @@ from swarm_protocol.contracts import (
     SkippyExecutionPlan,
     SkippyRuntimeFeature,
 )
-from swarm_protocol.model_manifest import artifact_collection_hash, execution_plan_hash
+from swarm_protocol.model_manifest import (
+    artifact_collection_hash,
+    execution_plan_hash,
+    execution_plan_identity_hash,
+)
 from swarm_protocol.registry import ModelRegistryBundle
-from swarm_protocol.skippy_package_import import attach_skippy_package
+from swarm_protocol.skippy_package_import import attach_skippy_direct_gguf, attach_skippy_package
 from swarm_protocol.skippy_execution import (
     materialize_skippy_execution_span,
     required_skippy_storage_bytes,
     select_skippy_execution_plan,
     skippy_execution_provider_for_device,
+    skippy_span_static_bytes,
     verify_skippy_execution_span,
 )
 
@@ -126,6 +131,11 @@ def _fixture(*, package_layer_count: int = 2):
             SkippyRuntimeFeature.SESSION_RESET,
         ),
         activation_width=1024,
+        activation_bytes_per_token=4096,
+        cache_type_k="f16",
+        cache_type_v="f16",
+        kv_bytes_per_token_by_layer=(256, 256),
+        model_max_context_tokens=32768,
         providers=(
             ExecutionProviderKind.CPU,
             ExecutionProviderKind.CUDA,
@@ -185,6 +195,8 @@ def test_skippy_plan_is_bound_by_registry_and_supports_native_devices():
     assert select_skippy_execution_plan(index, device="vulkan:0").plan_id == "skippy-q4-k-m-v1"
     assert skippy_execution_provider_for_device("metal") is ExecutionProviderKind.METAL
     assert bundle.manifest.execution_plan_hash == execution_plan_hash(index)
+    identity = execution_plan_identity_hash(index, index.execution_plans[0])
+    assert len(identity) == 64
 
 
 def test_skippy_span_downloads_only_owned_layers_and_boundary(tmp_path):
@@ -277,7 +289,9 @@ def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
         model_id=populated_index.model_id,
         immutable_revision=populated_index.immutable_revision,
         artifacts=tuple(
-            artifact for artifact in populated_index.artifacts if artifact.role not in execution_roles
+            artifact
+            for artifact in populated_index.artifacts
+            if artifact.role not in execution_roles
         ),
     )
     base_model = populated_model.model_copy(update={"execution_plan_hash": None})
@@ -292,9 +306,7 @@ def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
         lfs = None
         if artifact.path != "model-package.json":
             lfs = SimpleNamespace(sha256=artifact.sha256, size=artifact.size)
-        siblings.append(
-            SimpleNamespace(rfilename=artifact.path, size=artifact.size, lfs=lfs)
-        )
+        siblings.append(SimpleNamespace(rfilename=artifact.path, size=artifact.size, lfs=lfs))
     api = SimpleNamespace(
         model_info=lambda *args, **kwargs: SimpleNamespace(sha="9" * 40, siblings=siblings)
     )
@@ -316,3 +328,86 @@ def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
     assert plan.package_repository_id == "meshllm/Qwen3-0.6B-Q4_K_M-layers"
     assert len(plan.layer_paths) == 2
     assert attached.manifest.execution_plan_hash == execution_plan_hash(attached.artifact_index)
+
+
+def test_direct_gguf_needs_no_layer_package_and_loads_as_runtime_slice(tmp_path):
+    _, populated_index, populated_model = _fixture()
+    execution_roles = {
+        ArtifactRole.EXECUTION_LAYER,
+        ArtifactRole.EXECUTION_PACKAGE_MANIFEST,
+        ArtifactRole.EXECUTION_SHARED,
+    }
+    base_index = ModelArtifactIndex(
+        model_id=populated_index.model_id,
+        immutable_revision=populated_index.immutable_revision,
+        artifacts=tuple(
+            artifact
+            for artifact in populated_index.artifacts
+            if artifact.role not in execution_roles
+        ),
+    )
+    base_bundle = ModelRegistryBundle(
+        manifest=populated_model.model_copy(update={"execution_plan_hash": None}),
+        artifact_index=base_index,
+    )
+    payload = b"ordinary-gguf-source"
+    source = tmp_path / "model-q4.gguf"
+    source.write_bytes(payload)
+    sibling = SimpleNamespace(
+        rfilename="model-q4.gguf",
+        size=len(payload),
+        lfs=SimpleNamespace(sha256=_sha(payload), size=len(payload)),
+    )
+    api = SimpleNamespace(
+        model_info=lambda *args, **kwargs: SimpleNamespace(
+            sha="8" * 40,
+            siblings=(sibling,),
+        )
+    )
+    geometry = SimpleNamespace(
+        activation_width=1024,
+        context_length=32768,
+        kv_bytes_per_token=512,
+        layer_count=2,
+        static_bytes_by_layer=(700, 800),
+    )
+    attached = attach_skippy_direct_gguf(
+        base_bundle,
+        repository_id="community/Qwen3-0.6B-GGUF",
+        revision="main",
+        source_paths=("model-q4.gguf",),
+        plan_id="skippy-direct-q4",
+        quantization="Q4_K_M",
+        runtime_release="mesh-llm/v0.74.0",
+        runtime_abi_version="0.1.32",
+        api=api,
+        downloader=lambda **kwargs: str(source),
+        geometry_inspector=lambda paths, cache_k, cache_v: geometry,
+    )
+
+    plan = attached.artifact_index.execution_plans[0]
+    assert isinstance(plan, SkippyExecutionPlan)
+    assert plan.format == "gguf-direct"
+    assert plan.source_model_paths == ("model-q4.gguf",)
+    assert SkippyRuntimeFeature.RUNTIME_SLICE in plan.required_runtime_features
+    assert SkippyRuntimeFeature.LAYER_PACKAGE not in plan.required_runtime_features
+    assert skippy_span_static_bytes(
+        attached.artifact_index,
+        plan,
+        attached.manifest,
+        LayerSpan(start=0, end=1),
+    ) == 700
+
+    root = tmp_path / "snapshot"
+    root.mkdir()
+    (root / "model-q4.gguf").write_bytes(payload)
+    verified = materialize_skippy_execution_span(
+        attached.artifact_index,
+        attached.manifest,
+        LayerSpan(start=1, end=2),
+        device="cpu",
+        snapshot_downloader=lambda **kwargs: root,
+    )
+    assert verified.part_paths == (root / "model-q4.gguf",)
+    assert verified.geometry_path == root / "model-q4.gguf"
+    assert verified.artifact_bytes == len(payload)

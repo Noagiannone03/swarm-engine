@@ -1,4 +1,4 @@
-"""Fail-closed materialization of signed Skippy sparse-GGUF layer packages."""
+"""Fail-closed materialization of signed Skippy GGUF execution sources."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ _DEVICE_PROVIDERS = {
 
 @dataclass(frozen=True)
 class VerifiedSkippySpan:
-    """Exact package parts verified for one worker's contiguous layer range."""
+    """Exact GGUF source bytes verified for one worker's contiguous range."""
 
     plan: SkippyExecutionPlan
     span: LayerSpan
@@ -45,6 +45,15 @@ class VerifiedSkippySpan:
         """Compatibility name used by the signed READY lease."""
 
         return self.artifact_hashes
+
+    @property
+    def geometry_path(self) -> Path:
+        """Authenticated GGUF carrying the architecture and KV metadata."""
+
+        if self.plan.format == "gguf-direct":
+            return self.part_paths[0]
+        assert self.plan.shared_metadata_path is not None
+        return self.package_root / self.plan.shared_metadata_path
 
 
 def skippy_execution_provider_for_device(device: str) -> ExecutionProviderKind:
@@ -87,17 +96,31 @@ def required_skippy_descriptors(
     manifest: ModelManifest,
     span: LayerSpan,
 ) -> tuple[ArtifactDescriptor, ...]:
-    """Return the manifest, shared boundary parts, and exact assigned layers."""
+    """Return the complete direct source or exact package parts for a span."""
 
-    if span.end > manifest.num_layers or len(plan.layer_paths) != manifest.num_layers:
+    if (
+        span.end > manifest.num_layers
+        or len(plan.kv_bytes_per_token_by_layer) != manifest.num_layers
+    ):
         raise ValueError("Skippy execution span exceeds the signed model layer count")
+    descriptors = {artifact.path: artifact for artifact in artifact_index.artifacts}
+    if plan.format == "gguf-direct":
+        try:
+            return tuple(descriptors[path] for path in plan.source_model_paths)
+        except KeyError as exc:  # pragma: no cover - index contract catches this
+            raise ValueError("direct Skippy plan references an unsigned GGUF") from exc
+    assert plan.package_manifest_path is not None
+    assert plan.shared_metadata_path is not None
+    assert plan.embeddings_path is not None
+    assert plan.output_path is not None
+    if len(plan.layer_paths) != manifest.num_layers:
+        raise ValueError("Skippy layer package does not cover the signed model")
     paths = [plan.package_manifest_path, plan.shared_metadata_path]
     if span.start == 0:
         paths.append(plan.embeddings_path)
     paths.extend(plan.layer_paths[span.start : span.end])
     if span.end == manifest.num_layers:
         paths.append(plan.output_path)
-    descriptors = {artifact.path: artifact for artifact in artifact_index.artifacts}
     try:
         return tuple(descriptors[path] for path in paths)
     except KeyError as exc:
@@ -122,10 +145,14 @@ def skippy_span_static_bytes(
     manifest: ModelManifest,
     span: LayerSpan,
 ) -> int | None:
-    """Return exact static bytes; every transformer-layer boundary is executable."""
+    """Return exact resident tensor bytes for an executable transformer span."""
 
     if span.end > manifest.num_layers:
         return None
+    if plan.format == "gguf-direct":
+        if len(plan.direct_static_bytes_by_layer) != manifest.num_layers:
+            return None
+        return sum(plan.direct_static_bytes_by_layer[span.start : span.end])
     return required_skippy_storage_bytes(artifact_index, plan, manifest, span)
 
 
@@ -156,6 +183,14 @@ def _verify_package_manifest_contract(
     manifest: ModelManifest,
     plan: SkippyExecutionPlan,
 ) -> Path:
+    if plan.format != "gguf-layer-package":
+        raise ValueError("direct GGUF execution has no layer-package manifest")
+    assert plan.package_manifest_path is not None
+    assert plan.package_model_id is not None
+    assert plan.package_abi_version is not None
+    assert plan.shared_metadata_path is not None
+    assert plan.embeddings_path is not None
+    assert plan.output_path is not None
     descriptor_by_path = {artifact.path: artifact for artifact in artifact_index.artifacts}
     package_path = verify_artifact(root, descriptor_by_path[plan.package_manifest_path])
     if package_path.stat().st_size > _MAX_PACKAGE_MANIFEST_BYTES:
@@ -217,17 +252,25 @@ def verify_skippy_execution_span(
     """Verify package semantics and every selected byte before READY."""
 
     plan = select_skippy_execution_plan(artifact_index, device=device, plan_id=plan_id)
-    package_manifest_path = _verify_package_manifest_contract(
-        root,
-        artifact_index,
-        manifest,
-        plan,
-    )
+    if plan.format == "gguf-layer-package":
+        package_manifest_path = _verify_package_manifest_contract(
+            root,
+            artifact_index,
+            manifest,
+            plan,
+        )
+    else:
+        direct_descriptor = next(
+            artifact
+            for artifact in artifact_index.artifacts
+            if artifact.path == plan.source_model_paths[0]
+        )
+        package_manifest_path = verify_artifact(root, direct_descriptor)
     required = required_skippy_descriptors(artifact_index, plan, manifest, span)
     selected_parts = tuple(
         verify_artifact(root, descriptor)
         for descriptor in required
-        if descriptor.path != plan.package_manifest_path
+        if plan.format == "gguf-direct" or descriptor.path != plan.package_manifest_path
     )
     return VerifiedSkippySpan(
         plan=plan,

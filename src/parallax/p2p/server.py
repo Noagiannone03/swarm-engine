@@ -62,6 +62,7 @@ from swarm_protocol.contracts import (
 )
 from swarm_protocol.execution import WorkerExecutionAdmission
 from swarm_protocol.execution_rpc import WorkerExecutionControlService
+from swarm_protocol.model_manifest import execution_plan_identity_hash
 from swarm_protocol.portable_execution import (
     portable_span_static_bytes,
     select_execution_plan,
@@ -500,7 +501,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "request_id": request_id,
                 "status_code": 400,
                 "error": (
-                    "this qualified Rust frontend supports tool_choice only as " "'auto' or 'none'"
+                    "this qualified Rust frontend supports tool_choice only as 'auto' or 'none'"
                 ),
             }
 
@@ -1125,6 +1126,10 @@ class GradientServer:
                     backend = BackendKind.SGLANG
                 span_static_bytes = None
                 materialization_identity_hashes = (manifest.weight_collection_hash,)
+                execution_identity = None
+                activation_bytes_per_token = manifest.activation_bytes_per_token
+                kv_bytes_per_token_by_layer = manifest.kv_bytes_per_token_by_layer
+                execution_context_limit = manifest.model_max_context_tokens
                 execution_granularity_layers = 1
                 execution_device = None
                 if backend is BackendKind.ONNXRUNTIME:
@@ -1143,7 +1148,14 @@ class GradientServer:
                         execution_plan,
                         manifest,
                     )
-                    materialization_identity_hashes = (manifest.execution_plan_hash,)
+                    execution_identity = execution_plan_identity_hash(
+                        bundle.artifact_index,
+                        execution_plan,
+                    )
+                    materialization_identity_hashes = (execution_identity,)
+                    activation_bytes_per_token = execution_plan.activation_hidden_size * (
+                        2 if execution_plan.activation_dtype == "float16" else 4
+                    )
                     execution_granularity_layers = execution_plan.execution_granularity_layers
                     if self._shared_state is not None:
                         self._shared_state.update(
@@ -1166,7 +1178,14 @@ class GradientServer:
                         execution_plan,
                         manifest,
                     )
-                    materialization_identity_hashes = (manifest.execution_plan_hash,)
+                    execution_identity = execution_plan_identity_hash(
+                        bundle.artifact_index,
+                        execution_plan,
+                    )
+                    materialization_identity_hashes = (execution_identity,)
+                    activation_bytes_per_token = execution_plan.activation_bytes_per_token
+                    kv_bytes_per_token_by_layer = execution_plan.kv_bytes_per_token_by_layer
+                    execution_context_limit = execution_plan.model_max_context_tokens
                     execution_granularity_layers = execution_plan.execution_granularity_layers
                     if self._shared_state is not None:
                         self._shared_state.update(
@@ -1181,17 +1200,22 @@ class GradientServer:
                     current_span=None,
                     topology_observer=self._observe_autonomous_topology,
                     demand_region_id=(
-                        os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip()
-                        or "global"
+                        os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip() or "global"
                     ),
                     span_static_bytes=span_static_bytes,
                     materialization_identity_hashes=materialization_identity_hashes,
+                    execution_plan_identity_hash=execution_identity,
+                    activation_bytes_per_token=activation_bytes_per_token,
+                    kv_bytes_per_token_by_layer=kv_bytes_per_token_by_layer,
                 )
                 self.swarm_v3_placement_controller = controller
                 offer = None
                 offer_capacity_sequence = None
                 manifest_published = False
-                preferred_context_tokens = int(self.planned_context_tokens)
+                preferred_context_tokens = min(
+                    int(self.planned_context_tokens),
+                    execution_context_limit,
+                )
                 context_tiers = autonomous_context_tiers(
                     preferred_context_tokens,
                     minimum_tokens=int(os.environ.get("FABI_SWARM_V3_MIN_CONTEXT_TOKENS", "4096")),
@@ -1302,15 +1326,15 @@ class GradientServer:
                                 return
                             phase = self._shared_state.get("swarm_v3_placement_phase")
                             current_generation = int(
-                                self._shared_state.get("swarm_v3_placement_generation", 0)
-                                or 0
+                                self._shared_state.get("swarm_v3_placement_generation", 0) or 0
                             )
                             if phase != "building" or current_generation != generation:
                                 break
                             self.stop_event.wait(0.5)
-                        if self._shared_state is not None and self._shared_state.get(
-                            "swarm_v3_placement_phase"
-                        ) == "ready":
+                        if (
+                            self._shared_state is not None
+                            and self._shared_state.get("swarm_v3_placement_phase") == "ready"
+                        ):
                             return
                         continue
                     self.stop_event.wait(0.5)
@@ -1414,9 +1438,7 @@ class GradientServer:
         if str(self.scheduler_addr).startswith("/"):
             raise ValueError("Iroh workers require an endpoint ID, not a Lattica multiaddress")
         self.scheduler_peer_id = str(self.scheduler_addr)
-        demand_region = (
-            os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip() or "global"
-        )
+        demand_region = os.environ.get("FABI_SWARM_V3_DEMAND_REGION", "").strip() or "global"
         self.iroh_transport = IrohTransport.from_environment(
             "worker",
             trusted_demand_publishers={demand_region: self.scheduler_peer_id},
@@ -2279,9 +2301,9 @@ class GradientServer:
                     for req in forward_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert (
-                                self.block_start_index == 0
-                            ), "Request routing table is not set for non-head rank"
+                            assert self.block_start_index == 0, (
+                                "Request routing table is not set for non-head rank"
+                            )
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -2337,9 +2359,9 @@ class GradientServer:
                     for req in abort_request.reqs:
                         # set routing table if not scheduler mode
                         if len(req.routing_table) == 0 and self.scheduler_addr is None:
-                            assert (
-                                self.block_start_index == 0
-                            ), "Request routing table is not set for non-head rank"
+                            assert self.block_start_index == 0, (
+                                "Request routing table is not set for non-head rank"
+                            )
 
                             req.routing_table.extend(self.routing_table)
                             logger.info(
@@ -2825,9 +2847,7 @@ class GradientServer:
                     dict(storage_contract_failure)
                 )
             ):
-                storage_contract_failure = self._shared_state.get(
-                    "storage_contract_failure"
-                )
+                storage_contract_failure = self._shared_state.get("storage_contract_failure")
             placement_error = self._shared_state.get("swarm_v3_placement_error")
             if placement_error is not None and self.swarm_v3_placement_controller is not None:
                 try:
@@ -2975,12 +2995,8 @@ class GradientServer:
                             measured_decode_tokens_per_second=metrics.get(
                                 "decode_tokens_per_second"
                             ),
-                            execution_plan_id=self._shared_state.get(
-                                "execution_plan_id"
-                            ),
-                            execution_device=self._shared_state.get(
-                                "execution_device"
-                            ),
+                            execution_plan_id=self._shared_state.get("execution_plan_id"),
+                            execution_device=self._shared_state.get("execution_device"),
                         )
                     )
                     report["placement_mode"] = self.swarm_v3_placement_mode
@@ -3005,6 +3021,15 @@ class GradientServer:
                                     span_static_bytes = None
                                     materialization_identity_hashes = (
                                         manifest.weight_collection_hash,
+                                    )
+                                    execution_identity = None
+                                    activation_bytes_per_token = (
+                                        advertisement.lease.activation_bytes_per_token
+                                        or manifest.activation_bytes_per_token
+                                    )
+                                    kv_bytes_per_token_by_layer = (
+                                        advertisement.lease.kv_geometry.bytes_per_token_by_layer
+                                        or manifest.kv_bytes_per_token_by_layer
                                     )
                                     if runtime_backend in {"onnxruntime", "skippy"}:
                                         serving_device = str(
@@ -3041,9 +3066,11 @@ class GradientServer:
                                             execution_plan,
                                             manifest,
                                         )
-                                        materialization_identity_hashes = (
-                                            manifest.execution_plan_hash,
+                                        execution_identity = execution_plan_identity_hash(
+                                            bundle.artifact_index,
+                                            execution_plan,
                                         )
+                                        materialization_identity_hashes = (execution_identity,)
                                     self.swarm_v3_placement_controller = AutonomousWorkerPlacement(
                                         catalog=catalog,
                                         admission=self.swarm_v3_execution_admission,
@@ -3064,6 +3091,9 @@ class GradientServer:
                                         materialization_identity_hashes=(
                                             materialization_identity_hashes
                                         ),
+                                        execution_plan_identity_hash=execution_identity,
+                                        activation_bytes_per_token=activation_bytes_per_token,
+                                        kv_bytes_per_token_by_layer=kv_bytes_per_token_by_layer,
                                     )
                                 placement = self.swarm_v3_placement_controller.observe(
                                     advertisement=advertisement,
@@ -3102,9 +3132,7 @@ class GradientServer:
                     capacity = None
                     if self._shared_state is not None:
                         placement_phase = self._shared_state.get("swarm_v3_placement_phase")
-                        placement_decision = self._shared_state.get(
-                            "swarm_v3_placement_decision"
-                        )
+                        placement_decision = self._shared_state.get("swarm_v3_placement_decision")
                         capacity_hardware = self._shared_state.get("capacity_hardware")
                         if isinstance(capacity_hardware, dict):
                             capacity = {
@@ -3155,8 +3183,7 @@ class GradientServer:
                 if probe_state == "failed":
                     error = self._shared_state.get("capacity_probe_error") or {}
                     raise RuntimeError(
-                        "backend capacity preflight failed: "
-                        f"{error.get('detail', error)}"
+                        f"backend capacity preflight failed: {error.get('detail', error)}"
                     )
                 if probe_state in {"ready", "frozen"}:
                     detected = self._shared_state.get("capacity_hardware")

@@ -10,10 +10,12 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 mesh-llm-native-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "e60b2fe43aa05271569fbeff2a457133aef456a1" }
+model-artifact = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "e60b2fe43aa05271569fbeff2a457133aef456a1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 skippy-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "e60b2fe43aa05271569fbeff2a457133aef456a1", features = ["dynamic-native-runtime"] }
+skippy-ffi = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "e60b2fe43aa05271569fbeff2a457133aef456a1" }
 
 [dev-dependencies]
 tempfile = "3.20"

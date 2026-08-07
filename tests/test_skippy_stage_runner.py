@@ -103,6 +103,29 @@ class _FakeNative:
             )
         ]
 
+    def inspect_skippy_package_geometry(self, path, cache_type_k, cache_type_v):
+        assert Path(path).name == "metadata.gguf"
+        assert (cache_type_k, cache_type_v) == ("f16", "f16")
+        return SimpleNamespace(
+            architecture="qwen3",
+            context_length=32768,
+            activation_width=1024,
+            layer_count=2,
+            kv_bytes_per_token=512,
+        )
+
+    def inspect_skippy_source_geometry(self, paths, cache_type_k, cache_type_v):
+        assert [Path(path).name for path in paths] == ["model.gguf"]
+        assert (cache_type_k, cache_type_v) == ("f16", "f16")
+        return SimpleNamespace(
+            architecture="qwen3",
+            context_length=32768,
+            activation_width=1024,
+            layer_count=2,
+            kv_bytes_per_token=512,
+            static_bytes_by_layer=(700, 800),
+        )
+
     def SkippyStage(self, parts, **kwargs):
         self.stage = _FakeStage(parts, **kwargs)
         return self.stage
@@ -118,8 +141,17 @@ def _verified(tmp_path):
         plan=SimpleNamespace(
             runtime_release="mesh-llm/v0.74.0",
             runtime_abi_version="0.1.32",
+            format="gguf-layer-package",
+            shared_metadata_path="metadata.gguf",
+            cache_type_k="f16",
+            cache_type_v="f16",
+            activation_width=1024,
+            model_max_context_tokens=32768,
+            kv_bytes_per_token_by_layer=(256, 256),
         ),
         span=LayerSpan(start=0, end=2),
+        package_root=tmp_path,
+        geometry_path=tmp_path / "metadata.gguf",
         part_paths=tuple(parts),
     )
 
@@ -157,12 +189,47 @@ def test_runner_reuses_native_stage_and_typed_activations(tmp_path):
 
     assert native.loaded == (tmp_path, "0.74.0", "0.1.32", "vulkan")
     assert native.stage.kwargs["selected_backend_device"] == "Vulkan0"
+    assert native.stage.kwargs["load_mode"] == "layer_package"
     assert prefill.predicted_token is None
     assert prefill.activation.payload == b"native-output"
     assert decode.predicted_token == 42
     assert isinstance(native.stage.calls[-1][1], _FakeActivation)
     runner.release("request-1")
     assert native.stage.dropped == ["request-1"]
+
+
+def test_direct_gguf_runner_uses_runtime_slice_without_a_package(tmp_path):
+    source = tmp_path / "model.gguf"
+    source.write_bytes(b"gguf")
+    verified = SimpleNamespace(
+        plan=SimpleNamespace(
+            runtime_release="mesh-llm/v0.74.0",
+            runtime_abi_version="0.1.32",
+            format="gguf-direct",
+            cache_type_k="f16",
+            cache_type_v="f16",
+            activation_width=1024,
+            model_max_context_tokens=32768,
+            kv_bytes_per_token_by_layer=(256, 256),
+            direct_static_bytes_by_layer=(700, 800),
+        ),
+        span=LayerSpan(start=0, end=2),
+        package_root=tmp_path,
+        geometry_path=source,
+        part_paths=(source,),
+    )
+    native = _FakeNative()
+    SkippyRuntimeStageRunner(
+        verified,
+        device="vulkan:0",
+        model_layer_count=2,
+        max_context_tokens=32768,
+        max_sessions=1,
+        native_module=native,
+        runtime_root=tmp_path,
+    )
+
+    assert native.stage.kwargs["load_mode"] == "runtime_slice"
 
 
 def test_runtime_discovery_is_exact_and_ambiguous_installations_fail(tmp_path, monkeypatch):
@@ -187,11 +254,14 @@ def test_runtime_discovery_is_exact_and_ambiguous_installations_fail(tmp_path, m
     write_runtime("wrong-abi", abi="0.1.31")
     monkeypatch.setenv("FABI_SKIPPY_NATIVE_RUNTIME_DIR", str(expected))
 
-    assert discover_skippy_native_runtime(
-        mesh_release="0.74.0",
-        runtime_abi="0.1.32",
-        backend="vulkan",
-    ) == expected.resolve()
+    assert (
+        discover_skippy_native_runtime(
+            mesh_release="0.74.0",
+            runtime_abi="0.1.32",
+            backend="vulkan",
+        )
+        == expected.resolve()
+    )
 
     monkeypatch.setenv("FABI_SKIPPY_NATIVE_RUNTIME_DIR", str(tmp_path))
     write_runtime("duplicate")

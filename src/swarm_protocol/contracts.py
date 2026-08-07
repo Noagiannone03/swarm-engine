@@ -73,6 +73,7 @@ class ArtifactRole(str, Enum):
     EXECUTION_PACKAGE_MANIFEST = "execution_package_manifest"
     EXECUTION_LAYER = "execution_layer"
     EXECUTION_SHARED = "execution_shared"
+    EXECUTION_MODEL = "execution_model"
 
 
 class ExecutionProviderKind(str, Enum):
@@ -93,6 +94,7 @@ class SkippyRuntimeFeature(str, Enum):
     """Feature-probed Skippy ABI surfaces required by a signed plan."""
 
     LAYER_PACKAGE = "layer_package"
+    RUNTIME_SLICE = "runtime_slice"
     ACTIVATION_FRAME = "activation_frame"
     SESSION_RESET = "session_reset"
     GENERATION_SIGNALS = "generation_signals"
@@ -180,8 +182,10 @@ class ExecutionStageDescriptor(ContractModel):
         paths = (self.graph_path, *self.external_data_paths)
         for path in paths:
             parts = path.split("/")
-            if path.startswith("/") or "\\" in path or any(
-                part in {"", ".", ".."} for part in parts
+            if (
+                path.startswith("/")
+                or "\\" in path
+                or any(part in {"", ".", ".."} for part in parts)
             ):
                 raise ValueError("execution artifact path must be normalized relative POSIX")
         if tuple(sorted(set(self.external_data_paths))) != self.external_data_paths:
@@ -220,16 +224,10 @@ class ModelExecutionPlan(ContractModel):
     # host.  Keep the exception list signed and node-exact: a worker profiles a
     # warm-up and refuses READY if any other node falls back to CPU.  This is
     # materially different from silently accepting arbitrary CPU fallback.
-    allowed_cpu_fallback_nodes: Annotated[
-        tuple[NonEmpty, ...], Field(max_length=256)
-    ] = ()
-    allowed_cpu_only_stages: Annotated[
-        tuple[NonEmpty, ...], Field(max_length=16)
-    ] = ()
+    allowed_cpu_fallback_nodes: Annotated[tuple[NonEmpty, ...], Field(max_length=256)] = ()
+    allowed_cpu_only_stages: Annotated[tuple[NonEmpty, ...], Field(max_length=16)] = ()
     execution_granularity_layers: PositiveInt = 1
-    providers: Annotated[
-        tuple[ExecutionProviderKind, ...], Field(min_length=1, max_length=16)
-    ]
+    providers: Annotated[tuple[ExecutionProviderKind, ...], Field(min_length=1, max_length=16)]
     stages: Annotated[tuple[ExecutionStageDescriptor, ...], Field(min_length=3, max_length=100_000)]
 
     @model_validator(mode="after")
@@ -269,48 +267,67 @@ class ModelExecutionPlan(ContractModel):
 
 
 class SkippyExecutionPlan(ContractModel):
-    """Signed sparse-GGUF stage plan executed by a feature-probed Skippy runtime.
+    """Signed GGUF stage plan executed by a feature-probed Skippy runtime.
 
     The plan deliberately describes artifacts and compatibility, not placement.
     Fabi V3 still chooses a worker's contiguous span from live memory, context,
-    demand, and topology. A worker then downloads only the package parts needed
-    for that exact span.
+    demand, and topology. A direct GGUF needs no conversion and is filtered at
+    load time; an optional layer package lets a worker download only its span.
     """
 
     protocol_version: int = PROTOCOL_VERSION
     plan_id: Annotated[str, Field(min_length=1, max_length=255)]
     backend: Literal[BackendKind.SKIPPY] = BackendKind.SKIPPY
-    format: Literal["gguf-layer-package"] = "gguf-layer-package"
+    format: Literal["gguf-direct", "gguf-layer-package"] = "gguf-layer-package"
     quantization: Annotated[str, Field(min_length=1, max_length=128)]
     package_repository_id: Annotated[str, Field(min_length=1, max_length=255)]
     package_revision: CommitHex
-    package_manifest_path: Annotated[str, Field(min_length=1, max_length=1024)]
-    package_manifest_sha256: HashHex
-    package_schema_version: Literal[1] = 1
-    package_model_id: Annotated[str, Field(min_length=1, max_length=512)]
+    source_model_paths: Annotated[tuple[NonEmpty, ...], Field(max_length=1024)] = ()
+    package_manifest_path: Annotated[str, Field(min_length=1, max_length=1024)] | None = None
+    package_manifest_sha256: HashHex | None = None
+    package_schema_version: Literal[1] | None = 1
+    package_model_id: Annotated[str, Field(min_length=1, max_length=512)] | None = None
     package_source_sha256: HashHex
-    package_abi_version: Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
+    package_abi_version: Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")] | None = None
     runtime_release: Annotated[str, Field(min_length=1, max_length=128)]
     runtime_abi_version: Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
     required_runtime_features: Annotated[
         tuple[SkippyRuntimeFeature, ...], Field(min_length=1, max_length=64)
     ]
     activation_width: PositiveInt
-    execution_granularity_layers: PositiveInt = 1
-    providers: Annotated[
-        tuple[ExecutionProviderKind, ...], Field(min_length=1, max_length=16)
+    # Skippy's staged ABI currently emits token-major F32 activation frames.
+    # Keep the wire geometry in the signed plan: it is a routing input and must
+    # never be inherited from the source SafeTensors checkpoint's BF16 dtype.
+    activation_wire_dtype: Literal["f32"] = "f32"
+    activation_bytes_per_token: PositiveInt
+    # The native stage is opened with these exact cache types.  The per-layer
+    # byte geometry is signed separately so request admission never guesses
+    # from the quantisation used for static weights.
+    cache_type_k: Literal["f16"] = "f16"
+    cache_type_v: Literal["f16"] = "f16"
+    kv_bytes_per_token_by_layer: Annotated[
+        tuple[PositiveInt, ...], Field(min_length=1, max_length=100_000)
     ]
-    shared_metadata_path: Annotated[str, Field(min_length=1, max_length=1024)]
-    embeddings_path: Annotated[str, Field(min_length=1, max_length=1024)]
-    output_path: Annotated[str, Field(min_length=1, max_length=1024)]
-    layer_paths: Annotated[tuple[NonEmpty, ...], Field(min_length=1, max_length=100_000)]
+    model_max_context_tokens: PositiveInt
+    execution_granularity_layers: PositiveInt = 1
+    providers: Annotated[tuple[ExecutionProviderKind, ...], Field(min_length=1, max_length=16)]
+    shared_metadata_path: Annotated[str, Field(min_length=1, max_length=1024)] | None = None
+    embeddings_path: Annotated[str, Field(min_length=1, max_length=1024)] | None = None
+    output_path: Annotated[str, Field(min_length=1, max_length=1024)] | None = None
+    layer_paths: Annotated[tuple[NonEmpty, ...], Field(max_length=100_000)] = ()
+    # Direct GGUF workers keep the complete file on disk but load only the
+    # tensors in their assigned runtime slice. These signed tensor byte totals
+    # make placement exact instead of dividing the file size heuristically.
+    direct_static_bytes_by_layer: Annotated[
+        tuple[PositiveInt, ...], Field(max_length=100_000)
+    ] = ()
 
     @model_validator(mode="after")
     def validate_plan(self) -> Self:
         if self.protocol_version != PROTOCOL_VERSION:
             raise ValueError(f"unsupported protocol version: {self.protocol_version}")
         if self.execution_granularity_layers != 1:
-            raise ValueError("Skippy layer packages currently require one-layer granularity")
+            raise ValueError("Skippy runtime slices currently require one-layer granularity")
         provider_values = tuple(provider.value for provider in self.providers)
         if tuple(sorted(set(provider_values))) != provider_values:
             raise ValueError("execution providers must be sorted and unique")
@@ -326,27 +343,73 @@ class SkippyExecutionPlan(ContractModel):
         feature_values = tuple(feature.value for feature in self.required_runtime_features)
         if tuple(sorted(set(feature_values))) != feature_values:
             raise ValueError("Skippy runtime features must be sorted and unique")
-        if SkippyRuntimeFeature.LAYER_PACKAGE not in self.required_runtime_features:
-            raise ValueError("Skippy plan must require layer-package support")
-        paths = (
-            self.package_manifest_path,
-            self.shared_metadata_path,
-            self.embeddings_path,
-            self.output_path,
-            *self.layer_paths,
-        )
+        if self.activation_bytes_per_token != self.activation_width * 4:
+            raise ValueError("Skippy F32 activation geometry does not match activation width")
+        if self.format == "gguf-direct":
+            if SkippyRuntimeFeature.RUNTIME_SLICE not in self.required_runtime_features:
+                raise ValueError("direct GGUF plans must require runtime-slice support")
+            if not self.source_model_paths:
+                raise ValueError("direct GGUF plan has no source model path")
+            package_fields = (
+                self.package_manifest_path,
+                self.package_manifest_sha256,
+                self.package_schema_version,
+                self.package_model_id,
+                self.package_abi_version,
+                self.shared_metadata_path,
+                self.embeddings_path,
+                self.output_path,
+            )
+            if any(value is not None for value in package_fields) or self.layer_paths:
+                raise ValueError("direct GGUF plan cannot contain layer-package fields")
+            if len(self.direct_static_bytes_by_layer) != len(
+                self.kv_bytes_per_token_by_layer
+            ):
+                raise ValueError("direct GGUF static and KV geometry must cover every layer")
+            paths = self.source_model_paths
+        else:
+            if SkippyRuntimeFeature.LAYER_PACKAGE not in self.required_runtime_features:
+                raise ValueError("layer-package plan must require layer-package support")
+            package_fields = (
+                self.package_manifest_path,
+                self.package_manifest_sha256,
+                self.package_schema_version,
+                self.package_model_id,
+                self.package_abi_version,
+                self.shared_metadata_path,
+                self.embeddings_path,
+                self.output_path,
+            )
+            if self.source_model_paths or any(
+                value is None for value in package_fields
+            ):
+                raise ValueError("layer-package plan has incomplete package fields")
+            if self.direct_static_bytes_by_layer:
+                raise ValueError("layer-package plan cannot contain direct GGUF geometry")
+            if len(self.kv_bytes_per_token_by_layer) != len(self.layer_paths):
+                raise ValueError("Skippy KV geometry must contain exactly one value per layer")
+            paths = (
+                self.package_manifest_path,
+                self.shared_metadata_path,
+                self.embeddings_path,
+                self.output_path,
+                *self.layer_paths,
+            )
         if len(paths) != len(set(paths)):
-            raise ValueError("Skippy package paths must be unique")
+            raise ValueError("Skippy execution paths must be unique")
         for path in paths:
             parts = path.split("/")
-            if path.startswith("/") or "\\" in path or any(
-                part in {"", ".", ".."} for part in parts
+            if (
+                path.startswith("/")
+                or "\\" in path
+                or any(part in {"", ".", ".."} for part in parts)
             ):
                 raise ValueError("Skippy artifact path must be normalized relative POSIX")
-        package_major, package_minor, _ = map(int, self.package_abi_version.split("."))
-        runtime_major, runtime_minor, _ = map(int, self.runtime_abi_version.split("."))
-        if package_major != runtime_major or package_minor > runtime_minor:
-            raise ValueError("Skippy package ABI is incompatible with the selected runtime ABI")
+        if self.package_abi_version is not None:
+            package_major, package_minor, _ = map(int, self.package_abi_version.split("."))
+            runtime_major, runtime_minor, _ = map(int, self.runtime_abi_version.split("."))
+            if package_major != runtime_major or package_minor > runtime_minor:
+                raise ValueError("Skippy package ABI is incompatible with the selected runtime ABI")
         return self
 
 
@@ -407,20 +470,33 @@ class ModelArtifactIndex(ContractModel):
                                 "execution external data must reference a signed data artifact"
                             )
                 continue
-            expected_roles = {
-                plan.package_manifest_path: ArtifactRole.EXECUTION_PACKAGE_MANIFEST,
-                plan.shared_metadata_path: ArtifactRole.EXECUTION_SHARED,
-                plan.embeddings_path: ArtifactRole.EXECUTION_SHARED,
-                plan.output_path: ArtifactRole.EXECUTION_SHARED,
-                **{path: ArtifactRole.EXECUTION_LAYER for path in plan.layer_paths},
-            }
+            if plan.format == "gguf-direct":
+                expected_roles = {
+                    path: ArtifactRole.EXECUTION_MODEL for path in plan.source_model_paths
+                }
+            else:
+                assert plan.package_manifest_path is not None
+                assert plan.shared_metadata_path is not None
+                assert plan.embeddings_path is not None
+                assert plan.output_path is not None
+                expected_roles = {
+                    plan.package_manifest_path: ArtifactRole.EXECUTION_PACKAGE_MANIFEST,
+                    plan.shared_metadata_path: ArtifactRole.EXECUTION_SHARED,
+                    plan.embeddings_path: ArtifactRole.EXECUTION_SHARED,
+                    plan.output_path: ArtifactRole.EXECUTION_SHARED,
+                    **{path: ArtifactRole.EXECUTION_LAYER for path in plan.layer_paths},
+                }
             for path, role in expected_roles.items():
                 artifact = artifacts.get(path)
                 if artifact is None or artifact.role is not role:
                     raise ValueError(
                         f"Skippy package artifact {path!r} must have role {role.value}"
                     )
-            if artifacts[plan.package_manifest_path].sha256 != plan.package_manifest_sha256:
+            if (
+                plan.package_manifest_path is not None
+                and artifacts[plan.package_manifest_path].sha256
+                != plan.package_manifest_sha256
+            ):
                 raise ValueError("Skippy package manifest digest does not match its descriptor")
         return self
 
@@ -544,9 +620,7 @@ class ModelManifest(ContractModel):
     # configuration.  The rope contract hash alone proves equality but cannot
     # be used by autonomous workers to build context-aware demand classes.
     model_max_context_tokens: PositiveInt
-    context_classes: Annotated[
-        tuple[PositiveInt, ...], Field(min_length=1, max_length=32)
-    ]
+    context_classes: Annotated[tuple[PositiveInt, ...], Field(min_length=1, max_length=32)]
     activation_bytes_per_token: PositiveInt
     kv_bytes_per_token_by_layer: tuple[PositiveInt, ...]
     weight_bytes_by_layer: tuple[PositiveInt, ...] = ()
@@ -653,6 +727,11 @@ class SpanLease(ContractModel):
     effective_span_mode: EffectiveSpanMode
     state: SpanState
     weight_hashes: tuple[HashHex, ...]
+    # Exact executable-plan identity and wire payload size.  Legacy engines do
+    # not need these fields, while portable/Skippy routes require them before
+    # they can be composed with another worker.
+    execution_plan_identity_hash: HashHex | None = None
+    activation_bytes_per_token: PositiveInt | None = None
     measured_prefill_tokens_per_second: Annotated[float, Field(gt=0)] | None = None
     measured_decode_tokens_per_second: Annotated[float, Field(gt=0)] | None = None
     # Hard per-session limit enforced by the serving frontend. This must stay

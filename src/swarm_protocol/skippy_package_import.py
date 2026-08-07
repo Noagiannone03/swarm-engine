@@ -1,4 +1,4 @@
-"""Import existing Skippy layer packages into Fabi's signed model registry."""
+"""Import direct GGUF sources or sparse Skippy packages into Fabi's registry."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -38,6 +38,21 @@ _REQUIRED_FEATURES = (
     SkippyRuntimeFeature.LAYER_PACKAGE,
     SkippyRuntimeFeature.SESSION_RESET,
 )
+_DIRECT_REQUIRED_FEATURES = (
+    SkippyRuntimeFeature.ACTIVATION_FRAME,
+    SkippyRuntimeFeature.BACKEND_DEVICES,
+    SkippyRuntimeFeature.GENERATION_SIGNALS,
+    SkippyRuntimeFeature.RUNTIME_SLICE,
+    SkippyRuntimeFeature.SESSION_RESET,
+)
+
+
+class _Geometry(Protocol):
+    activation_width: int
+    context_length: int
+    kv_bytes_per_token: int
+    layer_count: int
+    static_bytes_by_layer: list[int] | tuple[int, ...]
 
 
 def _field(value: object, name: str) -> object | None:
@@ -116,6 +131,188 @@ def _read_package_manifest(
     return payload, _mapping(parsed, "manifest")
 
 
+def _inspect_direct_geometry(
+    paths: list[Path], cache_type_k: str, cache_type_v: str
+) -> _Geometry:
+    try:
+        import fabi_network_native
+    except (ImportError, OSError) as exc:  # pragma: no cover - product wheel integration
+        raise RuntimeError("the qualified Fabi native wheel is required to inspect GGUF") from exc
+    return fabi_network_native.inspect_skippy_source_geometry(
+        paths,
+        cache_type_k,
+        cache_type_v,
+    )
+
+
+def _direct_source_hash(descriptors: list[ArtifactDescriptor]) -> str:
+    digest = hashlib.sha256(b"fabi/skippy-direct-source/v1\0")
+    for descriptor in sorted(descriptors, key=lambda item: item.path):
+        digest.update(descriptor.path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(descriptor.sha256.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(descriptor.size).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def attach_skippy_direct_gguf(
+    base_bundle: ModelRegistryBundle,
+    *,
+    repository_id: str,
+    revision: str | None,
+    source_paths: tuple[str, ...],
+    plan_id: str,
+    quantization: str,
+    runtime_release: str,
+    runtime_abi_version: str,
+    providers: tuple[ExecutionProviderKind, ...] = _DEFAULT_PROVIDERS,
+    token: bool | str | None = None,
+    api: HfApi | None = None,
+    downloader: Callable[..., str] = hf_hub_download,
+    geometry_inspector: Callable[[list[Path], str, str], _Geometry] = _inspect_direct_geometry,
+) -> ModelRegistryBundle:
+    """Bind an ordinary immutable GGUF directly, without producing a layer package."""
+
+    if not source_paths:
+        raise ValueError("direct Skippy execution requires at least one GGUF file")
+    if tuple(sorted(set(source_paths))) != source_paths:
+        raise ValueError("direct GGUF source paths must be sorted and unique")
+    client = api or HfApi()
+    resolved = client.model_info(repository_id, revision=revision, token=token)
+    immutable_revision = str(_field(resolved, "sha") or "").lower()
+    if len(immutable_revision) != _COMMIT_LENGTH or not all(
+        character in "0123456789abcdef" for character in immutable_revision
+    ):
+        raise ValueError("Hugging Face did not resolve an immutable GGUF commit")
+    info = client.model_info(
+        repository_id,
+        revision=immutable_revision,
+        files_metadata=True,
+        token=token,
+    )
+    if str(_field(info, "sha") or "").lower() != immutable_revision:
+        raise ValueError("Hugging Face GGUF metadata changed during resolution")
+    siblings = {
+        str(_field(sibling, "rfilename")): sibling for sibling in (_field(info, "siblings") or ())
+    }
+    descriptors: list[ArtifactDescriptor] = []
+    local_paths: list[Path] = []
+    for source_path in source_paths:
+        parts = source_path.split("/")
+        if (
+            not source_path.lower().endswith(".gguf")
+            or source_path.startswith("/")
+            or "\\" in source_path
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError(f"unsafe or non-GGUF direct source path: {source_path!r}")
+        sibling = siblings.get(source_path)
+        if sibling is None:
+            raise ValueError(f"GGUF repository is missing {source_path!r}")
+        size = _field(sibling, "size")
+        lfs = _field(sibling, "lfs")
+        sha256 = str(_field(lfs, "sha256") or "").lower()
+        lfs_size = _field(lfs, "size")
+        if (
+            not isinstance(size, int)
+            or size <= 0
+            or lfs_size != size
+            or len(sha256) != 64
+            or not all(character in "0123456789abcdef" for character in sha256)
+        ):
+            raise ValueError(f"GGUF source {source_path!r} has no exact LFS identity")
+        descriptors.append(
+            ArtifactDescriptor(
+                path=source_path,
+                size=size,
+                sha256=sha256,
+                media_type="application/vnd.gguf",
+                role=ArtifactRole.EXECUTION_MODEL,
+            )
+        )
+        local_paths.append(
+            Path(
+                downloader(
+                    repo_id=repository_id,
+                    filename=source_path,
+                    revision=immutable_revision,
+                    token=token,
+                )
+            )
+        )
+    geometry = geometry_inspector(local_paths, "f16", "f16")
+    manifest = base_bundle.manifest
+    static_bytes = tuple(int(value) for value in geometry.static_bytes_by_layer)
+    if int(geometry.layer_count) != manifest.num_layers or len(static_bytes) != manifest.num_layers:
+        raise ValueError("direct GGUF layer geometry differs from the logical model")
+    if any(value <= 0 for value in static_bytes):
+        raise ValueError("direct GGUF has incomplete per-layer tensor geometry")
+    if int(geometry.context_length) < manifest.model_max_context_tokens:
+        raise ValueError("direct GGUF context is smaller than the logical model contract")
+    if int(geometry.kv_bytes_per_token) != sum(manifest.kv_bytes_per_token_by_layer):
+        raise ValueError("direct GGUF KV geometry differs from the logical model contract")
+    dtype_bytes = {"bfloat16": 2, "float16": 2, "float32": 4}.get(manifest.dtype)
+    if dtype_bytes is None or manifest.activation_bytes_per_token % dtype_bytes:
+        raise ValueError("logical model has unsupported activation geometry")
+    if int(geometry.activation_width) != manifest.activation_bytes_per_token // dtype_bytes:
+        raise ValueError("direct GGUF activation width differs from the logical model contract")
+    plan = SkippyExecutionPlan(
+        plan_id=plan_id,
+        format="gguf-direct",
+        quantization=quantization,
+        package_repository_id=repository_id,
+        package_revision=immutable_revision,
+        source_model_paths=source_paths,
+        package_schema_version=None,
+        package_source_sha256=_direct_source_hash(descriptors),
+        runtime_release=runtime_release,
+        runtime_abi_version=runtime_abi_version,
+        required_runtime_features=_DIRECT_REQUIRED_FEATURES,
+        activation_width=int(geometry.activation_width),
+        activation_bytes_per_token=int(geometry.activation_width) * 4,
+        cache_type_k="f16",
+        cache_type_v="f16",
+        kv_bytes_per_token_by_layer=manifest.kv_bytes_per_token_by_layer,
+        model_max_context_tokens=manifest.model_max_context_tokens,
+        providers=providers,
+        direct_static_bytes_by_layer=static_bytes,
+    )
+    existing_paths = {artifact.path for artifact in base_bundle.artifact_index.artifacts}
+    collisions = sorted(existing_paths & {artifact.path for artifact in descriptors})
+    if collisions:
+        raise ValueError(f"direct GGUF paths collide with existing artifacts: {collisions}")
+    if any(
+        existing.plan_id == plan.plan_id for existing in base_bundle.artifact_index.execution_plans
+    ):
+        raise ValueError(f"execution plan id already exists: {plan.plan_id}")
+    index = ModelArtifactIndex(
+        model_id=base_bundle.artifact_index.model_id,
+        immutable_revision=base_bundle.artifact_index.immutable_revision,
+        artifacts=tuple(
+            sorted(
+                (*base_bundle.artifact_index.artifacts, *descriptors),
+                key=lambda artifact: artifact.path,
+            )
+        ),
+        tensors=base_bundle.artifact_index.tensors,
+        execution_plans=tuple(
+            sorted(
+                (*base_bundle.artifact_index.execution_plans, plan),
+                key=lambda execution_plan: execution_plan.plan_id,
+            )
+        ),
+    )
+    bound_manifest = ModelManifest.model_validate(
+        {
+            **manifest.model_dump(mode="json"),
+            "execution_plan_hash": execution_plan_hash(index),
+        }
+    )
+    return ModelRegistryBundle(manifest=bound_manifest, artifact_index=index)
+
+
 def attach_skippy_package(
     base_bundle: ModelRegistryBundle,
     *,
@@ -144,8 +341,7 @@ def attach_skippy_package(
     ):
         raise ValueError("Hugging Face did not resolve an immutable package commit")
     siblings = {
-        str(_field(sibling, "rfilename")): sibling
-        for sibling in (_field(info, "siblings") or ())
+        str(_field(sibling, "rfilename")): sibling for sibling in (_field(info, "siblings") or ())
     }
     package_bytes, package = _read_package_manifest(
         package_repository_id,
@@ -223,6 +419,7 @@ def attach_skippy_package(
         raise ValueError("Skippy package does not identify its quantization/distribution")
     plan = SkippyExecutionPlan(
         plan_id=plan_id,
+        format="gguf-layer-package",
         quantization=quantization,
         package_repository_id=package_repository_id,
         package_revision=immutable_revision,
@@ -235,6 +432,11 @@ def attach_skippy_package(
         runtime_abi_version=runtime_abi_version,
         required_runtime_features=_REQUIRED_FEATURES,
         activation_width=activation_width,
+        activation_bytes_per_token=activation_width * 4,
+        cache_type_k="f16",
+        cache_type_v="f16",
+        kv_bytes_per_token_by_layer=base_bundle.manifest.kv_bytes_per_token_by_layer,
+        model_max_context_tokens=base_bundle.manifest.model_max_context_tokens,
         providers=providers,
         shared_metadata_path=shared_entries["metadata"][0],
         embeddings_path=shared_entries["embeddings"][0],
@@ -245,7 +447,9 @@ def attach_skippy_package(
     collisions = sorted(existing_paths & {artifact.path for artifact in execution_artifacts})
     if collisions:
         raise ValueError(f"Skippy package paths collide with existing artifacts: {collisions}")
-    if any(existing.plan_id == plan.plan_id for existing in base_bundle.artifact_index.execution_plans):
+    if any(
+        existing.plan_id == plan.plan_id for existing in base_bundle.artifact_index.execution_plans
+    ):
         raise ValueError(f"execution plan id already exists: {plan.plan_id}")
     index = ModelArtifactIndex(
         model_id=base_bundle.artifact_index.model_id,
