@@ -42,6 +42,20 @@ message Req {
   string route_id = 12;  // Signed protocol-v3 route identity
   uint64 route_epoch = 13;  // Fencing epoch for retries/failover
   string authority_request_id = 14;  // Coordinator request identity signed into the route
+  NativeActivationFrame native_activation = 15;  // Skippy activation descriptor + opaque payload
+}
+
+message NativeActivationFrame {
+  uint32 version = 1;
+  string dtype = 2;
+  string layout = 3;
+  int32 producer_stage_index = 4;
+  int32 layer_start = 5;
+  int32 layer_end = 6;
+  uint32 token_count = 7;
+  uint32 sequence_count = 8;
+  uint64 flags = 9;
+  bytes payload = 10;
 }
 
 message SamplingParams {

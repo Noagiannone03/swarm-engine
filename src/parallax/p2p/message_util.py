@@ -6,6 +6,7 @@ between the P2P server and the executor.
 """
 
 import io
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 try:
@@ -17,6 +18,76 @@ from parallax.p2p.proto import forward_pb2
 from parallax.server.backend_capabilities import TensorRuntime, tensor_runtime_for_device
 from parallax.server.request import IntermediateRequest, Request, RequestStatus
 from parallax.server.sampling.sampling_params import SamplingParams
+
+
+# Keep the same hard ceiling as Mesh-LLM's maintained Skippy protocol. This is
+# a protocol safety bound, not a generation timeout or a context-size policy.
+_MAX_NATIVE_ACTIVATION_BYTES = 512 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class NativeActivationFrame:
+    """Backend-neutral Python carrier for one verified Skippy activation frame."""
+
+    version: int
+    dtype: str
+    layout: str
+    producer_stage_index: int
+    layer_start: int
+    layer_end: int
+    token_count: int
+    sequence_count: int
+    flags: int
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        if self.dtype not in {"f32", "f16", "bf16"}:
+            raise ValueError(f"unsupported native activation dtype {self.dtype!r}")
+        if self.layout not in {"opaque", "token_major"}:
+            raise ValueError(f"unsupported native activation layout {self.layout!r}")
+        if self.layer_end < self.layer_start:
+            raise ValueError("native activation has an invalid layer range")
+        if self.token_count <= 0 or self.sequence_count <= 0:
+            raise ValueError("native activation dimensions must be positive")
+        if not self.payload:
+            raise ValueError("native activation payload must not be empty")
+        if len(self.payload) > _MAX_NATIVE_ACTIVATION_BYTES:
+            raise ValueError(
+                "native activation payload exceeds the 512 MiB protocol limit"
+            )
+
+
+def _native_activation_to_proto(
+    frame: NativeActivationFrame,
+    target: forward_pb2.NativeActivationFrame,
+) -> None:
+    target.version = frame.version
+    target.dtype = frame.dtype
+    target.layout = frame.layout
+    target.producer_stage_index = frame.producer_stage_index
+    target.layer_start = frame.layer_start
+    target.layer_end = frame.layer_end
+    target.token_count = frame.token_count
+    target.sequence_count = frame.sequence_count
+    target.flags = frame.flags
+    target.payload = frame.payload
+
+
+def _native_activation_from_proto(
+    frame: forward_pb2.NativeActivationFrame,
+) -> NativeActivationFrame:
+    return NativeActivationFrame(
+        version=frame.version,
+        dtype=frame.dtype,
+        layout=frame.layout,
+        producer_stage_index=frame.producer_stage_index,
+        layer_start=frame.layer_start,
+        layer_end=frame.layer_end,
+        token_count=frame.token_count,
+        sequence_count=frame.sequence_count,
+        flags=frame.flags,
+        payload=bytes(frame.payload),
+    )
 
 
 def _require_mlx():
@@ -58,7 +129,13 @@ def request_to_proto(
         proto_req.authority_request_id = request.authority_request_id
 
         if request.hidden_states is not None:
-            proto_req.hidden_states = tensor_to_bytes(request.hidden_states, device=device)
+            if isinstance(request.hidden_states, NativeActivationFrame):
+                _native_activation_to_proto(
+                    request.hidden_states,
+                    proto_req.native_activation,
+                )
+            else:
+                proto_req.hidden_states = tensor_to_bytes(request.hidden_states, device=device)
 
         if request.next_token_id is not None:
             proto_req.next_token_id = request.next_token_id
@@ -92,7 +169,9 @@ def proto_to_request(
         next_token_id = proto_req.next_token_id
 
         hidden_states = None
-        if proto_req.hidden_states:
+        if proto_req.HasField("native_activation"):
+            hidden_states = _native_activation_from_proto(proto_req.native_activation)
+        elif proto_req.hidden_states:
             hidden_states = bytes_to_tensor(proto_req.hidden_states, device)
 
         status = None
@@ -248,6 +327,8 @@ def tensor_to_bytes(tensor: Any, device: Optional[str] = "mlx") -> bytes:
         if array.size == 0:
             raise ValueError("Tensor must have size > 0")
         return save({"tensor": array})
+    elif tensor_runtime is TensorRuntime.NATIVE:
+        raise TypeError("native activation frames must use the typed protobuf field")
     else:
         mlx = _require_mlx()
         assert tensor.size > 0, "Tensor must have size > 0"
@@ -271,6 +352,8 @@ def bytes_to_tensor(
         from safetensors.numpy import load
 
         return load(tensor)["tensor"]
+    elif tensor_runtime is TensorRuntime.NATIVE:
+        raise TypeError("native activation frames must use the typed protobuf field")
     else:
         mlx = _require_mlx()
         buffer = io.BytesIO(tensor)

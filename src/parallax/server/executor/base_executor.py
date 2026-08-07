@@ -67,6 +67,7 @@ class BaseExecutor:
         dtype: str = "float16",
         # Device override
         device: Optional[str] = None,
+        resolved_dtype: Optional[Any] = None,
         # Scheduler Configs
         max_batch_size: Optional[int] = 8,
         max_sequence_length: Optional[int] = None,
@@ -143,7 +144,11 @@ class BaseExecutor:
 
         # TODO: Duplicate code to MLXExecutor.
         self.num_shard_layers = end_layer - start_layer
-        self.dtype = get_device_dtype(dtype, self.device)
+        self.dtype = (
+            resolved_dtype
+            if resolved_dtype is not None
+            else get_device_dtype(dtype, self.device)
+        )
         logger.debug(
             f"Executor dtype set to {dtype} (resolved={self.dtype}); shard_layers={self.num_shard_layers}"
         )

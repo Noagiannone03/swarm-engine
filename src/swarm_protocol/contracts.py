@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import Enum
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -35,6 +35,7 @@ class BackendKind(str, Enum):
     VLLM = "vllm"
     SGLANG = "sglang"
     ONNXRUNTIME = "onnxruntime"
+    SKIPPY = "skippy"
 
 
 class WorkerRole(str, Enum):
@@ -69,16 +70,33 @@ class ArtifactRole(str, Enum):
     WEIGHT = "weight"
     EXECUTION_GRAPH = "execution_graph"
     EXECUTION_DATA = "execution_data"
+    EXECUTION_PACKAGE_MANIFEST = "execution_package_manifest"
+    EXECUTION_LAYER = "execution_layer"
+    EXECUTION_SHARED = "execution_shared"
 
 
 class ExecutionProviderKind(str, Enum):
-    """Portable ONNX Runtime targets qualified by a published plan."""
+    """Native execution targets qualified by a published plan."""
 
     WINML = "winml"
     DIRECTML = "directml"
     OPENVINO = "openvino"
     QNN = "qnn"
     CPU = "cpu"
+    METAL = "metal"
+    CUDA = "cuda"
+    ROCM = "rocm"
+    VULKAN = "vulkan"
+
+
+class SkippyRuntimeFeature(str, Enum):
+    """Feature-probed Skippy ABI surfaces required by a signed plan."""
+
+    LAYER_PACKAGE = "layer_package"
+    ACTIVATION_FRAME = "activation_frame"
+    SESSION_RESET = "session_reset"
+    GENERATION_SIGNALS = "generation_signals"
+    BACKEND_DEVICES = "backend_devices"
 
 
 class OnnxExportTarget(str, Enum):
@@ -181,7 +199,7 @@ class ModelExecutionPlan(ContractModel):
 
     protocol_version: int = PROTOCOL_VERSION
     plan_id: Annotated[str, Field(min_length=1, max_length=255)]
-    backend: BackendKind = BackendKind.ONNXRUNTIME
+    backend: Literal[BackendKind.ONNXRUNTIME] = BackendKind.ONNXRUNTIME
     format: Annotated[str, Field(pattern=r"^onnx$")] = "onnx"
     precision: Annotated[str, Field(min_length=1, max_length=64)]
     quantization: Annotated[str, Field(min_length=1, max_length=128)]
@@ -250,6 +268,94 @@ class ModelExecutionPlan(ContractModel):
         return self
 
 
+class SkippyExecutionPlan(ContractModel):
+    """Signed sparse-GGUF stage plan executed by a feature-probed Skippy runtime.
+
+    The plan deliberately describes artifacts and compatibility, not placement.
+    Fabi V3 still chooses a worker's contiguous span from live memory, context,
+    demand, and topology. A worker then downloads only the package parts needed
+    for that exact span.
+    """
+
+    protocol_version: int = PROTOCOL_VERSION
+    plan_id: Annotated[str, Field(min_length=1, max_length=255)]
+    backend: Literal[BackendKind.SKIPPY] = BackendKind.SKIPPY
+    format: Literal["gguf-layer-package"] = "gguf-layer-package"
+    quantization: Annotated[str, Field(min_length=1, max_length=128)]
+    package_repository_id: Annotated[str, Field(min_length=1, max_length=255)]
+    package_revision: CommitHex
+    package_manifest_path: Annotated[str, Field(min_length=1, max_length=1024)]
+    package_manifest_sha256: HashHex
+    package_schema_version: Literal[1] = 1
+    package_model_id: Annotated[str, Field(min_length=1, max_length=512)]
+    package_source_sha256: HashHex
+    package_abi_version: Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
+    runtime_release: Annotated[str, Field(min_length=1, max_length=128)]
+    runtime_abi_version: Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
+    required_runtime_features: Annotated[
+        tuple[SkippyRuntimeFeature, ...], Field(min_length=1, max_length=64)
+    ]
+    activation_width: PositiveInt
+    execution_granularity_layers: PositiveInt = 1
+    providers: Annotated[
+        tuple[ExecutionProviderKind, ...], Field(min_length=1, max_length=16)
+    ]
+    shared_metadata_path: Annotated[str, Field(min_length=1, max_length=1024)]
+    embeddings_path: Annotated[str, Field(min_length=1, max_length=1024)]
+    output_path: Annotated[str, Field(min_length=1, max_length=1024)]
+    layer_paths: Annotated[tuple[NonEmpty, ...], Field(min_length=1, max_length=100_000)]
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> Self:
+        if self.protocol_version != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version: {self.protocol_version}")
+        if self.execution_granularity_layers != 1:
+            raise ValueError("Skippy layer packages currently require one-layer granularity")
+        provider_values = tuple(provider.value for provider in self.providers)
+        if tuple(sorted(set(provider_values))) != provider_values:
+            raise ValueError("execution providers must be sorted and unique")
+        allowed_providers = {
+            ExecutionProviderKind.CPU,
+            ExecutionProviderKind.CUDA,
+            ExecutionProviderKind.METAL,
+            ExecutionProviderKind.ROCM,
+            ExecutionProviderKind.VULKAN,
+        }
+        if not set(self.providers) <= allowed_providers:
+            raise ValueError("Skippy plan contains a non-native execution provider")
+        feature_values = tuple(feature.value for feature in self.required_runtime_features)
+        if tuple(sorted(set(feature_values))) != feature_values:
+            raise ValueError("Skippy runtime features must be sorted and unique")
+        if SkippyRuntimeFeature.LAYER_PACKAGE not in self.required_runtime_features:
+            raise ValueError("Skippy plan must require layer-package support")
+        paths = (
+            self.package_manifest_path,
+            self.shared_metadata_path,
+            self.embeddings_path,
+            self.output_path,
+            *self.layer_paths,
+        )
+        if len(paths) != len(set(paths)):
+            raise ValueError("Skippy package paths must be unique")
+        for path in paths:
+            parts = path.split("/")
+            if path.startswith("/") or "\\" in path or any(
+                part in {"", ".", ".."} for part in parts
+            ):
+                raise ValueError("Skippy artifact path must be normalized relative POSIX")
+        package_major, package_minor, _ = map(int, self.package_abi_version.split("."))
+        runtime_major, runtime_minor, _ = map(int, self.runtime_abi_version.split("."))
+        if package_major != runtime_major or package_minor > runtime_minor:
+            raise ValueError("Skippy package ABI is incompatible with the selected runtime ABI")
+        return self
+
+
+ExecutionPlan = Annotated[
+    ModelExecutionPlan | SkippyExecutionPlan,
+    Field(discriminator="backend"),
+]
+
+
 class ModelArtifactIndex(ContractModel):
     """Persistent artifact index referenced by the compact DHT model manifest."""
 
@@ -258,7 +364,7 @@ class ModelArtifactIndex(ContractModel):
     immutable_revision: NonEmpty
     artifacts: Annotated[tuple[ArtifactDescriptor, ...], Field(min_length=1, max_length=100_000)]
     tensors: Annotated[tuple[TensorArtifactDescriptor, ...], Field(max_length=1_000_000)] = ()
-    execution_plans: Annotated[tuple[ModelExecutionPlan, ...], Field(max_length=128)] = ()
+    execution_plans: Annotated[tuple[ExecutionPlan, ...], Field(max_length=128)] = ()
 
     @model_validator(mode="after")
     def validate_index(self) -> Self:
@@ -289,16 +395,33 @@ class ModelArtifactIndex(ContractModel):
         if tuple(sorted(set(plan_ids))) != plan_ids:
             raise ValueError("execution plans must be sorted by unique plan id")
         for plan in self.execution_plans:
-            for stage in plan.stages:
-                graph = artifacts.get(stage.graph_path)
-                if graph is None or graph.role is not ArtifactRole.EXECUTION_GRAPH:
-                    raise ValueError("execution graph must reference a signed graph artifact")
-                for path in stage.external_data_paths:
-                    data = artifacts.get(path)
-                    if data is None or data.role is not ArtifactRole.EXECUTION_DATA:
-                        raise ValueError(
-                            "execution external data must reference a signed data artifact"
-                        )
+            if isinstance(plan, ModelExecutionPlan):
+                for stage in plan.stages:
+                    graph = artifacts.get(stage.graph_path)
+                    if graph is None or graph.role is not ArtifactRole.EXECUTION_GRAPH:
+                        raise ValueError("execution graph must reference a signed graph artifact")
+                    for path in stage.external_data_paths:
+                        data = artifacts.get(path)
+                        if data is None or data.role is not ArtifactRole.EXECUTION_DATA:
+                            raise ValueError(
+                                "execution external data must reference a signed data artifact"
+                            )
+                continue
+            expected_roles = {
+                plan.package_manifest_path: ArtifactRole.EXECUTION_PACKAGE_MANIFEST,
+                plan.shared_metadata_path: ArtifactRole.EXECUTION_SHARED,
+                plan.embeddings_path: ArtifactRole.EXECUTION_SHARED,
+                plan.output_path: ArtifactRole.EXECUTION_SHARED,
+                **{path: ArtifactRole.EXECUTION_LAYER for path in plan.layer_paths},
+            }
+            for path, role in expected_roles.items():
+                artifact = artifacts.get(path)
+                if artifact is None or artifact.role is not role:
+                    raise ValueError(
+                        f"Skippy package artifact {path!r} must have role {role.value}"
+                    )
+            if artifacts[plan.package_manifest_path].sha256 != plan.package_manifest_sha256:
+                raise ValueError("Skippy package manifest digest does not match its descriptor")
         return self
 
 

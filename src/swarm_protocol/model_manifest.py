@@ -141,11 +141,17 @@ def artifact_collection_hash(index: ModelArtifactIndex, role: ArtifactRole) -> s
 
 
 def execution_plan_hash(index: ModelArtifactIndex) -> str:
-    """Bind portable graph topology and every referenced byte descriptor."""
+    """Bind portable execution topology and every referenced byte descriptor."""
 
     if not index.execution_plans:
         raise ValueError("model artifact index has no execution plans")
-    portable_roles = {ArtifactRole.EXECUTION_GRAPH, ArtifactRole.EXECUTION_DATA}
+    portable_roles = {
+        ArtifactRole.EXECUTION_GRAPH,
+        ArtifactRole.EXECUTION_DATA,
+        ArtifactRole.EXECUTION_PACKAGE_MANIFEST,
+        ArtifactRole.EXECUTION_LAYER,
+        ArtifactRole.EXECUTION_SHARED,
+    }
     payload = {
         "plans": [plan.model_dump(mode="json") for plan in index.execution_plans],
         "artifacts": [

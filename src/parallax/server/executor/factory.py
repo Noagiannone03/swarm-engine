@@ -60,7 +60,7 @@ def create_executor_config(args: argparse.Namespace, shared_state=None, conn=Non
         "planned_context_tokens": getattr(args, "planned_context_tokens", None),
     }
 
-    if args.gpu_backend == "onnxruntime":
+    if args.gpu_backend in {"onnxruntime", "skippy"}:
         config["execution_plan_id"] = getattr(args, "execution_plan_id", None)
 
     if args.gpu_backend == "sglang":
@@ -121,6 +121,10 @@ def create_from_args(
         from parallax.server.executor.onnx_executor import OnnxExecutor
 
         executor = OnnxExecutor(**config)
+    elif backend == "skippy":
+        from parallax.server.executor.skippy_executor import SkippyExecutor
+
+        executor = SkippyExecutor(**config)
     return executor
 
 

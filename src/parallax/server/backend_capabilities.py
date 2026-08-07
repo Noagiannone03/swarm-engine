@@ -20,6 +20,9 @@ from typing import Any
 
 class DeviceKind(str, Enum):
     CUDA = "cuda"
+    ROCM = "rocm"
+    VULKAN = "vulkan"
+    METAL = "metal"
     XPU = "xpu"
     MLX = "mlx"
     WINML = "winml"
@@ -33,6 +36,7 @@ class TensorRuntime(str, Enum):
     TORCH = "torch"
     MLX = "mlx"
     NUMPY = "numpy"
+    NATIVE = "native"
 
 
 @dataclass(frozen=True)
@@ -47,7 +51,25 @@ _DEVICE_CAPABILITIES = {
     DeviceKind.CUDA: DeviceCapability(
         kind=DeviceKind.CUDA,
         tensor_runtime=TensorRuntime.TORCH,
-        executor_backends=frozenset({"sglang", "vllm"}),
+        executor_backends=frozenset({"sglang", "skippy", "vllm"}),
+        accelerator=True,
+    ),
+    DeviceKind.ROCM: DeviceCapability(
+        kind=DeviceKind.ROCM,
+        tensor_runtime=TensorRuntime.NATIVE,
+        executor_backends=frozenset({"skippy"}),
+        accelerator=True,
+    ),
+    DeviceKind.VULKAN: DeviceCapability(
+        kind=DeviceKind.VULKAN,
+        tensor_runtime=TensorRuntime.NATIVE,
+        executor_backends=frozenset({"skippy"}),
+        accelerator=True,
+    ),
+    DeviceKind.METAL: DeviceCapability(
+        kind=DeviceKind.METAL,
+        tensor_runtime=TensorRuntime.NATIVE,
+        executor_backends=frozenset({"skippy"}),
         accelerator=True,
     ),
     DeviceKind.XPU: DeviceCapability(
@@ -91,13 +113,14 @@ _DEVICE_CAPABILITIES = {
         executor_backends=frozenset(),
         accelerator=True,
     ),
-    # Torch CPU tensors are valid on the wire and in common tensor utilities,
-    # but Fabi does not yet claim a qualified CPU layer executor.  Keeping the
-    # engine set empty prevents an unbenchmarked host from joining as READY.
+    # Torch CPU tensors remain valid in the legacy tensor utilities. Skippy's
+    # native CPU executor does not use that codec: it exchanges typed native
+    # activation frames and must still complete the signed model/runtime probe
+    # before the worker can advertise READY.
     DeviceKind.CPU: DeviceCapability(
         kind=DeviceKind.CPU,
         tensor_runtime=TensorRuntime.TORCH,
-        executor_backends=frozenset(),
+        executor_backends=frozenset({"skippy"}),
         accelerator=False,
     ),
 }
@@ -114,7 +137,9 @@ def device_kind(device: str | None) -> DeviceKind:
         kind = DeviceKind(base)
     except ValueError as exc:
         raise ValueError(f"Unsupported execution device: {device}") from exc
-    if separator and (not index.isdigit() or kind in {DeviceKind.MLX, DeviceKind.CPU}):
+    if separator and (
+        not index.isdigit() or kind in {DeviceKind.METAL, DeviceKind.MLX, DeviceKind.CPU}
+    ):
         raise ValueError(f"Invalid execution device: {device}")
     return kind
 
@@ -140,7 +165,7 @@ def canonical_device_for_rank(device: str, rank: int) -> str:
 
     kind = device_kind(device)
     normalized = str(device).strip().lower()
-    if ":" in normalized or kind in {DeviceKind.MLX, DeviceKind.CPU}:
+    if ":" in normalized or kind in {DeviceKind.METAL, DeviceKind.MLX, DeviceKind.CPU}:
         return normalized
     if rank < 0:
         raise ValueError("device rank must be non-negative")

@@ -193,7 +193,18 @@ class ModelRegistryBundle(ContractModel):
         return self
 
     def _validate_execution_plan_layers(self, plan) -> None:
-        from swarm_protocol.contracts import ExecutionStageKind
+        from swarm_protocol.contracts import (
+            ExecutionStageKind,
+            ModelExecutionPlan,
+            SkippyExecutionPlan,
+        )
+
+        if isinstance(plan, SkippyExecutionPlan):
+            if len(plan.layer_paths) != self.manifest.num_layers:
+                raise ValueError("Skippy execution layers do not cover every model layer")
+            return
+        if not isinstance(plan, ModelExecutionPlan):
+            raise TypeError(f"unsupported execution plan type: {type(plan).__name__}")
 
         inputs = [stage for stage in plan.stages if stage.kind is ExecutionStageKind.INPUT]
         outputs = [stage for stage in plan.stages if stage.kind is ExecutionStageKind.OUTPUT]

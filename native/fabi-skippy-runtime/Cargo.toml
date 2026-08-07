@@ -1,0 +1,23 @@
+[package]
+name = "fabi-skippy-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Verified Skippy native-runtime bridge for Fabi workers"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+mesh-llm-native-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "e60b2fe43aa05271569fbeff2a457133aef456a1" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+skippy-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm", rev = "e60b2fe43aa05271569fbeff2a457133aef456a1", features = ["dynamic-native-runtime"] }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

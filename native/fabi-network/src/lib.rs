@@ -17,4 +17,7 @@ pub mod telemetry;
 #[cfg(feature = "python")]
 mod python;
 
+#[cfg(all(feature = "python", feature = "skippy-runtime"))]
+mod skippy_python;
+
 pub const ALPN: &[u8] = b"fabi/network/1";

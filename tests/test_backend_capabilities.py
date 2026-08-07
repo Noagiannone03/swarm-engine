@@ -32,6 +32,7 @@ def test_device_registry_separates_tensor_runtime_from_executor_engine():
     assert tensor_runtime_for_device("directml:0") is TensorRuntime.NUMPY
     assert tensor_runtime_for_device("openvino") is TensorRuntime.NUMPY
     assert capability_for_device("xpu").executor_backends == frozenset({"sglang"})
+    assert capability_for_device("cpu").executor_backends == frozenset({"skippy"})
 
 
 def test_device_parser_and_rank_canonicalization_fail_closed():
@@ -53,7 +54,8 @@ def test_executor_registry_accepts_only_real_device_engine_pairs():
         require_executor_backend("winml", "onnxruntime")
     with pytest.raises(ValueError, match="not supported on xpu"):
         require_executor_backend("xpu", "vllm")
-    with pytest.raises(ValueError, match="none qualified"):
+    assert require_executor_backend("cpu", "skippy") == "skippy"
+    with pytest.raises(ValueError, match="not supported on cpu"):
         require_executor_backend("cpu", "sglang")
 
 

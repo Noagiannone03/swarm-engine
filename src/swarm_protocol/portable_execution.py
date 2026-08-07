@@ -71,7 +71,9 @@ def select_execution_plan(
     candidates = tuple(
         plan
         for plan in artifact_index.execution_plans
-        if provider in plan.providers and (plan_id is None or plan.plan_id == plan_id)
+        if isinstance(plan, ModelExecutionPlan)
+        and provider in plan.providers
+        and (plan_id is None or plan.plan_id == plan_id)
     )
     if not candidates:
         requested = f" plan {plan_id!r}" if plan_id is not None else ""

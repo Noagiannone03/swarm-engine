@@ -308,7 +308,7 @@ def parse_args() -> argparse.Namespace:
         "--gpu-backend",
         type=str,
         default="sglang",
-        choices=["sglang", "vllm", "onnxruntime"],
+        choices=["sglang", "vllm", "onnxruntime", "skippy"],
         help="GPU backend to use",
     )
     parser.add_argument(
@@ -359,10 +359,10 @@ def validate_args(args: argparse.Namespace) -> None:
     if getattr(args, "execution_device", None) is not None:
         device_kind(args.execution_device)
     if (
-        getattr(args, "gpu_backend", None) == "onnxruntime"
+        getattr(args, "gpu_backend", None) in {"onnxruntime", "skippy"}
         and args.enable_weight_refit
     ):
-        raise ValueError("onnxruntime does not support weight refit")
+        raise ValueError(f"{args.gpu_backend} does not support weight refit")
 
     # Validate memory fraction
     if not 0.0 <= args.kv_cache_memory_fraction <= 1.0:

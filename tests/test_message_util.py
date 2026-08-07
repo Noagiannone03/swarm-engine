@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from parallax.p2p.message_util import (
+    NativeActivationFrame,
     abort_request_to_proto,
     bytes_to_tensor,
     proto_to_abort_request,
@@ -91,6 +92,36 @@ class TestMessageUtil:
         assert proto_req.rid == self.request_id
         assert proto_req.next_token_id == 42
         assert proto_req.hidden_states  # hidden_states should be serialized
+
+    def test_native_activation_uses_typed_protobuf_and_round_trips(self):
+        activation = NativeActivationFrame(
+            version=1,
+            dtype="f32",
+            layout="token_major",
+            producer_stage_index=0,
+            layer_start=0,
+            layer_end=7,
+            token_count=2,
+            sequence_count=1,
+            flags=3,
+            payload=b"activation-frame",
+        )
+        request = IntermediateRequest(
+            request_id=self.request_id,
+            input_ids=[1, 2],
+            current_position=2,
+            status=RequestStatus.PREFILLING,
+            hidden_states=activation,
+            sampling_params=self.sampling_params,
+            routing_table=["worker-b"],
+        )
+
+        encoded = request_to_proto([request], device="vulkan:0")
+
+        assert encoded.reqs[0].HasField("native_activation")
+        assert encoded.reqs[0].hidden_states == b""
+        [restored] = proto_to_request(encoded, device="vulkan:0")
+        assert restored.hidden_states == activation
 
     def test_proto_to_request_conversion(self):
         """Test the round-trip conversion from request to proto and back."""

@@ -14,5 +14,7 @@ build/
 hosts.json
 uv.lock
 native/fabi-network/target/
+native/fabi-skippy-runtime/target/
+native/fabi-skippy-runtime/Cargo.lock
 
 AGENTS.md

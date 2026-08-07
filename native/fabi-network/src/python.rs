@@ -1600,6 +1600,8 @@ fn fabi_network_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCatalogRecord>()?;
     module.add_class::<PyRpcRequest>()?;
     module.add_class::<PyRpcStream>()?;
+    #[cfg(feature = "skippy-runtime")]
+    crate::skippy_python::register(module)?;
     module.add("PROTOCOL_VERSION", 1)?;
     Ok(())
 }

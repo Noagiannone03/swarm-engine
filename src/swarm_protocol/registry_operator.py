@@ -58,6 +58,7 @@ from swarm_protocol.registry import (
     TufRegistryPublisher,
     TufTimestampRefresher,
 )
+from swarm_protocol.skippy_package_import import attach_skippy_package
 
 _KEY_ROLES = ("root", "targets", "snapshot", "timestamp")
 _MAX_SECRET_BYTES = 4096
@@ -732,6 +733,38 @@ def attach_portable_execution_file(
     return bundle
 
 
+def attach_skippy_package_file(
+    output: Path,
+    *,
+    bundle_path: Path,
+    package_repository_id: str,
+    package_revision: str | None,
+    plan_id: str,
+    runtime_release: str,
+    runtime_abi_version: str,
+    providers: tuple[ExecutionProviderKind, ...],
+    token: bool | str | None = None,
+) -> ModelRegistryBundle:
+    """Resolve a public layer package and atomically emit its Fabi bundle."""
+
+    if output.resolve() == bundle_path.resolve():
+        raise ValueError("Skippy bundle output must not replace its input")
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite Skippy bundle: {output}")
+    bundle = attach_skippy_package(
+        load_bundles((bundle_path,))[0],
+        package_repository_id=package_repository_id,
+        package_revision=package_revision,
+        plan_id=plan_id,
+        runtime_release=runtime_release,
+        runtime_abi_version=runtime_abi_version,
+        providers=providers,
+        token=token,
+    )
+    _atomic_create_public(output, bundle.canonical_bytes() + b"\n")
+    return bundle
+
+
 def initialize_staging_registry(
     repository_dir: Path,
     key_dir: Path,
@@ -805,7 +838,14 @@ def _bundle_summary(bundle: ModelRegistryBundle) -> dict[str, object]:
         "signed_execution_bytes": sum(
             artifact.size
             for artifact in bundle.artifact_index.artifacts
-            if artifact.role in {ArtifactRole.EXECUTION_GRAPH, ArtifactRole.EXECUTION_DATA}
+            if artifact.role
+            in {
+                ArtifactRole.EXECUTION_DATA,
+                ArtifactRole.EXECUTION_GRAPH,
+                ArtifactRole.EXECUTION_LAYER,
+                ArtifactRole.EXECUTION_PACKAGE_MANIFEST,
+                ArtifactRole.EXECUTION_SHARED,
+            }
         ),
     }
 
@@ -864,6 +904,28 @@ def _parser() -> argparse.ArgumentParser:
         help="qualified provider; repeat only when the same graph was verified on each provider",
     )
     attach.add_argument("--output", type=Path, required=True)
+
+    attach_skippy = commands.add_parser("attach-skippy-execution")
+    attach_skippy.add_argument("--bundle", type=Path, required=True)
+    attach_skippy.add_argument("--package-repository-id", required=True)
+    attach_skippy.add_argument("--package-revision")
+    attach_skippy.add_argument("--plan-id", required=True)
+    attach_skippy.add_argument("--runtime-release", default="mesh-llm/v0.74.0")
+    attach_skippy.add_argument("--runtime-abi-version", default="0.1.32")
+    attach_skippy.add_argument(
+        "--provider",
+        action="append",
+        choices=[
+            ExecutionProviderKind.CPU.value,
+            ExecutionProviderKind.CUDA.value,
+            ExecutionProviderKind.METAL.value,
+            ExecutionProviderKind.ROCM.value,
+            ExecutionProviderKind.VULKAN.value,
+        ],
+        help="qualified native backend; repeat to restrict the release matrix",
+    )
+    attach_skippy.add_argument("--use-hf-token", action="store_true")
+    attach_skippy.add_argument("--output", type=Path, required=True)
 
     initialize = commands.add_parser("init-staging")
     initialize.add_argument("--repository-dir", type=Path, required=True)
@@ -954,6 +1016,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         result = {
             "status": "portable_execution_attached",
+            **_bundle_summary(bundle),
+            "output": str(args.output),
+        }
+    elif args.command == "attach-skippy-execution":
+        provider_values = args.provider or [
+            ExecutionProviderKind.CPU.value,
+            ExecutionProviderKind.CUDA.value,
+            ExecutionProviderKind.METAL.value,
+            ExecutionProviderKind.ROCM.value,
+            ExecutionProviderKind.VULKAN.value,
+        ]
+        bundle = attach_skippy_package_file(
+            args.output,
+            bundle_path=args.bundle,
+            package_repository_id=args.package_repository_id,
+            package_revision=args.package_revision,
+            plan_id=args.plan_id,
+            runtime_release=args.runtime_release,
+            runtime_abi_version=args.runtime_abi_version,
+            providers=tuple(
+                sorted(
+                    {ExecutionProviderKind(value) for value in provider_values},
+                    key=lambda provider: provider.value,
+                )
+            ),
+            token=True if args.use_hf_token else None,
+        )
+        result = {
+            "status": "skippy_execution_attached",
             **_bundle_summary(bundle),
             "output": str(args.output),
         }

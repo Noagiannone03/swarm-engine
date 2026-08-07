@@ -30,10 +30,133 @@ from parallax.server.backend_capabilities import (
     device_kind,
     require_executor_backend,
 )
+from parallax.server.memory_budget import (
+    configured_cuda_reserve_bytes,
+    configured_system_admission_floor_bytes,
+)
 from parallax.utils.shared_state import SharedState
 from parallax_utils.logging_config import get_logger, set_log_level
 
 logger = get_logger(__name__)
+
+_SKIPPY_CAPACITY_DEVICE: dict[str, Any] | None = None
+
+
+def _skippy_backend_for_device(device: str) -> str:
+    mapping = {
+        DeviceKind.CPU: "cpu",
+        DeviceKind.CUDA: "cuda",
+        DeviceKind.METAL: "metal",
+        DeviceKind.ROCM: "rocm",
+        DeviceKind.VULKAN: "vulkan",
+    }
+    try:
+        return mapping[device_kind(device)]
+    except KeyError as exc:
+        raise RuntimeError(f"{device!r} has no Skippy native runtime") from exc
+
+
+def _skippy_backend_device(device: str) -> str:
+    from parallax.server.skippy_stage_runner import _backend_device
+
+    return _backend_device(device)
+
+
+def _initialize_skippy_runtime(device: str) -> str:
+    global _SKIPPY_CAPACITY_DEVICE
+
+    from parallax.server.skippy_stage_runner import (
+        SKIPPY_MESH_RELEASE,
+        SKIPPY_RUNTIME_ABI,
+        discover_skippy_native_runtime,
+    )
+
+    try:
+        import fabi_network_native
+    except (ImportError, OSError) as exc:
+        raise RuntimeError("qualified Fabi native wheel has no Skippy runtime") from exc
+    backend = _skippy_backend_for_device(device)
+    root = discover_skippy_native_runtime(
+        mesh_release=SKIPPY_MESH_RELEASE,
+        runtime_abi=SKIPPY_RUNTIME_ABI,
+        backend=backend,
+    )
+    devices = fabi_network_native.load_skippy_native_runtime(
+        root,
+        SKIPPY_MESH_RELEASE,
+        SKIPPY_RUNTIME_ABI,
+        backend,
+    )
+    selected = _skippy_backend_device(device)
+    matches = [
+        native_device
+        for native_device in devices
+        if selected in {native_device.name, native_device.device_id}
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Skippy capacity probe could not uniquely resolve {selected!r}"
+        )
+    native_device = matches[0]
+    _SKIPPY_CAPACITY_DEVICE = {
+        "name": str(native_device.name),
+        "device_id": (
+            str(native_device.device_id) if native_device.device_id else None
+        ),
+        "kind": str(native_device.kind),
+        "memory_free": int(native_device.memory_free),
+        "memory_total": int(native_device.memory_total),
+        "caps": int(native_device.caps),
+        "execution_device": device,
+    }
+    return device
+
+
+def _skippy_node_hardware(node_id: str | None, execution_device: str) -> dict[str, Any]:
+    """Build capacity only from Skippy's live backend API and maintained OS counters."""
+
+    if _SKIPPY_CAPACITY_DEVICE is None:
+        raise RuntimeError("Skippy native runtime has not been initialized")
+    observed = _SKIPPY_CAPACITY_DEVICE
+    total = int(observed["memory_total"])
+    available = min(total, int(observed["memory_free"]))
+    if total <= 0 or available <= 0:
+        raise RuntimeError("Skippy backend reported no usable device memory")
+    unified = observed["kind"] == "integrated_gpu" or device_kind(
+        execution_device
+    ) in {DeviceKind.METAL, DeviceKind.CPU}
+    if unified:
+        import psutil
+
+        system = psutil.virtual_memory()
+        system_available = int(system.available)
+        reserve = configured_system_admission_floor_bytes(
+            int(system.total),
+            system_available,
+        )
+        usable = min(available, max(0, system_available - reserve))
+        system_reserve = reserve
+    else:
+        reserve = configured_cuda_reserve_bytes(total)
+        usable = max(0, available - reserve)
+        system_available = None
+        system_reserve = None
+    return {
+        "node_id": node_id,
+        "num_gpus": 0 if device_kind(execution_device) is DeviceKind.CPU else 1,
+        "tflops_fp16": 0.0,
+        "gpu_name": observed["name"],
+        "memory_gb": total / 1024**3,
+        "usable_memory_bytes": usable,
+        "device_available_memory_bytes": available,
+        "device_reserve_bytes": reserve,
+        "system_available_memory_bytes": system_available,
+        "system_reserve_bytes": system_reserve,
+        "memory_bandwidth_gbps": 0.0,
+        "device": execution_device,
+        "skippy_backend_device": observed["device_id"] or observed["name"],
+        "skippy_backend_caps": observed["caps"],
+    }
 
 DEFAULT_CAPACITY_SAMPLE_SECONDS = 1.0
 DEFAULT_CAPACITY_RISE_SAMPLES = 3
@@ -132,6 +255,8 @@ def _initialize_backend_runtime(
     kind = device_kind(device)
     device = canonical_device_for_rank(device, 0)
     require_executor_backend(device, gpu_backend)
+    if gpu_backend == "skippy":
+        return _initialize_skippy_runtime(device)
     if kind is DeviceKind.MLX:
         import mlx.core as mx
 
@@ -198,7 +323,11 @@ def run_runtime_capacity_probe(
         while not state.get("capacity_contract_frozen", False) and not state.get(
             "capacity_probe_stop", False
         ):
-            hardware = detector(None, device)
+            hardware = (
+                _skippy_node_hardware(None, device)
+                if gpu_backend == "skippy" and detector is detect_node_hardware
+                else detector(None, device)
+            )
             advertised = hardware.get("usable_memory_bytes")
             if advertised is None:
                 raise RuntimeError("backend did not expose a usable-memory envelope")

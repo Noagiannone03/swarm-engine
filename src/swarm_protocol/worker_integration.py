@@ -34,6 +34,10 @@ from swarm_protocol.portable_execution import (
     VerifiedExecutionSpan,
     materialize_execution_span,
 )
+from swarm_protocol.skippy_execution import (
+    VerifiedSkippySpan,
+    materialize_skippy_execution_span,
+)
 
 _REPORT_TTL_MS = 45_000
 _VERIFICATION_RETRY_SECONDS = 30.0
@@ -88,7 +92,7 @@ class WorkerServingSnapshot:
 class _VerifiedServingContract:
     key: tuple[str, str, int, int, str, str | None, str | None]
     bundle: ModelRegistryBundle
-    artifacts: VerifiedSpanArtifacts | VerifiedExecutionSpan
+    artifacts: VerifiedSpanArtifacts | VerifiedExecutionSpan | VerifiedSkippySpan
 
 
 def _runtime_version() -> str:
@@ -402,6 +406,19 @@ class WorkerProtocolV3Reporter:
                     plan_id=serving.execution_plan_id,
                     local_files_only=True,
                 )
+            elif serving.backend is BackendKind.SKIPPY:
+                if not serving.execution_plan_id or not serving.execution_device:
+                    raise ValueError(
+                        "Skippy worker snapshot lacks execution plan or device identity"
+                    )
+                artifacts = materialize_skippy_execution_span(
+                    bundle.artifact_index,
+                    bundle.manifest,
+                    serving.span,
+                    device=serving.execution_device,
+                    plan_id=serving.execution_plan_id,
+                    local_files_only=True,
+                )
             else:
                 model_root = _local_model_root(
                     serving.model_id,
@@ -466,7 +483,7 @@ class WorkerProtocolV3Reporter:
             roles.add(WorkerRole.FRONTEND)
         execution_granularity_layers = (
             verified.artifacts.plan.execution_granularity_layers
-            if isinstance(verified.artifacts, VerifiedExecutionSpan)
+            if isinstance(verified.artifacts, (VerifiedExecutionSpan, VerifiedSkippySpan))
             else 1
         )
         offer = WorkerOffer(

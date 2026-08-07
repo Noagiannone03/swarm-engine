@@ -13,7 +13,8 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = []
 python = ["dep:pyo3"]
-python-extension = ["python", "pyo3/extension-module"]
+skippy-runtime = ["dep:fabi-skippy-runtime"]
+python-extension = ["python", "skippy-runtime", "pyo3/extension-module"]
 
 [dependencies]
 anyhow = "1.0"
@@ -23,6 +24,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 data-encoding = "2.9"
 futures = "0.3"
 fabi-dxgi = { path = "../fabi-dxgi" }
+fabi-skippy-runtime = { path = "../fabi-skippy-runtime", optional = true }
 iroh = { version = "=1.0.3", default-features = true }
 libp2p = { version = "=0.56.0", default-features = false, features = ["dns", "ed25519", "identify", "kad", "macros", "noise", "tcp", "tokio", "yamux"] }
 n0-future = "0.3"

@@ -82,3 +82,28 @@ def test_directml_capacity_probe_honors_explicit_device(monkeypatch):
 
     assert selected == "directml:2"
     assert imported == ["parallax.server.executor.onnx_executor"]
+
+
+def test_skippy_capacity_uses_native_backend_memory_without_estimation(monkeypatch):
+    gib = 1024**3
+    monkeypatch.setattr(
+        runtime_capacity,
+        "_SKIPPY_CAPACITY_DEVICE",
+        {
+            "name": "NVIDIA RTX",
+            "device_id": "CUDA0",
+            "kind": "gpu",
+            "memory_free": 10 * gib,
+            "memory_total": 16 * gib,
+            "caps": 7,
+            "execution_device": "cuda:0",
+        },
+    )
+
+    hardware = runtime_capacity._skippy_node_hardware("worker-1", "cuda:0")
+
+    assert hardware["device_available_memory_bytes"] == 10 * gib
+    assert hardware["device_reserve_bytes"] == 512 * 1024**2
+    assert hardware["usable_memory_bytes"] == 10 * gib - 512 * 1024**2
+    assert hardware["skippy_backend_device"] == "CUDA0"
+    assert hardware["skippy_backend_caps"] == 7

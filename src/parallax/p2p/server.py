@@ -66,6 +66,10 @@ from swarm_protocol.portable_execution import (
     portable_span_static_bytes,
     select_execution_plan,
 )
+from swarm_protocol.skippy_execution import (
+    select_skippy_execution_plan,
+    skippy_span_static_bytes,
+)
 from swarm_protocol.worker_integration import (
     WorkerProtocolV3Reporter,
     WorkerServingSnapshot,
@@ -1109,19 +1113,16 @@ class GradientServer:
                 )
                 manifest = bundle.manifest
                 initial_hardware = self._stable_capacity_hardware()
-                backend = (
-                    BackendKind.MLX
-                    if initial_hardware.get("device") == "mlx"
-                    else (
-                        BackendKind.VLLM
-                        if self.gpu_backend == "vllm"
-                        else (
-                            BackendKind.ONNXRUNTIME
-                            if self.gpu_backend == "onnxruntime"
-                            else BackendKind.SGLANG
-                        )
-                    )
-                )
+                if self.gpu_backend == "skippy":
+                    backend = BackendKind.SKIPPY
+                elif initial_hardware.get("device") == "mlx":
+                    backend = BackendKind.MLX
+                elif self.gpu_backend == "vllm":
+                    backend = BackendKind.VLLM
+                elif self.gpu_backend == "onnxruntime":
+                    backend = BackendKind.ONNXRUNTIME
+                else:
+                    backend = BackendKind.SGLANG
                 span_static_bytes = None
                 materialization_identity_hashes = (manifest.weight_collection_hash,)
                 execution_granularity_layers = 1
@@ -1138,6 +1139,29 @@ class GradientServer:
                         raise RuntimeError("portable bootstrap plan is not bound by the manifest")
                     span_static_bytes = partial(
                         portable_span_static_bytes,
+                        bundle.artifact_index,
+                        execution_plan,
+                        manifest,
+                    )
+                    materialization_identity_hashes = (manifest.execution_plan_hash,)
+                    execution_granularity_layers = execution_plan.execution_granularity_layers
+                    if self._shared_state is not None:
+                        self._shared_state.update(
+                            execution_plan_id=execution_plan.plan_id,
+                            execution_device=execution_device,
+                        )
+                elif backend is BackendKind.SKIPPY:
+                    execution_device = str(initial_hardware.get("device") or "").strip()
+                    if not execution_device:
+                        raise RuntimeError("Skippy bootstrap has no qualified execution device")
+                    execution_plan = select_skippy_execution_plan(
+                        bundle.artifact_index,
+                        device=execution_device,
+                    )
+                    if manifest.execution_plan_hash is None:
+                        raise RuntimeError("Skippy bootstrap plan is not bound by the manifest")
+                    span_static_bytes = partial(
+                        skippy_span_static_bytes,
                         bundle.artifact_index,
                         execution_plan,
                         manifest,
@@ -2904,7 +2928,7 @@ class GradientServer:
                         else 1
                     ),
                 )
-                if runtime_backend == "onnxruntime":
+                if runtime_backend in {"onnxruntime", "skippy"}:
                     required_contract += (
                         self._shared_state.get("execution_plan_id"),
                         self._shared_state.get("execution_device"),
@@ -2915,19 +2939,16 @@ class GradientServer:
                         if self.swarm_v3_placement_mode == "autonomous"
                         else int(info["max_sequence_length"])
                     )
-                    backend = (
-                        BackendKind.MLX
-                        if runtime_backend == "mlx"
-                        else (
-                            BackendKind.VLLM
-                            if runtime_backend == "vllm"
-                            else (
-                                BackendKind.ONNXRUNTIME
-                                if runtime_backend == "onnxruntime"
-                                else BackendKind.SGLANG
-                            )
-                        )
-                    )
+                    if runtime_backend == "mlx":
+                        backend = BackendKind.MLX
+                    elif runtime_backend == "vllm":
+                        backend = BackendKind.VLLM
+                    elif runtime_backend == "onnxruntime":
+                        backend = BackendKind.ONNXRUNTIME
+                    elif runtime_backend == "skippy":
+                        backend = BackendKind.SKIPPY
+                    else:
+                        backend = BackendKind.SGLANG
                     report = self.swarm_v3_reporter.snapshot(
                         WorkerServingSnapshot(
                             worker_id=self.lattica.peer_id(),
@@ -2985,7 +3006,7 @@ class GradientServer:
                                     materialization_identity_hashes = (
                                         manifest.weight_collection_hash,
                                     )
-                                    if runtime_backend == "onnxruntime":
+                                    if runtime_backend in {"onnxruntime", "skippy"}:
                                         serving_device = str(
                                             self._shared_state.get("execution_device")
                                         )
@@ -2996,17 +3017,26 @@ class GradientServer:
                                             str(self.model_name),
                                             immutable_revision=str(self.model_revision),
                                         )
-                                        execution_plan = select_execution_plan(
-                                            bundle.artifact_index,
-                                            device=serving_device,
-                                            plan_id=serving_plan_id,
-                                        )
+                                        if runtime_backend == "skippy":
+                                            execution_plan = select_skippy_execution_plan(
+                                                bundle.artifact_index,
+                                                device=serving_device,
+                                                plan_id=serving_plan_id,
+                                            )
+                                            static_bytes = skippy_span_static_bytes
+                                        else:
+                                            execution_plan = select_execution_plan(
+                                                bundle.artifact_index,
+                                                device=serving_device,
+                                                plan_id=serving_plan_id,
+                                            )
+                                            static_bytes = portable_span_static_bytes
                                         if manifest.execution_plan_hash is None:
                                             raise RuntimeError(
                                                 "portable serving plan is not bound by the manifest"
                                             )
                                         span_static_bytes = partial(
-                                            portable_span_static_bytes,
+                                            static_bytes,
                                             bundle.artifact_index,
                                             execution_plan,
                                             manifest,
