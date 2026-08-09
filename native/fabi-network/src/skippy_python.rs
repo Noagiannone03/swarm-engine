@@ -375,7 +375,7 @@ impl PySkippyKvPageBuilder {
         v_row_bytes: u32,
         v_element_bytes: u32,
         payload_bytes: u64,
-        payload_sha256: String,
+        payload_sha256: &str,
         flags: u64,
     ) -> PyResult<Self> {
         let payload_bytes = usize::try_from(payload_bytes)
@@ -426,7 +426,7 @@ impl PySkippyKvPageBuilder {
             .map_err(|_| py_error("Skippy KV import length exceeds u64"))
     }
 
-    fn append(&mut self, chunk: Vec<u8>) -> PyResult<()> {
+    fn append(&mut self, chunk: &[u8]) -> PyResult<()> {
         if chunk.is_empty() {
             return Err(py_error("Skippy KV import chunk is empty"));
         }
@@ -442,7 +442,7 @@ impl PySkippyKvPageBuilder {
         if next_len > state.payload_bytes {
             return Err(py_error("Skippy KV import exceeds its declared payload"));
         }
-        state.payload.extend_from_slice(&chunk);
+        state.payload.extend_from_slice(chunk);
         Ok(())
     }
 
@@ -773,6 +773,7 @@ impl PySkippyStage {
         .map_err(py_error)
     }
 
+    #[allow(clippy::needless_pass_by_value)] // PyO3 extracts the frozen page from Python.
     fn import_kv_page(
         &self,
         py: Python<'_>,
