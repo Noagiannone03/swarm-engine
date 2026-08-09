@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,6 +16,7 @@ from parallax.server.skippy_stage_runner import (
 )
 from parallax_utils.logging_config import get_logger
 from swarm_protocol.contracts import LayerSpan, SkippyExactStateKind
+from swarm_protocol.kv_snapshot import KvSnapshotCompatibility
 from swarm_protocol.skippy_execution import materialize_skippy_execution_span
 from swarm_protocol.worker_integration import WorkerProtocolV3Reporter
 
@@ -132,6 +134,7 @@ class SkippyExecutor(BaseExecutor):
             max_sessions=max_sessions,
         )
         self.execution_plan = verified.plan
+        self.model_manifest = bundle.manifest
         self.checkpoint_exports = (
             SkippyCheckpointExportRegistry(
                 runner=self.runner,
@@ -349,7 +352,11 @@ class SkippyExecutor(BaseExecutor):
             if isinstance(token_count, bool) or not isinstance(token_count, int):
                 raise ValueError("checkpoint token_count must be an integer")
             descriptor = registry.prepare(request_id=request_id, token_count=token_count)
-            return descriptor.as_wire_dict(), None
+            result = descriptor.as_wire_dict()
+            compatibility = self._checkpoint_compatibility(result)
+            result["compatibility"] = compatibility.to_wire_dict()
+            result["compatibility_identity_hash"] = compatibility.identity_hash
+            return result, None
         if command == "checkpoint_export_read":
             if binary_request is not None:
                 raise ValueError("checkpoint export read does not accept binary data")
@@ -379,6 +386,18 @@ class SkippyExecutor(BaseExecutor):
             descriptor = request.get("descriptor")
             if not isinstance(descriptor, dict):
                 raise ValueError("checkpoint import descriptor is missing")
+            compatibility_payload = descriptor.get("compatibility")
+            try:
+                source_compatibility = KvSnapshotCompatibility.from_wire_dict(compatibility_payload)
+            except (TypeError, ValueError) as error:
+                raise ValueError("checkpoint import compatibility is invalid") from error
+            claimed_identity_hash = descriptor.get("compatibility_identity_hash")
+            if not isinstance(claimed_identity_hash, str) or not hmac.compare_digest(
+                claimed_identity_hash,
+                source_compatibility.identity_hash,
+            ):
+                raise ValueError("checkpoint import compatibility identity is invalid")
+            source_compatibility.require_compatible(self._checkpoint_compatibility(descriptor))
             handle = registry.begin_import(request_id=request_id, descriptor=descriptor)
             return {"handle": handle}, None
         if command == "checkpoint_import_write":
@@ -414,6 +433,35 @@ class SkippyExecutor(BaseExecutor):
             aborted = registry.abort_import(handle=handle, request_id=request_id)
             return {"aborted": aborted}, None
         raise ValueError("unknown executor checkpoint command")
+
+    def _checkpoint_compatibility(
+        self,
+        descriptor: dict[str, Any],
+    ) -> KvSnapshotCompatibility:
+        plan = self.execution_plan
+        manifest = self.model_manifest
+        return KvSnapshotCompatibility(
+            model_swarm_id=manifest.model_swarm_id,
+            immutable_revision=manifest.immutable_revision,
+            tokenizer_hash=manifest.tokenizer_hash,
+            dtype=manifest.dtype,
+            prefill_contract_hash=manifest.prefill_contract_hash,
+            attention_kv_contract_hash=manifest.attention_kv_contract_hash,
+            execution_plan_id=plan.plan_id,
+            package_source_sha256=plan.package_source_sha256,
+            runtime_release=plan.runtime_release,
+            runtime_abi_version=plan.runtime_abi_version,
+            layer_start=int(descriptor["layer_start"]),
+            layer_end=int(descriptor["layer_end"]),
+            state_kind=plan.exact_state_kind,
+            page_version=int(descriptor["version"]),
+            k_type=int(descriptor["k_type"]),
+            v_type=int(descriptor["v_type"]),
+            k_row_bytes=int(descriptor["k_row_bytes"]),
+            v_row_bytes=int(descriptor["v_row_bytes"]),
+            v_element_bytes=int(descriptor["v_element_bytes"]),
+            flags=int(descriptor.get("flags", 0)),
+        )
 
     def _request_abort_requested(self, rid: str) -> bool:
         shared_state = getattr(self, "shared_state", None)

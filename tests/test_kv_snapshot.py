@@ -58,6 +58,7 @@ def test_snapshot_accepts_exact_target_and_returns_only_uncheckpointed_suffix():
     checkpoint.validate_payload(payload)
     assert checkpoint.resume_suffix((10, 20, 30, 40, 50)) == (40, 50)
     assert compatibility.identity_hash == _compatibility().identity_hash
+    assert KvSnapshotCompatibility.from_wire_dict(compatibility.to_wire_dict()) == compatibility
 
 
 def test_snapshot_rejects_runtime_or_native_layout_mismatch():

@@ -97,6 +97,23 @@ class KvSnapshotCompatibility:
         digest = hashlib.sha256(_IDENTITY_DOMAIN + canonical).hexdigest()
         return digest
 
+    def to_wire_dict(self) -> dict[str, object]:
+        """Return the canonical MessagePack-safe compatibility payload."""
+
+        payload: dict[str, object] = asdict(self)
+        payload["state_kind"] = self.state_kind.value
+        return payload
+
+    @classmethod
+    def from_wire_dict(cls, payload: object) -> KvSnapshotCompatibility:
+        """Parse an untrusted wire payload through the complete contract."""
+
+        if not isinstance(payload, dict):
+            raise TypeError("snapshot compatibility must be a dictionary")
+        values = dict(payload)
+        values["state_kind"] = SkippyExactStateKind(values.get("state_kind"))
+        return cls(**values)
+
     def require_compatible(self, target: KvSnapshotCompatibility) -> None:
         """Reject a target unless every native continuation invariant matches."""
 
