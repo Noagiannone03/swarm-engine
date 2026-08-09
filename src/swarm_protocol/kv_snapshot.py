@@ -11,19 +11,15 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
-from enum import Enum
 
+from swarm_protocol.contracts import SkippyExactStateKind
 from swarm_protocol.recovery import token_sequence_checksum
 
 _IDENTITY_DOMAIN = b"fabi-swarm-v3-kv-snapshot-identity\0"
 _MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024 * 1024
 
 
-class KvStateKind(str, Enum):
-    """Exact continuation state carried by a checkpoint."""
-
-    DENSE_ATTENTION_KV = "dense_attention_kv"
-    KV_RECURRENT = "kv_recurrent"
+KvStateKind = SkippyExactStateKind
 
 
 @dataclass(frozen=True)
@@ -72,8 +68,10 @@ class KvSnapshotCompatibility:
                 raise ValueError(f"{name} must not be empty")
         if self.layer_start < 0 or self.layer_end <= self.layer_start:
             raise ValueError("snapshot compatibility has an invalid layer range")
-        if not isinstance(self.state_kind, KvStateKind):
-            raise TypeError("state_kind must be a KvStateKind")
+        if not isinstance(self.state_kind, SkippyExactStateKind):
+            raise TypeError("state_kind must be a SkippyExactStateKind")
+        if self.state_kind is SkippyExactStateKind.DISABLED:
+            raise ValueError("disabled exact state cannot produce a warm checkpoint")
         if self.page_version <= 0:
             raise ValueError("snapshot page version must be positive")
         for name in ("k_type", "v_type", "k_row_bytes", "v_row_bytes", "v_element_bytes"):

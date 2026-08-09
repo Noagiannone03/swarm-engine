@@ -99,6 +99,16 @@ class SkippyRuntimeFeature(str, Enum):
     SESSION_RESET = "session_reset"
     GENERATION_SIGNALS = "generation_signals"
     BACKEND_DEVICES = "backend_devices"
+    EXACT_KV_PAGE = "exact_kv_page"
+    EXACT_RECURRENT_STATE = "exact_recurrent_state"
+
+
+class SkippyExactStateKind(str, Enum):
+    """Model-family continuation state certified by a signed Skippy plan."""
+
+    DISABLED = "disabled"
+    DENSE_ATTENTION_KV = "dense_attention_kv"
+    KV_RECURRENT = "kv_recurrent"
 
 
 class OnnxExportTarget(str, Enum):
@@ -294,6 +304,11 @@ class SkippyExecutionPlan(ContractModel):
     required_runtime_features: Annotated[
         tuple[SkippyRuntimeFeature, ...], Field(min_length=1, max_length=64)
     ]
+    # Warm recovery is model-family-specific. Unknown or uncertified families
+    # remain on token-exact cold replay even when the native runtime happens to
+    # expose state-export symbols.
+    exact_state_kind: SkippyExactStateKind = SkippyExactStateKind.DISABLED
+    exact_state_certification_hash: HashHex | None = None
     activation_width: PositiveInt
     # Skippy's staged ABI currently emits token-major F32 activation frames.
     # Keep the wire geometry in the signed plan: it is a routing input and must
@@ -318,9 +333,7 @@ class SkippyExecutionPlan(ContractModel):
     # Direct GGUF workers keep the complete file on disk but load only the
     # tensors in their assigned runtime slice. These signed tensor byte totals
     # make placement exact instead of dividing the file size heuristically.
-    direct_static_bytes_by_layer: Annotated[
-        tuple[PositiveInt, ...], Field(max_length=100_000)
-    ] = ()
+    direct_static_bytes_by_layer: Annotated[tuple[PositiveInt, ...], Field(max_length=100_000)] = ()
 
     @model_validator(mode="after")
     def validate_plan(self) -> Self:
@@ -343,6 +356,19 @@ class SkippyExecutionPlan(ContractModel):
         feature_values = tuple(feature.value for feature in self.required_runtime_features)
         if tuple(sorted(set(feature_values))) != feature_values:
             raise ValueError("Skippy runtime features must be sorted and unique")
+        if self.exact_state_kind is SkippyExactStateKind.DISABLED:
+            if self.exact_state_certification_hash is not None:
+                raise ValueError("disabled Skippy exact state cannot carry a certification")
+        else:
+            if self.exact_state_certification_hash is None:
+                raise ValueError("Skippy exact state requires a signed certification hash")
+            if SkippyRuntimeFeature.EXACT_KV_PAGE not in self.required_runtime_features:
+                raise ValueError("Skippy exact state requires native KV-page support")
+            if (
+                self.exact_state_kind is SkippyExactStateKind.KV_RECURRENT
+                and SkippyRuntimeFeature.EXACT_RECURRENT_STATE not in self.required_runtime_features
+            ):
+                raise ValueError("recurrent Skippy state requires recurrent-state support")
         if self.activation_bytes_per_token != self.activation_width * 4:
             raise ValueError("Skippy F32 activation geometry does not match activation width")
         if self.format == "gguf-direct":
@@ -362,9 +388,7 @@ class SkippyExecutionPlan(ContractModel):
             )
             if any(value is not None for value in package_fields) or self.layer_paths:
                 raise ValueError("direct GGUF plan cannot contain layer-package fields")
-            if len(self.direct_static_bytes_by_layer) != len(
-                self.kv_bytes_per_token_by_layer
-            ):
+            if len(self.direct_static_bytes_by_layer) != len(self.kv_bytes_per_token_by_layer):
                 raise ValueError("direct GGUF static and KV geometry must cover every layer")
             paths = self.source_model_paths
         else:
@@ -380,9 +404,7 @@ class SkippyExecutionPlan(ContractModel):
                 self.embeddings_path,
                 self.output_path,
             )
-            if self.source_model_paths or any(
-                value is None for value in package_fields
-            ):
+            if self.source_model_paths or any(value is None for value in package_fields):
                 raise ValueError("layer-package plan has incomplete package fields")
             if self.direct_static_bytes_by_layer:
                 raise ValueError("layer-package plan cannot contain direct GGUF geometry")
@@ -494,8 +516,7 @@ class ModelArtifactIndex(ContractModel):
                     )
             if (
                 plan.package_manifest_path is not None
-                and artifacts[plan.package_manifest_path].sha256
-                != plan.package_manifest_sha256
+                and artifacts[plan.package_manifest_path].sha256 != plan.package_manifest_sha256
             ):
                 raise ValueError("Skippy package manifest digest does not match its descriptor")
         return self

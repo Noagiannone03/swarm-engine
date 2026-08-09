@@ -11,6 +11,7 @@ from swarm_protocol.contracts import (
     LayerSpan,
     ModelArtifactIndex,
     ModelManifest,
+    SkippyExactStateKind,
     SkippyExecutionPlan,
     SkippyRuntimeFeature,
 )
@@ -20,7 +21,6 @@ from swarm_protocol.model_manifest import (
     execution_plan_identity_hash,
 )
 from swarm_protocol.registry import ModelRegistryBundle
-from swarm_protocol.skippy_package_import import attach_skippy_direct_gguf, attach_skippy_package
 from swarm_protocol.skippy_execution import (
     materialize_skippy_execution_span,
     required_skippy_storage_bytes,
@@ -29,6 +29,7 @@ from swarm_protocol.skippy_execution import (
     skippy_span_static_bytes,
     verify_skippy_execution_span,
 )
+from swarm_protocol.skippy_package_import import attach_skippy_direct_gguf, attach_skippy_package
 
 
 def _sha(payload: bytes) -> str:
@@ -278,6 +279,29 @@ def test_skippy_plan_rejects_newer_package_minor_abi():
         SkippyExecutionPlan.model_validate(payload)
 
 
+def test_skippy_warm_state_requires_signed_family_certification_and_native_features():
+    _, index, _ = _fixture()
+    payload = index.execution_plans[0].model_dump(mode="json")
+    payload["exact_state_kind"] = SkippyExactStateKind.DENSE_ATTENTION_KV.value
+
+    with pytest.raises(ValueError, match="certification"):
+        SkippyExecutionPlan.model_validate(payload)
+
+    payload["exact_state_certification_hash"] = "c" * 64
+    with pytest.raises(ValueError, match="KV-page"):
+        SkippyExecutionPlan.model_validate(payload)
+
+    payload["required_runtime_features"] = sorted(
+        [*payload["required_runtime_features"], SkippyRuntimeFeature.EXACT_KV_PAGE.value]
+    )
+    certified = SkippyExecutionPlan.model_validate(payload)
+    assert certified.exact_state_kind is SkippyExactStateKind.DENSE_ATTENTION_KV
+
+    payload["exact_state_kind"] = SkippyExactStateKind.KV_RECURRENT.value
+    with pytest.raises(ValueError, match="recurrent-state"):
+        SkippyExecutionPlan.model_validate(payload)
+
+
 def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
     contents, populated_index, populated_model = _fixture()
     execution_roles = {
@@ -391,12 +415,15 @@ def test_direct_gguf_needs_no_layer_package_and_loads_as_runtime_slice(tmp_path)
     assert plan.source_model_paths == ("model-q4.gguf",)
     assert SkippyRuntimeFeature.RUNTIME_SLICE in plan.required_runtime_features
     assert SkippyRuntimeFeature.LAYER_PACKAGE not in plan.required_runtime_features
-    assert skippy_span_static_bytes(
-        attached.artifact_index,
-        plan,
-        attached.manifest,
-        LayerSpan(start=0, end=1),
-    ) == 700
+    assert (
+        skippy_span_static_bytes(
+            attached.artifact_index,
+            plan,
+            attached.manifest,
+            LayerSpan(start=0, end=1),
+        )
+        == 700
+    )
 
     root = tmp_path / "snapshot"
     root.mkdir()
