@@ -606,6 +606,12 @@ def _build_memory_pressure_guards():
                         ),
                     )
                 )
+    except ModuleNotFoundError:
+        # Portable Skippy/Metal and Skippy/DirectML runtimes deliberately do
+        # not ship PyTorch.  The host guard above is authoritative for Apple
+        # unified memory, and the native capacity probe covers the selected
+        # accelerator, so absence of this optional provider is not an error.
+        pass
     except Exception:
         logger.warning("Could not initialize accelerator memory-pressure guards", exc_info=True)
     return guards

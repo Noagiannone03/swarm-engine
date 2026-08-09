@@ -3241,9 +3241,18 @@ class GradientServer:
                     ),
                 )
                 if runtime_backend in {"onnxruntime", "skippy"}:
+                    shared_state = getattr(self, "_shared_state", None)
                     required_contract += (
-                        self._shared_state.get("execution_plan_id"),
-                        self._shared_state.get("execution_device"),
+                        (
+                            shared_state.get("execution_plan_id")
+                            if shared_state is not None
+                            else None
+                        ),
+                        (
+                            shared_state.get("execution_device")
+                            if shared_state is not None
+                            else None
+                        ),
                     )
                 if all(value is not None for value in required_contract):
                     serving_context_ceiling = (

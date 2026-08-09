@@ -205,7 +205,11 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
         set_send_opt()
     elif socket_type == zmq.PULL:
         set_recv_opt()
-    elif socket_type == zmq.DEALER:
+    # Bidirectional socket types need both directions configured.  Keep this
+    # list aligned with SGLang's maintained ``config_socket`` implementation:
+    # the executor checkpoint control plane is REQ/REP, while PAIR is used by
+    # a few local control paths upstream.
+    elif socket_type in (zmq.DEALER, zmq.REQ, zmq.REP, zmq.PAIR):
         set_send_opt()
         set_recv_opt()
     else:
