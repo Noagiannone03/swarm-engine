@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from parallax.p2p.message_util import NativeActivationFrame
+from parallax.server.executor.base_executor import ExecutorBatchCancelled
 from parallax.server.executor.skippy_executor import SkippyExecutor
 
 
@@ -26,7 +27,8 @@ class FakeRunner:
         self.result = result
         self.calls = []
 
-    def prefill(self, *args):
+    def prefill(self, *args, **kwargs):
+        del kwargs
         self.calls.append(("prefill", args))
         return self.result
 
@@ -136,3 +138,27 @@ def test_final_token_contract_rejects_non_integer_values():
         instance._gen_token_id_from_hidden(True)
     with pytest.raises(TypeError, match="exactly one integer"):
         instance._gen_token_id_from_hidden([7])
+
+
+def test_shared_abort_marker_prevents_entering_native_execution():
+    instance = executor(
+        first=True,
+        last=True,
+        result=SimpleNamespace(activation=None, predicted_token=42),
+    )
+    instance.shared_state = SimpleNamespace(
+        request_abort_requested=lambda request_id: request_id == "cancel-me"
+    )
+    request = SimpleNamespace(
+        request_id="cancel-me",
+        input_ids=[10],
+        hidden_states=None,
+        sampling_params=object(),
+        is_prefill=True,
+    )
+
+    with pytest.raises(ExecutorBatchCancelled) as raised:
+        instance.process_batch({"requests": [request]}, return_decoded_tokens=True)
+
+    assert raised.value.request_ids == ("cancel-me",)
+    assert instance.runner.calls == []

@@ -60,3 +60,28 @@ def test_first_peer_turns_propagated_pipeline_error_into_frontend_error():
         EngineCoreFinishReason.ERROR,
         None,
     )
+
+
+def test_cooperative_cancellation_is_terminal_abort_not_backend_error():
+    executor = object.__new__(MinimalExecutor)
+    executor.tp_rank = 0
+    executor.is_first_peer = True
+    executor.is_last_peer = True
+    executor.finished_batch = []
+    released = []
+    terminal = []
+    executor.release_and_evict_request = released.append
+    executor._send_engine_core_terminal_output = lambda **kwargs: terminal.append(kwargs)
+    request = Request(request_id="cancelled")
+
+    executor.abort_batch([request])
+
+    assert released == ["cancelled"]
+    assert request.status == RequestStatus.FINISHED_ABORT
+    assert request.terminal_error is False
+    assert terminal == [
+        {
+            "request_id": "cancelled",
+            "finish_reason": EngineCoreFinishReason.ABORT,
+        }
+    ]

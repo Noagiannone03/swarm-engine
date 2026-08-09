@@ -11,6 +11,8 @@ import multiprocessing
 import time
 from typing import Any, Dict, Optional, Union
 
+_REQUEST_ABORT_PREFIX = "request_abort:"
+
 
 class SharedState:
     """Wrapper for multiprocessing.Manager().dict() with dict-like interface.
@@ -153,6 +155,35 @@ class SharedState:
     def set_status(self, status: str) -> None:
         """Set current status."""
         self._dict["status"] = status
+
+    @staticmethod
+    def _request_abort_key(request_id: str) -> str:
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
+            raise ValueError("request_id is invalid")
+        return f"{_REQUEST_ABORT_PREFIX}{request_id}"
+
+    def request_abort(self, request_id: str) -> None:
+        """Publish a process-wide cooperative cancellation marker.
+
+        Native model calls can release the GIL for minutes during a long
+        prefill.  The P2P control process therefore cannot rely on the
+        executor's normal ZMQ poll loop to observe an abort.  This marker is
+        stored in the existing multiprocessing manager and can be checked
+        between native prefill chunks without introducing a wall-clock
+        timeout.
+        """
+
+        self._dict[self._request_abort_key(request_id)] = time.monotonic_ns()
+
+    def request_abort_requested(self, request_id: str) -> bool:
+        """Return whether another process requested cooperative cancellation."""
+
+        return self._request_abort_key(request_id) in self._dict
+
+    def clear_request_abort(self, request_id: str) -> None:
+        """Remove one terminal request's cancellation marker."""
+
+        self._dict.pop(self._request_abort_key(request_id), None)
 
     @classmethod
     def create(cls) -> "SharedState":

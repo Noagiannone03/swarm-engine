@@ -267,6 +267,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         execution_admission: Optional[WorkerExecutionAdmission] = None,
         link_probe_authorizer: Optional[Callable[[str], bool]] = None,
         link_probe_idle: Optional[Callable[[], bool]] = None,
+        shared_state: Optional[SharedState] = None,
     ):
         if lattica is not None:
             super().__init__(lattica)
@@ -282,6 +283,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         self.execution_admission = execution_admission
         self.link_probe_authorizer = link_probe_authorizer
         self.link_probe_idle = link_probe_idle
+        self.shared_state = shared_state
         self._link_probe_lock = threading.Lock()
         self._link_probe_last_received: dict[str, float] = {}
         self._recv_from_peer = None
@@ -317,6 +319,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         aborted: list[str] = []
         with self._recv_from_peer_lock:
             for plan in expired:
+                if self.shared_state is not None:
+                    self.shared_state.request_abort(plan.request_id)
                 request = forward_pb2.AbortRequest()
                 item = request.reqs.add()
                 item.rid = plan.request_id
@@ -416,6 +420,9 @@ class TransformerConnectionHandler(ConnectionHandler):
                     routing_table=tuple(req.routing_table),
                     caller_endpoint_id=caller,
                 )
+        if self.shared_state is not None:
+            for req in request.reqs:
+                self.shared_state.request_abort(req.authority_request_id or req.rid)
         with self._recv_from_peer_lock:
             self.recv_from_peer.send_multipart([b"abort", request.SerializeToString()])
         return forward_pb2.AbortResponse()
@@ -458,6 +465,13 @@ class TransformerConnectionHandler(ConnectionHandler):
             request.get("vllm_xargs"),
             purpose="completion abort",
         )
+
+        # vLLM's maintained abort API remains the frontend authority.  The
+        # shared marker additionally wakes a native Skippy prefill at its next
+        # bounded chunk boundary instead of waiting for the whole model call
+        # to return before the executor can read the engine-core abort frame.
+        if self.shared_state is not None:
+            self.shared_state.request_abort(request_id)
 
         vllm_request_id = f"chatcmpl-{request_id}"
         with httpx.Client(
@@ -1697,6 +1711,7 @@ class GradientServer:
             execution_admission=self.swarm_v3_execution_admission,
             link_probe_authorizer=lambda peer_id: peer_id in self._authorized_link_peer_id_set,
             link_probe_idle=self._link_probe_idle,
+            shared_state=self._shared_state,
         )  # thread
         if self.iroh_transport is not None:
             self.iroh_transport.register(self.connection_handler)

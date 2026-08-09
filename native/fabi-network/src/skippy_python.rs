@@ -398,6 +398,22 @@ impl PySkippyStage {
         .map_err(py_error)
     }
 
+    fn prefill_tokens(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        token_ids: Vec<i32>,
+    ) -> PyResult<()> {
+        let inner = Arc::clone(&self.inner);
+        py.detach(move || {
+            inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Skippy stage lock poisoned"))?
+                .prefill_tokens(&session_id, &token_ids)
+        })
+        .map_err(py_error)
+    }
+
     fn reset_session(&self, py: Python<'_>, session_id: String) -> PyResult<()> {
         let inner = Arc::clone(&self.inner);
         py.detach(move || {

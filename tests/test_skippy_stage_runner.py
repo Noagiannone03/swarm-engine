@@ -8,6 +8,8 @@ import pytest
 from parallax.p2p.message_util import NativeActivationFrame
 from parallax.server.sampling.sampling_params import SamplingParams
 from parallax.server.skippy_stage_runner import (
+    SKIPPY_COOPERATIVE_PREFILL_CHUNK_TOKENS,
+    SkippyRequestCancelled,
     SkippyRuntimeStageRunner,
     _backend_device,
     discover_skippy_native_runtime,
@@ -50,6 +52,7 @@ class _FakeStage:
         self.parts = parts
         self.kwargs = kwargs
         self.calls = []
+        self.prefill_token_calls = []
         self.dropped = []
 
     def _output(self, token_ids, input_frame, sample):
@@ -76,6 +79,9 @@ class _FakeStage:
     def decode(self, request_id, token_id, input_frame, **kwargs):
         del request_id
         return self._output([token_id], input_frame, kwargs.get("sample", False))
+
+    def prefill_tokens(self, request_id, token_ids):
+        self.prefill_token_calls.append((request_id, list(token_ids)))
 
     def drop_session(self, request_id):
         self.dropped.append(request_id)
@@ -228,6 +234,61 @@ def test_runner_rejects_empty_activation_from_non_terminal_stage(tmp_path):
 
     with pytest.raises(ValueError, match="non-terminal"):
         runner.prefill("request-empty", [1], None, None)
+
+
+def test_full_replica_prefill_uses_bounded_native_chunks(tmp_path):
+    native = _FakeNative()
+    runner = SkippyRuntimeStageRunner(
+        _verified(tmp_path),
+        device="vulkan:0",
+        model_layer_count=2,
+        max_context_tokens=32768,
+        max_sessions=1,
+        native_module=native,
+        runtime_root=tmp_path,
+    )
+    token_ids = list(range(SKIPPY_COOPERATIVE_PREFILL_CHUNK_TOKENS * 2 + 17))
+
+    result = runner.prefill(
+        "long-request",
+        token_ids,
+        None,
+        SamplingParams(temperature=0),
+        is_cancelled=lambda: False,
+    )
+
+    assert [len(call[1]) for call in native.stage.prefill_token_calls] == [512, 512]
+    assert len(native.stage.calls) == 1
+    assert len(native.stage.calls[0][0]) == 17
+    assert native.stage.calls[0][2] is True
+    assert result.predicted_token == 42
+    assert result.activation is None
+
+
+def test_full_replica_prefill_observes_abort_between_native_chunks(tmp_path):
+    native = _FakeNative()
+    runner = SkippyRuntimeStageRunner(
+        _verified(tmp_path),
+        device="vulkan:0",
+        model_layer_count=2,
+        max_context_tokens=32768,
+        max_sessions=1,
+        native_module=native,
+        runtime_root=tmp_path,
+    )
+
+    with pytest.raises(SkippyRequestCancelled, match="was cancelled"):
+        runner.prefill(
+            "cancelled-request",
+            list(range(SKIPPY_COOPERATIVE_PREFILL_CHUNK_TOKENS * 2)),
+            None,
+            SamplingParams(temperature=0),
+            is_cancelled=lambda: bool(native.stage.prefill_token_calls),
+        )
+
+    assert [len(call[1]) for call in native.stage.prefill_token_calls] == [512]
+    assert native.stage.calls == []
+    assert native.stage.dropped == ["cancelled-request"]
 
 
 def test_direct_gguf_runner_uses_runtime_slice_without_a_package(tmp_path):

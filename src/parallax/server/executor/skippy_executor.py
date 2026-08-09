@@ -6,9 +6,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from parallax.p2p.message_util import NativeActivationFrame
-from parallax.server.executor.base_executor import BaseExecutor
+from parallax.server.executor.base_executor import BaseExecutor, ExecutorBatchCancelled
 from parallax.server.request import InitialRequest, IntermediateRequest, Request
-from parallax.server.skippy_stage_runner import SkippyRuntimeStageRunner
+from parallax.server.skippy_stage_runner import (
+    SkippyRequestCancelled,
+    SkippyRuntimeStageRunner,
+)
 from parallax_utils.logging_config import get_logger
 from swarm_protocol.contracts import LayerSpan
 from swarm_protocol.skippy_execution import materialize_skippy_execution_span
@@ -245,32 +248,40 @@ class SkippyExecutor(BaseExecutor):
     ) -> Dict[str, Any]:
         values: list[NativeActivationFrame | int] = []
         for request in prepared_inputs["requests"]:
+            if self._request_abort_requested(request.request_id):
+                raise ExecutorBatchCancelled([request.request_id])
             input_activation = None if self.is_first_peer else request.hidden_states
             if input_activation is not None and not isinstance(
                 input_activation, NativeActivationFrame
             ):
                 raise TypeError("Skippy stage received an untyped activation")
             sampling = request.sampling_params if return_decoded_tokens else None
-            if request.is_prefill:
-                result = self.runner.prefill(
-                    request.request_id,
-                    list(request.input_ids),
-                    input_activation,
-                    sampling,
-                )
-            else:
-                if isinstance(request, InitialRequest):
-                    token_id = request.output_ids[-1] if request.output_ids else None
+            try:
+                if request.is_prefill:
+                    result = self.runner.prefill(
+                        request.request_id,
+                        list(request.input_ids),
+                        input_activation,
+                        sampling,
+                        is_cancelled=lambda rid=request.request_id: (
+                            self._request_abort_requested(rid)
+                        ),
+                    )
                 else:
-                    token_id = request.next_token_id
-                if token_id is None:
-                    raise RuntimeError("Skippy decode request has no committed token")
-                result = self.runner.decode(
-                    request.request_id,
-                    int(token_id),
-                    input_activation,
-                    sampling,
-                )
+                    if isinstance(request, InitialRequest):
+                        token_id = request.output_ids[-1] if request.output_ids else None
+                    else:
+                        token_id = request.next_token_id
+                    if token_id is None:
+                        raise RuntimeError("Skippy decode request has no committed token")
+                    result = self.runner.decode(
+                        request.request_id,
+                        int(token_id),
+                        input_activation,
+                        sampling,
+                    )
+            except SkippyRequestCancelled as exc:
+                raise ExecutorBatchCancelled([request.request_id]) from exc
             if return_decoded_tokens:
                 if result.predicted_token is None:
                     raise RuntimeError("final Skippy stage did not sample a token")
@@ -305,6 +316,12 @@ class SkippyExecutor(BaseExecutor):
 
     def _release_request(self, rid: str) -> None:
         self.runner.release(rid)
+
+    def _request_abort_requested(self, rid: str) -> bool:
+        shared_state = getattr(self, "shared_state", None)
+        return bool(
+            shared_state is not None and shared_state.request_abort_requested(rid)
+        )
 
     def check_and_refit_weight(self, refit_weight_path: str) -> None:
         if refit_weight_path:

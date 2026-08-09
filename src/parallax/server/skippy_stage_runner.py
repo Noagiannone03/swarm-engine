@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,6 @@ from parallax.p2p.message_util import NativeActivationFrame
 from parallax.server.backend_capabilities import DeviceKind, device_kind
 from parallax.server.sampling.sampling_params import SamplingParams
 from swarm_protocol.skippy_execution import VerifiedSkippySpan
-
 
 _BACKEND_BY_DEVICE = {
     DeviceKind.CPU: "cpu",
@@ -24,6 +24,11 @@ _BACKEND_BY_DEVICE = {
 }
 SKIPPY_MESH_RELEASE = "0.74.0"
 SKIPPY_RUNTIME_ABI = "0.1.32"
+SKIPPY_COOPERATIVE_PREFILL_CHUNK_TOKENS = 512
+
+
+class SkippyRequestCancelled(RuntimeError):
+    """Raised after a native chunk boundary observes a fenced abort."""
 
 
 @dataclass(frozen=True)
@@ -273,6 +278,9 @@ class SkippyRuntimeStageRunner:
         ) != verified.plan.direct_static_bytes_by_layer:
             raise RuntimeError("Skippy GGUF tensor geometry differs from the signed plan")
         self.max_sessions = int(max_sessions)
+        self.is_full_model_stage = (
+            verified.span.start == 0 and verified.span.end == model_layer_count
+        )
         selected_backend_device = _backend_device(device)
         identifiers = {
             value
@@ -311,10 +319,45 @@ class SkippyRuntimeStageRunner:
         token_ids: list[int],
         activation: NativeActivationFrame | None,
         sampling_params: SamplingParams | None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> SkippyForwardResult:
+        if not token_ids:
+            raise ValueError("Skippy prefill token list is empty")
         native_input = _to_native_frame(self.native, activation)
         kwargs = {} if sampling_params is None else _sampling_kwargs(sampling_params)
-        output = self.stage.prefill(request_id, token_ids, native_input, **kwargs)
+
+        # Mesh's maintained OpenAI frontend advances prompt ingestion in
+        # bounded chunks and checks its cancellation token between chunks.
+        # Do the same for a complete local replica.  Intermediate pipeline
+        # stages still need their activation frame for every chunk, so their
+        # distributed chunk protocol is deliberately not approximated here.
+        cooperative = (
+            self.is_full_model_stage
+            and native_input is None
+            and sampling_params is not None
+            and len(token_ids) > SKIPPY_COOPERATIVE_PREFILL_CHUNK_TOKENS
+        )
+        if cooperative:
+            chunks = tuple(
+                token_ids[offset : offset + SKIPPY_COOPERATIVE_PREFILL_CHUNK_TOKENS]
+                for offset in range(
+                    0,
+                    len(token_ids),
+                    SKIPPY_COOPERATIVE_PREFILL_CHUNK_TOKENS,
+                )
+            )
+            for chunk in chunks[:-1]:
+                self._raise_if_cancelled(request_id, is_cancelled)
+                self.stage.prefill_tokens(request_id, chunk)
+                self._raise_if_cancelled(request_id, is_cancelled)
+            self._raise_if_cancelled(request_id, is_cancelled)
+            output = self.stage.prefill(request_id, chunks[-1], None, **kwargs)
+            self._raise_if_cancelled(request_id, is_cancelled)
+        else:
+            self._raise_if_cancelled(request_id, is_cancelled)
+            output = self.stage.prefill(request_id, token_ids, native_input, **kwargs)
+            self._raise_if_cancelled(request_id, is_cancelled)
         predicted_token = output.predicted_token
         return SkippyForwardResult(
             activation=_from_native_frame(
@@ -323,6 +366,16 @@ class SkippyRuntimeStageRunner:
             ),
             predicted_token=predicted_token,
         )
+
+    def _raise_if_cancelled(
+        self,
+        request_id: str,
+        is_cancelled: Callable[[], bool] | None,
+    ) -> None:
+        if is_cancelled is None or not is_cancelled():
+            return
+        self.stage.drop_session(request_id)
+        raise SkippyRequestCancelled(f"Skippy request {request_id} was cancelled")
 
     def decode(
         self,

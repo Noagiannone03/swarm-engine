@@ -29,9 +29,9 @@ from parallax.p2p.message_util import (
     proto_to_request,
     request_to_proto,
 )
-from parallax.server.backend_capabilities import is_torch_device
 from parallax.p2p.proto import forward_pb2
 from parallax.p2p.server import ServerState
+from parallax.server.backend_capabilities import is_torch_device
 from parallax.server.engine_core_protocol import (
     ENGINE_IDENTITY,
     EngineCoreFinishReason,
@@ -54,6 +54,14 @@ from parallax.utils.utils import get_current_device, get_device_dtype, get_zmq_s
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+class ExecutorBatchCancelled(RuntimeError):
+    """Cooperative backend cancellation observed during a model call."""
+
+    def __init__(self, request_ids: List[str]):
+        self.request_ids = tuple(str(request_id) for request_id in request_ids)
+        super().__init__(f"cancelled executor requests: {', '.join(self.request_ids)}")
 
 
 class BaseExecutor:
@@ -721,7 +729,15 @@ class BaseExecutor:
     def release_and_evict_request(self, rid: str):
         """Release per-request resources and evict from scheduler. Best-effort, never raises."""
         # Release resources
-        self._release_request(rid)
+        try:
+            self._release_request(rid)
+        finally:
+            # Cooperative abort markers are generation-scoped. Clear them
+            # for every backend so an inactive request cannot leave unbounded
+            # manager keys or poison a later replay identity.
+            shared_state = getattr(self, "shared_state", None)
+            if shared_state is not None:
+                shared_state.clear_request_abort(rid)
 
         # Evict from scheduler
         try:
@@ -752,6 +768,23 @@ class BaseExecutor:
                 self._send_engine_core_terminal_output(
                     request_id=req.request_id,
                     finish_reason=EngineCoreFinishReason.ERROR,
+                )
+
+    def abort_batch(self, requests: List[Request]) -> None:
+        """Commit cooperative cancellation as ABORT, never as backend failure."""
+
+        for req in requests:
+            req.abort = True
+            req.update_status(RequestStatus.FINISHED_ABORT)
+            self.release_and_evict_request(req.request_id)
+            if self.tp_rank != 0:
+                continue
+            if not (self.is_first_peer and self.is_last_peer):
+                self.finished_batch.append(req)
+            if self.is_first_peer:
+                self._send_engine_core_terminal_output(
+                    request_id=req.request_id,
+                    finish_reason=EngineCoreFinishReason.ABORT,
                 )
 
     def run_loop(self):
@@ -900,6 +933,18 @@ class BaseExecutor:
                                 f"in {(time.time() - start_time) * 1000:.3f} ms"
                             )
 
+            except ExecutorBatchCancelled as cancelled:
+                request_ids = set(cancelled.request_ids)
+                cancelled_requests = [
+                    request
+                    for request in batch_to_process
+                    if request.request_id in request_ids
+                ]
+                logger.info(
+                    "Native execution cooperatively cancelled requests %s",
+                    sorted(request_ids),
+                )
+                self.abort_batch(cancelled_requests)
             except Exception as e:
                 logger.exception(f"Error processing batch: {e}")
                 self.fail_batch(batch_to_process)

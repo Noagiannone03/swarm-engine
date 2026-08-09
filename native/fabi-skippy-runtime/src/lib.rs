@@ -693,6 +693,18 @@ impl SkippyStage {
         }
     }
 
+    /// Advance a complete local stage without materializing an activation.
+    ///
+    /// Mesh's maintained frontend performs long prompt ingestion as bounded
+    /// native chunks and checks cancellation between them.  A full-span Fabi
+    /// replica has no downstream stage, so intermediate activation frames are
+    /// unnecessary and can be avoided entirely until the final sampled
+    /// chunk.
+    pub fn prefill_tokens(&mut self, session_id: &str, token_ids: &[i32]) -> Result<()> {
+        ensure!(!token_ids.is_empty(), "Skippy prefill chunk is empty");
+        self.session(session_id)?.prefill_chunk(token_ids)
+    }
+
     pub fn decode(
         &mut self,
         session_id: &str,

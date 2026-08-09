@@ -113,7 +113,7 @@ class FakeRejectedHttpClient(FakeHttpClient):
         return FakeRejectedStreamResponse()
 
 
-def make_handler(admission=None):
+def make_handler(admission=None, shared_state=None):
     return TransformerConnectionHandler(
         lattica=None,
         recv_from_peer_addr="inproc://recv",
@@ -123,6 +123,7 @@ def make_handler(admission=None):
         http_port=3000,
         iroh_transport=FakeIrohTransport(),
         execution_admission=admission,
+        shared_state=shared_state,
     )
 
 
@@ -167,6 +168,29 @@ def test_abort_completion_fails_closed_without_active_v3():
 
     with pytest.raises(PermissionError, match="active protocol v3"):
         handler.abort_completion({"request_id": "request", "vllm_xargs": {}})
+
+
+def test_abort_completion_publishes_native_cancellation_marker(monkeypatch):
+    admission = FakeAdmission()
+    marked = []
+    shared_state = SimpleNamespace(request_abort=marked.append)
+    handler = make_handler(admission, shared_state)
+    FakeHttpClient.instances.clear()
+    monkeypatch.setattr(p2p_server, "authenticated_rpc_peer_id", lambda: "coordinator")
+    monkeypatch.setattr(p2p_server.httpx, "Client", FakeHttpClient)
+
+    handler.abort_completion(
+        {
+            "request_id": "native-prefill",
+            "vllm_xargs": {
+                "fabi_route_id": "route-7",
+                "fabi_route_epoch": 7,
+                "parallax_routing_table": ["worker-a"],
+            },
+        }
+    )
+
+    assert marked == ["native-prefill"]
 
 
 def test_expired_v3_route_is_aborted_locally_exactly_once():
