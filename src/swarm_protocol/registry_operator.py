@@ -62,6 +62,7 @@ from swarm_protocol.registry import (
 from swarm_protocol.skippy_package_import import (
     attach_skippy_direct_gguf,
     attach_skippy_package,
+    certify_skippy_exact_state,
 )
 
 _KEY_ROLES = ("root", "targets", "snapshot", "timestamp")
@@ -826,6 +827,28 @@ def attach_skippy_direct_file(
     return bundle
 
 
+def certify_skippy_exact_state_file(
+    output: Path,
+    *,
+    bundle_path: Path,
+    plan_id: str,
+    state_kind: SkippyExactStateKind,
+) -> ModelRegistryBundle:
+    """Certify one existing plan and emit a new bundle without mutating the input."""
+
+    if output.resolve() == bundle_path.resolve():
+        raise ValueError("certified bundle output must not replace its input")
+    if output.exists():
+        raise FileExistsError(f"refusing to overwrite certified bundle: {output}")
+    bundle = certify_skippy_exact_state(
+        load_bundles((bundle_path,))[0],
+        plan_id=plan_id,
+        state_kind=state_kind,
+    )
+    _atomic_create_public(output, bundle.canonical_bytes() + b"\n")
+    return bundle
+
+
 def initialize_staging_registry(
     repository_dir: Path,
     key_dir: Path,
@@ -1036,6 +1059,17 @@ def _parser() -> argparse.ArgumentParser:
     attach_skippy_direct.add_argument("--use-hf-token", action="store_true")
     attach_skippy_direct.add_argument("--output", type=Path, required=True)
 
+    certify_skippy = commands.add_parser("certify-skippy-exact-state")
+    certify_skippy.add_argument("--bundle", type=Path, required=True)
+    certify_skippy.add_argument("--plan-id", required=True)
+    certify_skippy.add_argument(
+        "--state-kind",
+        choices=[SkippyExactStateKind.DENSE_ATTENTION_KV.value],
+        required=True,
+        help="operator-qualified model-family continuation state",
+    )
+    certify_skippy.add_argument("--output", type=Path, required=True)
+
     initialize = commands.add_parser("init-staging")
     initialize.add_argument("--repository-dir", type=Path, required=True)
     initialize.add_argument("--key-dir", type=Path, required=True)
@@ -1188,6 +1222,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         result = {
             "status": "skippy_direct_attached",
+            **_bundle_summary(bundle),
+            "output": str(args.output),
+        }
+    elif args.command == "certify-skippy-exact-state":
+        bundle = certify_skippy_exact_state_file(
+            args.output,
+            bundle_path=args.bundle,
+            plan_id=args.plan_id,
+            state_kind=SkippyExactStateKind(args.state_kind),
+        )
+        result = {
+            "status": "skippy_exact_state_certified",
             **_bundle_summary(bundle),
             "output": str(args.output),
         }

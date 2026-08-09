@@ -30,7 +30,11 @@ from swarm_protocol.skippy_execution import (
     skippy_span_static_bytes,
     verify_skippy_execution_span,
 )
-from swarm_protocol.skippy_package_import import attach_skippy_direct_gguf, attach_skippy_package
+from swarm_protocol.skippy_package_import import (
+    attach_skippy_direct_gguf,
+    attach_skippy_package,
+    certify_skippy_exact_state,
+)
 
 
 def _sha(payload: bytes) -> str:
@@ -301,6 +305,32 @@ def test_skippy_warm_state_requires_signed_family_certification_and_native_featu
     payload["exact_state_kind"] = SkippyExactStateKind.KV_RECURRENT.value
     with pytest.raises(ValueError, match="recurrent-state"):
         SkippyExecutionPlan.model_validate(payload)
+
+
+def test_existing_skippy_plan_is_certified_without_rebuilding_its_artifacts():
+    _, index, model = _fixture()
+    source = ModelRegistryBundle(manifest=model, artifact_index=index)
+
+    certified = certify_skippy_exact_state(
+        source,
+        plan_id="skippy-q4-k-m-v1",
+        state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
+    )
+
+    plan = certified.artifact_index.execution_plans[0]
+    assert isinstance(plan, SkippyExecutionPlan)
+    assert plan.exact_state_kind is SkippyExactStateKind.DENSE_ATTENTION_KV
+    assert plan.exact_state_certification_hash == skippy_exact_state_certification_hash(
+        certified.manifest, plan
+    )
+    assert certified.artifact_index.artifacts == source.artifact_index.artifacts
+    assert certified.model_swarm_id != source.model_swarm_id
+    with pytest.raises(ValueError, match="already exact-state certified"):
+        certify_skippy_exact_state(
+            certified,
+            plan_id=plan.plan_id,
+            state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
+        )
 
 
 def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):

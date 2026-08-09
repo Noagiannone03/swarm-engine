@@ -83,6 +83,42 @@ def _certify_exact_state(
     )
 
 
+def certify_skippy_exact_state(
+    bundle: ModelRegistryBundle,
+    *,
+    plan_id: str,
+    state_kind: SkippyExactStateKind,
+) -> ModelRegistryBundle:
+    """Return a new bundle with one existing Skippy plan explicitly certified."""
+
+    state_kind = SkippyExactStateKind(state_kind)
+    if state_kind is SkippyExactStateKind.DISABLED:
+        raise ValueError("exact-state certification cannot select disabled")
+    matches = tuple(
+        plan for plan in bundle.artifact_index.execution_plans if plan.plan_id == plan_id
+    )
+    if len(matches) != 1 or not isinstance(matches[0], SkippyExecutionPlan):
+        raise ValueError(f"bundle has no unique Skippy execution plan {plan_id!r}")
+    selected = matches[0]
+    if selected.exact_state_kind is not SkippyExactStateKind.DISABLED:
+        raise ValueError(f"Skippy execution plan {plan_id!r} is already exact-state certified")
+    certified = _certify_exact_state(bundle.manifest, selected, state_kind)
+    plans = tuple(
+        certified if plan.plan_id == plan_id else plan
+        for plan in bundle.artifact_index.execution_plans
+    )
+    index = ModelArtifactIndex.model_validate(
+        {**bundle.artifact_index.model_dump(mode="json"), "execution_plans": plans}
+    )
+    manifest = ModelManifest.model_validate(
+        {
+            **bundle.manifest.model_dump(mode="json"),
+            "execution_plan_hash": execution_plan_hash(index),
+        }
+    )
+    return ModelRegistryBundle(manifest=manifest, artifact_index=index)
+
+
 class _Geometry(Protocol):
     activation_width: int
     context_length: int
