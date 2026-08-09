@@ -5,7 +5,7 @@ use std::{
 
 use fabi_skippy_runtime::{
     NativeDeviceInfo, SkippyPackageGeometry, SkippyStage, StageActivationFrame, StageForwardOutput,
-    StageLoadMode, StageOpenOptions, StageSamplingConfig, inspect_package_geometry,
+    StageKvPage, StageLoadMode, StageOpenOptions, StageSamplingConfig, inspect_package_geometry,
     inspect_source_geometry, load_verified_native_runtime,
 };
 use pyo3::{
@@ -173,6 +173,125 @@ impl PySkippyActivationFrame {
         self.inner.sequence_count()
     }
 
+    #[getter]
+    fn flags(&self) -> u64 {
+        self.inner.flags()
+    }
+
+    fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, self.inner.payload())
+    }
+}
+
+#[pyclass(name = "SkippyKvPage", frozen)]
+#[derive(Clone)]
+pub(crate) struct PySkippyKvPage {
+    inner: StageKvPage,
+}
+
+#[pymethods]
+impl PySkippyKvPage {
+    #[new]
+    #[pyo3(signature = (
+        payload,
+        *,
+        version,
+        layer_start,
+        layer_end,
+        token_start,
+        token_count,
+        layer_count,
+        k_type,
+        v_type,
+        k_row_bytes,
+        v_row_bytes,
+        v_element_bytes,
+        flags=0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        payload: Vec<u8>,
+        version: u32,
+        layer_start: i32,
+        layer_end: i32,
+        token_start: u64,
+        token_count: u64,
+        layer_count: u32,
+        k_type: u32,
+        v_type: u32,
+        k_row_bytes: u32,
+        v_row_bytes: u32,
+        v_element_bytes: u32,
+        flags: u64,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: StageKvPage::from_parts(
+                version,
+                layer_start,
+                layer_end,
+                token_start,
+                token_count,
+                layer_count,
+                k_type,
+                v_type,
+                k_row_bytes,
+                v_row_bytes,
+                v_element_bytes,
+                flags,
+                payload,
+            )
+            .map_err(py_error)?,
+        })
+    }
+
+    #[getter]
+    fn version(&self) -> u32 {
+        self.inner.version()
+    }
+    #[getter]
+    fn layer_start(&self) -> i32 {
+        self.inner.layer_start()
+    }
+    #[getter]
+    fn layer_end(&self) -> i32 {
+        self.inner.layer_end()
+    }
+    #[getter]
+    fn token_start(&self) -> u64 {
+        self.inner.token_start()
+    }
+    #[getter]
+    fn token_count(&self) -> u64 {
+        self.inner.token_count()
+    }
+    #[getter]
+    fn layer_count(&self) -> u32 {
+        self.inner.layer_count()
+    }
+    #[getter]
+    fn k_type(&self) -> u32 {
+        self.inner.k_type()
+    }
+    #[getter]
+    fn v_type(&self) -> u32 {
+        self.inner.v_type()
+    }
+    #[getter]
+    fn k_row_bytes(&self) -> u32 {
+        self.inner.k_row_bytes()
+    }
+    #[getter]
+    fn v_row_bytes(&self) -> u32 {
+        self.inner.v_row_bytes()
+    }
+    #[getter]
+    fn v_element_bytes(&self) -> u32 {
+        self.inner.v_element_bytes()
+    }
+    #[getter]
+    fn payload_bytes(&self) -> u64 {
+        self.inner.payload_bytes()
+    }
     #[getter]
     fn flags(&self) -> u64 {
         self.inner.flags()
@@ -458,6 +577,41 @@ impl PySkippyStage {
         Ok(PyBytes::new(py, &payload))
     }
 
+    fn export_kv_page(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        token_start: u64,
+        token_count: u64,
+    ) -> PyResult<PySkippyKvPage> {
+        let inner = Arc::clone(&self.inner);
+        py.detach(move || {
+            inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Skippy stage lock poisoned"))?
+                .export_kv_page(&session_id, token_start, token_count)
+        })
+        .map(|inner| PySkippyKvPage { inner })
+        .map_err(py_error)
+    }
+
+    fn import_kv_page(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        page: PyRef<'_, PySkippyKvPage>,
+    ) -> PyResult<()> {
+        let inner = Arc::clone(&self.inner);
+        let page = page.inner.clone();
+        py.detach(move || {
+            inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Skippy stage lock poisoned"))?
+                .import_kv_page(&session_id, &page)
+        })
+        .map_err(py_error)
+    }
+
     fn import_full_state(
         &self,
         py: Python<'_>,
@@ -530,6 +684,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PySkippyNativeDevice>()?;
     module.add_class::<PySkippyPackageGeometry>()?;
     module.add_class::<PySkippyActivationFrame>()?;
+    module.add_class::<PySkippyKvPage>()?;
     module.add_class::<PySkippyForwardOutput>()?;
     module.add_class::<PySkippyStage>()?;
     Ok(())

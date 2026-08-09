@@ -41,6 +41,37 @@ class SkippyForwardResult:
     predicted_token: int | None
 
 
+@dataclass(frozen=True)
+class SkippyKvPage:
+    """Exact Mesh KV page plus the native layout descriptor required to restore it."""
+
+    version: int
+    layer_start: int
+    layer_end: int
+    token_start: int
+    token_count: int
+    layer_count: int
+    k_type: int
+    v_type: int
+    k_row_bytes: int
+    v_row_bytes: int
+    v_element_bytes: int
+    flags: int
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        if self.version <= 0:
+            raise ValueError("Skippy KV page has no ABI version")
+        if self.layer_start < 0 or self.layer_end <= self.layer_start:
+            raise ValueError("Skippy KV page has an invalid layer range")
+        if self.layer_count != self.layer_end - self.layer_start:
+            raise ValueError("Skippy KV page layer count differs from its range")
+        if self.token_start < 0 or self.token_count <= 0:
+            raise ValueError("Skippy KV page has an invalid token range")
+        if not self.payload:
+            raise ValueError("Skippy KV page payload is empty")
+
+
 def _mesh_release_version(value: str) -> str:
     normalized = value.strip()
     for prefix in ("mesh-llm/v", "mesh-llm/", "v"):
@@ -273,9 +304,11 @@ class SkippyRuntimeStageRunner:
             raise RuntimeError("Skippy GGUF context is smaller than the signed plan")
         if geometry.kv_bytes_per_token != sum(verified.plan.kv_bytes_per_token_by_layer):
             raise RuntimeError("Skippy GGUF KV geometry differs from the signed plan")
-        if verified.plan.format == "gguf-direct" and tuple(
-            int(value) for value in geometry.static_bytes_by_layer
-        ) != verified.plan.direct_static_bytes_by_layer:
+        if (
+            verified.plan.format == "gguf-direct"
+            and tuple(int(value) for value in geometry.static_bytes_by_layer)
+            != verified.plan.direct_static_bytes_by_layer
+        ):
             raise RuntimeError("Skippy GGUF tensor geometry differs from the signed plan")
         self.max_sessions = int(max_sessions)
         self.is_full_model_stage = (
@@ -305,9 +338,7 @@ class SkippyRuntimeStageRunner:
             cache_type_k=verified.plan.cache_type_k,
             cache_type_v=verified.plan.cache_type_v,
             load_mode=(
-                "runtime_slice"
-                if verified.plan.format == "gguf-direct"
-                else "layer_package"
+                "runtime_slice" if verified.plan.format == "gguf-direct" else "layer_package"
             ),
         )
         self.runtime_root = runtime_root
@@ -404,3 +435,50 @@ class SkippyRuntimeStageRunner:
 
     def import_full_state(self, request_id: str, payload: bytes, token_count: int) -> None:
         self.stage.import_full_state(request_id, payload, token_count)
+
+    def export_kv_page(
+        self,
+        request_id: str,
+        *,
+        token_start: int,
+        token_count: int,
+    ) -> SkippyKvPage:
+        native_page = self.stage.export_kv_page(request_id, token_start, token_count)
+        payload = bytes(native_page.payload())
+        if len(payload) != int(native_page.payload_bytes):
+            raise RuntimeError("native Skippy KV page payload length changed during export")
+        return SkippyKvPage(
+            version=int(native_page.version),
+            layer_start=int(native_page.layer_start),
+            layer_end=int(native_page.layer_end),
+            token_start=int(native_page.token_start),
+            token_count=int(native_page.token_count),
+            layer_count=int(native_page.layer_count),
+            k_type=int(native_page.k_type),
+            v_type=int(native_page.v_type),
+            k_row_bytes=int(native_page.k_row_bytes),
+            v_row_bytes=int(native_page.v_row_bytes),
+            v_element_bytes=int(native_page.v_element_bytes),
+            flags=int(native_page.flags),
+            payload=payload,
+        )
+
+    def import_kv_page(self, request_id: str, page: SkippyKvPage) -> None:
+        if page.layer_start != self.verified.span.start or page.layer_end != self.verified.span.end:
+            raise ValueError("Skippy KV page does not match the runner's signed layer span")
+        native_page = self.native.SkippyKvPage(
+            page.payload,
+            version=page.version,
+            layer_start=page.layer_start,
+            layer_end=page.layer_end,
+            token_start=page.token_start,
+            token_count=page.token_count,
+            layer_count=page.layer_count,
+            k_type=page.k_type,
+            v_type=page.v_type,
+            k_row_bytes=page.k_row_bytes,
+            v_row_bytes=page.v_row_bytes,
+            v_element_bytes=page.v_element_bytes,
+            flags=page.flags,
+        )
+        self.stage.import_kv_page(request_id, native_page)

@@ -47,6 +47,43 @@ class _FakeActivation:
         return self._payload
 
 
+class _FakeKvPage:
+    def __init__(
+        self,
+        payload,
+        *,
+        version,
+        layer_start,
+        layer_end,
+        token_start,
+        token_count,
+        layer_count,
+        k_type,
+        v_type,
+        k_row_bytes,
+        v_row_bytes,
+        v_element_bytes,
+        flags=0,
+    ):
+        self._payload = bytes(payload)
+        self.version = version
+        self.layer_start = layer_start
+        self.layer_end = layer_end
+        self.token_start = token_start
+        self.token_count = token_count
+        self.layer_count = layer_count
+        self.k_type = k_type
+        self.v_type = v_type
+        self.k_row_bytes = k_row_bytes
+        self.v_row_bytes = v_row_bytes
+        self.v_element_bytes = v_element_bytes
+        self.payload_bytes = len(self._payload)
+        self.flags = flags
+
+    def payload(self):
+        return self._payload
+
+
 class _FakeStage:
     def __init__(self, parts, **kwargs):
         self.parts = parts
@@ -93,9 +130,30 @@ class _FakeStage:
     def import_full_state(self, request_id, payload, token_count):
         self.imported = (request_id, payload, token_count)
 
+    def export_kv_page(self, request_id, token_start, token_count):
+        self.exported_kv = (request_id, token_start, token_count)
+        return _FakeKvPage(
+            b"exact-kv",
+            version=1,
+            layer_start=0,
+            layer_end=2,
+            token_start=token_start,
+            token_count=token_count,
+            layer_count=2,
+            k_type=1,
+            v_type=1,
+            k_row_bytes=128,
+            v_row_bytes=128,
+            v_element_bytes=2,
+        )
+
+    def import_kv_page(self, request_id, page):
+        self.imported_kv = (request_id, page)
+
 
 class _FakeNative:
     SkippyActivationFrame = _FakeActivation
+    SkippyKvPage = _FakeKvPage
 
     def __init__(self):
         self.loaded = None
@@ -204,6 +262,31 @@ def test_runner_reuses_native_stage_and_typed_activations(tmp_path):
     assert isinstance(native.stage.calls[-1][1], _FakeActivation)
     runner.release("request-1")
     assert native.stage.dropped == ["request-1"]
+
+
+def test_runner_round_trips_exact_native_kv_descriptor(tmp_path):
+    native = _FakeNative()
+    runner = SkippyRuntimeStageRunner(
+        _verified(tmp_path),
+        device="vulkan:0",
+        model_layer_count=2,
+        max_context_tokens=32768,
+        max_sessions=2,
+        native_module=native,
+        runtime_root=tmp_path,
+    )
+
+    page = runner.export_kv_page("request-kv", token_start=0, token_count=96)
+    runner.import_kv_page("replacement-kv", page)
+
+    assert native.stage.exported_kv == ("request-kv", 0, 96)
+    imported_request, imported_page = native.stage.imported_kv
+    assert imported_request == "replacement-kv"
+    assert imported_page.payload() == b"exact-kv"
+    assert imported_page.token_start == 0
+    assert imported_page.token_count == 96
+    assert imported_page.layer_start == 0
+    assert imported_page.layer_end == 2
 
 
 def test_runner_rejects_empty_activation_from_non_terminal_stage(tmp_path):
@@ -374,10 +457,7 @@ def test_runtime_discovery_covers_installed_product_layout(tmp_path, monkeypatch
     interpreter.parent.mkdir(parents=True)
     interpreter.touch()
     bundle = (
-        tmp_path
-        / "runtime"
-        / "native-runtimes"
-        / "meshllm-native-runtime-darwin-aarch64-metal"
+        tmp_path / "runtime" / "native-runtimes" / "meshllm-native-runtime-darwin-aarch64-metal"
     )
     bundle.mkdir(parents=True)
     (bundle / "manifest.json").write_text(

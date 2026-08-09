@@ -20,8 +20,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use skippy_ffi::TensorRole;
 use skippy_runtime::{
-    ActivationFrame, BackendDeviceType, FlashAttentionType, RuntimeConfig, RuntimeLoadMode,
-    SamplingConfig, StageModel, StageSession, backend_devices, parse_cache_type,
+    ActivationFrame, BackendDeviceType, FlashAttentionType, RuntimeConfig, RuntimeKvPage,
+    RuntimeKvPageDesc, RuntimeLoadMode, SamplingConfig, StageModel, StageSession, backend_devices,
+    parse_cache_type,
 };
 
 /// Stable Mesh release audited for Fabi's first Skippy product integration.
@@ -291,6 +292,140 @@ fn inspect_compact_geometry(
 #[derive(Clone, Debug)]
 pub struct StageActivationFrame {
     inner: ActivationFrame,
+}
+
+/// Exact native KV bytes for one contiguous stage and token interval.
+///
+/// The descriptor is intentionally preserved rather than inferred by Fabi:
+/// Mesh's runtime owns the physical K/V layout and validates it again on
+/// import.  Fabi adds stage and token-boundary checks before crossing that
+/// native boundary.
+#[derive(Clone, Debug)]
+pub struct StageKvPage {
+    inner: RuntimeKvPage,
+}
+
+impl StageKvPage {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        version: u32,
+        layer_start: i32,
+        layer_end: i32,
+        token_start: u64,
+        token_count: u64,
+        layer_count: u32,
+        k_type: u32,
+        v_type: u32,
+        k_row_bytes: u32,
+        v_row_bytes: u32,
+        v_element_bytes: u32,
+        flags: u64,
+        payload: Vec<u8>,
+    ) -> Result<Self> {
+        ensure!(layer_start < layer_end, "invalid KV page layer range");
+        ensure!(token_count > 0, "KV page token count must be positive");
+        let expected_layer_count =
+            u32::try_from(layer_end - layer_start).context("KV page layer range exceeds u32")?;
+        ensure!(
+            layer_count == expected_layer_count,
+            "KV page layer count does not match its range"
+        );
+        let payload_bytes = u64::try_from(payload.len()).context("KV page exceeds u64")?;
+        ensure!(payload_bytes > 0, "KV page payload is empty");
+        token_start
+            .checked_add(token_count)
+            .context("KV page token range overflows")?;
+        Ok(Self {
+            inner: RuntimeKvPage {
+                desc: RuntimeKvPageDesc {
+                    version,
+                    layer_start,
+                    layer_end,
+                    token_start,
+                    token_count,
+                    layer_count,
+                    k_type,
+                    v_type,
+                    k_row_bytes,
+                    v_row_bytes,
+                    v_element_bytes,
+                    payload_bytes,
+                    flags,
+                },
+                payload,
+            },
+        })
+    }
+
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.inner.desc.version
+    }
+
+    #[must_use]
+    pub fn layer_start(&self) -> i32 {
+        self.inner.desc.layer_start
+    }
+
+    #[must_use]
+    pub fn layer_end(&self) -> i32 {
+        self.inner.desc.layer_end
+    }
+
+    #[must_use]
+    pub fn token_start(&self) -> u64 {
+        self.inner.desc.token_start
+    }
+
+    #[must_use]
+    pub fn token_count(&self) -> u64 {
+        self.inner.desc.token_count
+    }
+
+    #[must_use]
+    pub fn layer_count(&self) -> u32 {
+        self.inner.desc.layer_count
+    }
+
+    #[must_use]
+    pub fn k_type(&self) -> u32 {
+        self.inner.desc.k_type
+    }
+
+    #[must_use]
+    pub fn v_type(&self) -> u32 {
+        self.inner.desc.v_type
+    }
+
+    #[must_use]
+    pub fn k_row_bytes(&self) -> u32 {
+        self.inner.desc.k_row_bytes
+    }
+
+    #[must_use]
+    pub fn v_row_bytes(&self) -> u32 {
+        self.inner.desc.v_row_bytes
+    }
+
+    #[must_use]
+    pub fn v_element_bytes(&self) -> u32 {
+        self.inner.desc.v_element_bytes
+    }
+
+    #[must_use]
+    pub fn payload_bytes(&self) -> u64 {
+        self.inner.desc.payload_bytes
+    }
+
+    #[must_use]
+    pub fn flags(&self) -> u64 {
+        self.inner.desc.flags
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.inner.payload
+    }
 }
 
 impl StageActivationFrame {
@@ -749,6 +884,60 @@ impl SkippyStage {
         let layer_end = self.layer_end;
         self.session(session_id)?
             .export_full_state(layer_start, layer_end)
+    }
+
+    pub fn export_kv_page(
+        &mut self,
+        session_id: &str,
+        token_start: u64,
+        token_count: u64,
+    ) -> Result<StageKvPage> {
+        let token_end = token_start
+            .checked_add(token_count)
+            .context("KV export token range overflows")?;
+        let known_tokens = self.session_token_count(session_id)?;
+        ensure!(token_count > 0, "KV export token count must be positive");
+        ensure!(
+            token_end <= known_tokens,
+            "KV export range [{token_start}, {token_end}) exceeds session boundary {known_tokens}"
+        );
+        let layer_start = self.layer_start;
+        let layer_end = self.layer_end;
+        Ok(StageKvPage {
+            inner: self.session(session_id)?.export_kv_page(
+                layer_start,
+                layer_end,
+                token_start,
+                token_count,
+            )?,
+        })
+    }
+
+    pub fn import_kv_page(&mut self, session_id: &str, page: &StageKvPage) -> Result<()> {
+        ensure!(
+            page.layer_start() == self.layer_start && page.layer_end() == self.layer_end,
+            "KV page stage [{}, {}) does not match loaded stage [{}, {})",
+            page.layer_start(),
+            page.layer_end(),
+            self.layer_start,
+            self.layer_end,
+        );
+        ensure!(
+            page.payload_bytes()
+                == u64::try_from(page.payload().len()).context("KV page exceeds u64")?,
+            "KV page payload length does not match its descriptor"
+        );
+        let current_tokens = self
+            .sessions
+            .get(session_id)
+            .map_or(0, StageSession::token_count);
+        ensure!(
+            current_tokens == page.token_start(),
+            "KV page starts at token {} but the destination session is at token {current_tokens}",
+            page.token_start(),
+        );
+        self.session(session_id)?
+            .import_kv_page(&page.inner.desc, &page.inner.payload)
     }
 
     pub fn import_full_state(
