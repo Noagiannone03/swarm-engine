@@ -154,7 +154,7 @@ def execution_plan_hash(index: ModelArtifactIndex) -> str:
         ArtifactRole.EXECUTION_MODEL,
     }
     payload = {
-        "plans": [plan.model_dump(mode="json") for plan in index.execution_plans],
+        "plans": [_execution_plan_contract_payload(plan) for plan in index.execution_plans],
         "artifacts": [
             artifact.model_dump(mode="json", exclude_none=True)
             for artifact in index.artifacts
@@ -162,6 +162,26 @@ def execution_plan_hash(index: ModelArtifactIndex) -> str:
         ],
     }
     return _canonical_hash("fabi/model-execution-plans/v1", payload)
+
+
+def _execution_plan_contract_payload(plan: object) -> dict[str, object]:
+    """Serialize a plan without changing identities published by older readers."""
+
+    from swarm_protocol.contracts import SkippyExactStateKind, SkippyExecutionPlan
+
+    if not hasattr(plan, "model_dump"):
+        raise TypeError("execution plan is not a protocol contract")
+    payload = plan.model_dump(mode="json")
+    if (
+        isinstance(plan, SkippyExecutionPlan)
+        and plan.exact_state_kind is SkippyExactStateKind.DISABLED
+    ):
+        # These fields were added after the first Skippy plans were published.
+        # Their neutral values must remain wire-identical to their absence, or
+        # merely upgrading a reader forks every existing model swarm.
+        payload.pop("exact_state_kind", None)
+        payload.pop("exact_state_certification_hash", None)
+    return payload
 
 
 def skippy_exact_state_certification_hash(manifest: ModelManifest, plan: object) -> str:
@@ -240,7 +260,7 @@ def execution_plan_identity_hash(index: ModelArtifactIndex, plan) -> str:
         missing = sorted(paths - descriptors.keys())
         raise ValueError(f"execution plan references missing artifacts: {missing}")
     payload = {
-        "plan": plan.model_dump(mode="json"),
+        "plan": _execution_plan_contract_payload(plan),
         "artifacts": [descriptors[path] for path in sorted(descriptors)],
     }
     return _canonical_hash("fabi/model-execution-plan-identity/v1", payload)

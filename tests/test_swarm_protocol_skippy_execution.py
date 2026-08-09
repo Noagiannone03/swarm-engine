@@ -307,6 +307,19 @@ def test_skippy_warm_state_requires_signed_family_certification_and_native_featu
         SkippyExecutionPlan.model_validate(payload)
 
 
+def test_legacy_skippy_plan_without_exact_state_fields_keeps_its_identity():
+    _, index, model = _fixture()
+    raw = ModelRegistryBundle(manifest=model, artifact_index=index).model_dump(mode="json")
+    plan = raw["artifact_index"]["execution_plans"][0]
+    plan.pop("exact_state_kind")
+    plan.pop("exact_state_certification_hash")
+
+    loaded = ModelRegistryBundle.model_validate(raw)
+
+    assert loaded.manifest.execution_plan_hash == model.execution_plan_hash
+    assert loaded.model_swarm_id == model.model_swarm_id
+
+
 def test_existing_skippy_plan_is_certified_without_rebuilding_its_artifacts():
     _, index, model = _fixture()
     source = ModelRegistryBundle(manifest=model, artifact_index=index)
