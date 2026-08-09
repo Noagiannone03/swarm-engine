@@ -115,10 +115,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -239,7 +239,7 @@ jobs:
             tests/scheduler_tests/test_contribution_gate_v2.py
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fabi-network-${{ runner.os }}-${{ runner.arch }}
           path: native/fabi-network/target/wheels/*.whl
