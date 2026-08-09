@@ -62,6 +62,8 @@ def create_executor_config(args: argparse.Namespace, shared_state=None, conn=Non
 
     if args.gpu_backend in {"onnxruntime", "skippy"}:
         config["execution_plan_id"] = getattr(args, "execution_plan_id", None)
+    if args.gpu_backend == "skippy":
+        config["executor_control_addr"] = getattr(args, "executor_control_addr", None)
 
     if args.gpu_backend == "sglang":
         config.update(

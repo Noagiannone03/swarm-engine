@@ -25,6 +25,9 @@ class FakeAdmission:
     def authorize_frontend(self, **kwargs):
         self.calls.append(kwargs)
 
+    def authorize_coordinator_control(self, **kwargs):
+        self.calls.append(kwargs)
+
     def consume_expired_routes(self):
         routes = tuple(self.expired_routes)
         self.expired_routes.clear()
@@ -168,6 +171,76 @@ def test_abort_completion_fails_closed_without_active_v3():
 
     with pytest.raises(PermissionError, match="active protocol v3"):
         handler.abort_completion({"request_id": "request", "vllm_xargs": {}})
+
+
+def test_checkpoint_export_is_coordinator_fenced_and_keeps_binary_chunks_separate(
+    monkeypatch,
+):
+    admission = FakeAdmission()
+    handler = make_handler(admission)
+    calls = []
+    monkeypatch.setattr(p2p_server, "authenticated_rpc_peer_id", lambda: "coordinator")
+
+    def control(request):
+        calls.append(request)
+        if request["command"] == "checkpoint_export_prepare":
+            return {"handle": "handle-1", "payload_bytes": 3}, None
+        return {"next_offset": 3, "done": True}, b"kv!"
+
+    monkeypatch.setattr(handler, "_executor_control", control)
+    authority = {
+        "fabi_route_id": "route-7",
+        "fabi_route_epoch": 7,
+        "parallax_routing_table": ["worker-a", "worker-b"],
+    }
+
+    prepared = handler.prepare_recovery_checkpoint(
+        {
+            "request_id": "scheduler-request",
+            "route_authority": authority,
+            "token_count": 64,
+        }
+    )
+    chunk = handler.read_recovery_checkpoint(
+        {
+            "request_id": "scheduler-request",
+            "route_authority": authority,
+            "handle": "handle-1",
+            "offset": 0,
+        }
+    )
+
+    assert prepared == {"handle": "handle-1", "payload_bytes": 3}
+    assert chunk == {"next_offset": 3, "done": True, "chunk": b"kv!"}
+    assert calls == [
+        {
+            "command": "checkpoint_export_prepare",
+            "request_id": "scheduler-request",
+            "token_count": 64,
+        },
+        {
+            "command": "checkpoint_export_read",
+            "request_id": "scheduler-request",
+            "handle": "handle-1",
+            "offset": 0,
+        },
+    ]
+    assert admission.calls == [
+        {
+            "request_id": "scheduler-request",
+            "route_id": "route-7",
+            "epoch": 7,
+            "routing_table": ("worker-a", "worker-b"),
+            "caller_endpoint_id": "coordinator",
+        },
+        {
+            "request_id": "scheduler-request",
+            "route_id": "route-7",
+            "epoch": 7,
+            "routing_table": ("worker-a", "worker-b"),
+            "caller_endpoint_id": "coordinator",
+        },
+    ]
 
 
 def test_abort_completion_publishes_native_cancellation_marker(monkeypatch):

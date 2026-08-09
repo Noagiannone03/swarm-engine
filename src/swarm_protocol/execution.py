@@ -531,6 +531,32 @@ class WorkerExecutionAdmission:
         if plan.stages[0].worker_id != self.worker_id:
             raise ExecutionAdmissionError("frontend request did not reach the route head")
 
+    def authorize_coordinator_control(
+        self,
+        *,
+        request_id: str,
+        route_id: str,
+        epoch: int,
+        routing_table: tuple[str, ...],
+        caller_endpoint_id: str,
+    ) -> None:
+        """Authorize route-fenced control from the request coordinator at any stage."""
+
+        self._authorize_plan(
+            request_id=request_id,
+            route_id=route_id,
+            epoch=epoch,
+            routing_table=routing_table,
+        )
+        authorized = self._lookup_authorized_route(
+            request_id=request_id,
+            route_id=route_id,
+            epoch=epoch,
+            routing_table=routing_table,
+        )
+        if caller_endpoint_id != authorized.coordinator_endpoint_id:
+            raise PermissionError("route control did not come from the request coordinator")
+
     def authorize_forward(
         self,
         *,

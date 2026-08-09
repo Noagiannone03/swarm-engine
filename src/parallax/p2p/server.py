@@ -23,6 +23,7 @@ from typing import Any, Callable, List, Optional
 
 import dijkstar
 import httpx
+import msgpack
 import zmq
 from lattica import ConnectionHandler, Lattica, rpc_method, rpc_stream, rpc_stream_iter
 
@@ -111,6 +112,9 @@ _LINK_REACHABILITY_TTL_MS = int(
 _SCHEDULER_CONNECT_ATTEMPT_TIMEOUT_SECONDS = 15.0
 _SCHEDULER_CONNECT_INITIAL_BACKOFF_SECONDS = 1.0
 _SCHEDULER_CONNECT_MAX_BACKOFF_SECONDS = 60.0
+_CHECKPOINT_CONTROL_TIMEOUT_MS = int(
+    float(os.environ.get("FABI_CHECKPOINT_CONTROL_TIMEOUT_SECONDS", "300")) * 1_000
+)
 # Establishing the loopback frontend request remains bounded, but a live
 # streaming response has no read deadline.  Long prefills can legitimately be
 # silent; route capabilities, worker leases, explicit abort and the Iroh
@@ -268,6 +272,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         link_probe_authorizer: Optional[Callable[[str], bool]] = None,
         link_probe_idle: Optional[Callable[[], bool]] = None,
         shared_state: Optional[SharedState] = None,
+        executor_control_addr: Optional[str] = None,
     ):
         if lattica is not None:
             super().__init__(lattica)
@@ -284,10 +289,14 @@ class TransformerConnectionHandler(ConnectionHandler):
         self.link_probe_authorizer = link_probe_authorizer
         self.link_probe_idle = link_probe_idle
         self.shared_state = shared_state
+        self.executor_control_addr = executor_control_addr
         self._link_probe_lock = threading.Lock()
         self._link_probe_last_received: dict[str, float] = {}
         self._recv_from_peer = None
         self._recv_from_peer_lock = threading.Lock()
+        self._executor_control_context = None
+        self._executor_control_socket = None
+        self._executor_control_lock = threading.Lock()
 
     def get_stub(self, peer_id: str):
         if getattr(self, "iroh_transport", None) is not None:
@@ -301,6 +310,225 @@ class TransformerConnectionHandler(ConnectionHandler):
                 zmq.Context(2), zmq.PUSH, self.recv_from_peer_addr, True
             )
         return self._recv_from_peer
+
+    def _reset_executor_control_socket(self) -> None:
+        socket = self._executor_control_socket
+        self._executor_control_socket = None
+        if socket is not None:
+            socket.close(linger=0)
+
+    def close_executor_control(self) -> None:
+        with self._executor_control_lock:
+            self._reset_executor_control_socket()
+            context = self._executor_control_context
+            self._executor_control_context = None
+            if context is not None:
+                context.term()
+
+    def _executor_control(
+        self,
+        request: dict[str, Any],
+        binary_request: bytes | None = None,
+    ) -> tuple[dict[str, Any], bytes | None]:
+        if not self.executor_control_addr:
+            raise RuntimeError("worker executor has no recovery-control channel")
+        with self._executor_control_lock:
+            if self._executor_control_context is None:
+                self._executor_control_context = zmq.Context(1)
+            if self._executor_control_socket is None:
+                socket = get_zmq_socket(
+                    self._executor_control_context,
+                    zmq.REQ,
+                    self.executor_control_addr,
+                    bind=False,
+                )
+                socket.setsockopt(zmq.RCVTIMEO, _CHECKPOINT_CONTROL_TIMEOUT_MS)
+                socket.setsockopt(zmq.SNDTIMEO, _CHECKPOINT_CONTROL_TIMEOUT_MS)
+                self._executor_control_socket = socket
+            socket = self._executor_control_socket
+            try:
+                frames = [msgpack.packb(request, use_bin_type=True)]
+                if binary_request is not None:
+                    frames.append(binary_request)
+                socket.send_multipart(frames)
+                frames = socket.recv_multipart()
+            except zmq.ZMQError:
+                self._reset_executor_control_socket()
+                raise
+        if len(frames) not in {1, 2}:
+            raise RuntimeError("executor control response has an invalid frame count")
+        metadata = msgpack.unpackb(frames[0], raw=False, strict_map_key=True)
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("ok"), bool):
+            raise RuntimeError("executor control response is malformed")
+        if not metadata["ok"]:
+            detail = metadata.get("error")
+            raise RuntimeError(
+                detail if isinstance(detail, str) else "executor rejected recovery control"
+            )
+        result = metadata.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("executor control result is malformed")
+        return result, frames[1] if len(frames) == 2 else None
+
+    def _authorize_coordinator_control_request(self, request: object, *, purpose: str) -> str:
+        if self.execution_admission is None:
+            raise PermissionError(f"{purpose} requires active protocol v3")
+        if not isinstance(request, dict):
+            raise TypeError(f"{purpose} request must be an object")
+        request_id = request.get("request_id")
+        authority = request.get("route_authority")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
+            raise ValueError(f"{purpose} request_id is invalid")
+        if not isinstance(authority, dict):
+            raise PermissionError(f"{purpose} is missing route authority")
+        self.execution_admission.authorize_coordinator_control(
+            request_id=request_id,
+            route_id=str(authority.get("fabi_route_id", "")),
+            epoch=int(authority.get("fabi_route_epoch", 0)),
+            routing_table=tuple(authority.get("parallax_routing_table", ())),
+            caller_endpoint_id=authenticated_rpc_peer_id(),
+        )
+        return request_id
+
+    @rpc_method
+    def prepare_recovery_checkpoint(self, request):
+        request_id = self._authorize_coordinator_control_request(
+            request,
+            purpose="checkpoint export",
+        )
+        token_count = request.get("token_count")
+        if isinstance(token_count, bool) or not isinstance(token_count, int):
+            raise ValueError("checkpoint token_count must be an integer")
+        result, binary = self._executor_control(
+            {
+                "command": "checkpoint_export_prepare",
+                "request_id": request_id,
+                "token_count": token_count,
+            }
+        )
+        if binary is not None:
+            raise RuntimeError("checkpoint prepare returned an unexpected binary frame")
+        return result
+
+    @rpc_method
+    def read_recovery_checkpoint(self, request):
+        request_id = self._authorize_coordinator_control_request(
+            request,
+            purpose="checkpoint read",
+        )
+        handle = request.get("handle")
+        offset = request.get("offset")
+        if not isinstance(handle, str):
+            raise ValueError("checkpoint handle is missing")
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            raise ValueError("checkpoint offset must be an integer")
+        result, binary = self._executor_control(
+            {
+                "command": "checkpoint_export_read",
+                "request_id": request_id,
+                "handle": handle,
+                "offset": offset,
+            }
+        )
+        if binary is None:
+            raise RuntimeError("checkpoint read returned no payload")
+        result["chunk"] = binary
+        return result
+
+    @rpc_method
+    def drop_recovery_checkpoint(self, request):
+        request_id = self._authorize_coordinator_control_request(
+            request,
+            purpose="checkpoint drop",
+        )
+        handle = request.get("handle")
+        if not isinstance(handle, str):
+            raise ValueError("checkpoint handle is missing")
+        result, binary = self._executor_control(
+            {
+                "command": "checkpoint_export_drop",
+                "request_id": request_id,
+                "handle": handle,
+            }
+        )
+        if binary is not None:
+            raise RuntimeError("checkpoint drop returned an unexpected binary frame")
+        return result
+
+    @rpc_method
+    def begin_recovery_checkpoint_import(self, request):
+        request_id = self._authorize_coordinator_control_request(
+            request,
+            purpose="checkpoint import",
+        )
+        descriptor = request.get("descriptor")
+        if not isinstance(descriptor, dict):
+            raise ValueError("checkpoint import descriptor is missing")
+        result, binary = self._executor_control(
+            {
+                "command": "checkpoint_import_begin",
+                "request_id": request_id,
+                "descriptor": descriptor,
+            }
+        )
+        if binary is not None:
+            raise RuntimeError("checkpoint import begin returned an unexpected binary frame")
+        return result
+
+    @rpc_method
+    def write_recovery_checkpoint_import(self, request):
+        request_id = self._authorize_coordinator_control_request(
+            request,
+            purpose="checkpoint import write",
+        )
+        handle = request.get("handle")
+        offset = request.get("offset")
+        chunk = request.get("chunk")
+        if not isinstance(handle, str):
+            raise ValueError("checkpoint import handle is missing")
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            raise ValueError("checkpoint import offset must be an integer")
+        if not isinstance(chunk, bytes):
+            raise ValueError("checkpoint import chunk is missing")
+        result, binary = self._executor_control(
+            {
+                "command": "checkpoint_import_write",
+                "request_id": request_id,
+                "handle": handle,
+                "offset": offset,
+            },
+            chunk,
+        )
+        if binary is not None:
+            raise RuntimeError("checkpoint import write returned an unexpected binary frame")
+        return result
+
+    @rpc_method
+    def commit_recovery_checkpoint_import(self, request):
+        return self._finish_recovery_checkpoint_import(request, abort=False)
+
+    @rpc_method
+    def abort_recovery_checkpoint_import(self, request):
+        return self._finish_recovery_checkpoint_import(request, abort=True)
+
+    def _finish_recovery_checkpoint_import(self, request: object, *, abort: bool):
+        request_id = self._authorize_coordinator_control_request(
+            request,
+            purpose="checkpoint import abort" if abort else "checkpoint import commit",
+        )
+        handle = request.get("handle")
+        if not isinstance(handle, str):
+            raise ValueError("checkpoint import handle is missing")
+        result, binary = self._executor_control(
+            {
+                "command": "checkpoint_import_abort" if abort else "checkpoint_import_commit",
+                "request_id": request_id,
+                "handle": handle,
+            }
+        )
+        if binary is not None:
+            raise RuntimeError("checkpoint import finish returned an unexpected binary frame")
+        return result
 
     def update_serving_span(self, block_start_index: int, block_end_index: int) -> None:
         """Atomically refresh metadata copied into the long-lived RPC handler."""
@@ -910,9 +1138,11 @@ class GradientServer:
         chunked_prefill_size: Optional[int] = None,
         kv_block_size: int = 1,
         conn: Any = None,
+        executor_control_addr: Optional[str] = None,
     ):
         self.recv_from_peer_addr = recv_from_peer_addr
         self.send_to_peer_addr = send_to_peer_addr
+        self.executor_control_addr = executor_control_addr
         self.initial_peers = initial_peers
         self.scheduler_addr = scheduler_addr
         self.relay_servers = relay_servers
@@ -1712,6 +1942,7 @@ class GradientServer:
             link_probe_authorizer=lambda peer_id: peer_id in self._authorized_link_peer_id_set,
             link_probe_idle=self._link_probe_idle,
             shared_state=self._shared_state,
+            executor_control_addr=self.executor_control_addr,
         )  # thread
         if self.iroh_transport is not None:
             self.iroh_transport.register(self.connection_handler)
@@ -3262,6 +3493,8 @@ class GradientServer:
         except Exception:
             logger.debug("Failed to join P2P background threads", exc_info=True)
         finally:
+            if self.connection_handler is not None:
+                self.connection_handler.close_executor_control()
             if self.lattica is not None:
                 try:
                     self.lattica.close()
@@ -3297,6 +3530,7 @@ def _run_p2p_server_process(
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
     conn: Any = None,
+    executor_control_addr: Optional[str] = None,
 ):
     """Run P2P server in subprocess"""
     # Set log level in subprocess (spawn mode doesn't inherit log configuration)
@@ -3344,6 +3578,7 @@ def _run_p2p_server_process(
             chunked_prefill_size=chunked_prefill_size,
             kv_block_size=kv_block_size,
             conn=conn,
+            executor_control_addr=executor_control_addr,
         )
         # Attach shared state to server for syncing layer allocation
         if shared_state is not None:
@@ -3399,6 +3634,7 @@ def launch_p2p_server_process(
     shared_state: Optional[dict] = None,
     log_level: str = "INFO",
     conn: Optional[Any] = None,
+    executor_control_addr: Optional[str] = None,
 ) -> multiprocessing.Process:
     """Launch P2P server as a subprocess and return the process object
 
@@ -3437,6 +3673,7 @@ def launch_p2p_server_process(
             shared_state,
             log_level,
             conn,
+            executor_control_addr,
         ),
     )
     process.start()

@@ -425,6 +425,13 @@ def test_data_plane_requires_committed_route_exact_fence_and_authenticated_hop()
         routing_table=routing_table,
         caller_endpoint_id=WORKER_ENDPOINT,
     )
+    admission.authorize_coordinator_control(
+        request_id=route.request_id,
+        route_id=route.route_id,
+        epoch=route.epoch,
+        routing_table=routing_table,
+        caller_endpoint_id=COORDINATOR_ENDPOINT,
+    )
 
     with pytest.raises(PermissionError, match="coordinator"):
         admission.authorize_frontend(
@@ -441,6 +448,14 @@ def test_data_plane_requires_committed_route_exact_fence_and_authenticated_hop()
             epoch=route.epoch + 1,
             routing_table=routing_table,
             caller_endpoint_id=WORKER_ENDPOINT,
+        )
+    with pytest.raises(PermissionError, match="coordinator"):
+        admission.authorize_coordinator_control(
+            request_id=route.request_id,
+            route_id=route.route_id,
+            epoch=route.epoch,
+            routing_table=routing_table,
+            caller_endpoint_id=ATTACKER_ENDPOINT,
         )
 
 

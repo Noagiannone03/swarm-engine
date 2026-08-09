@@ -13,6 +13,7 @@ use pyo3::{
     prelude::*,
     types::{PyBytes, PyModule},
 };
+use sha2::{Digest, Sha256};
 
 fn py_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
@@ -299,6 +300,183 @@ impl PySkippyKvPage {
 
     fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, self.inner.payload())
+    }
+
+    fn payload_slice<'py>(
+        &self,
+        py: Python<'py>,
+        offset: u64,
+        length: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let payload = self.inner.payload_slice(offset, length).map_err(py_error)?;
+        Ok(PyBytes::new(py, payload))
+    }
+
+    #[getter]
+    fn payload_sha256(&self) -> String {
+        self.inner.payload_sha256()
+    }
+}
+
+struct KvPageBuilderState {
+    version: u32,
+    layer_start: i32,
+    layer_end: i32,
+    token_start: u64,
+    token_count: u64,
+    layer_count: u32,
+    k_type: u32,
+    v_type: u32,
+    k_row_bytes: u32,
+    v_row_bytes: u32,
+    v_element_bytes: u32,
+    flags: u64,
+    payload_bytes: usize,
+    payload_sha256: String,
+    payload: Vec<u8>,
+}
+
+#[pyclass(name = "SkippyKvPageBuilder")]
+pub(crate) struct PySkippyKvPageBuilder {
+    state: Option<KvPageBuilderState>,
+}
+
+#[pymethods]
+impl PySkippyKvPageBuilder {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        version,
+        layer_start,
+        layer_end,
+        token_start,
+        token_count,
+        layer_count,
+        k_type,
+        v_type,
+        k_row_bytes,
+        v_row_bytes,
+        v_element_bytes,
+        payload_bytes,
+        payload_sha256,
+        flags=0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        version: u32,
+        layer_start: i32,
+        layer_end: i32,
+        token_start: u64,
+        token_count: u64,
+        layer_count: u32,
+        k_type: u32,
+        v_type: u32,
+        k_row_bytes: u32,
+        v_row_bytes: u32,
+        v_element_bytes: u32,
+        payload_bytes: u64,
+        payload_sha256: String,
+        flags: u64,
+    ) -> PyResult<Self> {
+        let payload_bytes = usize::try_from(payload_bytes)
+            .map_err(|_| py_error("Skippy KV import payload exceeds usize"))?;
+        if payload_bytes == 0 {
+            return Err(py_error("Skippy KV import payload is empty"));
+        }
+        let normalized_digest = payload_sha256.trim().to_ascii_lowercase();
+        if normalized_digest.len() != 64
+            || !normalized_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(py_error("Skippy KV import SHA-256 is invalid"));
+        }
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(payload_bytes)
+            .map_err(|error| py_error(format!("cannot reserve Skippy KV import: {error}")))?;
+        Ok(Self {
+            state: Some(KvPageBuilderState {
+                version,
+                layer_start,
+                layer_end,
+                token_start,
+                token_count,
+                layer_count,
+                k_type,
+                v_type,
+                k_row_bytes,
+                v_row_bytes,
+                v_element_bytes,
+                flags,
+                payload_bytes,
+                payload_sha256: normalized_digest,
+                payload,
+            }),
+        })
+    }
+
+    #[getter]
+    fn bytes_received(&self) -> PyResult<u64> {
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| py_error("Skippy KV import is already finished"))?;
+        u64::try_from(state.payload.len())
+            .map_err(|_| py_error("Skippy KV import length exceeds u64"))
+    }
+
+    fn append(&mut self, chunk: Vec<u8>) -> PyResult<()> {
+        if chunk.is_empty() {
+            return Err(py_error("Skippy KV import chunk is empty"));
+        }
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| py_error("Skippy KV import is already finished"))?;
+        let next_len = state
+            .payload
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| py_error("Skippy KV import length overflows"))?;
+        if next_len > state.payload_bytes {
+            return Err(py_error("Skippy KV import exceeds its declared payload"));
+        }
+        state.payload.extend_from_slice(&chunk);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PyResult<PySkippyKvPage> {
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| py_error("Skippy KV import is already finished"))?;
+        if state.payload.len() != state.payload_bytes {
+            return Err(py_error("Skippy KV import payload is incomplete"));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&state.payload);
+        let actual_digest = format!("{:x}", hasher.finalize());
+        if actual_digest != state.payload_sha256 {
+            return Err(py_error("Skippy KV import SHA-256 mismatch"));
+        }
+        StageKvPage::from_parts(
+            state.version,
+            state.layer_start,
+            state.layer_end,
+            state.token_start,
+            state.token_count,
+            state.layer_count,
+            state.k_type,
+            state.v_type,
+            state.k_row_bytes,
+            state.v_row_bytes,
+            state.v_element_bytes,
+            state.flags,
+            state.payload,
+        )
+        .map(|inner| PySkippyKvPage { inner })
+        .map_err(py_error)
     }
 }
 
@@ -685,6 +863,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PySkippyPackageGeometry>()?;
     module.add_class::<PySkippyActivationFrame>()?;
     module.add_class::<PySkippyKvPage>()?;
+    module.add_class::<PySkippyKvPageBuilder>()?;
     module.add_class::<PySkippyForwardOutput>()?;
     module.add_class::<PySkippyStage>()?;
     Ok(())

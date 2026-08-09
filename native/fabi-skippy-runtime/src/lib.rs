@@ -426,6 +426,25 @@ impl StageKvPage {
     pub fn payload(&self) -> &[u8] {
         &self.inner.payload
     }
+
+    pub fn payload_slice(&self, offset: u64, length: u64) -> Result<&[u8]> {
+        let start = usize::try_from(offset).context("KV page chunk offset exceeds usize")?;
+        let length = usize::try_from(length).context("KV page chunk length exceeds usize")?;
+        let end = start
+            .checked_add(length)
+            .context("KV page chunk range overflows")?;
+        self.inner
+            .payload
+            .get(start..end)
+            .context("KV page chunk range exceeds payload")
+    }
+
+    #[must_use]
+    pub fn payload_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(&self.inner.payload);
+        format!("{:x}", hasher.finalize())
+    }
 }
 
 impl StageActivationFrame {

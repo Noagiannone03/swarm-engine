@@ -21,6 +21,7 @@ import time
 from abc import abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
+import msgpack
 import zmq
 
 from parallax.p2p.message_util import (
@@ -91,6 +92,7 @@ class BaseExecutor:
         # P2P Communication Configs
         send_to_peer_addr: Optional[str] = None,
         recv_from_peer_addr: Optional[str] = None,
+        executor_control_addr: Optional[str] = None,
         # IPC Communication Configs
         executor_input_ipc_addr: Optional[str] = None,
         executor_output_ipc_addr: Optional[str] = None,
@@ -153,9 +155,7 @@ class BaseExecutor:
         # TODO: Duplicate code to MLXExecutor.
         self.num_shard_layers = end_layer - start_layer
         self.dtype = (
-            resolved_dtype
-            if resolved_dtype is not None
-            else get_device_dtype(dtype, self.device)
+            resolved_dtype if resolved_dtype is not None else get_device_dtype(dtype, self.device)
         )
         logger.debug(
             f"Executor dtype set to {dtype} (resolved={self.dtype}); shard_layers={self.num_shard_layers}"
@@ -221,6 +221,10 @@ class BaseExecutor:
             if send_to_peer_addr:
                 self.send_to_peer_socket = get_zmq_socket(
                     self.zmq_context, zmq.PUSH, send_to_peer_addr, bind=False
+                )
+            if executor_control_addr:
+                self.executor_control_socket = get_zmq_socket(
+                    self.zmq_context, zmq.REP, executor_control_addr, bind=True
                 )
             if self.is_first_peer and executor_input_ipc_addr:
                 self.recv_from_ipc_socket = self._connect_engine_core_input_socket(
@@ -597,6 +601,50 @@ class BaseExecutor:
 
         return recv_reqs, refit_weight_path
 
+    def process_executor_control_requests(self) -> None:
+        """Serve local, bounded control messages between inference steps."""
+
+        socket = getattr(self, "executor_control_socket", None)
+        if self.tp_rank != 0 or socket is None:
+            return
+        while True:
+            try:
+                frames = socket.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            binary_response: bytes | None = None
+            try:
+                if len(frames) not in {1, 2}:
+                    raise ValueError(
+                        "executor control request must contain metadata and optional binary"
+                    )
+                request = msgpack.unpackb(frames[0], raw=False, strict_map_key=True)
+                if not isinstance(request, dict):
+                    raise TypeError("executor control request must be an object")
+                binary_request = frames[1] if len(frames) == 2 else None
+                result, binary_response = self.handle_executor_control(request, binary_request)
+                metadata = {"ok": True, "result": result}
+            except Exception as exc:
+                logger.warning("Executor control request failed: %s", exc)
+                metadata = {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:512],
+                }
+                binary_response = None
+            response = [msgpack.packb(metadata, use_bin_type=True)]
+            if binary_response is not None:
+                response.append(binary_response)
+            socket.send_multipart(response)
+
+    def handle_executor_control(
+        self,
+        request: dict[str, Any],
+        binary_request: bytes | None = None,
+    ) -> tuple[dict[str, Any], bytes | None]:
+        del request, binary_request
+        raise RuntimeError("executor does not support exact recovery checkpoints")
+
     def prepare_batch_inputs(self, batched_requests: List[Request]) -> Optional[Dict[str, Any]]:
         """Prepares inputs for ShardedModel from a batch of requests.
         Args:
@@ -682,9 +730,9 @@ class BaseExecutor:
             context_lengths: Context lengths for each request
         """
         # Extract hidden_states and probs from output (always a dict now)
-        assert isinstance(
-            batch_output, dict
-        ), f"Expected dict from process_batch, got {type(batch_output)}"
+        assert isinstance(batch_output, dict), (
+            f"Expected dict from process_batch, got {type(batch_output)}"
+        )
         hidden_states = batch_output["hidden_states"]
         token_probs = batch_output["probs"]
 
@@ -795,6 +843,11 @@ class BaseExecutor:
         self._should_stop = False
         while not self._should_stop:
             received_requests = []
+
+            # Checkpoint requests are serviced only between model calls. This
+            # gives the native page a coherent token boundary without racing
+            # the backend's KV mutation.
+            self.process_executor_control_requests()
 
             # Receive requests from the Rust frontend.
             if self.is_first_peer:
@@ -936,9 +989,7 @@ class BaseExecutor:
             except ExecutorBatchCancelled as cancelled:
                 request_ids = set(cancelled.request_ids)
                 cancelled_requests = [
-                    request
-                    for request in batch_to_process
-                    if request.request_id in request_ids
+                    request for request in batch_to_process if request.request_id in request_ids
                 ]
                 logger.info(
                     "Native execution cooperatively cancelled requests %s",
@@ -979,6 +1030,7 @@ class BaseExecutor:
                     "send_to_peer_socket",
                     "recv_from_ipc_socket",
                     "send_to_ipc_socket",
+                    "executor_control_socket",
                 ):
                     socket = getattr(self, socket_name, None)
                     if socket is not None:
@@ -1007,9 +1059,9 @@ class BaseExecutor:
         """
         # This peer is the last peer or a single node.
         if self.is_last_peer and self.is_first_peer:
-            assert isinstance(
-                request, (InitialRequest, IntermediateRequest)
-            ), "Invalid request type for decoding."
+            assert isinstance(request, (InitialRequest, IntermediateRequest)), (
+                "Invalid request type for decoding."
+            )
 
             next_token_id, hidden_states = self._gen_token_id_from_hidden(hidden_states)
             return IntermediateRequest(
@@ -1029,9 +1081,9 @@ class BaseExecutor:
         if self.is_last_peer:
             # Last peer decodes a token and sends it back to the first peer.
             # The token is wrapped in an IntermediateRequest.
-            assert isinstance(
-                request, IntermediateRequest
-            ), "Last peer must receive an IntermediateRequest."
+            assert isinstance(request, IntermediateRequest), (
+                "Last peer must receive an IntermediateRequest."
+            )
 
             next_token_id, hidden_states = self._gen_token_id_from_hidden(hidden_states)
             return IntermediateRequest(
@@ -1056,9 +1108,9 @@ class BaseExecutor:
             return IntermediateRequest.from_initial_request(
                 request, hidden_states=hidden_states, lora_path=request.lora_path
             )
-        assert isinstance(
-            request, IntermediateRequest
-        ), "Intermediate peer must process an IntermediateRequest."
+        assert isinstance(request, IntermediateRequest), (
+            "Intermediate peer must process an IntermediateRequest."
+        )
         return IntermediateRequest.from_intermediate_request(
             request, hidden_states, lora_path=request.lora_path
         )

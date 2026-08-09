@@ -630,7 +630,8 @@ if __name__ == "__main__":
         (
             args.recv_from_peer_addr,
             args.send_to_peer_addr,
-        ) = create_local_zmq_endpoints(2)
+            args.executor_control_addr,
+        ) = create_local_zmq_endpoints(3)
         if args.nccl_port is None:
             args.nccl_port = initialize_nccl_port()
 
@@ -678,6 +679,7 @@ if __name__ == "__main__":
                     notify_url=args.notify_url,
                     recv_from_peer_addr=args.recv_from_peer_addr,
                     send_to_peer_addr=args.send_to_peer_addr,
+                    executor_control_addr=args.executor_control_addr,
                     model_name=args.model_path,
                     max_batch_size=args.max_batch_size,
                     max_sequence_length=args.max_sequence_length,
@@ -754,6 +756,7 @@ if __name__ == "__main__":
                 notify_url=args.notify_url,
                 recv_from_peer_addr=args.recv_from_peer_addr,
                 send_to_peer_addr=args.send_to_peer_addr,
+                executor_control_addr=args.executor_control_addr,
                 model_name=args.model_path,
                 max_batch_size=args.max_batch_size,
                 max_sequence_length=args.max_sequence_length,
@@ -979,5 +982,18 @@ if __name__ == "__main__":
             stop_p2p_server(p2p_server_process)
 
         freeze_and_stop_runtime_capacity_probe(shared_state, capacity_probe_process)
+
+        if args is not None:
+            cleanup_local_zmq_endpoints(
+                [
+                    endpoint
+                    for endpoint in (
+                        getattr(args, "recv_from_peer_addr", None),
+                        getattr(args, "send_to_peer_addr", None),
+                        getattr(args, "executor_control_addr", None),
+                    )
+                    if endpoint is not None
+                ]
+            )
 
         logger.debug("All processes shut down.")

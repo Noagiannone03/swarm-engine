@@ -72,6 +72,41 @@ class SkippyKvPage:
             raise ValueError("Skippy KV page payload is empty")
 
 
+@dataclass(frozen=True)
+class SkippyKvPageExport:
+    """Native-owned KV page exposed through bounded transient chunks."""
+
+    version: int
+    layer_start: int
+    layer_end: int
+    token_start: int
+    token_count: int
+    layer_count: int
+    k_type: int
+    v_type: int
+    k_row_bytes: int
+    v_row_bytes: int
+    v_element_bytes: int
+    flags: int
+    payload_bytes: int
+    payload_sha256: str
+    _native_page: Any
+
+    def __post_init__(self) -> None:
+        if self.payload_bytes <= 0:
+            raise ValueError("Skippy KV export payload is empty")
+        if len(self.payload_sha256) != 64:
+            raise ValueError("Skippy KV export has no SHA-256 digest")
+
+    def read_chunk(self, offset: int, length: int) -> bytes:
+        if offset < 0 or length <= 0:
+            raise ValueError("Skippy KV chunk range is invalid")
+        end = offset + length
+        if end > self.payload_bytes:
+            raise ValueError("Skippy KV chunk range exceeds payload")
+        return bytes(self._native_page.payload_slice(offset, length))
+
+
 def _mesh_release_version(value: str) -> str:
     normalized = value.strip()
     for prefix in ("mesh-llm/v", "mesh-llm/", "v"):
@@ -463,6 +498,34 @@ class SkippyRuntimeStageRunner:
             payload=payload,
         )
 
+    def prepare_kv_page_export(
+        self,
+        request_id: str,
+        *,
+        token_start: int,
+        token_count: int,
+    ) -> SkippyKvPageExport:
+        """Keep the native page resident and expose it without a full Python copy."""
+
+        native_page = self.stage.export_kv_page(request_id, token_start, token_count)
+        return SkippyKvPageExport(
+            version=int(native_page.version),
+            layer_start=int(native_page.layer_start),
+            layer_end=int(native_page.layer_end),
+            token_start=int(native_page.token_start),
+            token_count=int(native_page.token_count),
+            layer_count=int(native_page.layer_count),
+            k_type=int(native_page.k_type),
+            v_type=int(native_page.v_type),
+            k_row_bytes=int(native_page.k_row_bytes),
+            v_row_bytes=int(native_page.v_row_bytes),
+            v_element_bytes=int(native_page.v_element_bytes),
+            flags=int(native_page.flags),
+            payload_bytes=int(native_page.payload_bytes),
+            payload_sha256=str(native_page.payload_sha256),
+            _native_page=native_page,
+        )
+
     def import_kv_page(self, request_id: str, page: SkippyKvPage) -> None:
         if page.layer_start != self.verified.span.start or page.layer_end != self.verified.span.end:
             raise ValueError("Skippy KV page does not match the runner's signed layer span")
@@ -482,3 +545,32 @@ class SkippyRuntimeStageRunner:
             flags=page.flags,
         )
         self.stage.import_kv_page(request_id, native_page)
+
+    def begin_kv_page_import(self, descriptor: dict[str, int | str]) -> Any:
+        """Allocate one native builder after the executor admitted its exact size."""
+
+        return self.native.SkippyKvPageBuilder(
+            version=int(descriptor["version"]),
+            layer_start=int(descriptor["layer_start"]),
+            layer_end=int(descriptor["layer_end"]),
+            token_start=int(descriptor["token_start"]),
+            token_count=int(descriptor["token_count"]),
+            layer_count=int(descriptor["layer_count"]),
+            k_type=int(descriptor["k_type"]),
+            v_type=int(descriptor["v_type"]),
+            k_row_bytes=int(descriptor["k_row_bytes"]),
+            v_row_bytes=int(descriptor["v_row_bytes"]),
+            v_element_bytes=int(descriptor["v_element_bytes"]),
+            flags=int(descriptor.get("flags", 0)),
+            payload_bytes=int(descriptor["payload_bytes"]),
+            payload_sha256=str(descriptor["payload_sha256"]),
+        )
+
+    @staticmethod
+    def append_kv_page_import(builder: Any, chunk: bytes) -> int:
+        builder.append(chunk)
+        return int(builder.bytes_received)
+
+    def commit_kv_page_import(self, request_id: str, builder: Any) -> None:
+        page = builder.finish()
+        self.stage.import_kv_page(request_id, page)

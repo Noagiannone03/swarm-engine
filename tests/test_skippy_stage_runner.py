@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -83,6 +84,45 @@ class _FakeKvPage:
     def payload(self):
         return self._payload
 
+    def payload_slice(self, offset, length):
+        return self._payload[offset : offset + length]
+
+    @property
+    def payload_sha256(self):
+        return hashlib.sha256(self._payload).hexdigest()
+
+
+class _FakeKvPageBuilder:
+    def __init__(self, **descriptor):
+        self.descriptor = descriptor
+        self.payload = bytearray()
+
+    @property
+    def bytes_received(self):
+        return len(self.payload)
+
+    def append(self, chunk):
+        self.payload.extend(chunk)
+
+    def finish(self):
+        assert len(self.payload) == self.descriptor["payload_bytes"]
+        assert hashlib.sha256(self.payload).hexdigest() == self.descriptor["payload_sha256"]
+        return _FakeKvPage(
+            self.payload,
+            version=self.descriptor["version"],
+            layer_start=self.descriptor["layer_start"],
+            layer_end=self.descriptor["layer_end"],
+            token_start=self.descriptor["token_start"],
+            token_count=self.descriptor["token_count"],
+            layer_count=self.descriptor["layer_count"],
+            k_type=self.descriptor["k_type"],
+            v_type=self.descriptor["v_type"],
+            k_row_bytes=self.descriptor["k_row_bytes"],
+            v_row_bytes=self.descriptor["v_row_bytes"],
+            v_element_bytes=self.descriptor["v_element_bytes"],
+            flags=self.descriptor["flags"],
+        )
+
 
 class _FakeStage:
     def __init__(self, parts, **kwargs):
@@ -154,6 +194,7 @@ class _FakeStage:
 class _FakeNative:
     SkippyActivationFrame = _FakeActivation
     SkippyKvPage = _FakeKvPage
+    SkippyKvPageBuilder = _FakeKvPageBuilder
 
     def __init__(self):
         self.loaded = None
@@ -287,6 +328,67 @@ def test_runner_round_trips_exact_native_kv_descriptor(tmp_path):
     assert imported_page.token_count == 96
     assert imported_page.layer_start == 0
     assert imported_page.layer_end == 2
+
+
+def test_runner_reads_native_kv_export_in_bounded_chunks(tmp_path):
+    native = _FakeNative()
+    runner = SkippyRuntimeStageRunner(
+        _verified(tmp_path),
+        device="vulkan:0",
+        model_layer_count=2,
+        max_context_tokens=32768,
+        max_sessions=2,
+        native_module=native,
+        runtime_root=tmp_path,
+    )
+
+    export = runner.prepare_kv_page_export("request-kv", token_start=0, token_count=96)
+
+    assert export.payload_bytes == len(b"exact-kv")
+    assert export.payload_sha256 == hashlib.sha256(b"exact-kv").hexdigest()
+    assert export.read_chunk(0, 5) == b"exact"
+    assert export.read_chunk(5, 3) == b"-kv"
+    with pytest.raises(ValueError, match="exceeds"):
+        export.read_chunk(5, 4)
+
+
+def test_runner_builds_native_kv_import_incrementally(tmp_path):
+    native = _FakeNative()
+    runner = SkippyRuntimeStageRunner(
+        _verified(tmp_path),
+        device="vulkan:0",
+        model_layer_count=2,
+        max_context_tokens=32768,
+        max_sessions=2,
+        native_module=native,
+        runtime_root=tmp_path,
+    )
+    payload = b"exact-kv"
+    descriptor = {
+        "version": 1,
+        "layer_start": 0,
+        "layer_end": 2,
+        "token_start": 0,
+        "token_count": 96,
+        "layer_count": 2,
+        "k_type": 1,
+        "v_type": 1,
+        "k_row_bytes": 128,
+        "v_row_bytes": 128,
+        "v_element_bytes": 2,
+        "flags": 0,
+        "payload_bytes": len(payload),
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+    builder = runner.begin_kv_page_import(descriptor)
+    assert runner.append_kv_page_import(builder, payload[:4]) == 4
+    assert runner.append_kv_page_import(builder, payload[4:]) == len(payload)
+    runner.commit_kv_page_import("replacement-kv", builder)
+
+    imported_request, imported_page = native.stage.imported_kv
+    assert imported_request == "replacement-kv"
+    assert imported_page.payload() == payload
 
 
 def test_runner_rejects_empty_activation_from_non_terminal_stage(tmp_path):

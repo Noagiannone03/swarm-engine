@@ -7,13 +7,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from parallax.p2p.message_util import NativeActivationFrame
 from parallax.server.executor.base_executor import BaseExecutor, ExecutorBatchCancelled
+from parallax.server.executor.checkpoint_control import SkippyCheckpointExportRegistry
 from parallax.server.request import InitialRequest, IntermediateRequest, Request
 from parallax.server.skippy_stage_runner import (
     SkippyRequestCancelled,
     SkippyRuntimeStageRunner,
 )
 from parallax_utils.logging_config import get_logger
-from swarm_protocol.contracts import LayerSpan
+from swarm_protocol.contracts import LayerSpan, SkippyExactStateKind
 from swarm_protocol.skippy_execution import materialize_skippy_execution_span
 from swarm_protocol.worker_integration import WorkerProtocolV3Reporter
 
@@ -51,6 +52,7 @@ class SkippyExecutor(BaseExecutor):
         layer_latency_update_every: int = 4096,
         send_to_peer_addr: Optional[str] = None,
         recv_from_peer_addr: Optional[str] = None,
+        executor_control_addr: Optional[str] = None,
         executor_input_ipc_addr: Optional[str] = None,
         executor_output_ipc_addr: Optional[str] = None,
         tp_rank: Optional[int] = 0,
@@ -130,6 +132,18 @@ class SkippyExecutor(BaseExecutor):
             max_sessions=max_sessions,
         )
         self.execution_plan = verified.plan
+        self.checkpoint_exports = (
+            SkippyCheckpointExportRegistry(
+                runner=self.runner,
+                kv_bytes_per_token=sum(
+                    verified.plan.kv_bytes_per_token_by_layer[start_layer:end_layer]
+                ),
+                layer_start=start_layer,
+                layer_end=end_layer,
+            )
+            if verified.plan.exact_state_kind is not SkippyExactStateKind.DISABLED
+            else None
+        )
         self.cache_manager = _SkippyCacheCapacity(
             num_gpu_blocks=context_limit * max_sessions,
         )
@@ -150,6 +164,7 @@ class SkippyExecutor(BaseExecutor):
             layer_latency_update_every=layer_latency_update_every,
             send_to_peer_addr=send_to_peer_addr,
             recv_from_peer_addr=recv_from_peer_addr,
+            executor_control_addr=executor_control_addr,
             executor_input_ipc_addr=executor_input_ipc_addr,
             executor_output_ipc_addr=executor_output_ipc_addr,
             tp_rank=tp_rank,
@@ -263,8 +278,8 @@ class SkippyExecutor(BaseExecutor):
                         list(request.input_ids),
                         input_activation,
                         sampling,
-                        is_cancelled=lambda rid=request.request_id: (
-                            self._request_abort_requested(rid)
+                        is_cancelled=lambda rid=request.request_id: self._request_abort_requested(
+                            rid
                         ),
                     )
                 else:
@@ -288,9 +303,7 @@ class SkippyExecutor(BaseExecutor):
                 values.append(result.predicted_token)
             else:
                 if result.activation is None:
-                    raise RuntimeError(
-                        "non-final Skippy stage did not return an activation"
-                    )
+                    raise RuntimeError("non-final Skippy stage did not return an activation")
                 values.append(result.activation)
         return {"hidden_states": values, "probs": None}
 
@@ -317,11 +330,94 @@ class SkippyExecutor(BaseExecutor):
     def _release_request(self, rid: str) -> None:
         self.runner.release(rid)
 
+    def handle_executor_control(
+        self,
+        request: dict[str, Any],
+        binary_request: bytes | None = None,
+    ) -> tuple[dict[str, Any], bytes | None]:
+        registry = self.checkpoint_exports
+        if registry is None:
+            raise RuntimeError("signed Skippy plan does not certify exact warm state")
+        command = request.get("command")
+        request_id = request.get("request_id")
+        if not isinstance(request_id, str):
+            raise ValueError("checkpoint control request_id is missing")
+        if command == "checkpoint_export_prepare":
+            if binary_request is not None:
+                raise ValueError("checkpoint export prepare does not accept binary data")
+            token_count = request.get("token_count")
+            if isinstance(token_count, bool) or not isinstance(token_count, int):
+                raise ValueError("checkpoint token_count must be an integer")
+            descriptor = registry.prepare(request_id=request_id, token_count=token_count)
+            return descriptor.as_wire_dict(), None
+        if command == "checkpoint_export_read":
+            if binary_request is not None:
+                raise ValueError("checkpoint export read does not accept binary data")
+            handle = request.get("handle")
+            offset = request.get("offset")
+            if not isinstance(handle, str):
+                raise ValueError("checkpoint export handle is missing")
+            if isinstance(offset, bool) or not isinstance(offset, int):
+                raise ValueError("checkpoint export offset must be an integer")
+            chunk, next_offset, done = registry.read(
+                handle=handle,
+                request_id=request_id,
+                offset=offset,
+            )
+            return {"next_offset": next_offset, "done": done}, chunk
+        if command == "checkpoint_export_drop":
+            if binary_request is not None:
+                raise ValueError("checkpoint export drop does not accept binary data")
+            handle = request.get("handle")
+            if not isinstance(handle, str):
+                raise ValueError("checkpoint export handle is missing")
+            dropped = registry.drop(handle=handle, request_id=request_id)
+            return {"dropped": dropped}, None
+        if command == "checkpoint_import_begin":
+            if binary_request is not None:
+                raise ValueError("checkpoint import begin does not accept binary data")
+            descriptor = request.get("descriptor")
+            if not isinstance(descriptor, dict):
+                raise ValueError("checkpoint import descriptor is missing")
+            handle = registry.begin_import(request_id=request_id, descriptor=descriptor)
+            return {"handle": handle}, None
+        if command == "checkpoint_import_write":
+            handle = request.get("handle")
+            offset = request.get("offset")
+            if not isinstance(handle, str):
+                raise ValueError("checkpoint import handle is missing")
+            if isinstance(offset, bool) or not isinstance(offset, int):
+                raise ValueError("checkpoint import offset must be an integer")
+            if binary_request is None:
+                raise ValueError("checkpoint import chunk is missing")
+            next_offset, done = registry.append_import(
+                handle=handle,
+                request_id=request_id,
+                offset=offset,
+                chunk=binary_request,
+            )
+            return {"next_offset": next_offset, "done": done}, None
+        if command == "checkpoint_import_commit":
+            if binary_request is not None:
+                raise ValueError("checkpoint import commit does not accept binary data")
+            handle = request.get("handle")
+            if not isinstance(handle, str):
+                raise ValueError("checkpoint import handle is missing")
+            registry.commit_import(handle=handle, request_id=request_id)
+            return {"committed": True}, None
+        if command == "checkpoint_import_abort":
+            if binary_request is not None:
+                raise ValueError("checkpoint import abort does not accept binary data")
+            handle = request.get("handle")
+            if not isinstance(handle, str):
+                raise ValueError("checkpoint import handle is missing")
+            aborted = registry.abort_import(handle=handle, request_id=request_id)
+            return {"aborted": aborted}, None
+        raise ValueError("unknown executor checkpoint command")
+
     def _request_abort_requested(self, rid: str) -> bool:
         shared_state = getattr(self, "shared_state", None)
-        return bool(
-            shared_state is not None and shared_state.request_abort_requested(rid)
-        )
+        return bool(shared_state is not None and shared_state.request_abort_requested(rid))
 
     def check_and_refit_weight(self, refit_weight_path: str) -> None:
         if refit_weight_path:
