@@ -247,9 +247,7 @@ class FakeRuntime:
         model_swarm_id,
         required_context_tokens,
     ):
-        self.unmet_context_requests.append(
-            (request_id, model_swarm_id, required_context_tokens)
-        )
+        self.unmet_context_requests.append((request_id, model_swarm_id, required_context_tokens))
         return True
 
     def active_reservation(self, request_id):
@@ -360,6 +358,36 @@ class FailoverRuntime:
 
     def close(self):
         self.active.clear()
+
+
+class FakeRecoveryCheckpoints:
+    def __init__(self):
+        self.observed = []
+        self.restored = []
+        self.finished = []
+        self.closed = False
+
+    def observe_committed(self, snapshot, plan):
+        self.observed.append((snapshot.committed_position, plan.epoch))
+        return True
+
+    def checkpoint_for_recovery(self, *, request_id, failed_epoch, replay_token_ids):
+        assert failed_epoch == 1
+        assert replay_token_ids == (10, 20, 30, 40)
+        return SimpleNamespace(request_id=request_id, token_count=3)
+
+    def restore(self, checkpoint, *, snapshot, plan):
+        self.restored.append((checkpoint.token_count, snapshot.epoch, plan.epoch))
+        return True
+
+    def finish_request(self, request_id):
+        self.finished.append(request_id)
+
+    def status(self):
+        return {"enabled": True, "ready_requests": 1}
+
+    def close(self):
+        self.closed = True
 
 
 def manager_and_runtime():
@@ -514,6 +542,7 @@ def test_local_request_agent_replans_replays_and_resumes_exactly_once(tmp_path):
     )
     runtime = FailoverRuntime(primary, replacement)
     journal = SqliteRecoveryJournal(tmp_path / "recovery.sqlite3")
+    checkpoints = FakeRecoveryCheckpoints()
     manager = RequestAgentOpenAIManager(
         runtime,
         MODEL_SWARM_ID,
@@ -521,6 +550,7 @@ def test_local_request_agent_replans_replays_and_resumes_exactly_once(tmp_path):
         model_context_limit=8192,
         completion_service_type=object,
         recovery_journal=journal,
+        recovery_checkpoints=checkpoints,
     )
     app = create_request_agent_app(manager, api_credential=API_CREDENTIAL)
 
@@ -556,6 +586,10 @@ def test_local_request_agent_replans_replays_and_resumes_exactly_once(tmp_path):
         f"route-replacement-{request_id}",
     )
     assert snapshot.committed_output_token_ids == (40, 41)
+    assert checkpoints.observed == [(1, 1), (2, 2)]
+    assert checkpoints.restored == [(3, 2, 2)]
+    assert checkpoints.finished == [request_id]
+    assert checkpoints.closed is True
     phase_events, gap = manager.request_phases.read_after(0)
     assert gap is False
     phases = [event.phase for event in phase_events if event.request_id == request_id]
@@ -663,16 +697,12 @@ def test_request_agent_ready_file_uses_actual_bound_port_and_owner_only_mode(tmp
 def test_request_agent_bound_url_brackets_ipv6_and_rejects_ambiguous_listeners():
     server = SimpleNamespace(
         servers=[
-            SimpleNamespace(
-                sockets=[SimpleNamespace(getsockname=lambda: ("::1", 43128, 0, 0))]
-            )
+            SimpleNamespace(sockets=[SimpleNamespace(getsockname=lambda: ("::1", 43128, 0, 0))])
         ],
     )
     assert _bound_base_url(server, "::1") == "http://[::1]:43128"
 
-    server.servers[0].sockets.append(
-        SimpleNamespace(getsockname=lambda: ("::1", 43129, 0, 0))
-    )
+    server.servers[0].sockets.append(SimpleNamespace(getsockname=lambda: ("::1", 43129, 0, 0)))
     with pytest.raises(RuntimeError, match="exactly one listener"):
         _bound_base_url(server, "::1")
 

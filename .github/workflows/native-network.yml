@@ -12,6 +12,8 @@ on:
       - 'src/backend/main.py'
       - 'src/backend/server/request_handler.py'
       - 'src/backend/server/request_agent_frontend.py'
+      - 'src/backend/server/recovery_checkpoint.py'
+      - 'src/backend/server/recovery_checkpoint_store.py'
       - 'src/backend/server/contribution_gate.py'
       - 'src/parallax/launch.py'
       - 'src/parallax/p2p/server.py'
@@ -31,6 +33,10 @@ on:
       - 'src/swarm_protocol/**'
       - 'tools/agentic_workload_sim/**'
       - 'tests/test_backend_request_handler.py'
+      - 'tests/test_checkpoint_control.py'
+      - 'tests/test_executor_checkpoint_ipc.py'
+      - 'tests/test_kv_snapshot.py'
+      - 'tests/test_p2p_completion_abort.py'
       - 'tests/test_backend_capabilities.py'
       - 'tests/test_skippy_stage_runner.py'
       - 'tests/test_skippy_executor.py'
@@ -39,6 +45,8 @@ on:
       - 'tests/test_runtime_capacity.py'
       - 'tests/test_server_info_memory.py'
       - 'tests/test_request_agent_frontend.py'
+      - 'tests/test_recovery_checkpoint.py'
+      - 'tests/test_recovery_checkpoint_store.py'
       - 'tests/test_executor_supervision.py'
       - 'tests/test_launch.py'
       - 'tests/test_model_artifact_cache.py'
@@ -58,6 +66,8 @@ on:
       - 'src/backend/main.py'
       - 'src/backend/server/request_handler.py'
       - 'src/backend/server/request_agent_frontend.py'
+      - 'src/backend/server/recovery_checkpoint.py'
+      - 'src/backend/server/recovery_checkpoint_store.py'
       - 'src/backend/server/contribution_gate.py'
       - 'src/parallax/launch.py'
       - 'src/parallax/p2p/server.py'
@@ -77,6 +87,10 @@ on:
       - 'src/swarm_protocol/**'
       - 'tools/agentic_workload_sim/**'
       - 'tests/test_backend_request_handler.py'
+      - 'tests/test_checkpoint_control.py'
+      - 'tests/test_executor_checkpoint_ipc.py'
+      - 'tests/test_kv_snapshot.py'
+      - 'tests/test_p2p_completion_abort.py'
       - 'tests/test_backend_capabilities.py'
       - 'tests/test_skippy_stage_runner.py'
       - 'tests/test_skippy_executor.py'
@@ -85,6 +99,8 @@ on:
       - 'tests/test_runtime_capacity.py'
       - 'tests/test_server_info_memory.py'
       - 'tests/test_request_agent_frontend.py'
+      - 'tests/test_recovery_checkpoint.py'
+      - 'tests/test_recovery_checkpoint_store.py'
       - 'tests/test_executor_supervision.py'
       - 'tests/test_launch.py'
       - 'tests/test_model_artifact_cache.py'
@@ -222,6 +238,10 @@ jobs:
             tests/test_swarm_protocol_*.py \
             tests/test_agentic_workload_probe.py \
             tests/test_backend_request_handler.py \
+            tests/test_checkpoint_control.py \
+            tests/test_executor_checkpoint_ipc.py \
+            tests/test_kv_snapshot.py \
+            tests/test_p2p_completion_abort.py \
             tests/test_backend_capabilities.py \
             tests/test_skippy_stage_runner.py \
             tests/test_skippy_executor.py \
@@ -230,6 +250,8 @@ jobs:
             tests/test_runtime_capacity.py \
             tests/test_server_info_memory.py \
             tests/test_request_agent_frontend.py \
+            tests/test_recovery_checkpoint.py \
+            tests/test_recovery_checkpoint_store.py \
             tests/test_executor_supervision.py \
             tests/test_launch.py \
             tests/test_model_artifact_cache.py \

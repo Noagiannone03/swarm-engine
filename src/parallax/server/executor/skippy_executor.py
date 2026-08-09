@@ -17,6 +17,7 @@ from parallax.server.skippy_stage_runner import (
 from parallax_utils.logging_config import get_logger
 from swarm_protocol.contracts import LayerSpan, SkippyExactStateKind
 from swarm_protocol.kv_snapshot import KvSnapshotCompatibility
+from swarm_protocol.recovery import token_sequence_checksum
 from swarm_protocol.skippy_execution import materialize_skippy_execution_span
 from swarm_protocol.worker_integration import WorkerProtocolV3Reporter
 
@@ -29,6 +30,14 @@ class _SkippyCacheCapacity:
 
     num_gpu_blocks: int
     block_size: int = 1
+
+
+@dataclass(frozen=True)
+class _SkippyResumeMarker:
+    route_id: str
+    epoch: int
+    token_count: int
+    token_prefix_checksum: str
 
 
 class SkippyExecutor(BaseExecutor):
@@ -135,6 +144,10 @@ class SkippyExecutor(BaseExecutor):
         )
         self.execution_plan = verified.plan
         self.model_manifest = bundle.manifest
+        self._checkpoint_import_markers: dict[str, _SkippyResumeMarker] = {}
+        self._checkpoint_import_handle_by_request: dict[str, str] = {}
+        self._checkpoint_resume_markers: dict[str, _SkippyResumeMarker] = {}
+        self._authority_by_engine_request: dict[str, str] = {}
         self.checkpoint_exports = (
             SkippyCheckpointExportRegistry(
                 runner=self.runner,
@@ -266,8 +279,10 @@ class SkippyExecutor(BaseExecutor):
     ) -> Dict[str, Any]:
         values: list[NativeActivationFrame | int] = []
         for request in prepared_inputs["requests"]:
-            if self._request_abort_requested(request.request_id):
+            native_request_id = self._native_request_id(request)
+            if self._request_abort_requested(native_request_id):
                 raise ExecutorBatchCancelled([request.request_id])
+            resume_marker = self._apply_checkpoint_resume(request, native_request_id)
             input_activation = None if self.is_first_peer else request.hidden_states
             if input_activation is not None and not isinstance(
                 input_activation, NativeActivationFrame
@@ -277,11 +292,11 @@ class SkippyExecutor(BaseExecutor):
             try:
                 if request.is_prefill:
                     result = self.runner.prefill(
-                        request.request_id,
+                        native_request_id,
                         list(request.input_ids),
                         input_activation,
                         sampling,
-                        is_cancelled=lambda rid=request.request_id: self._request_abort_requested(
+                        is_cancelled=lambda rid=native_request_id: self._request_abort_requested(
                             rid
                         ),
                     )
@@ -293,13 +308,20 @@ class SkippyExecutor(BaseExecutor):
                     if token_id is None:
                         raise RuntimeError("Skippy decode request has no committed token")
                     result = self.runner.decode(
-                        request.request_id,
+                        native_request_id,
                         int(token_id),
                         input_activation,
                         sampling,
                     )
             except SkippyRequestCancelled as exc:
                 raise ExecutorBatchCancelled([request.request_id]) from exc
+            except BaseException:
+                if resume_marker is not None:
+                    self.runner.release(native_request_id)
+                    self._checkpoint_resume_markers.pop(native_request_id, None)
+                raise
+            if resume_marker is not None:
+                self._checkpoint_resume_markers.pop(native_request_id, None)
             if return_decoded_tokens:
                 if result.predicted_token is None:
                     raise RuntimeError("final Skippy stage did not sample a token")
@@ -331,7 +353,12 @@ class SkippyExecutor(BaseExecutor):
         return hidden_states, [hidden_states]
 
     def _release_request(self, rid: str) -> None:
-        self.runner.release(rid)
+        native_request_id = self._authority_by_engine_request.pop(rid, rid)
+        self.runner.release(native_request_id)
+        self._checkpoint_resume_markers.pop(native_request_id, None)
+        shared_state = getattr(self, "shared_state", None)
+        if shared_state is not None:
+            shared_state.clear_request_abort(native_request_id)
 
     def handle_executor_control(
         self,
@@ -398,7 +425,13 @@ class SkippyExecutor(BaseExecutor):
             ):
                 raise ValueError("checkpoint import compatibility identity is invalid")
             source_compatibility.require_compatible(self._checkpoint_compatibility(descriptor))
+            resume_marker = self._resume_marker(descriptor)
             handle = registry.begin_import(request_id=request_id, descriptor=descriptor)
+            previous_handle = self._checkpoint_import_handle_by_request.get(request_id)
+            if previous_handle is not None and previous_handle != handle:
+                self._checkpoint_import_markers.pop(previous_handle, None)
+            self._checkpoint_import_markers[handle] = resume_marker
+            self._checkpoint_import_handle_by_request[request_id] = handle
             return {"handle": handle}, None
         if command == "checkpoint_import_write":
             handle = request.get("handle")
@@ -423,6 +456,13 @@ class SkippyExecutor(BaseExecutor):
             if not isinstance(handle, str):
                 raise ValueError("checkpoint import handle is missing")
             registry.commit_import(handle=handle, request_id=request_id)
+            marker = self._checkpoint_import_markers.pop(handle, None)
+            if self._checkpoint_import_handle_by_request.get(request_id) == handle:
+                self._checkpoint_import_handle_by_request.pop(request_id, None)
+            if marker is None:
+                self.runner.release(request_id)
+                raise RuntimeError("checkpoint import resume marker is missing")
+            self._checkpoint_resume_markers[request_id] = marker
             return {"committed": True}, None
         if command == "checkpoint_import_abort":
             if binary_request is not None:
@@ -431,8 +471,81 @@ class SkippyExecutor(BaseExecutor):
             if not isinstance(handle, str):
                 raise ValueError("checkpoint import handle is missing")
             aborted = registry.abort_import(handle=handle, request_id=request_id)
+            self._checkpoint_import_markers.pop(handle, None)
+            if self._checkpoint_import_handle_by_request.get(request_id) == handle:
+                self._checkpoint_import_handle_by_request.pop(request_id, None)
             return {"aborted": aborted}, None
+        if command == "checkpoint_import_discard":
+            if binary_request is not None:
+                raise ValueError("checkpoint import discard does not accept binary data")
+            marker = self._checkpoint_resume_markers.get(request_id)
+            if marker is None:
+                return {"discarded": False}, None
+            requested = self._resume_marker(request)
+            if marker != requested:
+                raise PermissionError("checkpoint discard identity differs from import")
+            self._checkpoint_resume_markers.pop(request_id, None)
+            self.runner.release(request_id)
+            return {"discarded": True}, None
         raise ValueError("unknown executor checkpoint command")
+
+    @staticmethod
+    def _resume_marker(payload: dict[str, Any]) -> _SkippyResumeMarker:
+        route_id = payload.get("resume_route_id")
+        epoch = payload.get("resume_route_epoch")
+        token_count = payload.get("token_count")
+        checksum = payload.get("token_prefix_checksum")
+        if not isinstance(route_id, str) or not route_id:
+            raise ValueError("checkpoint resume route is missing")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
+            raise ValueError("checkpoint resume epoch is invalid")
+        if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count <= 0:
+            raise ValueError("checkpoint resume token count is invalid")
+        if not isinstance(checksum, str) or len(checksum) != 64:
+            raise ValueError("checkpoint resume token checksum is invalid")
+        try:
+            bytes.fromhex(checksum)
+        except ValueError as error:
+            raise ValueError("checkpoint resume token checksum is invalid") from error
+        return _SkippyResumeMarker(
+            route_id=route_id,
+            epoch=epoch,
+            token_count=token_count,
+            token_prefix_checksum=checksum,
+        )
+
+    def _native_request_id(self, request: Request) -> str:
+        authority_request_id = getattr(request, "authority_request_id", None)
+        native_request_id = (
+            authority_request_id
+            if isinstance(authority_request_id, str) and authority_request_id
+            else request.request_id
+        )
+        self._authority_by_engine_request[request.request_id] = native_request_id
+        return native_request_id
+
+    def _apply_checkpoint_resume(
+        self,
+        request: Request,
+        native_request_id: str,
+    ) -> _SkippyResumeMarker | None:
+        if not request.is_prefill:
+            return None
+        marker = self._checkpoint_resume_markers.get(native_request_id)
+        if marker is None:
+            return None
+        if request.route_id != marker.route_id or request.route_epoch != marker.epoch:
+            raise PermissionError("checkpoint resume request crossed its route fence")
+        full_input_ids = tuple(request.origin_input_ids or request.input_ids)
+        if marker.token_count >= len(full_input_ids):
+            raise ValueError("checkpoint resume must leave at least one replay token")
+        if (
+            token_sequence_checksum(full_input_ids[: marker.token_count])
+            != marker.token_prefix_checksum
+        ):
+            raise ValueError("checkpoint resume prefix differs from the recovery journal")
+        request.input_ids = list(full_input_ids[marker.token_count :])
+        return marker
 
     def _checkpoint_compatibility(
         self,

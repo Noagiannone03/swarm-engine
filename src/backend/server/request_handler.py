@@ -737,11 +737,12 @@ class RequestHandler:
                                 replay_completion_committed = False
                                 logger.info(
                                     "Promoted request %s to recovery route %s at epoch %s "
-                                    "after %s committed output tokens",
+                                    "after %s committed output tokens (warm_prefix_tokens=%s)",
                                     request_id,
                                     promoted.primary_plan.route_id,
                                     recovery_epoch,
                                     len(recovering.committed_output_token_ids),
+                                    getattr(promoted, "warm_checkpoint_token_count", 0),
                                 )
                                 return True
                             except Exception:

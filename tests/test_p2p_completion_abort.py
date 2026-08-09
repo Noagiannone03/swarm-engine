@@ -243,6 +243,68 @@ def test_checkpoint_export_is_coordinator_fenced_and_keeps_binary_chunks_separat
     ]
 
 
+def test_checkpoint_import_propagates_the_authenticated_resume_fence(monkeypatch):
+    admission = FakeAdmission()
+    handler = make_handler(admission)
+    calls = []
+    monkeypatch.setattr(p2p_server, "authenticated_rpc_peer_id", lambda: "coordinator")
+
+    def control(request):
+        calls.append(request)
+        if request["command"] == "checkpoint_import_begin":
+            return {"handle": "import-1"}, None
+        return {"discarded": True}, None
+
+    monkeypatch.setattr(handler, "_executor_control", control)
+    authority = {
+        "fabi_route_id": "route-8",
+        "fabi_route_epoch": 8,
+        "parallax_routing_table": ["worker-a", "worker-b"],
+    }
+    descriptor = {
+        "token_count": 63,
+        "token_prefix_checksum": "ab" * 32,
+    }
+
+    begun = handler.begin_recovery_checkpoint_import(
+        {
+            "request_id": "scheduler-request",
+            "route_authority": authority,
+            "descriptor": descriptor,
+        }
+    )
+    discarded = handler.discard_recovery_checkpoint_import(
+        {
+            "request_id": "scheduler-request",
+            "route_authority": authority,
+            "token_count": 63,
+            "token_prefix_checksum": "ab" * 32,
+        }
+    )
+
+    assert begun == {"handle": "import-1"}
+    assert discarded == {"discarded": True}
+    assert calls == [
+        {
+            "command": "checkpoint_import_begin",
+            "request_id": "scheduler-request",
+            "descriptor": {
+                **descriptor,
+                "resume_route_id": "route-8",
+                "resume_route_epoch": 8,
+            },
+        },
+        {
+            "command": "checkpoint_import_discard",
+            "request_id": "scheduler-request",
+            "resume_route_id": "route-8",
+            "resume_route_epoch": 8,
+            "token_count": 63,
+            "token_prefix_checksum": "ab" * 32,
+        },
+    ]
+
+
 def test_abort_completion_publishes_native_cancellation_marker(monkeypatch):
     admission = FakeAdmission()
     marked = []

@@ -7,6 +7,7 @@ import asyncio
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import socket
 import threading
@@ -30,6 +31,8 @@ from backend.server.openai_compat import (
     openai_models_payload,
 )
 from backend.server.request_handler import RequestHandler
+from backend.server.recovery_checkpoint import RecoveryCheckpointCoordinator
+from backend.server.recovery_checkpoint_store import EncryptedRecoveryCheckpointStore
 from parallax.utils.model_download import download_model_file
 from parallax.utils.model_config import get_model_context_limit, normalize_model_config
 from swarm_protocol.artifact_verification import verify_artifact
@@ -61,6 +64,8 @@ from swarm_protocol.routing import RoutePlanningError
 _MAX_OPENAI_REQUEST_BYTES = 16 * 1024 * 1024
 _READINESS_CACHE_MS = 1_000
 _OPENAI_SSE_KEEPALIVE_SECONDS = 15.0
+
+logger = logging.getLogger(__name__)
 
 
 async def _with_sse_keepalive(source, *, interval_seconds: float):
@@ -106,6 +111,7 @@ async def _with_sse_keepalive(source, *, interval_seconds: float):
 class RequestAgentRouteContext:
     manifest: ModelManifest
     primary_plan: RoutePlan
+    warm_checkpoint_token_count: int = 0
 
 
 def _environment_flag(name: str) -> bool:
@@ -171,6 +177,7 @@ class RequestAgentOpenAIManager:
         local_files_only: bool = False,
         completion_service_type: type | None = None,
         recovery_journal: InMemoryRecoveryJournal | SqliteRecoveryJournal | None = None,
+        recovery_checkpoints: RecoveryCheckpointCoordinator | None = None,
     ) -> None:
         self.runtime = runtime
         self.model_swarm_id = model_swarm_id
@@ -214,6 +221,8 @@ class RequestAgentOpenAIManager:
         self._tokenizer = tokenizer
         self._model_context_limit = model_context_limit
         self._completion_service_type = completion_service_type
+        self._endpoint_by_worker: dict[str, str] = {}
+        self._stub_by_endpoint: dict[str, object] = {}
         self._owns_recovery_journal = recovery_journal is None
         if recovery_journal is None:
             state_dir = getattr(runtime, "state_dir", None)
@@ -225,8 +234,20 @@ class RequestAgentOpenAIManager:
                     "local Request Agent restarted before the client stream completed"
                 )
         self.recovery_journal = recovery_journal
-        self._endpoint_by_worker: dict[str, str] = {}
-        self._stub_by_endpoint: dict[str, object] = {}
+        if recovery_checkpoints is None and getattr(runtime, "state_dir", None) is not None:
+            try:
+                recovery_checkpoints = RecoveryCheckpointCoordinator(
+                    store=EncryptedRecoveryCheckpointStore(
+                        Path(runtime.state_dir) / "recovery-checkpoints"
+                    ),
+                    get_stub=self.get_completion_stub,
+                )
+            except (OSError, RuntimeError, ValueError):
+                logger.warning(
+                    "Warm checkpoint storage is unavailable; exact cold replay remains active",
+                    exc_info=True,
+                )
+        self.recovery_checkpoints = recovery_checkpoints
         self._readiness_cached_at_ms = 0
         self._readiness_cached_context = 0
         self._closed = False
@@ -506,17 +527,30 @@ class RequestAgentOpenAIManager:
                 position=committed_position,
                 token_ids=token_ids,
             )
-            return
-        for token_id in token_ids:
-            current = self.recovery_journal.get(str(request_id))
-            if current is None:
-                raise RecoveryConflict("request is not present in the recovery journal")
-            self.recovery_journal.commit_token(
-                str(request_id),
-                epoch=epoch,
-                position=current.committed_position,
-                token_id=token_id,
-            )
+        else:
+            for token_id in token_ids:
+                current = self.recovery_journal.get(str(request_id))
+                if current is None:
+                    raise RecoveryConflict("request is not present in the recovery journal")
+                self.recovery_journal.commit_token(
+                    str(request_id),
+                    epoch=epoch,
+                    position=current.committed_position,
+                    token_id=token_id,
+                )
+        checkpoints = self.recovery_checkpoints
+        if checkpoints is not None:
+            snapshot = self.recovery_journal.get(str(request_id))
+            reservation = self._active_reservation(str(request_id))
+            if snapshot is not None and reservation is not None:
+                try:
+                    checkpoints.observe_committed(snapshot, reservation.committed.plan)
+                except BaseException:
+                    logger.warning(
+                        "Unable to schedule warm checkpoint for %s; cold replay remains active",
+                        request_id,
+                        exc_info=True,
+                    )
 
     def finish_generation_journal(
         self,
@@ -535,6 +569,11 @@ class RequestAgentOpenAIManager:
             state=state,
             failure=failure,
         )
+        if self.recovery_checkpoints is not None:
+            try:
+                self.recovery_checkpoints.finish_request(str(request_id))
+            except BaseException:
+                logger.warning("Unable to clean recovery checkpoint", exc_info=True)
         self.request_phases.publish(
             str(request_id),
             state.value,
@@ -556,6 +595,20 @@ class RequestAgentOpenAIManager:
             raise RecoveryConflict("request is not present in the recovery journal")
         if snapshot.epoch != failed_epoch:
             raise RecoveryConflict("failed route epoch differs from the recovery journal")
+        warm_checkpoint = None
+        if self.recovery_checkpoints is not None:
+            try:
+                warm_checkpoint = self.recovery_checkpoints.checkpoint_for_recovery(
+                    request_id=str(request_id),
+                    failed_epoch=failed_epoch,
+                    replay_token_ids=snapshot.replay_token_ids,
+                )
+            except BaseException:
+                logger.warning(
+                    "Warm checkpoint lookup failed for %s; using cold replay",
+                    request_id,
+                    exc_info=True,
+                )
         if not self._runtime_emits_phases:
             self.request_phases.publish(
                 str(request_id),
@@ -592,15 +645,38 @@ class RequestAgentOpenAIManager:
         with self._lock:
             for stage in plan.stages:
                 self._endpoint_by_worker[stage.worker_id] = stage.endpoint_id
+        warm_checkpoint_token_count = 0
+        if warm_checkpoint is not None and self.recovery_checkpoints is not None:
+            try:
+                restored = self.recovery_checkpoints.restore(
+                    warm_checkpoint,
+                    snapshot=recovering,
+                    plan=plan,
+                )
+            except BaseException:
+                restored = False
+                logger.warning(
+                    "Warm checkpoint restore failed for %s; using cold replay",
+                    request_id,
+                    exc_info=True,
+                )
+            if restored:
+                warm_checkpoint_token_count = warm_checkpoint.token_count
         self.request_phases.publish(
             str(request_id),
             "replaying",
             epoch=plan.epoch,
             route_id=plan.route_id,
+            detail=(
+                f"warm checkpoint restored through token {warm_checkpoint_token_count}"
+                if warm_checkpoint_token_count
+                else "exact cold replay"
+            ),
         )
         return recovering, RequestAgentRouteContext(
             manifest=self._bundle.manifest,
             primary_plan=plan,
+            warm_checkpoint_token_count=warm_checkpoint_token_count,
         )
 
     def build_generation_replay_request(
@@ -689,6 +765,14 @@ class RequestAgentOpenAIManager:
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         return self._refresh_live_context() >= 2
 
+    def _recovery_checkpoint_status(self) -> dict[str, object]:
+        if self.recovery_checkpoints is None:
+            return {"enabled": False}
+        try:
+            return self.recovery_checkpoints.status()
+        except BaseException as error:
+            return {"enabled": False, "error": type(error).__name__}
+
     def status(self) -> dict[str, object]:
         return {
             **self.runtime.status(),
@@ -697,6 +781,7 @@ class RequestAgentOpenAIManager:
             "max_supported_context_tokens": self._refresh_live_context(),
             "frontend": "openai-local",
             "recovery_journal": self.recovery_journal.status(),
+            "recovery_checkpoints": self._recovery_checkpoint_status(),
             "request_phases": self.request_phases.snapshot(),
         }
 
@@ -709,10 +794,16 @@ class RequestAgentOpenAIManager:
         if callable(set_phase_observer):
             set_phase_observer(None)
         first_error: BaseException | None = None
+        if self.recovery_checkpoints is not None:
+            try:
+                self.recovery_checkpoints.close()
+            except BaseException as error:
+                first_error = error
         try:
             self.runtime.close()
         except BaseException as error:
-            first_error = error
+            if first_error is None:
+                first_error = error
         if self._owns_recovery_journal:
             close_journal = getattr(self.recovery_journal, "close", None)
             if callable(close_journal):

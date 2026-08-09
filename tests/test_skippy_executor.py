@@ -5,9 +5,10 @@ import pytest
 
 from parallax.p2p.message_util import NativeActivationFrame
 from parallax.server.executor.base_executor import ExecutorBatchCancelled
-from parallax.server.executor.skippy_executor import SkippyExecutor
+from parallax.server.executor.skippy_executor import SkippyExecutor, _SkippyResumeMarker
 from swarm_protocol.contracts import SkippyExactStateKind
 from swarm_protocol.kv_snapshot import KvSnapshotIncompatible
+from swarm_protocol.recovery import token_sequence_checksum
 
 
 def activation(layer_start: int = 0, layer_end: int = 4) -> NativeActivationFrame:
@@ -39,12 +40,19 @@ class FakeRunner:
         self.calls.append(("decode", args))
         return self.result
 
+    def release(self, request_id):
+        self.calls.append(("release", request_id))
+
 
 def executor(*, first: bool, last: bool, result):
     instance = SkippyExecutor.__new__(SkippyExecutor)
     instance.runner = FakeRunner(result)
     instance.is_first_peer = first
     instance.is_last_peer = last
+    instance._checkpoint_import_markers = {}
+    instance._checkpoint_import_handle_by_request = {}
+    instance._checkpoint_resume_markers = {}
+    instance._authority_by_engine_request = {}
     return instance
 
 
@@ -74,6 +82,11 @@ def checkpoint_executor():
         attention_kv_contract_hash=hashlib.sha256(b"attention").hexdigest(),
     )
     instance.checkpoint_exports = Registry()
+    instance.runner = FakeRunner(SimpleNamespace(activation=None, predicted_token=None))
+    instance._checkpoint_import_markers = {}
+    instance._checkpoint_import_handle_by_request = {}
+    instance._checkpoint_resume_markers = {}
+    instance._authority_by_engine_request = {}
     return instance
 
 
@@ -88,6 +101,10 @@ def checkpoint_descriptor(instance):
         "v_row_bytes": 128,
         "v_element_bytes": 2,
         "flags": 0,
+        "token_count": 2,
+        "resume_route_id": "route-8",
+        "resume_route_epoch": 8,
+        "token_prefix_checksum": token_sequence_checksum((10, 20)),
     }
     compatibility = instance._checkpoint_compatibility(descriptor)
     descriptor["compatibility"] = compatibility.to_wire_dict()
@@ -259,3 +276,89 @@ def test_checkpoint_import_rejects_a_forged_compatibility_identity():
         )
 
     assert instance.checkpoint_exports.begin_calls == []
+
+
+def test_warm_resume_verifies_the_full_prefix_and_prefills_only_the_suffix():
+    instance = executor(
+        first=True,
+        last=True,
+        result=SimpleNamespace(activation=None, predicted_token=42),
+    )
+    marker = _SkippyResumeMarker(
+        route_id="route-9",
+        epoch=9,
+        token_count=3,
+        token_prefix_checksum=token_sequence_checksum((10, 20, 30)),
+    )
+    instance._checkpoint_resume_markers["request-8"] = marker
+    request = SimpleNamespace(
+        request_id="request-8",
+        input_ids=[10, 20, 30, 40],
+        origin_input_ids=[10, 20, 30, 40],
+        hidden_states=None,
+        sampling_params=object(),
+        is_prefill=True,
+        route_id="route-9",
+        route_epoch=9,
+    )
+
+    output = instance.process_batch({"requests": [request]}, return_decoded_tokens=True)
+
+    assert output == {"hidden_states": [42], "probs": None}
+    assert instance.runner.calls == [
+        ("prefill", ("request-8", [40], None, request.sampling_params))
+    ]
+    assert instance._checkpoint_resume_markers == {}
+
+
+def test_warm_resume_rejects_a_divergent_token_prefix_before_native_execution():
+    instance = executor(
+        first=True,
+        last=True,
+        result=SimpleNamespace(activation=None, predicted_token=42),
+    )
+    instance._checkpoint_resume_markers["request-9"] = _SkippyResumeMarker(
+        route_id="route-9",
+        epoch=9,
+        token_count=3,
+        token_prefix_checksum=token_sequence_checksum((10, 20, 99)),
+    )
+    request = SimpleNamespace(
+        request_id="request-9",
+        input_ids=[10, 20, 30, 40],
+        origin_input_ids=[10, 20, 30, 40],
+        hidden_states=None,
+        sampling_params=object(),
+        is_prefill=True,
+        route_id="route-9",
+        route_epoch=9,
+    )
+
+    with pytest.raises(ValueError, match="prefix differs"):
+        instance.process_batch({"requests": [request]}, return_decoded_tokens=True)
+
+    assert instance.runner.calls == []
+
+
+def test_native_session_uses_the_stable_authority_id_across_engine_request_ids():
+    instance = executor(
+        first=True,
+        last=True,
+        result=SimpleNamespace(activation=None, predicted_token=42),
+    )
+    request = SimpleNamespace(
+        request_id="engine-internal-1",
+        authority_request_id="request-agent-1",
+        input_ids=[10, 20],
+        hidden_states=None,
+        sampling_params=object(),
+        is_prefill=True,
+    )
+
+    instance.process_batch({"requests": [request]}, return_decoded_tokens=True)
+    instance._release_request("engine-internal-1")
+
+    assert instance.runner.calls == [
+        ("prefill", ("request-agent-1", [10, 20], None, request.sampling_params)),
+        ("release", "request-agent-1"),
+    ]

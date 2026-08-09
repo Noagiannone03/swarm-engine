@@ -464,6 +464,12 @@ class TransformerConnectionHandler(ConnectionHandler):
         descriptor = request.get("descriptor")
         if not isinstance(descriptor, dict):
             raise ValueError("checkpoint import descriptor is missing")
+        authority = request.get("route_authority")
+        if not isinstance(authority, dict):
+            raise PermissionError("checkpoint import is missing route authority")
+        descriptor = dict(descriptor)
+        descriptor["resume_route_id"] = str(authority.get("fabi_route_id", ""))
+        descriptor["resume_route_epoch"] = int(authority.get("fabi_route_epoch", 0))
         result, binary = self._executor_control(
             {
                 "command": "checkpoint_import_begin",
@@ -510,6 +516,39 @@ class TransformerConnectionHandler(ConnectionHandler):
     @rpc_method
     def abort_recovery_checkpoint_import(self, request):
         return self._finish_recovery_checkpoint_import(request, abort=True)
+
+    @rpc_method
+    def discard_recovery_checkpoint_import(self, request):
+        request_id = self._authorize_coordinator_control_request(
+            request,
+            purpose="checkpoint import discard",
+        )
+        authority = request.get("route_authority")
+        if not isinstance(authority, dict):
+            raise PermissionError("checkpoint discard is missing route authority")
+        token_count = request.get("token_count")
+        token_prefix_checksum = request.get("token_prefix_checksum")
+        if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count <= 0:
+            raise ValueError("checkpoint discard token count is invalid")
+        if not isinstance(token_prefix_checksum, str) or len(token_prefix_checksum) != 64:
+            raise ValueError("checkpoint discard token checksum is invalid")
+        try:
+            bytes.fromhex(token_prefix_checksum)
+        except ValueError as error:
+            raise ValueError("checkpoint discard token checksum is invalid") from error
+        result, binary = self._executor_control(
+            {
+                "command": "checkpoint_import_discard",
+                "request_id": request_id,
+                "resume_route_id": str(authority.get("fabi_route_id", "")),
+                "resume_route_epoch": int(authority.get("fabi_route_epoch", 0)),
+                "token_count": token_count,
+                "token_prefix_checksum": token_prefix_checksum,
+            }
+        )
+        if binary is not None:
+            raise RuntimeError("checkpoint import discard returned an unexpected binary frame")
+        return result
 
     def _finish_recovery_checkpoint_import(self, request: object, *, abort: bool):
         request_id = self._authorize_coordinator_control_request(
