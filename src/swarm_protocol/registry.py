@@ -8,10 +8,10 @@ stored by the runtime.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
-import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -179,7 +179,10 @@ class ModelRegistryBundle(ContractModel):
         for role, digest in expected.items():
             if artifact_collection_hash(self.artifact_index, role) != digest:
                 raise ValueError(f"manifest {role.value} collection hash does not match its index")
-        from swarm_protocol.model_manifest import execution_plan_hash
+        from swarm_protocol.model_manifest import (
+            execution_plan_hash,
+            skippy_exact_state_certification_hash,
+        )
 
         if self.artifact_index.execution_plans:
             if self.manifest.execution_plan_hash is None:
@@ -188,6 +191,15 @@ class ModelRegistryBundle(ContractModel):
                 raise ValueError("manifest execution plan hash does not match its index")
             for plan in self.artifact_index.execution_plans:
                 self._validate_execution_plan_layers(plan)
+                from swarm_protocol.contracts import SkippyExactStateKind, SkippyExecutionPlan
+
+                if (
+                    isinstance(plan, SkippyExecutionPlan)
+                    and plan.exact_state_kind is not SkippyExactStateKind.DISABLED
+                    and plan.exact_state_certification_hash
+                    != skippy_exact_state_certification_hash(self.manifest, plan)
+                ):
+                    raise ValueError("Skippy exact-state certification does not match its plan")
         elif self.manifest.execution_plan_hash is not None:
             raise ValueError("manifest binds an execution plan missing from its artifact index")
         return self

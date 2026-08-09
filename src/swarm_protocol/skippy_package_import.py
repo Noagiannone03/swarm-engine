@@ -16,10 +16,14 @@ from swarm_protocol.contracts import (
     ExecutionProviderKind,
     ModelArtifactIndex,
     ModelManifest,
+    SkippyExactStateKind,
     SkippyExecutionPlan,
     SkippyRuntimeFeature,
 )
-from swarm_protocol.model_manifest import execution_plan_hash
+from swarm_protocol.model_manifest import (
+    execution_plan_hash,
+    skippy_exact_state_certification_hash,
+)
 from swarm_protocol.registry import ModelRegistryBundle
 
 _MAX_PACKAGE_MANIFEST_BYTES = 16 * 1024 * 1024
@@ -45,6 +49,38 @@ _DIRECT_REQUIRED_FEATURES = (
     SkippyRuntimeFeature.RUNTIME_SLICE,
     SkippyRuntimeFeature.SESSION_RESET,
 )
+
+
+def _certify_exact_state(
+    manifest: ModelManifest,
+    plan: SkippyExecutionPlan,
+    state_kind: SkippyExactStateKind,
+) -> SkippyExecutionPlan:
+    """Create the final immutable plan from one explicit operator assertion."""
+
+    state_kind = SkippyExactStateKind(state_kind)
+    if state_kind is SkippyExactStateKind.DISABLED:
+        return plan
+    features = tuple(
+        sorted(
+            {*plan.required_runtime_features, SkippyRuntimeFeature.EXACT_KV_PAGE},
+            key=lambda feature: feature.value,
+        )
+    )
+    candidate = plan.model_copy(
+        update={
+            "required_runtime_features": features,
+            "exact_state_kind": state_kind,
+        }
+    )
+    return SkippyExecutionPlan.model_validate(
+        {
+            **candidate.model_dump(mode="json"),
+            "exact_state_certification_hash": skippy_exact_state_certification_hash(
+                manifest, candidate
+            ),
+        }
+    )
 
 
 class _Geometry(Protocol):
@@ -131,9 +167,7 @@ def _read_package_manifest(
     return payload, _mapping(parsed, "manifest")
 
 
-def _inspect_direct_geometry(
-    paths: list[Path], cache_type_k: str, cache_type_v: str
-) -> _Geometry:
+def _inspect_direct_geometry(paths: list[Path], cache_type_k: str, cache_type_v: str) -> _Geometry:
     try:
         import fabi_network_native
     except (ImportError, OSError) as exc:  # pragma: no cover - product wheel integration
@@ -168,6 +202,7 @@ def attach_skippy_direct_gguf(
     runtime_release: str,
     runtime_abi_version: str,
     providers: tuple[ExecutionProviderKind, ...] = _DEFAULT_PROVIDERS,
+    exact_state_kind: SkippyExactStateKind = SkippyExactStateKind.DISABLED,
     token: bool | str | None = None,
     api: HfApi | None = None,
     downloader: Callable[..., str] = hf_hub_download,
@@ -279,6 +314,7 @@ def attach_skippy_direct_gguf(
         providers=providers,
         direct_static_bytes_by_layer=static_bytes,
     )
+    plan = _certify_exact_state(manifest, plan, exact_state_kind)
     existing_paths = {artifact.path for artifact in base_bundle.artifact_index.artifacts}
     collisions = sorted(existing_paths & {artifact.path for artifact in descriptors})
     if collisions:
@@ -322,6 +358,7 @@ def attach_skippy_package(
     runtime_release: str,
     runtime_abi_version: str,
     providers: tuple[ExecutionProviderKind, ...] = _DEFAULT_PROVIDERS,
+    exact_state_kind: SkippyExactStateKind = SkippyExactStateKind.DISABLED,
     token: bool | str | None = None,
     api: HfApi | None = None,
     downloader: Callable[..., str] = hf_hub_download,
@@ -443,6 +480,7 @@ def attach_skippy_package(
         output_path=shared_entries["output"][0],
         layer_paths=tuple(entry[0] for entry in layer_entries),
     )
+    plan = _certify_exact_state(base_bundle.manifest, plan, exact_state_kind)
     existing_paths = {artifact.path for artifact in base_bundle.artifact_index.artifacts}
     collisions = sorted(existing_paths & {artifact.path for artifact in execution_artifacts})
     if collisions:

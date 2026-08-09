@@ -164,6 +164,41 @@ def execution_plan_hash(index: ModelArtifactIndex) -> str:
     return _canonical_hash("fabi/model-execution-plans/v1", payload)
 
 
+def skippy_exact_state_certification_hash(manifest: ModelManifest, plan: object) -> str:
+    """Bind an operator-certified Skippy continuation-state contract.
+
+    Native KV pages are portable only between executions that agree on the
+    complete model continuation contract. The enclosing signed TUF target
+    makes this digest the registry operator's explicit qualification claim.
+    """
+
+    from swarm_protocol.contracts import SkippyExactStateKind, SkippyExecutionPlan
+
+    if not isinstance(plan, SkippyExecutionPlan):
+        raise TypeError("exact-state certification requires a Skippy execution plan")
+    if plan.exact_state_kind is SkippyExactStateKind.DISABLED:
+        raise ValueError("disabled Skippy exact state cannot be certified")
+    payload = {
+        "state_kind": plan.exact_state_kind.value,
+        "model": {
+            "model_id": manifest.model_id,
+            "immutable_revision": manifest.immutable_revision,
+            "architecture_graph_hash": manifest.architecture_graph_hash,
+            "tokenizer_hash": manifest.tokenizer_hash,
+            "weight_collection_hash": manifest.weight_collection_hash,
+            "rope_context_contract_hash": manifest.rope_context_contract_hash,
+            "attention_kv_contract_hash": manifest.attention_kv_contract_hash,
+            "prefill_contract_hash": manifest.prefill_contract_hash,
+            "wire_protocol_version": manifest.wire_protocol_version,
+        },
+        # Exclude only the digest being computed. This deliberately binds all
+        # current and future plan fields, including artifacts, geometry,
+        # providers, quantization and runtime feature probes.
+        "execution": plan.model_dump(mode="json", exclude={"exact_state_certification_hash"}),
+    }
+    return _canonical_hash("fabi/skippy-exact-state-certification/v1", payload)
+
+
 def execution_plan_identity_hash(index: ModelArtifactIndex, plan) -> str:
     """Hash one executable plan and every byte descriptor it can load.
 

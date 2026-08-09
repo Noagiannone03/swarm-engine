@@ -19,6 +19,7 @@ from swarm_protocol.model_manifest import (
     artifact_collection_hash,
     execution_plan_hash,
     execution_plan_identity_hash,
+    skippy_exact_state_certification_hash,
 )
 from swarm_protocol.registry import ModelRegistryBundle
 from swarm_protocol.skippy_execution import (
@@ -342,6 +343,7 @@ def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
         plan_id="skippy-q4-k-m-v1",
         runtime_release="mesh-llm/v0.74.0",
         runtime_abi_version="0.1.32",
+        exact_state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
         api=api,
         downloader=lambda **kwargs: str(package_path),
     )
@@ -404,6 +406,7 @@ def test_direct_gguf_needs_no_layer_package_and_loads_as_runtime_slice(tmp_path)
         quantization="Q4_K_M",
         runtime_release="mesh-llm/v0.74.0",
         runtime_abi_version="0.1.32",
+        exact_state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
         api=api,
         downloader=lambda **kwargs: str(source),
         geometry_inspector=lambda paths, cache_k, cache_v: geometry,
@@ -415,6 +418,11 @@ def test_direct_gguf_needs_no_layer_package_and_loads_as_runtime_slice(tmp_path)
     assert plan.source_model_paths == ("model-q4.gguf",)
     assert SkippyRuntimeFeature.RUNTIME_SLICE in plan.required_runtime_features
     assert SkippyRuntimeFeature.LAYER_PACKAGE not in plan.required_runtime_features
+    assert SkippyRuntimeFeature.EXACT_KV_PAGE in plan.required_runtime_features
+    assert plan.exact_state_kind is SkippyExactStateKind.DENSE_ATTENTION_KV
+    assert plan.exact_state_certification_hash == skippy_exact_state_certification_hash(
+        attached.manifest, plan
+    )
     assert (
         skippy_span_static_bytes(
             attached.artifact_index,
@@ -438,3 +446,13 @@ def test_direct_gguf_needs_no_layer_package_and_loads_as_runtime_slice(tmp_path)
     assert verified.part_paths == (root / "model-q4.gguf",)
     assert verified.geometry_path == root / "model-q4.gguf"
     assert verified.artifact_bytes == len(payload)
+
+    tampered_plan = plan.model_copy(update={"exact_state_certification_hash": "f" * 64})
+    tampered_index = attached.artifact_index.model_copy(
+        update={"execution_plans": (tampered_plan,)}
+    )
+    tampered_manifest = attached.manifest.model_copy(
+        update={"execution_plan_hash": execution_plan_hash(tampered_index)}
+    )
+    with pytest.raises(ValueError, match="exact-state certification"):
+        ModelRegistryBundle(manifest=tampered_manifest, artifact_index=tampered_index)

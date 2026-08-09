@@ -43,6 +43,7 @@ from swarm_protocol.contracts import (
     ModelExecutionPlan,
     ModelManifest,
     OnnxExportTarget,
+    SkippyExactStateKind,
 )
 from swarm_protocol.model_manifest import (
     build_hub_model_bundle,
@@ -51,8 +52,8 @@ from swarm_protocol.model_manifest import (
 from swarm_protocol.onnx_stage_builder import portable_build_inventory_hash
 from swarm_protocol.registry import (
     ModelRegistryBundle,
-    RouteAuthorityKey,
     RegistryRoleSigners,
+    RouteAuthorityKey,
     RouteAuthorityKeyset,
     TrustedModelRegistry,
     TufRegistryPublisher,
@@ -746,6 +747,7 @@ def attach_skippy_package_file(
     runtime_release: str,
     runtime_abi_version: str,
     providers: tuple[ExecutionProviderKind, ...],
+    exact_state_kind: SkippyExactStateKind = SkippyExactStateKind.DISABLED,
     token: bool | str | None = None,
 ) -> ModelRegistryBundle:
     """Resolve a public layer package and atomically emit its Fabi bundle."""
@@ -762,6 +764,7 @@ def attach_skippy_package_file(
         runtime_release=runtime_release,
         runtime_abi_version=runtime_abi_version,
         providers=providers,
+        exact_state_kind=exact_state_kind,
         token=token,
     )
     _atomic_create_public(output, bundle.canonical_bytes() + b"\n")
@@ -781,6 +784,7 @@ def attach_skippy_direct_file(
     runtime_abi_version: str,
     runtime_root: Path,
     providers: tuple[ExecutionProviderKind, ...],
+    exact_state_kind: SkippyExactStateKind = SkippyExactStateKind.DISABLED,
     token: bool | str | None = None,
 ) -> ModelRegistryBundle:
     """Inspect an ordinary GGUF with the qualified runtime and bind it atomically."""
@@ -815,6 +819,7 @@ def attach_skippy_direct_file(
         runtime_release=runtime_release,
         runtime_abi_version=runtime_abi_version,
         providers=providers,
+        exact_state_kind=exact_state_kind,
         token=token,
     )
     _atomic_create_public(output, bundle.canonical_bytes() + b"\n")
@@ -969,6 +974,15 @@ def _parser() -> argparse.ArgumentParser:
     attach_skippy.add_argument("--runtime-release", default="mesh-llm/v0.74.0")
     attach_skippy.add_argument("--runtime-abi-version", default="0.1.32")
     attach_skippy.add_argument(
+        "--exact-state-kind",
+        choices=[
+            SkippyExactStateKind.DISABLED.value,
+            SkippyExactStateKind.DENSE_ATTENTION_KV.value,
+        ],
+        default=SkippyExactStateKind.DISABLED.value,
+        help="operator-qualified continuation state; dense KV requires live qualification",
+    )
+    attach_skippy.add_argument(
         "--provider",
         action="append",
         choices=[
@@ -997,6 +1011,15 @@ def _parser() -> argparse.ArgumentParser:
     attach_skippy_direct.add_argument("--quantization", required=True)
     attach_skippy_direct.add_argument("--runtime-release", default="mesh-llm/v0.74.0")
     attach_skippy_direct.add_argument("--runtime-abi-version", default="0.1.32")
+    attach_skippy_direct.add_argument(
+        "--exact-state-kind",
+        choices=[
+            SkippyExactStateKind.DISABLED.value,
+            SkippyExactStateKind.DENSE_ATTENTION_KV.value,
+        ],
+        default=SkippyExactStateKind.DISABLED.value,
+        help="operator-qualified continuation state; dense KV requires live qualification",
+    )
     attach_skippy_direct.add_argument("--runtime-root", type=Path, required=True)
     attach_skippy_direct.add_argument(
         "--provider",
@@ -1127,6 +1150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     key=lambda provider: provider.value,
                 )
             ),
+            exact_state_kind=SkippyExactStateKind(args.exact_state_kind),
             token=True if args.use_hf_token else None,
         )
         result = {
@@ -1159,6 +1183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     key=lambda provider: provider.value,
                 )
             ),
+            exact_state_kind=SkippyExactStateKind(args.exact_state_kind),
             token=True if args.use_hf_token else None,
         )
         result = {
