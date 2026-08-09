@@ -57,10 +57,10 @@ class _FakeStage:
         return SimpleNamespace(
             predicted_token=42 if sample else None,
             activation=_FakeActivation(
-                b"native-output",
+                b"" if sample else b"native-output",
                 version=1,
-                dtype="f32",
-                layout="token_major",
+                dtype="unknown" if sample else "f32",
+                layout="opaque" if sample else "token_major",
                 producer_stage_index=0,
                 layer_start=0,
                 layer_end=2,
@@ -194,9 +194,40 @@ def test_runner_reuses_native_stage_and_typed_activations(tmp_path):
     assert prefill.predicted_token is None
     assert prefill.activation.payload == b"native-output"
     assert decode.predicted_token == 42
+    assert decode.activation is None
     assert isinstance(native.stage.calls[-1][1], _FakeActivation)
     runner.release("request-1")
     assert native.stage.dropped == ["request-1"]
+
+
+def test_runner_rejects_empty_activation_from_non_terminal_stage(tmp_path):
+    native = _FakeNative()
+    runner = SkippyRuntimeStageRunner(
+        _verified(tmp_path),
+        device="vulkan:0",
+        model_layer_count=2,
+        max_context_tokens=32768,
+        max_sessions=1,
+        native_module=native,
+        runtime_root=tmp_path,
+    )
+    native.stage._output = lambda token_ids, input_frame, sample: SimpleNamespace(
+        predicted_token=None,
+        activation=_FakeActivation(
+            b"",
+            version=1,
+            dtype="unknown",
+            layout="opaque",
+            producer_stage_index=0,
+            layer_start=0,
+            layer_end=2,
+            token_count=len(token_ids),
+            sequence_count=1,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="non-terminal"):
+        runner.prefill("request-empty", [1], None, None)
 
 
 def test_direct_gguf_runner_uses_runtime_slice_without_a_package(tmp_path):

@@ -28,7 +28,11 @@ SKIPPY_RUNTIME_ABI = "0.1.32"
 
 @dataclass(frozen=True)
 class SkippyForwardResult:
-    activation: NativeActivationFrame
+    # A terminal Skippy stage returns the sampled token with the ABI's
+    # canonical empty activation descriptor (dtype=unknown, payload_bytes=0).
+    # There is no downstream peer in that case, so model the absence instead
+    # of fabricating an activation dtype for a payload that does not exist.
+    activation: NativeActivationFrame | None
     predicted_token: int | None
 
 
@@ -168,18 +172,35 @@ def _to_native_frame(native: Any, frame: NativeActivationFrame | None) -> Any | 
     )
 
 
-def _from_native_frame(frame: Any) -> NativeActivationFrame:
+def _from_native_frame(
+    frame: Any,
+    *,
+    terminal_sample: bool,
+) -> NativeActivationFrame | None:
+    dtype = str(frame.dtype)
+    layout = str(frame.layout)
+    payload = bytes(frame.payload())
+    if dtype == "unknown":
+        if not terminal_sample:
+            raise ValueError("non-terminal Skippy stage returned an empty activation")
+        if layout != "opaque" or payload:
+            raise ValueError("terminal Skippy activation sentinel is malformed")
+        if int(frame.version) <= 0:
+            raise ValueError("terminal Skippy activation sentinel has no ABI version")
+        if int(frame.token_count) <= 0 or int(frame.sequence_count) <= 0:
+            raise ValueError("terminal Skippy activation sentinel has invalid dimensions")
+        return None
     return NativeActivationFrame(
         version=int(frame.version),
-        dtype=str(frame.dtype),
-        layout=str(frame.layout),
+        dtype=dtype,
+        layout=layout,
         producer_stage_index=int(frame.producer_stage_index),
         layer_start=int(frame.layer_start),
         layer_end=int(frame.layer_end),
         token_count=int(frame.token_count),
         sequence_count=int(frame.sequence_count),
         flags=int(frame.flags),
-        payload=bytes(frame.payload()),
+        payload=payload,
     )
 
 
@@ -294,9 +315,13 @@ class SkippyRuntimeStageRunner:
         native_input = _to_native_frame(self.native, activation)
         kwargs = {} if sampling_params is None else _sampling_kwargs(sampling_params)
         output = self.stage.prefill(request_id, token_ids, native_input, **kwargs)
+        predicted_token = output.predicted_token
         return SkippyForwardResult(
-            activation=_from_native_frame(output.activation),
-            predicted_token=output.predicted_token,
+            activation=_from_native_frame(
+                output.activation,
+                terminal_sample=predicted_token is not None,
+            ),
+            predicted_token=predicted_token,
         )
 
     def decode(
@@ -309,9 +334,13 @@ class SkippyRuntimeStageRunner:
         native_input = _to_native_frame(self.native, activation)
         kwargs = {} if sampling_params is None else _sampling_kwargs(sampling_params)
         output = self.stage.decode(request_id, token_id, native_input, **kwargs)
+        predicted_token = output.predicted_token
         return SkippyForwardResult(
-            activation=_from_native_frame(output.activation),
-            predicted_token=output.predicted_token,
+            activation=_from_native_frame(
+                output.activation,
+                terminal_sample=predicted_token is not None,
+            ),
+            predicted_token=predicted_token,
         )
 
     def release(self, request_id: str) -> None:

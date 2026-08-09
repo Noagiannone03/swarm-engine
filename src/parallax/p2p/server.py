@@ -2554,9 +2554,16 @@ class GradientServer:
                                         f"end_layer={end_layer}, response={response}"
                                     )
                             else:
-                                logger.warning(
-                                    f"Heartbeat: No layer allocation received yet, response: {response}"
-                                )
+                                if self.swarm_v3_placement_mode == "autonomous":
+                                    logger.debug(
+                                        "Heartbeat: legacy allocator returned no span; "
+                                        "worker-local v3 placement remains authoritative"
+                                    )
+                                else:
+                                    logger.warning(
+                                        "Heartbeat: No layer allocation received yet, "
+                                        f"response: {response}"
+                                    )
                                 self._handle_empty_scheduler_allocation()
                             if refit_message and isinstance(refit_message, dict):
                                 if self.enable_weight_refit:

@@ -72,7 +72,7 @@ def test_final_stage_decode_returns_native_sampled_token():
     instance = executor(
         first=False,
         last=True,
-        result=SimpleNamespace(activation=activation(8, 12), predicted_token=42),
+        result=SimpleNamespace(activation=None, predicted_token=42),
     )
     sampling = object()
     request = SimpleNamespace(
@@ -108,6 +108,24 @@ def test_final_stage_rejects_missing_native_sample():
 
     with pytest.raises(RuntimeError, match="did not sample"):
         instance.process_batch({"requests": [request]}, return_decoded_tokens=True)
+
+
+def test_intermediate_stage_rejects_missing_native_activation():
+    instance = executor(
+        first=True,
+        last=False,
+        result=SimpleNamespace(activation=None, predicted_token=None),
+    )
+    request = SimpleNamespace(
+        request_id="request-4",
+        input_ids=[10],
+        hidden_states=None,
+        sampling_params=object(),
+        is_prefill=True,
+    )
+
+    with pytest.raises(RuntimeError, match="non-final"):
+        instance.process_batch({"requests": [request]}, return_decoded_tokens=False)
 
 
 def test_final_token_contract_rejects_non_integer_values():

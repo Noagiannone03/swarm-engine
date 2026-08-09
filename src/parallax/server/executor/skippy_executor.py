@@ -276,6 +276,10 @@ class SkippyExecutor(BaseExecutor):
                     raise RuntimeError("final Skippy stage did not sample a token")
                 values.append(result.predicted_token)
             else:
+                if result.activation is None:
+                    raise RuntimeError(
+                        "non-final Skippy stage did not return an activation"
+                    )
                 values.append(result.activation)
         return {"hidden_states": values, "probs": None}
 
