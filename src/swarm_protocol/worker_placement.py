@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from swarm_protocol.context_placement import ContextCapacityDemandMap
 from swarm_protocol.contracts import (
     EffectiveSpanMode,
     KvGeometry,
@@ -24,8 +25,8 @@ from swarm_protocol.contracts import (
     WorkerOffer,
     WorkerRole,
 )
+from swarm_protocol.dht_discovery import CATALOG_SOFT_STATE_TTL_MS
 from swarm_protocol.discovery import DiscoverySnapshot
-from swarm_protocol.context_placement import ContextCapacityDemandMap
 from swarm_protocol.execution import WorkerExecutionAdmission
 from swarm_protocol.placement import (
     AutonomousPlacementPolicy,
@@ -452,7 +453,7 @@ class AutonomousWorkerPlacement:
                 max_sessions=max_sessions,
                 lease_seq=0,
                 issued_at_ms=now_ms,
-                expires_at_ms=now_ms + 45_000,
+                expires_at_ms=now_ms + CATALOG_SOFT_STATE_TTL_MS,
             ),
             outgoing_links=outgoing_links,
         )

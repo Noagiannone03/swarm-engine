@@ -301,7 +301,13 @@ class RequestAgentOpenAIManager:
                     self.model_swarm_id,
                     self._model_context_limit,
                 )
-            except (PermissionError, RoutePlanningError, RuntimeError, ValueError):
+            except (PermissionError, RoutePlanningError, RuntimeError, ValueError) as error:
+                logger.warning(
+                    "Request Agent DHT readiness refresh failed for model %s: %s: %s",
+                    self.model_swarm_id,
+                    type(error).__name__,
+                    str(error)[:256],
+                )
                 supported = 0
             # A DHT lookup can legitimately consume most of its protocol query
             # window. Timestamp the completed observation, not the start of the

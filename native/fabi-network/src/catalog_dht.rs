@@ -44,6 +44,11 @@ const DEFAULT_RECORD_TTL: Duration = Duration::from_mins(5);
 const DEFAULT_REPLICATION_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RECORDS: usize = 25_000;
 const DEFAULT_MAX_CLOCK_SKEW: Duration = Duration::from_secs(30);
+// A model snapshot currently spans 256 deterministic membership shards. Keep
+// enough lookups in flight that one WAN query timeout cannot be multiplied by
+// sixteen sequential batches; this also stays close to Petals' per-layer DHT
+// fan-out for today's 32-80 layer models.
+const MODEL_MEMBERSHIP_QUERY_CONCURRENCY: usize = 64;
 
 #[derive(NetworkBehaviour)]
 struct CatalogueBehaviour {
@@ -324,7 +329,7 @@ impl CatalogDhtHandle {
                 let handle = self.clone();
                 async move { handle.get_members(logical_key).await }
             })
-            .buffer_unordered(16)
+            .buffer_unordered(MODEL_MEMBERSHIP_QUERY_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
         let mut members = Vec::new();

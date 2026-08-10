@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable
 from typing import Protocol
 
+from swarm_protocol.context_placement import ContextCapacityDemandMap
 from swarm_protocol.contracts import (
     LinkMetric,
     ModelManifest,
@@ -20,10 +21,14 @@ from swarm_protocol.contracts import (
     SpanLease,
     WorkerOffer,
 )
-from swarm_protocol.context_placement import ContextCapacityDemandMap
 from swarm_protocol.discovery import DiscoveryError, DiscoverySnapshot, InMemoryDiscoveryStore
 
-_CATALOG_TTL_MS = 4 * 60 * 1000
+# Distributed catalogue records deliberately outlive both one heartbeat and one
+# complete WAN shard scan.  This is discovery soft state, not failure
+# detection: an unreachable worker still has to pass PREPARE/COMMIT before it
+# can serve a request.  Four minutes mirrors Petals' default server lease and
+# remains below the native signed-record ceiling of five minutes.
+CATALOG_SOFT_STATE_TTL_MS = 4 * 60 * 1000
 MAX_ADVERTISED_LINKS = 8
 
 
@@ -159,7 +164,7 @@ class DhtDiscoveryStore:
                 logical_key=logical_key,
                 sequence=now,
                 issued_at_ms=now,
-                expires_at_ms=now + _CATALOG_TTL_MS,
+                expires_at_ms=now + CATALOG_SOFT_STATE_TTL_MS,
                 payload=_json_payload(manifest),
             )
             changed = self._shadow.publish_manifest(manifest)
@@ -179,7 +184,7 @@ class DhtDiscoveryStore:
             raise DiscoveryError("context demand issue time is in the future")
         if demand.expires_at_ms <= now:
             raise DiscoveryError("cannot publish expired context demand")
-        if demand.expires_at_ms - demand.issued_at_ms > _CATALOG_TTL_MS:
+        if demand.expires_at_ms - demand.issued_at_ms > CATALOG_SOFT_STATE_TTL_MS:
             raise DiscoveryError("context demand TTL exceeds the catalogue maximum")
         with self._lock:
             manifest = self._known_manifests.get(demand.model_swarm_id)

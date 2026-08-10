@@ -23,6 +23,7 @@ from swarm_protocol import (
     reconciled_autonomous_context_limit,
 )
 from swarm_protocol.context_demand import build_context_histogram
+from swarm_protocol.dht_discovery import CATALOG_SOFT_STATE_TTL_MS
 
 HASHES = tuple(character * 64 for character in "abcdef")
 NOW = 1_000
@@ -621,6 +622,7 @@ def test_cold_worker_announces_building_before_executor_reload():
     assert intent.lease.state is SpanState.BUILDING
     assert intent.lease.weight_hashes == (HASHES[4],)
     assert intent.lease.available_kv_bytes_snapshot == 0
+    assert intent.lease.expires_at_ms - intent.lease.issued_at_ms == CATALOG_SOFT_STATE_TTL_MS
     assert events == [("reload", intent.lease.hosted_span, 10, 1)]
 
 

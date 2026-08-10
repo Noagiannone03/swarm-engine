@@ -12,9 +12,10 @@ from swarm_protocol import (
     ModelManifest,
     ModelMemberAdvertisement,
     ModelRegistryBundle,
-    artifact_collection_hash,
     SpanState,
+    artifact_collection_hash,
 )
+from swarm_protocol.dht_discovery import CATALOG_SOFT_STATE_TTL_MS
 from swarm_protocol.worker_integration import (
     WorkerProtocolV3Reporter,
     WorkerServingSnapshot,
@@ -123,6 +124,7 @@ def test_cold_offer_carries_the_signed_executor_granularity(tmp_path):
     )
 
     assert offer.execution_granularity_layers == 4
+    assert offer.expires_at_ms - offer.issued_at_ms == CATALOG_SOFT_STATE_TTL_MS
 
 
 def test_large_artifact_verification_never_blocks_heartbeat(monkeypatch, tmp_path):
@@ -146,6 +148,14 @@ def test_large_artifact_verification_never_blocks_heartbeat(monkeypatch, tmp_pat
     assert advertisement["lease"]["weight_hashes"]
     assert advertisement["lease"]["max_context_tokens"] == 32_768
     assert advertisement["lease"]["available_kv_bytes_snapshot"] == 1024 * 64 * 4
+    assert (
+        advertisement["offer"]["expires_at_ms"] - advertisement["offer"]["issued_at_ms"]
+        == CATALOG_SOFT_STATE_TTL_MS
+    )
+    assert (
+        advertisement["lease"]["expires_at_ms"] - advertisement["lease"]["issued_at_ms"]
+        == CATALOG_SOFT_STATE_TTL_MS
+    )
 
 
 def test_active_legacy_request_makes_shadow_kv_advertisement_fail_closed(monkeypatch, tmp_path):

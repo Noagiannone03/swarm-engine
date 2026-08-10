@@ -29,6 +29,7 @@ from swarm_protocol.contracts import (
     WorkerOffer,
     WorkerRole,
 )
+from swarm_protocol.dht_discovery import CATALOG_SOFT_STATE_TTL_MS
 from swarm_protocol.model_manifest import execution_plan_identity_hash
 from swarm_protocol.portable_execution import (
     VerifiedExecutionSpan,
@@ -40,7 +41,6 @@ from swarm_protocol.skippy_execution import (
     materialize_skippy_execution_span,
 )
 
-_REPORT_TTL_MS = 45_000
 _VERIFICATION_RETRY_SECONDS = 30.0
 logger = logging.getLogger(__name__)
 
@@ -208,7 +208,7 @@ class WorkerProtocolV3Reporter:
             supported_roles=frozenset(roles),
             offer_seq=offer_seq,
             issued_at_ms=now_ms,
-            expires_at_ms=now_ms + _REPORT_TTL_MS,
+            expires_at_ms=now_ms + CATALOG_SOFT_STATE_TTL_MS,
         )
 
     def publish_span_state(
@@ -230,7 +230,7 @@ class WorkerProtocolV3Reporter:
                         update={
                             "offer_seq": self._offer_seq,
                             "issued_at_ms": now_ms,
-                            "expires_at_ms": now_ms + _REPORT_TTL_MS,
+                            "expires_at_ms": now_ms + CATALOG_SOFT_STATE_TTL_MS,
                         }
                     ),
                     "lease": advertisement.lease.model_copy(
@@ -239,7 +239,7 @@ class WorkerProtocolV3Reporter:
                             "available_kv_bytes_snapshot": 0,
                             "lease_seq": self._lease_seq,
                             "issued_at_ms": now_ms,
-                            "expires_at_ms": now_ms + _REPORT_TTL_MS,
+                            "expires_at_ms": now_ms + CATALOG_SOFT_STATE_TTL_MS,
                         }
                     ),
                 }
@@ -369,21 +369,41 @@ class WorkerProtocolV3Reporter:
                     self._catalog_active = False
                     return
             try:
+                publish_started = time.monotonic()
                 catalog.publish_advertisement(advertisement)
             except Exception as exc:  # noqa: BLE001 - asynchronous network status boundary
+                publish_duration_ms = round((time.monotonic() - publish_started) * 1000)
                 status: dict[str, object] = {
                     "state": "error",
+                    "publish_duration_ms": publish_duration_ms,
                     "error": {
                         "code": type(exc).__name__,
                         "detail": str(exc)[:256],
                     },
                 }
+                logger.warning(
+                    "Swarm v3 catalogue publication failed after %d ms: %s: %s",
+                    publish_duration_ms,
+                    type(exc).__name__,
+                    str(exc)[:256],
+                )
             else:
+                publish_duration_ms = round((time.monotonic() - publish_started) * 1000)
+                expiry_margin_ms = advertisement.lease.expires_at_ms - time.time_ns() // 1_000_000
                 status = {
                     "state": "published",
                     "offer_seq": advertisement.offer.offer_seq,
                     "lease_seq": advertisement.lease.lease_seq,
+                    "publish_duration_ms": publish_duration_ms,
+                    "expiry_margin_ms": expiry_margin_ms,
                 }
+                if expiry_margin_ms <= publish_duration_ms:
+                    logger.warning(
+                        "Swarm v3 catalogue lease margin is too small after publication: "
+                        "duration=%d ms margin=%d ms",
+                        publish_duration_ms,
+                        expiry_margin_ms,
+                    )
             with self._lock:
                 self._catalog_status = status
 
@@ -498,7 +518,7 @@ class WorkerProtocolV3Reporter:
             supported_roles=frozenset(roles),
             offer_seq=self._offer_seq,
             issued_at_ms=now_ms,
-            expires_at_ms=now_ms + _REPORT_TTL_MS,
+            expires_at_ms=now_ms + CATALOG_SOFT_STATE_TTL_MS,
         )
         if isinstance(verified.artifacts, VerifiedSkippySpan):
             plan = verified.artifacts.plan
@@ -557,7 +577,7 @@ class WorkerProtocolV3Reporter:
             max_sessions=serving.max_sessions,
             lease_seq=self._lease_seq,
             issued_at_ms=now_ms,
-            expires_at_ms=now_ms + _REPORT_TTL_MS,
+            expires_at_ms=now_ms + CATALOG_SOFT_STATE_TTL_MS,
         )
         return ModelMemberAdvertisement(
             offer=offer,
