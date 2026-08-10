@@ -62,7 +62,10 @@ from swarm_protocol.request_status import RequestPhaseFeed
 from swarm_protocol.routing import RoutePlanningError
 
 _MAX_OPENAI_REQUEST_BYTES = 16 * 1024 * 1024
-_READINESS_CACHE_MS = 1_000
+# Petals' client routing state uses a 60-second DHT refresh period. This cache
+# is only an availability hint: every Fabi route still passes signed
+# PREPARE/COMMIT and worker-local memory/KV checks before execution.
+_READINESS_CACHE_MS = 60_000
 _OPENAI_SSE_KEEPALIVE_SECONDS = 15.0
 
 logger = logging.getLogger(__name__)
@@ -250,6 +253,10 @@ class RequestAgentOpenAIManager:
         self.recovery_checkpoints = recovery_checkpoints
         self._readiness_cached_at_ms = 0
         self._readiness_cached_context = 0
+        # Native Kademlia reads are synchronous and may consume their bounded
+        # protocol query window. Coalesce concurrent UI/admission refreshes so
+        # one cold lookup cannot amplify into N identical DHT walks.
+        self._readiness_refresh_lock = threading.Lock()
         self._closed = False
         self._lock = threading.RLock()
         self.request_phases = RequestPhaseFeed()
@@ -279,17 +286,32 @@ class RequestAgentOpenAIManager:
                 and now_ms - self._readiness_cached_at_ms <= _READINESS_CACHE_MS
             ):
                 return self._readiness_cached_context
-        try:
-            supported = self.runtime.max_supported_context_tokens(
-                self.model_swarm_id,
-                self._model_context_limit,
-            )
-        except (PermissionError, RoutePlanningError, RuntimeError, ValueError):
-            supported = 0
-        with self._lock:
-            self._readiness_cached_at_ms = now_ms
-            self._readiness_cached_context = supported
-        return supported
+        with self._readiness_refresh_lock:
+            # Another caller may have completed the refresh while this caller
+            # waited for the single-flight lock.
+            now_ms = time.monotonic_ns() // 1_000_000
+            with self._lock:
+                if (
+                    self._readiness_cached_at_ms > 0
+                    and now_ms - self._readiness_cached_at_ms <= _READINESS_CACHE_MS
+                ):
+                    return self._readiness_cached_context
+            try:
+                supported = self.runtime.max_supported_context_tokens(
+                    self.model_swarm_id,
+                    self._model_context_limit,
+                )
+            except (PermissionError, RoutePlanningError, RuntimeError, ValueError):
+                supported = 0
+            # A DHT lookup can legitimately consume most of its protocol query
+            # window. Timestamp the completed observation, not the start of the
+            # lookup, otherwise a healthy but slow lookup is already stale when
+            # it returns and the same OpenAI request immediately repeats it.
+            refreshed_at_ms = time.monotonic_ns() // 1_000_000
+            with self._lock:
+                self._readiness_cached_at_ms = refreshed_at_ms
+                self._readiness_cached_context = supported
+            return supported
 
     def max_supported_context_tokens(self) -> int:
         return self._refresh_live_context()
@@ -850,7 +872,7 @@ def create_request_agent_app(
 
     @app.get("/health")
     async def health() -> JSONResponse:
-        supported = manager.max_supported_context_tokens()
+        supported = await asyncio.to_thread(manager.max_supported_context_tokens)
         return JSONResponse(
             content={"status": "ready" if supported else "waiting"},
             status_code=200 if supported else 503,
@@ -876,7 +898,7 @@ def create_request_agent_app(
                 err_type="authentication_error",
                 code="invalid_api_key",
             )
-        return JSONResponse(content=manager.status())
+        return JSONResponse(content=await asyncio.to_thread(manager.status))
 
     @app.get("/v1/request-agent/events")
     async def request_agent_events(raw_request: Request):

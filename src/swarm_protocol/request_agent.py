@@ -27,13 +27,14 @@ from swarm_protocol.coordinator import (
     ControlTransport,
     RouteReservationCoordinator,
 )
-from swarm_protocol.discovery import DiscoveryStore
+from swarm_protocol.discovery import DiscoverySnapshot, DiscoveryStore
 from swarm_protocol.epochs import EpochAllocator
 from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
 from swarm_protocol.route_authority import RouteAdmissionEnvelope
 from swarm_protocol.routing import ExactRoutePlanner, PlannedRoute, RoutePlanningError
 
 _MAX_AUTHORITY_RESPONSE_BYTES = 1024 * 1024
+_DISCOVERY_SNAPSHOT_CACHE_MS = 60_000
 
 logger = logging.getLogger(__name__)
 
@@ -484,6 +485,13 @@ class _RequestLockEntry:
     users: int = 0
 
 
+@dataclass(frozen=True)
+class _PlanningSnapshotCacheEntry:
+    bundle: ModelRegistryBundle
+    snapshot: DiscoverySnapshot
+    refreshed_at_ms: int
+
+
 class RequestAgentRouteRuntime:
     """Plan and maintain exact routes from the local Request Agent.
 
@@ -563,6 +571,8 @@ class RequestAgentRouteRuntime:
         self._reservations: dict[str, _ManagedReservation] = {}
         self._recoverable_requests: dict[str, _RecoverableRequest] = {}
         self._failures: deque[dict[str, object]] = deque(maxlen=64)
+        self._planning_snapshots: dict[str, _PlanningSnapshotCacheEntry] = {}
+        self._discovery_refresh_lock = threading.Lock()
         self._lock = threading.RLock()
         self._phase_observer: Callable[[str, str], None] | None = None
         self._stop_event = threading.Event()
@@ -871,7 +881,8 @@ class RequestAgentRouteRuntime:
             try:
                 self._emit_phase(request_id, "planning")
                 bundle, snapshot = self._trusted_planning_snapshot(
-                    recoverable.request.model_swarm_id
+                    recoverable.request.model_swarm_id,
+                    force_refresh=True,
                 )
                 epoch = self.epoch_allocator.next_epoch()
                 self._emit_phase(request_id, "authorizing")
@@ -972,15 +983,90 @@ class RequestAgentRouteRuntime:
                         )
                 raise
 
-    def _trusted_planning_snapshot(self, model_swarm_id: str):
-        """Return one DHT snapshot only after matching it to the TUF contract."""
+    def _trusted_planning_snapshot(
+        self,
+        model_swarm_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[ModelRegistryBundle, DiscoverySnapshot]:
+        """Return a short-lived, TUF-matched and expiry-filtered DHT snapshot.
 
-        bundle = self.registry.fetch(model_swarm_id)
-        snapshot = self.discovery.snapshot(model_swarm_id=model_swarm_id)
-        manifest = snapshot.manifest(model_swarm_id)
-        if manifest is None or manifest != bundle.manifest:
-            raise PermissionError("DHT manifest does not match the TUF-authenticated bundle")
-        return bundle, snapshot
+        Petals refreshes routing state independently and builds requests from
+        the resulting local view. Fabi keeps the same separation while
+        retaining worker-local PREPARE/COMMIT as the admission authority: a
+        cached discovery record can only propose a route, never authorize one.
+        Cold recovery bypasses this cache to discover newly joined replicas.
+        """
+
+        model_swarm_id = str(model_swarm_id)
+        if not force_refresh:
+            cached = self._cached_planning_snapshot(model_swarm_id)
+            if cached is not None:
+                return cached
+        with self._discovery_refresh_lock:
+            if not force_refresh:
+                cached = self._cached_planning_snapshot(model_swarm_id)
+                if cached is not None:
+                    return cached
+            bundle = self.registry.fetch(model_swarm_id)
+            snapshot = self.discovery.snapshot(model_swarm_id=model_swarm_id)
+            manifest = snapshot.manifest(model_swarm_id)
+            if manifest is None or manifest != bundle.manifest:
+                raise PermissionError("DHT manifest does not match the TUF-authenticated bundle")
+            refreshed = self._filter_live_snapshot(snapshot, now_ms=self._now_ms())
+            entry = _PlanningSnapshotCacheEntry(
+                bundle=bundle,
+                snapshot=refreshed,
+                refreshed_at_ms=self._steady_now_ms(),
+            )
+            with self._lock:
+                self._planning_snapshots[model_swarm_id] = entry
+            return entry.bundle, entry.snapshot
+
+    def _cached_planning_snapshot(
+        self,
+        model_swarm_id: str,
+    ) -> tuple[ModelRegistryBundle, DiscoverySnapshot] | None:
+        steady_now_ms = self._steady_now_ms()
+        with self._lock:
+            entry = self._planning_snapshots.get(model_swarm_id)
+        if (
+            entry is None
+            or steady_now_ms - entry.refreshed_at_ms > _DISCOVERY_SNAPSHOT_CACHE_MS
+        ):
+            return None
+        refreshed = self._filter_live_snapshot(entry.snapshot, now_ms=self._now_ms())
+        return entry.bundle, refreshed
+
+    @staticmethod
+    def _filter_live_snapshot(
+        snapshot: DiscoverySnapshot,
+        *,
+        now_ms: int,
+    ) -> DiscoverySnapshot:
+        """Advance a cached view without extending any signed soft-state TTL."""
+
+        offers = tuple(offer for offer in snapshot.offers if offer.expires_at_ms > now_ms)
+        live_worker_ids = {offer.worker_id for offer in offers}
+        leases = tuple(
+            lease
+            for lease in snapshot.leases
+            if lease.expires_at_ms > now_ms and lease.worker_id in live_worker_ids
+        )
+        links = tuple(
+            link
+            for link in snapshot.links
+            if link.expires_at_ms > now_ms
+            and link.from_worker_id in live_worker_ids
+            and link.to_worker_id in live_worker_ids
+        )
+        return DiscoverySnapshot(
+            captured_at_ms=now_ms,
+            manifests=snapshot.manifests,
+            offers=offers,
+            leases=leases,
+            links=links,
+        )
 
     def max_supported_context_tokens(self, model_swarm_id: str, upper_bound: int) -> int:
         """Probe the largest live context with the exact planner, without reserving.

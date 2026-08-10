@@ -470,6 +470,36 @@ def test_local_request_agent_executes_non_streaming_openai_request():
     assert runtime.closed is True
 
 
+def test_readiness_refresh_coalesces_concurrent_dht_snapshots():
+    manager, runtime = manager_and_runtime()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def slow_capacity(model_swarm_id, upper_bound):
+        nonlocal calls
+        assert model_swarm_id == MODEL_SWARM_ID
+        with calls_lock:
+            calls += 1
+        time.sleep(0.05)
+        return min(4096, upper_bound)
+
+    runtime.max_supported_context_tokens = slow_capacity
+    results: list[int] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(manager.max_supported_context_tokens()))
+        for _ in range(4)
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(results) == [4096, 4096, 4096, 4096]
+    assert calls == 1
+    manager.close()
+
+
 def test_local_request_agent_reports_context_rejected_before_route_planning():
     manager, runtime = manager_and_runtime()
     app = create_request_agent_app(manager, api_credential=API_CREDENTIAL)

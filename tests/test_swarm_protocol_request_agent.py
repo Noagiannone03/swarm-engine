@@ -458,6 +458,73 @@ def test_request_agent_probes_exact_live_context_without_reserving():
     ]
 
 
+def test_request_agent_reuses_readiness_snapshot_for_immediate_reservation():
+    model = manifest()
+    store = discovery(model)
+    snapshot_calls = 0
+    original_snapshot = store.snapshot
+
+    def counted_snapshot(*, model_swarm_id=None, now_ms=None):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original_snapshot(model_swarm_id=model_swarm_id, now_ms=now_ms)
+
+    store.snapshot = counted_snapshot
+    runtime = RequestAgentRouteRuntime(
+        transport=CryptoTransport(),
+        discovery=store,
+        registry=SimpleNamespace(fetch=lambda _model_id: SimpleNamespace(manifest=model)),
+        authority=FakeAuthority(),
+        epoch_allocator=InMemoryEpochAllocator(),
+        coordinator_factory=FakeCoordinator,
+        clock_ms=lambda: 1_000,
+        start_maintenance_thread=False,
+    )
+    request = RequestContract(
+        request_id="cached-discovery-request",
+        model_swarm_id=model.model_swarm_id,
+        prompt_tokens=1_000,
+        reserved_output_tokens=200,
+        recovery_level=RecoveryLevel.RESTARTABLE,
+    )
+
+    assert runtime.max_supported_context_tokens(model.model_swarm_id, 600_000) == 524_288
+    reservation = runtime.reserve(request)
+
+    assert reservation.committed.plan.request_id == request.request_id
+    assert snapshot_calls == 1
+    runtime.release(reservation)
+
+
+def test_cached_discovery_snapshot_never_extends_signed_worker_expiry():
+    model = manifest()
+    clock = MutableClock(1_000)
+    runtime = RequestAgentRouteRuntime(
+        transport=CryptoTransport(),
+        discovery=discovery(model),
+        registry=SimpleNamespace(fetch=lambda _model_id: SimpleNamespace(manifest=model)),
+        authority=FakeAuthority(),
+        epoch_allocator=InMemoryEpochAllocator(),
+        coordinator_factory=FakeCoordinator,
+        clock_ms=clock,
+        steady_clock_ms=lambda: 1_000,
+        start_maintenance_thread=False,
+    )
+    request = RequestContract(
+        request_id="expired-cached-worker",
+        model_swarm_id=model.model_swarm_id,
+        prompt_tokens=1_000,
+        reserved_output_tokens=200,
+        recovery_level=RecoveryLevel.RESTARTABLE,
+    )
+
+    assert runtime.max_supported_context_tokens(model.model_swarm_id, 600_000) == 524_288
+    clock.now_ms = 20_000
+
+    with pytest.raises(Exception, match="no complete route"):
+        runtime.reserve(request)
+
+
 class MutableClock:
     def __init__(self, now_ms=0):
         self.now_ms = now_ms

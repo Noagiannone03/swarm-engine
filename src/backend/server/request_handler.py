@@ -374,10 +374,17 @@ class RequestHandler:
     ):
         start_time = time.time()
         logger.debug(f"Forwarding request {request_id}; stream={request_data.get('stream', False)}")
-        if (
-            self.scheduler_manage is None
-            or not self.scheduler_manage.get_schedule_status() == NODE_STATUS_AVAILABLE
-        ):
+        if self.scheduler_manage is None:
+            return openai_error_response(
+                "Server is not ready",
+                status_code=503,
+                err_type="server_unavailable",
+                code="server_not_ready",
+            )
+        schedule_status = await asyncio.to_thread(
+            self.scheduler_manage.get_schedule_status
+        )
+        if schedule_status != NODE_STATUS_AVAILABLE:
             return openai_error_response(
                 "Server is not ready",
                 status_code=503,
@@ -410,7 +417,7 @@ class RequestHandler:
                 )
 
             required_context_tokens = budget.required_tokens
-            route_context_limit = max_supported_context()
+            route_context_limit = await asyncio.to_thread(max_supported_context)
             if route_context_limit <= 0:
                 return openai_error_response(
                     "No context-capable pipeline is ready",
@@ -451,7 +458,8 @@ class RequestHandler:
                         "preferred_recovery_level",
                         lambda _request: RecoveryLevel.RESTARTABLE,
                     )(request_data)
-                    routing_table = self.scheduler_manage.get_routing_table(
+                    routing_table = await asyncio.to_thread(
+                        self.scheduler_manage.get_routing_table,
                         request_id,
                         received_ts,
                         required_context_tokens,

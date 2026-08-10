@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -412,6 +413,39 @@ def test_forward_request_returns_openai_error_when_scheduler_not_ready():
     assert payload["error"]["message"] == "Server is not ready"
     assert payload["error"]["type"] == "server_unavailable"
     assert payload["error"]["code"] == "server_not_ready"
+
+
+def test_blocking_route_discovery_does_not_stall_the_asyncio_event_loop():
+    class SlowRoutingManager(ForwardingSchedulerManage):
+        def get_routing_table(self, *args, **kwargs):
+            time.sleep(0.05)
+            return super().get_routing_table(*args, **kwargs)
+
+    async def exercise():
+        handler = RequestHandler()
+        manager = SlowRoutingManager()
+        handler.set_scheduler_manage(manager)
+        handler.stubs["node-a"] = StaticStub([b'{"choices":[]}'])
+        loop_progressed = asyncio.Event()
+
+        async def observe_loop_progress():
+            await asyncio.sleep(0.01)
+            loop_progressed.set()
+
+        response, _ = await asyncio.gather(
+            handler.v1_chat_completions(
+                {"messages": [{"role": "user", "content": "hello"}]},
+                "slow-discovery-request",
+                1.0,
+            ),
+            observe_loop_progress(),
+        )
+        return response, loop_progressed.is_set()
+
+    response, loop_progressed = asyncio.run(exercise())
+
+    assert response.status_code == 200
+    assert loop_progressed is True
 
 
 def test_forward_request_returns_openai_error_when_pipelines_are_busy():
