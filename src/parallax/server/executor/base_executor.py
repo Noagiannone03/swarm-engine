@@ -881,6 +881,15 @@ class BaseExecutor:
 
             # 5. Admit requests into running set up to capacity, then form batch
             self.scheduler.admit_requests()
+            unschedulable_prefills = self.scheduler.unschedulable_prefills()
+            if unschedulable_prefills:
+                logger.error(
+                    "Rejecting prefills larger than the backend's unchunked token "
+                    "budget: request_ids=%s max_num_tokens_per_batch=%d",
+                    [request.request_id for request in unschedulable_prefills],
+                    self.scheduler.max_num_tokens_per_batch,
+                )
+                self.fail_batch(unschedulable_prefills)
             # 5.1 Check for request timeouts and abort timed out requests
             try:
                 timed_out_reqs = self.scheduler.get_timed_out_requests()

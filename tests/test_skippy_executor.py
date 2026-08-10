@@ -5,7 +5,11 @@ import pytest
 
 from parallax.p2p.message_util import NativeActivationFrame
 from parallax.server.executor.base_executor import ExecutorBatchCancelled
-from parallax.server.executor.skippy_executor import SkippyExecutor, _SkippyResumeMarker
+from parallax.server.executor.skippy_executor import (
+    SkippyExecutor,
+    _local_prefill_chunk_tokens,
+    _SkippyResumeMarker,
+)
 from swarm_protocol.contracts import SkippyExactStateKind
 from swarm_protocol.kv_snapshot import KvSnapshotIncompatible
 from swarm_protocol.recovery import token_sequence_checksum
@@ -42,6 +46,33 @@ class FakeRunner:
 
     def release(self, request_id):
         self.calls.append(("release", request_id))
+
+
+def test_complete_replica_exposes_its_exact_native_prefill_quantum_to_scheduler():
+    assert (
+        _local_prefill_chunk_tokens(
+            is_full_model_stage=True,
+            max_num_tokens_per_batch=8192,
+        )
+        == 512
+    )
+    assert (
+        _local_prefill_chunk_tokens(
+            is_full_model_stage=True,
+            max_num_tokens_per_batch=256,
+        )
+        == 256
+    )
+
+
+def test_split_stage_does_not_claim_unqualified_distributed_chunking():
+    assert (
+        _local_prefill_chunk_tokens(
+            is_full_model_stage=False,
+            max_num_tokens_per_batch=8192,
+        )
+        is None
+    )
 
 
 def executor(*, first: bool, last: bool, result):

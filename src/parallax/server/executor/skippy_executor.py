@@ -11,6 +11,7 @@ from parallax.server.executor.base_executor import BaseExecutor, ExecutorBatchCa
 from parallax.server.executor.checkpoint_control import SkippyCheckpointExportRegistry
 from parallax.server.request import InitialRequest, IntermediateRequest, Request
 from parallax.server.skippy_stage_runner import (
+    SKIPPY_COOPERATIVE_PREFILL_CHUNK_TOKENS,
     SkippyRequestCancelled,
     SkippyRuntimeStageRunner,
 )
@@ -22,6 +23,30 @@ from swarm_protocol.skippy_execution import materialize_skippy_execution_span
 from swarm_protocol.worker_integration import WorkerProtocolV3Reporter
 
 logger = get_logger(__name__)
+
+
+def _local_prefill_chunk_tokens(
+    *,
+    is_full_model_stage: bool,
+    max_num_tokens_per_batch: int,
+) -> int | None:
+    """Return the exact local scheduling quantum supported by Skippy.
+
+    A complete replica advances long prompts through ``prefill_tokens`` in
+    bounded native chunks before sampling on the final chunk.  The generic
+    scheduler must account for that quantum instead of treating the whole
+    prompt as one unschedulable batch.  Split pipelines require a negotiated
+    end-to-end activation-chunk contract and therefore remain disabled here.
+    """
+
+    if not is_full_model_stage:
+        return None
+    if max_num_tokens_per_batch <= 0:
+        raise ValueError("Skippy max tokens per batch must be positive")
+    return min(
+        SKIPPY_COOPERATIVE_PREFILL_CHUNK_TOKENS,
+        max_num_tokens_per_batch,
+    )
 
 
 @dataclass
@@ -142,6 +167,10 @@ class SkippyExecutor(BaseExecutor):
             max_context_tokens=context_limit,
             max_sessions=max_sessions,
         )
+        local_prefill_chunk_tokens = _local_prefill_chunk_tokens(
+            is_full_model_stage=self.runner.is_full_model_stage,
+            max_num_tokens_per_batch=max_num_tokens_per_batch,
+        )
         self.execution_plan = verified.plan
         self.model_manifest = bundle.manifest
         self._checkpoint_import_markers: dict[str, _SkippyResumeMarker] = {}
@@ -189,7 +218,7 @@ class SkippyExecutor(BaseExecutor):
             dp_size=dp_size,
             shared_state=shared_state,
             enable_weight_refit=False,
-            chunked_prefill_size=None,
+            chunked_prefill_size=local_prefill_chunk_tokens,
             kv_block_size=1,
             conn=conn or [],
         )
@@ -201,14 +230,17 @@ class SkippyExecutor(BaseExecutor):
                 skippy_runtime_abi=verified.plan.runtime_abi_version,
                 skippy_backend_device=self.runner.backend_device,
                 skippy_execution_artifact_bytes=verified.artifact_bytes,
+                skippy_local_prefill_chunk_tokens=local_prefill_chunk_tokens,
             )
         logger.info(
-            "Skippy executor ready: plan=%s backend_device=%s span=[%d,%d) context=%d",
+            "Skippy executor ready: plan=%s backend_device=%s span=[%d,%d) "
+            "context=%d local_prefill_chunk_tokens=%s",
             verified.plan.plan_id,
             self.runner.backend_device,
             start_layer,
             end_layer,
             context_limit,
+            local_prefill_chunk_tokens,
         )
 
     def handle_input_requests(self, requests: List[Request]) -> None:

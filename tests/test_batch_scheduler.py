@@ -142,6 +142,21 @@ def test_token_budget_uses_explicit_chunked_prefill_size_without_cache_manager()
     assert [r.request_id for r in batch] == ["chunked"]
 
 
+def test_skippy_sized_open_code_prefill_is_schedulable_by_native_chunk():
+    sched = Scheduler(
+        max_batch_size=1,
+        max_num_tokens_per_batch=8192,
+        chunked_prefill_size=512,
+    )
+    request = make_prefill("open-code-13k", 13_544)
+    sched.enque_request(request)
+
+    batch = sched.form_batch()
+
+    assert batch == [request]
+    assert request.ready_for_next_step is False
+
+
 def test_token_budget_does_not_read_chunked_prefill_size_from_cache_manager():
     cache_mgr = FakeCacheManager()
     cache_mgr.chunked_prefill_size = 4
@@ -158,6 +173,24 @@ def test_token_budget_does_not_read_chunked_prefill_size_from_cache_manager():
     batch = sched.form_batch()
 
     assert batch == []
+
+
+def test_unchunked_oversized_prefill_is_reported_as_permanently_unschedulable():
+    sched = Scheduler(max_batch_size=1, max_num_tokens_per_batch=8192)
+    request = make_prefill("unsupported-open-code-13k", 13_544)
+    sched.enque_request(request)
+    sched.admit_requests()
+
+    assert sched.unschedulable_prefills() == [request]
+
+
+def test_scheduler_rejects_a_chunk_quantum_larger_than_its_batch_budget():
+    with pytest.raises(ValueError, match="no larger than"):
+        Scheduler(
+            max_batch_size=1,
+            max_num_tokens_per_batch=256,
+            chunked_prefill_size=512,
+        )
 
 
 def test_kv_cache_admission_guard_blocks_prefill():

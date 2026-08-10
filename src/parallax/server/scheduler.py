@@ -76,6 +76,14 @@ class Scheduler:
         """
         self.max_batch_size = max_batch_size
         self.max_num_tokens_per_batch = max_num_tokens_per_batch
+        if chunked_prefill_size is not None and (
+            chunked_prefill_size <= 0
+            or chunked_prefill_size > self.max_num_tokens_per_batch
+        ):
+            raise ValueError(
+                "chunked_prefill_size must be positive and no larger than "
+                "max_num_tokens_per_batch"
+            )
         self.micro_batch_size = max(1, max_batch_size // micro_batch_ratio)
         self.scheduler_wait_ms = scheduler_wait_ms
         self.is_first_peer = is_first_peer
@@ -422,3 +430,23 @@ class Scheduler:
                 inflight_tokens,
             )
         return batch
+
+    def unschedulable_prefills(self) -> List[Request]:
+        """Return ready prefills that can never fit the configured contract.
+
+        Admission and route leases are not evidence of forward progress.  A
+        backend without chunked prefill must fail a prompt larger than its
+        per-forward token budget explicitly; leaving it resident would renew
+        capacity forever without ever entering ``form_batch``.
+        """
+
+        if self.chunked_prefill_size is not None:
+            return []
+        return [
+            request
+            for request in self._running_requests.values()
+            if request.ready_for_next_step
+            and request.is_prefill
+            and (request.prompt_len or request.total_length)
+            > self.max_num_tokens_per_batch
+        ]
