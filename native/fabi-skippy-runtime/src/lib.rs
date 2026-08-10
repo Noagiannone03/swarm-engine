@@ -637,6 +637,35 @@ pub struct StageOpenOptions {
     pub load_mode: StageLoadMode,
 }
 
+fn runtime_config_for_stage(options: &StageOpenOptions) -> Result<RuntimeConfig> {
+    let terminal_stage = options.layer_end == options.model_layer_count;
+    Ok(RuntimeConfig {
+        stage_index: options.stage_index,
+        layer_start: options.layer_start,
+        layer_end: options.layer_end,
+        ctx_size: options.context_tokens,
+        lane_count: options.lane_count,
+        n_batch: options.n_batch,
+        n_ubatch: options.n_ubatch,
+        n_threads: options.n_threads,
+        n_threads_batch: options.n_threads_batch,
+        n_gpu_layers: -1,
+        mmap: options.use_mmap,
+        mlock: options.use_mlock,
+        selected_backend_device: options.selected_backend_device.clone(),
+        cache_type_k: parse_cache_type(&options.cache_type_k)?,
+        cache_type_v: parse_cache_type(&options.cache_type_v)?,
+        flash_attn_type: FlashAttentionType::Auto,
+        load_mode: options.load_mode.native(),
+        projector_path: None,
+        // Keep this aligned with Mesh's production LayerPackage contract:
+        // prompt ingress and terminal decode both need token embeddings.
+        include_embeddings: options.layer_start == 0 || terminal_stage,
+        include_output: terminal_stage,
+        filter_tensors_on_load: true,
+    })
+}
+
 /// Load an already-installed native bundle after Mesh's manifest contract and
 /// Fabi's product-generated per-file integrity manifest have both passed.
 ///
@@ -762,29 +791,7 @@ impl SkippyStage {
                 part.display()
             );
         }
-        let config = RuntimeConfig {
-            stage_index: options.stage_index,
-            layer_start: options.layer_start,
-            layer_end: options.layer_end,
-            ctx_size: options.context_tokens,
-            lane_count: options.lane_count,
-            n_batch: options.n_batch,
-            n_ubatch: options.n_ubatch,
-            n_threads: options.n_threads,
-            n_threads_batch: options.n_threads_batch,
-            n_gpu_layers: -1,
-            mmap: options.use_mmap,
-            mlock: options.use_mlock,
-            selected_backend_device: options.selected_backend_device.clone(),
-            cache_type_k: parse_cache_type(&options.cache_type_k)?,
-            cache_type_v: parse_cache_type(&options.cache_type_v)?,
-            flash_attn_type: FlashAttentionType::Auto,
-            load_mode: options.load_mode.native(),
-            projector_path: None,
-            include_embeddings: options.layer_start == 0,
-            include_output: options.layer_end == options.model_layer_count,
-            filter_tensors_on_load: true,
-        };
+        let config = runtime_config_for_stage(options)?;
         let model = StageModel::open_from_parts(parts, &config)
             .context("open verified Skippy stage source")?;
         Ok(Self {
@@ -1107,5 +1114,31 @@ mod tests {
             StageLoadMode::LayerPackage
         );
         assert!(StageLoadMode::parse("automatic").is_err());
+    }
+
+    #[test]
+    fn terminal_layer_package_stage_loads_embeddings_and_output() {
+        let options = StageOpenOptions {
+            stage_index: 1,
+            layer_start: 1,
+            layer_end: 28,
+            model_layer_count: 28,
+            context_tokens: 32_768,
+            lane_count: 1,
+            n_batch: None,
+            n_ubatch: None,
+            n_threads: None,
+            n_threads_batch: None,
+            selected_backend_device: Some("MTL0".to_string()),
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            use_mmap: None,
+            use_mlock: false,
+            load_mode: StageLoadMode::LayerPackage,
+        };
+
+        let config = runtime_config_for_stage(&options).unwrap();
+        assert!(config.include_embeddings);
+        assert!(config.include_output);
     }
 }

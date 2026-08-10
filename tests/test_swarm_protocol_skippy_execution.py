@@ -242,7 +242,7 @@ def test_skippy_span_downloads_only_owned_layers_and_boundary(tmp_path):
     )
 
 
-def test_skippy_final_span_gets_output_but_not_embeddings(tmp_path):
+def test_skippy_final_span_gets_embeddings_and_output(tmp_path):
     contents, index, model = _fixture()
     _write_contents(tmp_path, contents)
 
@@ -256,6 +256,30 @@ def test_skippy_final_span_gets_output_but_not_embeddings(tmp_path):
 
     assert [path.relative_to(tmp_path).as_posix() for path in verified.part_paths] == [
         "shared/metadata.gguf",
+        "shared/embeddings.gguf",
+        "layers/layer-001.gguf",
+        "shared/output.gguf",
+    ]
+
+
+def test_skippy_full_span_does_not_duplicate_embeddings(tmp_path):
+    contents, index, model = _fixture()
+    _write_contents(tmp_path, contents)
+
+    verified = verify_skippy_execution_span(
+        tmp_path,
+        index,
+        model,
+        LayerSpan(start=0, end=2),
+        device="cpu",
+    )
+
+    relative = [path.relative_to(tmp_path).as_posix() for path in verified.part_paths]
+    assert relative.count("shared/embeddings.gguf") == 1
+    assert relative == [
+        "shared/metadata.gguf",
+        "shared/embeddings.gguf",
+        "layers/layer-000.gguf",
         "layers/layer-001.gguf",
         "shared/output.gguf",
     ]

@@ -116,7 +116,11 @@ def required_skippy_descriptors(
     if len(plan.layer_paths) != manifest.num_layers:
         raise ValueError("Skippy layer package does not cover the signed model")
     paths = [plan.package_manifest_path, plan.shared_metadata_path]
-    if span.start == 0:
+    # Mesh's maintained LayerPackage loader requires the token embeddings on
+    # both boundary roles: the input stage embeds prompt tokens, while the
+    # terminal stage embeds each sampled token before the next decode step.
+    # A single-stage replica naturally satisfies both roles with one artifact.
+    if span.start == 0 or span.end == manifest.num_layers:
         paths.append(plan.embeddings_path)
     paths.extend(plan.layer_paths[span.start : span.end])
     if span.end == manifest.num_layers:
