@@ -144,6 +144,7 @@ def lease(
     *,
     state: SpanState = SpanState.READY,
     max_context_tokens: int = 65_536,
+    max_sessions: int = 1,
 ) -> SpanLease:
     return SpanLease(
         model_swarm_id=model.model_swarm_id,
@@ -159,7 +160,7 @@ def lease(
             allocatable_bytes=10_000,
         ),
         available_kv_bytes_snapshot=10_000,
-        max_sessions=1,
+        max_sessions=max_sessions,
         lease_seq=1,
         issued_at_ms=SWARM_NOW,
         expires_at_ms=SWARM_NOW + 60_000,
@@ -734,6 +735,51 @@ def test_adaptive_demand_can_select_an_exact_non_manifest_context_target():
     assert decision.span == LayerSpan(start=2, end=4)
     assert decision.context_tokens == exact_context
     assert utility.weighted_complete_routes > 0
+
+
+def test_exact_context_capacity_replicates_the_real_route_bottleneck():
+    model = manifest().model_copy(
+        update={
+            "model_max_context_tokens": 10,
+            "context_classes": (10,),
+            "kv_bytes_per_token_by_layer": (10, 10, 1, 1),
+        }
+    )
+    demand = _demand_map(
+        model_swarm_id=model.model_swarm_id,
+        region_id="eu-west",
+        issued_at_ms=1_000,
+        expires_at_ms=61_000,
+        classes=(
+            ContextClassDemand(
+                context_tokens=10,
+                desired_independent_routes=1,
+                desired_concurrent_slots=2,
+                desired_replicas_by_layer=(1,) * model.num_layers,
+                demand_weight_by_layer=(1.0,) * model.num_layers,
+            ),
+        ),
+    )
+
+    decision, utility = AutonomousPlacementPolicy().choose_contextual(
+        offer=offer(memory_bytes=500),
+        manifest=model,
+        leases=(
+            lease(model, "head", 0, 2, max_context_tokens=10, max_sessions=1),
+            lease(model, "tail", 2, 4, max_context_tokens=10, max_sessions=10),
+        ),
+        demand=demand,
+        qualified_context_limit_tokens=10,
+        kv_block_size=1,
+        now_ms=2_000,
+    )
+
+    # A second tail has abundant local KV but leaves the one-session head as
+    # the route bottleneck. Replicating the head raises complete pipeline
+    # capacity from one to the two slots actually requested.
+    assert decision.action is PlacementAction.JOIN
+    assert decision.span == LayerSpan(start=0, end=2)
+    assert utility.weighted_concurrent_slots == 2
 
 
 def test_context_reconfiguration_waits_for_reservations_to_drain():

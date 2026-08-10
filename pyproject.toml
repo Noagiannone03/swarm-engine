@@ -42,6 +42,9 @@ dependencies = [
   # with the supported protobuf 7 major line.
   "protobuf>=7.35.1,<8",
   "dijkstar==2.6.0",
+  # Exact bounded route/slot capacity for the live autonomous placement
+  # shortlist. NetworkX is pure Python and maintained across every worker OS.
+  "networkx>=3.4,<4",
   "lattica==1.0.21",
   "orjson",
   # Mergeable bounded context-demand histograms. The signed DHT payload uses
@@ -95,12 +98,6 @@ benchmark = [
   "tqdm",
   "datasets",
   "pillow",
-]
-
-simulation = [
-  # The offline lab uses the maintained max-flow implementation. It is not
-  # installed on production workers and is never part of placement authority.
-  "networkx>=3.4,<4",
 ]
 
 portable-builder = [

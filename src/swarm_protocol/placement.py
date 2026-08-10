@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
+
+import networkx as nx
 
 from swarm_protocol.context_placement import (
     CapacityDemandMap,
@@ -359,6 +361,14 @@ class ContextPlacementUtility:
         )
 
 
+@dataclass(frozen=True)
+class _ContextSupply:
+    layer_coverage: tuple[int, ...]
+    session_coverage: tuple[int, ...]
+    prefix_boundaries: frozenset[int]
+    suffix_boundaries: frozenset[int]
+
+
 class AutonomousPlacementPolicy:
     """Choose a locally feasible span without creating a voluntary coverage hole.
 
@@ -374,14 +384,20 @@ class AutonomousPlacementPolicy:
         minimum_improvement: float = 0.05,
         movement_cooldown_ms: int = 10 * 60 * 1_000,
         maximum_candidates: int = 65_536,
+        maximum_exact_candidates: int = 32,
     ) -> None:
         if not 0 <= minimum_improvement < 1:
             raise ValueError("minimum improvement must be in [0, 1)")
-        if movement_cooldown_ms < 0 or maximum_candidates <= 0:
+        if (
+            movement_cooldown_ms < 0
+            or maximum_candidates <= 0
+            or maximum_exact_candidates <= 0
+        ):
             raise ValueError("cooldown must be non-negative and candidate bound positive")
         self.minimum_improvement = minimum_improvement
         self.movement_cooldown_ms = movement_cooldown_ms
         self.maximum_candidates = maximum_candidates
+        self.maximum_exact_candidates = maximum_exact_candidates
 
     @staticmethod
     def _static_bytes(
@@ -581,6 +597,32 @@ class AutonomousPlacementPolicy:
                 continue
             for layer in range(lease.hosted_span.start, lease.hosted_span.end):
                 coverage[layer] += 1
+        return coverage
+
+    @staticmethod
+    def _session_coverage(
+        manifest: ModelManifest,
+        leases: tuple[SpanLease, ...],
+        *,
+        exclude_worker_id: str,
+        minimum_context_tokens: int,
+        states: frozenset[SpanState],
+    ) -> list[int]:
+        """Sum exact KV session supply per layer for the Petals-style screen."""
+
+        if minimum_context_tokens <= 0:
+            raise ValueError("session coverage context must be positive")
+        coverage = [0] * manifest.num_layers
+        for lease in leases:
+            if (
+                lease.model_swarm_id != manifest.model_swarm_id
+                or lease.worker_id == exclude_worker_id
+                or lease.state not in states
+                or lease.max_context_tokens < minimum_context_tokens
+            ):
+                continue
+            for layer in range(lease.hosted_span.start, lease.hosted_span.end):
+                coverage[layer] += lease.max_sessions
         return coverage
 
     @staticmethod
@@ -938,6 +980,7 @@ class AutonomousPlacementPolicy:
         kv_block_size: int,
         maximum_sessions: int | None = None,
         span_static_bytes: SpanStaticBytes | None = None,
+        supply_by_context: Mapping[int, _ContextSupply],
     ) -> ContextPlacementUtility:
         """Score one exact target across all cumulative demand classes."""
 
@@ -973,25 +1016,31 @@ class AutonomousPlacementPolicy:
             )
             if class_weight <= 0:
                 continue
-            planned_coverage = self._coverage(
-                manifest,
-                leases,
-                exclude_worker_id=offer.worker_id,
-                minimum_context_tokens=class_demand.context_tokens,
-                states=frozenset({SpanState.BUILDING, SpanState.WARMING, SpanState.READY}),
+            supply = supply_by_context[class_demand.context_tokens]
+            planned_coverage = supply.layer_coverage
+            planned_session_coverage = supply.session_coverage
+            completes_route = (
+                span.start in supply.prefix_boundaries
+                and span.end in supply.suffix_boundaries
             )
-            prefix, suffix = self._fixed_route_boundaries(
-                manifest,
-                leases,
-                exclude_worker_id=offer.worker_id,
-                minimum_context_tokens=class_demand.context_tokens,
-            )
-            completes_route = span.start in prefix and span.end in suffix
-            weighted_complete_routes += class_weight * int(completes_route)
             if completes_route:
-                weighted_concurrent_slots += class_weight * min(
-                    max_sessions,
-                    class_demand.desired_concurrent_slots,
+                replicas_before = min(planned_coverage)
+                replicas_after = min(
+                    count + int(span.start <= layer < span.end)
+                    for layer, count in enumerate(planned_coverage)
+                )
+                weighted_complete_routes += class_weight * (
+                    min(replicas_after, class_demand.desired_independent_routes)
+                    - min(replicas_before, class_demand.desired_independent_routes)
+                )
+                slots_before = min(planned_session_coverage)
+                slots_after = min(
+                    count + (max_sessions if span.start <= layer < span.end else 0)
+                    for layer, count in enumerate(planned_session_coverage)
+                )
+                weighted_concurrent_slots += class_weight * (
+                    min(slots_after, class_demand.desired_concurrent_slots)
+                    - min(slots_before, class_demand.desired_concurrent_slots)
                 )
             weighted_layer_deficit_filled += (
                 class_demand.confidence
@@ -1011,6 +1060,121 @@ class AutonomousPlacementPolicy:
             context_tokens=context_tokens,
             span_length=span.length,
             max_sessions=max_sessions,
+        )
+
+    @staticmethod
+    def _route_capacity(
+        *,
+        manifest: ModelManifest,
+        leases: tuple[SpanLease, ...],
+        exclude_worker_id: str,
+        minimum_context_tokens: int,
+        candidate_span: LayerSpan,
+        candidate_sessions: int,
+        session_capacity: bool,
+    ) -> int:
+        """Measure complete fixed-boundary capacity with maintained max-flow.
+
+        Every hosted span is a directed edge between layer boundaries.  For
+        redundancy each worker contributes one unit; for concurrency it
+        contributes its exact KV session count. BUILDING/WARMING intents are
+        included so simultaneous autonomous joins spread instead of all
+        choosing the same temporary deficit.
+        """
+
+        graph = nx.DiGraph()
+        graph.add_nodes_from(range(manifest.num_layers + 1))
+
+        def add_span(span: LayerSpan, capacity: int) -> None:
+            edge = (span.start, span.end)
+            previous = graph.get_edge_data(*edge, default={}).get("capacity", 0)
+            graph.add_edge(*edge, capacity=previous + capacity)
+
+        for lease in leases:
+            if (
+                lease.model_swarm_id != manifest.model_swarm_id
+                or lease.worker_id == exclude_worker_id
+                or lease.state not in {SpanState.BUILDING, SpanState.WARMING, SpanState.READY}
+                or lease.max_context_tokens < minimum_context_tokens
+            ):
+                continue
+            add_span(lease.hosted_span, lease.max_sessions if session_capacity else 1)
+        add_span(candidate_span, candidate_sessions if session_capacity else 1)
+        return int(
+            nx.maximum_flow_value(
+                graph,
+                0,
+                manifest.num_layers,
+                capacity="capacity",
+            )
+        )
+
+    def _exact_context_utility(
+        self,
+        *,
+        offer: WorkerOffer,
+        manifest: ModelManifest,
+        leases: tuple[SpanLease, ...],
+        demand: ContextCapacityDemandMap,
+        span: LayerSpan,
+        context_tokens: int,
+        approximate: ContextPlacementUtility,
+    ) -> ContextPlacementUtility:
+        """Replace local route guesses with capped end-to-end capacity."""
+
+        weighted_complete_routes = 0.0
+        weighted_concurrent_slots = 0.0
+        for class_demand in demand.classes:
+            if class_demand.context_tokens > context_tokens:
+                continue
+            if (
+                class_demand.desired_independent_routes == 0
+                and class_demand.desired_concurrent_slots == 0
+            ):
+                continue
+            class_weight = (
+                sum(class_demand.demand_weight_by_layer)
+                / manifest.num_layers
+                * class_demand.confidence
+            )
+            if class_weight <= 0:
+                continue
+            if class_demand.desired_independent_routes:
+                routes = self._route_capacity(
+                    manifest=manifest,
+                    leases=leases,
+                    exclude_worker_id=offer.worker_id,
+                    minimum_context_tokens=class_demand.context_tokens,
+                    candidate_span=span,
+                    candidate_sessions=approximate.max_sessions,
+                    session_capacity=False,
+                )
+                weighted_complete_routes += class_weight * min(
+                    routes,
+                    class_demand.desired_independent_routes,
+                )
+            if class_demand.desired_concurrent_slots:
+                slots = self._route_capacity(
+                    manifest=manifest,
+                    leases=leases,
+                    exclude_worker_id=offer.worker_id,
+                    minimum_context_tokens=class_demand.context_tokens,
+                    candidate_span=span,
+                    candidate_sessions=approximate.max_sessions,
+                    session_capacity=True,
+                )
+                weighted_concurrent_slots += class_weight * min(
+                    slots,
+                    class_demand.desired_concurrent_slots,
+                )
+
+        return ContextPlacementUtility(
+            weighted_complete_routes=weighted_complete_routes,
+            weighted_concurrent_slots=weighted_concurrent_slots,
+            weighted_layer_deficit_filled=approximate.weighted_layer_deficit_filled,
+            context_tokens=context_tokens,
+            span_length=span.length,
+            max_sessions=approximate.max_sessions,
         )
 
     def choose_contextual(
@@ -1056,6 +1220,38 @@ class AutonomousPlacementPolicy:
         if not demanded_classes:
             raise ValueError("context demand snapshot has no locally qualified demand")
 
+        planned_states = frozenset({SpanState.BUILDING, SpanState.WARMING, SpanState.READY})
+        supply_by_context: dict[int, _ContextSupply] = {}
+        for class_demand in demanded_classes:
+            prefix, suffix = self._fixed_route_boundaries(
+                manifest,
+                leases,
+                exclude_worker_id=offer.worker_id,
+                minimum_context_tokens=class_demand.context_tokens,
+            )
+            supply_by_context[class_demand.context_tokens] = _ContextSupply(
+                layer_coverage=tuple(
+                    self._coverage(
+                        manifest,
+                        leases,
+                        exclude_worker_id=offer.worker_id,
+                        minimum_context_tokens=class_demand.context_tokens,
+                        states=planned_states,
+                    )
+                ),
+                session_coverage=tuple(
+                    self._session_coverage(
+                        manifest,
+                        leases,
+                        exclude_worker_id=offer.worker_id,
+                        minimum_context_tokens=class_demand.context_tokens,
+                        states=planned_states,
+                    )
+                ),
+                prefix_boundaries=prefix,
+                suffix_boundaries=suffix,
+            )
+
         frontier = self.memory_frontier(
             offer=offer,
             manifest=manifest,
@@ -1089,6 +1285,7 @@ class AutonomousPlacementPolicy:
                 kv_block_size=kv_block_size,
                 maximum_sessions=point.max_sessions,
                 span_static_bytes=span_static_bytes,
+                supply_by_context=supply_by_context,
             )
             finalists.append((decision, utility))
 
@@ -1113,6 +1310,7 @@ class AutonomousPlacementPolicy:
                 kv_block_size=kv_block_size,
                 maximum_sessions=(None if current_lease is None else current_lease.max_sessions),
                 span_static_bytes=span_static_bytes,
+                supply_by_context=supply_by_context,
             )
             finalists.append(
                 (
@@ -1130,6 +1328,45 @@ class AutonomousPlacementPolicy:
 
         if not finalists:
             raise ValueError("no demanded span/context target fits the stable memory envelope")
+
+        # Petals' per-layer deficit is an efficient screen for a large
+        # frontier.  The bounded finalists are then measured end-to-end so a
+        # high-capacity duplicate cannot beat the actual bottleneck span.
+        shortlisted = sorted(
+            finalists,
+            key=lambda item: (
+                item[1].rank(),
+                -item[0].span.start if item[0].span is not None else 0,
+                (
+                    self._tiebreaker(offer.worker_id, item[0].span)
+                    if item[0].span is not None
+                    else 0
+                ),
+            ),
+            reverse=True,
+        )[: self.maximum_exact_candidates]
+        current_candidate = next(
+            (item for item in finalists if item[0].action is PlacementAction.KEEP),
+            None,
+        )
+        if current_candidate is not None and current_candidate not in shortlisted:
+            shortlisted.append(current_candidate)
+        finalists = [
+            (
+                decision,
+                self._exact_context_utility(
+                    offer=offer,
+                    manifest=manifest,
+                    leases=leases,
+                    demand=demand,
+                    span=decision.span,
+                    context_tokens=utility.context_tokens,
+                    approximate=utility,
+                ),
+            )
+            for decision, utility in shortlisted
+            if decision.span is not None
+        ]
 
         selected, selected_utility = max(
             finalists,
