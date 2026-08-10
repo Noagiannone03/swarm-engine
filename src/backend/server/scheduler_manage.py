@@ -645,6 +645,50 @@ class SchedulerManage:
             )
             return False
 
+    def observe_request_agent_admission(
+        self,
+        request_id: str,
+        model_swarm_id: str,
+        required_context_tokens: int,
+        lease_expires_at_ms: int,
+    ) -> bool:
+        if self.swarm_v3_mode != "active" or self.active_v3_routes is None:
+            return False
+        return self.active_v3_routes.observe_request_agent_admission(
+            request_id,
+            model_swarm_id,
+            required_context_tokens,
+            lease_expires_at_ms,
+        )
+
+    def observe_request_agent_renewal(
+        self,
+        request_id: str,
+        model_swarm_id: str,
+        required_context_tokens: int,
+        lease_expires_at_ms: int,
+    ) -> bool:
+        if self.swarm_v3_mode != "active" or self.active_v3_routes is None:
+            return False
+        return self.active_v3_routes.observe_request_agent_renewal(
+            request_id,
+            model_swarm_id,
+            required_context_tokens,
+            lease_expires_at_ms,
+        )
+
+    def observe_request_agent_completion(
+        self,
+        request_id: str,
+        model_swarm_id: str,
+    ) -> bool:
+        if self.swarm_v3_mode != "active" or self.active_v3_routes is None:
+            return False
+        return self.active_v3_routes.observe_request_agent_completion(
+            request_id,
+            model_swarm_id,
+        )
+
     def get_routing_table(
         self,
         request_id,

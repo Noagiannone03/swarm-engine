@@ -353,6 +353,56 @@ class ActiveRouteRuntime:
         self._observe_no_route(request_key, manifest, required)
         return True
 
+    def observe_request_agent_admission(
+        self,
+        request_id: str,
+        model_swarm_id: str,
+        required_context_tokens: int,
+        lease_expires_at_ms: int,
+    ) -> bool:
+        """Bridge a product Request Agent permit into aggregate demand."""
+
+        if self.demand_observer is None:
+            return False
+        manifest = self.planner.trusted_manifest(str(model_swarm_id))
+        self.demand_observer.record_admission(
+            str(request_id),
+            manifest,
+            required_context_tokens=int(required_context_tokens),
+            lease_expires_at_ms=int(lease_expires_at_ms),
+        )
+        return True
+
+    def observe_request_agent_renewal(
+        self,
+        request_id: str,
+        model_swarm_id: str,
+        required_context_tokens: int,
+        lease_expires_at_ms: int,
+    ) -> bool:
+        if self.demand_observer is None:
+            return False
+        manifest = self.planner.trusted_manifest(str(model_swarm_id))
+        return self.demand_observer.renew_admission(
+            str(request_id),
+            manifest,
+            required_context_tokens=int(required_context_tokens),
+            lease_expires_at_ms=int(lease_expires_at_ms),
+        )
+
+    def observe_request_agent_completion(
+        self,
+        request_id: str,
+        model_swarm_id: str,
+    ) -> bool:
+        if self.demand_observer is None:
+            return False
+        self.demand_observer.record_completion(
+            str(request_id),
+            model_swarm_id=str(model_swarm_id),
+        )
+        return True
+
     def is_active(self, request_id: str) -> bool:
         with self._lock:
             route = self._routes.get(str(request_id))

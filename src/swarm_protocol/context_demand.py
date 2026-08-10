@@ -83,6 +83,13 @@ class _CompletedRequest:
     service_time_ms: int
 
 
+@dataclass(frozen=True)
+class _InflightContext:
+    context_tokens: int
+    started_at_ms: int
+    lease_expires_at_ms: int | None = None
+
+
 class ContextDemandWindow:
     """Convert exact admissions into a bounded multi-context demand snapshot.
 
@@ -121,7 +128,7 @@ class ContextDemandWindow:
         # only per-class aggregates.
         self._rejections: OrderedDict[str, _TimedContext] = OrderedDict()
         self._completed: deque[_CompletedRequest] = deque(maxlen=maximum_events)
-        self._inflight: OrderedDict[str, tuple[int, int]] = OrderedDict()
+        self._inflight: OrderedDict[str, _InflightContext] = OrderedDict()
         self._lock = threading.RLock()
 
     def _context_for(self, required_context_tokens: int) -> int:
@@ -141,6 +148,14 @@ class ContextDemandWindow:
             if event.at_ms >= cutoff:
                 break
             self._rejections.pop(request_id, None)
+        expired_inflight = tuple(
+            request_id
+            for request_id, request in self._inflight.items()
+            if request.lease_expires_at_ms is not None
+            and request.lease_expires_at_ms <= now_ms
+        )
+        for request_id in expired_inflight:
+            self._inflight.pop(request_id, None)
 
     def record_admission(
         self,
@@ -148,18 +163,72 @@ class ContextDemandWindow:
         *,
         required_context_tokens: int,
         now_ms: int,
+        lease_expires_at_ms: int | None = None,
     ) -> None:
         if not request_id or now_ms < 0:
             raise ValueError("admitted request identity and time must be valid")
         context_tokens = self._context_for(required_context_tokens)
+        if lease_expires_at_ms is not None and lease_expires_at_ms <= now_ms:
+            raise ValueError("admission lease must expire after its observation time")
         with self._lock:
             self._prune_locked(now_ms)
-            if request_id in self._inflight:
+            current = self._inflight.get(request_id)
+            if current is not None:
+                if current.context_tokens != context_tokens:
+                    raise ValueError(
+                        "admitted request identity was reused with a different context"
+                    )
+                if (
+                    lease_expires_at_ms is not None
+                    and (
+                        current.lease_expires_at_ms is None
+                        or lease_expires_at_ms > current.lease_expires_at_ms
+                    )
+                ):
+                    self._inflight[request_id] = _InflightContext(
+                        context_tokens=current.context_tokens,
+                        started_at_ms=current.started_at_ms,
+                        lease_expires_at_ms=lease_expires_at_ms,
+                    )
+                    self._inflight.move_to_end(request_id)
                 return
             self._admissions.append(_TimedContext(now_ms, context_tokens))
-            self._inflight[request_id] = (context_tokens, now_ms)
+            self._inflight[request_id] = _InflightContext(
+                context_tokens=context_tokens,
+                started_at_ms=now_ms,
+                lease_expires_at_ms=lease_expires_at_ms,
+            )
             while len(self._inflight) > self.maximum_events:
                 self._inflight.popitem(last=False)
+
+    def renew_admission(
+        self,
+        request_id: str,
+        *,
+        lease_expires_at_ms: int,
+        now_ms: int,
+    ) -> bool:
+        """Advance a permit-backed inflight deadline without fabricating work."""
+
+        if not request_id or now_ms < 0 or lease_expires_at_ms <= now_ms:
+            raise ValueError("renewed admission identity and lease must be valid")
+        with self._lock:
+            self._prune_locked(now_ms)
+            current = self._inflight.get(request_id)
+            if current is None:
+                return False
+            if (
+                current.lease_expires_at_ms is not None
+                and lease_expires_at_ms < current.lease_expires_at_ms
+            ):
+                raise ValueError("renewed admission lease cannot move backwards")
+            self._inflight[request_id] = _InflightContext(
+                context_tokens=current.context_tokens,
+                started_at_ms=current.started_at_ms,
+                lease_expires_at_ms=lease_expires_at_ms,
+            )
+            self._inflight.move_to_end(request_id)
+            return True
 
     def record_no_route(
         self,
@@ -187,12 +256,11 @@ class ContextDemandWindow:
             current = self._inflight.pop(request_id, None)
             if current is None:
                 return
-            context_tokens, started_at_ms = current
             self._completed.append(
                 _CompletedRequest(
                     at_ms=now_ms,
-                    context_tokens=context_tokens,
-                    service_time_ms=max(0, now_ms - started_at_ms),
+                    context_tokens=current.context_tokens,
+                    service_time_ms=max(0, now_ms - current.started_at_ms),
                 )
             )
 
@@ -210,7 +278,7 @@ class ContextDemandWindow:
         admissions: tuple[_TimedContext, ...],
         rejections: tuple[_TimedContext, ...],
         completed: tuple[_CompletedRequest, ...],
-        inflight: tuple[tuple[int, int], ...],
+        inflight: tuple[_InflightContext, ...],
     ) -> tuple[tuple[int, ...], ContextDemandHistogram | None]:
         """Compress exact lengths while retaining active long-tail ceilings.
 
@@ -225,7 +293,7 @@ class ContextDemandWindow:
         samples = [item.context_tokens for item in admissions]
         samples.extend(item.context_tokens for item in rejections)
         samples.extend(item.context_tokens for item in completed)
-        samples.extend(item[0] for item in inflight)
+        samples.extend(item.context_tokens for item in inflight)
         if not samples:
             return (), None
 
@@ -246,7 +314,7 @@ class ContextDemandWindow:
         critical = sorted(
             {
                 *(item.context_tokens for item in rejections),
-                *(item[0] for item in inflight),
+                *(item.context_tokens for item in inflight),
             },
             reverse=True,
         )[:4]
@@ -292,7 +360,9 @@ class ContextDemandWindow:
         for context_tokens in points:
             admitted = sum(point_for(item.context_tokens) == context_tokens for item in admissions)
             rejected = sum(point_for(item.context_tokens) == context_tokens for item in rejections)
-            active = sum(point_for(item[0]) == context_tokens for item in inflight)
+            active = sum(
+                point_for(item.context_tokens) == context_tokens for item in inflight
+            )
             service_times = [
                 item.service_time_ms
                 for item in completed
@@ -400,12 +470,33 @@ class ContextDemandAnnouncer:
         manifest: ModelManifest,
         *,
         required_context_tokens: int,
+        lease_expires_at_ms: int | None = None,
     ) -> None:
         self._window(manifest).record_admission(
             request_id,
             required_context_tokens=required_context_tokens,
             now_ms=self._clock_ms(),
+            lease_expires_at_ms=lease_expires_at_ms,
         )
+
+    def renew_admission(
+        self,
+        request_id: str,
+        manifest: ModelManifest,
+        *,
+        required_context_tokens: int,
+        lease_expires_at_ms: int,
+    ) -> bool:
+        # Upsert the exact durable permit. A keepalive after a coordinator
+        # restart reconstructs the in-memory demand window; the permit expiry
+        # remains the single authoritative liveness boundary.
+        self._window(manifest).record_admission(
+            request_id,
+            required_context_tokens=required_context_tokens,
+            now_ms=self._clock_ms(),
+            lease_expires_at_ms=lease_expires_at_ms,
+        )
+        return True
 
     def record_no_route(
         self,
@@ -420,10 +511,19 @@ class ContextDemandAnnouncer:
             now_ms=self._clock_ms(),
         )
 
-    def record_completion(self, request_id: str) -> None:
+    def record_completion(
+        self,
+        request_id: str,
+        *,
+        model_swarm_id: str | None = None,
+    ) -> None:
         now_ms = self._clock_ms()
         with self._lock:
-            windows = tuple(self._windows.values())
+            if model_swarm_id is None:
+                windows = tuple(self._windows.values())
+            else:
+                window = self._windows.get(model_swarm_id)
+                windows = () if window is None else (window,)
         for window in windows:
             window.record_completion(request_id, now_ms=now_ms)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from collections.abc import Callable
@@ -37,6 +38,7 @@ from swarm_protocol.control import SignedControlMessage
 from swarm_protocol.route_authority import RouteAuthorityTrustStore
 
 router = APIRouter(prefix="/v1/swarm", tags=["Fabi Request Agent"])
+logger = logging.getLogger(__name__)
 
 
 class RoutePermitRequest(BaseModel):
@@ -158,6 +160,9 @@ class RequestAgentAuthority:
         model_swarm_id_provider: Callable[[], str],
         max_context_tokens_provider: Callable[[], int],
         unmet_context_observer: Callable[[str, int], bool],
+        context_admission_observer: Callable[[str, str, int, int], bool] | None = None,
+        context_renewal_observer: Callable[[str, str, int, int], bool] | None = None,
+        context_completion_observer: Callable[[str, str], bool] | None = None,
     ) -> None:
         if not gate.enabled:
             raise RuntimeError("Request Agent authority requires FABI_GATE=on")
@@ -168,6 +173,9 @@ class RequestAgentAuthority:
         self._model_swarm_id_provider = model_swarm_id_provider
         self._max_context_tokens_provider = max_context_tokens_provider
         self._unmet_context_observer = unmet_context_observer
+        self._context_admission_observer = context_admission_observer
+        self._context_renewal_observer = context_renewal_observer
+        self._context_completion_observer = context_completion_observer
         gate.bind_route_permit_ledger(ledger)
 
     def observe_unmet_context(
@@ -218,6 +226,7 @@ class RequestAgentAuthority:
                 raise RoutePermitConflict(
                     "request idempotency key was reused with a different permit contract"
                 )
+            self._observe_context_admission(existing)
             return RoutePermitResponse.from_permit(existing)
         current_model = self._model_swarm_id_provider()
         if contract.model_swarm_id != current_model:
@@ -241,6 +250,7 @@ class RequestAgentAuthority:
             recovery_policies=frozenset(contract.recovery_policies),
             ttl_ms=contract.ttl_ms,
         )
+        self._observe_context_admission(permit)
         return RoutePermitResponse.from_permit(permit)
 
     def issue_capability(
@@ -276,6 +286,21 @@ class RequestAgentAuthority:
             ttl_ms=contract.ttl_ms,
             idempotency_key=idempotency_key,
         )
+        observer = self._context_renewal_observer
+        if observer is not None:
+            try:
+                observer(
+                    permit.request_id,
+                    permit.model_swarm_id,
+                    permit.max_context_tokens,
+                    permit.expires_at_ms,
+                )
+            except Exception:
+                logger.warning(
+                    "Unable to renew context demand for request %s",
+                    permit.request_id,
+                    exc_info=True,
+                )
         return RoutePermitResponse.from_permit(permit)
 
     def release(self, *, credential: object, permit_id: str) -> bool:
@@ -283,7 +308,42 @@ class RequestAgentAuthority:
         if identity is None:
             reason = "missing" if not credential else "invalid"
             raise PermissionError(f"{reason} account credential")
-        return self.ledger.release_owned(permit_id, identity)
+        try:
+            permit = self.ledger.get_active(permit_id)
+        except RoutePermitError:
+            permit = None
+        released = self.ledger.release_owned(permit_id, identity)
+        observer = self._context_completion_observer
+        if released and permit is not None and observer is not None:
+            try:
+                observer(permit.request_id, permit.model_swarm_id)
+            except Exception:
+                logger.warning(
+                    "Unable to complete context demand for request %s",
+                    permit.request_id,
+                    exc_info=True,
+                )
+        return released
+
+    def _observe_context_admission(self, permit: AuthorizedContributionPermit) -> None:
+        observer = self._context_admission_observer
+        if observer is None:
+            return
+        try:
+            observer(
+                permit.request_id,
+                permit.model_swarm_id,
+                permit.max_context_tokens,
+                permit.expires_at_ms,
+            )
+        except Exception:
+            # Demand is advisory and must never invalidate a contribution
+            # permit that has already passed its authoritative checks.
+            logger.warning(
+                "Unable to observe context demand admission for request %s",
+                permit.request_id,
+                exc_info=True,
+            )
 
 
 _authority: RequestAgentAuthority | None = None
@@ -352,6 +412,9 @@ def configure_request_agent_authority(
             model_swarm_id_provider=current_model_swarm_id,
             max_context_tokens_provider=scheduler_manage.max_supported_context_tokens,
             unmet_context_observer=scheduler_manage.observe_unmet_context_demand,
+            context_admission_observer=scheduler_manage.observe_request_agent_admission,
+            context_renewal_observer=scheduler_manage.observe_request_agent_renewal,
+            context_completion_observer=scheduler_manage.observe_request_agent_completion,
         )
         set_request_agent_authority(authority)
         return authority

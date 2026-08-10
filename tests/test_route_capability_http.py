@@ -59,6 +59,9 @@ def install_authority(monkeypatch, tmp_path):
     ledger = SqliteRoutePermitLedger(tmp_path / "permits.sqlite3")
     capabilities = FakeCapabilities(account_hash(CREDENTIAL))
     unmet_context_requests = []
+    admitted_context_requests = []
+    renewed_context_requests = []
+    completed_context_requests = []
     authority = RequestAgentAuthority(
         gate=gate,
         ledger=ledger,
@@ -69,6 +72,20 @@ def install_authority(monkeypatch, tmp_path):
         unmet_context_observer=lambda request_id, required: (
             unmet_context_requests.append((request_id, required)) or True
         ),
+        context_admission_observer=lambda request_id, model_id, required, expires: (
+            admitted_context_requests.append((request_id, model_id, required, expires)) or True
+        ),
+        context_renewal_observer=lambda request_id, model_id, required, expires: (
+            renewed_context_requests.append((request_id, model_id, required, expires)) or True
+        ),
+        context_completion_observer=lambda request_id, model_id: (
+            completed_context_requests.append((request_id, model_id)) or True
+        ),
+    )
+    authority.context_observations = (
+        admitted_context_requests,
+        renewed_context_requests,
+        completed_context_requests,
     )
     set_request_agent_authority(authority)
     return authority, capabilities, unmet_context_requests
@@ -93,7 +110,7 @@ def auth_headers(*, credential=CREDENTIAL, idempotency_key="permit-issue"):
 
 
 def test_permit_endpoint_is_idempotent_account_scoped_and_shares_capacity(monkeypatch, tmp_path):
-    install_authority(monkeypatch, tmp_path)
+    authority, _, _ = install_authority(monkeypatch, tmp_path)
     client = TestClient(app)
     try:
         first = client.post(
@@ -137,6 +154,12 @@ def test_permit_endpoint_is_idempotent_account_scoped_and_shares_capacity(monkey
             f"/v1/swarm/route-permits/{permit_id}",
             headers=auth_headers(),
         ).json() == {"released": True}
+        admissions, _, completions = authority.context_observations
+        assert [(item[0], item[1], item[2]) for item in admissions] == [
+            ("request", MODEL, 16_384),
+            ("request", MODEL, 16_384),
+        ]
+        assert completions == [("request", MODEL)]
 
         corrected = client.post(
             "/v1/swarm/route-permits",
@@ -309,6 +332,12 @@ def test_permit_keepalive_rechecks_contribution_and_is_idempotent(monkeypatch, t
             json={"ttl_ms": 60_000},
         )
         assert retry.json() == first.json()
+        _, renewals, _ = authority.context_observations
+        assert [(item[0], item[1], item[2]) for item in renewals] == [
+            ("request", MODEL, 16_384),
+            ("request", MODEL, 16_384),
+        ]
+        assert all(item[3] == first.json()["expires_at_ms"] for item in renewals)
         original_retry = client.post(
             "/v1/swarm/route-permits",
             headers=auth_headers(),

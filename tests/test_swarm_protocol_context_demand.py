@@ -85,6 +85,67 @@ def test_window_is_idempotent_for_duplicate_admission_and_tracks_live_long_reque
     assert long.p95_service_time_ms == 0
 
 
+def test_permit_backed_inflight_follows_renewal_and_authoritative_expiry():
+    model = manifest()
+    window = ContextDemandWindow(model, "eu-west")
+    window.record_admission(
+        "leased",
+        required_context_tokens=21_758,
+        now_ms=1_000,
+        lease_expires_at_ms=2_000,
+    )
+
+    assert window.snapshot(now_ms=1_999).classes[-1].desired_concurrent_slots == 1
+    assert window.renew_admission(
+        "leased",
+        lease_expires_at_ms=4_000,
+        now_ms=1_999,
+    )
+    assert window.snapshot(now_ms=3_999).classes[-1].desired_concurrent_slots == 1
+    expired = window.snapshot(now_ms=4_000).classes[-1]
+    assert expired.desired_concurrent_slots == 1
+    assert expired.admitted_requests_per_minute == 0.2
+    assert window.snapshot(now_ms=301_001).classes == ()
+
+
+def test_permit_keepalive_upserts_after_announcer_restart_and_stays_model_scoped():
+    now = [1_000]
+    store = FakeStore()
+    announcer = ContextDemandAnnouncer(
+        store,
+        "eu-west",
+        clock_ms=lambda: now[0],
+        start_thread=False,
+    )
+    model = manifest()
+
+    # A durable permit keepalive may be the first event observed after this
+    # process restarts. It must rebuild the volatile window exactly once.
+    assert announcer.renew_admission(
+        "recovered",
+        model,
+        required_context_tokens=21_758,
+        lease_expires_at_ms=61_000,
+    )
+    now[0] = 2_000
+    assert announcer.renew_admission(
+        "recovered",
+        model,
+        required_context_tokens=21_758,
+        lease_expires_at_ms=62_000,
+    )
+    assert announcer.publish_once() == 1
+    recovered = store.published[-1].class_for(21_758)
+    assert recovered.admitted_requests_per_minute == 0.2
+    assert recovered.desired_concurrent_slots == 1
+
+    announcer.record_completion("recovered", model_swarm_id=model.model_swarm_id)
+    now[0] = 2_001
+    assert announcer.publish_once() == 1
+    assert store.published[-1].class_for(21_758).p95_service_time_ms == 1_000
+    announcer.close()
+
+
 def test_completion_keeps_service_signal_when_agentic_turn_outlives_window():
     model = manifest()
     window = ContextDemandWindow(model, "eu-west", window_ms=300_000)
