@@ -71,11 +71,11 @@ class RequestHandler:
             self.stubs[node_id] = self.scheduler_manage.completion_handler.get_stub(node_id)
         return self.stubs[node_id]
 
-    def _release_route(self, request_id: str) -> None:
+    async def _release_route(self, request_id: str) -> None:
         release = getattr(self.scheduler_manage, "release_routing_table", None)
         if release is not None:
             try:
-                release(str(request_id))
+                await asyncio.to_thread(release, str(request_id))
             except Exception:
                 # Route/permit cleanup is idempotent and their signed TTLs
                 # still fail closed. A transient authority outage during
@@ -530,7 +530,7 @@ class RequestHandler:
                             budget,
                         )
                     except ContextRequestError as exc:
-                        self._release_route(request_id)
+                        await self._release_route(request_id)
                         return openai_error_response(
                             str(exc),
                             status_code=400,
@@ -539,7 +539,7 @@ class RequestHandler:
                             code="context_validation_error",
                         )
                     except Exception:
-                        self._release_route(request_id)
+                        await self._release_route(request_id)
                         logger.exception(
                             "Unable to obtain exact frontend token IDs for %s",
                             request_id,
@@ -555,7 +555,7 @@ class RequestHandler:
                         verified_frontend_token_ids is not None
                         and frontend_budget.prompt_token_ids != verified_frontend_token_ids
                     ):
-                        self._release_route(request_id)
+                        await self._release_route(request_id)
                         logger.error(
                             "Qualified route heads disagree on prompt token IDs for %s",
                             request_id,
@@ -569,7 +569,7 @@ class RequestHandler:
                     verified_frontend_token_ids = frontend_budget.prompt_token_ids
 
                     if frontend_budget.prompt_token_ids != budget.prompt_token_ids:
-                        self._release_route(request_id)
+                        await self._release_route(request_id)
                         exact_token_replans += 1
                         if exact_token_replans > MAX_EXACT_TOKEN_REPLANS:
                             return openai_error_response(
@@ -578,7 +578,9 @@ class RequestHandler:
                                 err_type="server_unavailable",
                                 code="frontend_tokenizer_unstable",
                             )
-                        if frontend_budget.required_tokens > max_supported_context():
+                        if frontend_budget.required_tokens > await asyncio.to_thread(
+                            max_supported_context
+                        ):
                             await self._observe_unmet_context_demand(
                                 str(request_id),
                                 frontend_budget.required_tokens,
@@ -1018,7 +1020,7 @@ class RequestHandler:
                                             backend_request,
                                         )
                             finally:
-                                self._release_route(request_id)
+                                await self._release_route(request_id)
 
                     resp = StreamingResponse(
                         stream_generator(),
@@ -1066,7 +1068,7 @@ class RequestHandler:
                                         backend_request,
                                     )
                         finally:
-                            self._release_route(request_id)
+                            await self._release_route(request_id)
             except ClientDisconnectedError:
                 logger.info("Client disconnected before request %s completed", request_id)
                 return Response(status_code=499)
@@ -1079,7 +1081,7 @@ class RequestHandler:
                     code="upstream_worker_lost",
                 )
             except Exception as e:
-                self._release_route(request_id)
+                await self._release_route(request_id)
                 forward_attempts += 1
                 if forward_attempts < self.MAX_FORWARD_RETRY:
                     # small async delay before re-forwarding

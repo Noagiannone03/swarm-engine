@@ -448,6 +448,49 @@ def test_blocking_route_discovery_does_not_stall_the_asyncio_event_loop():
     assert loop_progressed is True
 
 
+def test_blocking_route_release_does_not_stall_the_asyncio_event_loop():
+    class SlowReleaseManager(ForwardingSchedulerManage):
+        def __init__(self):
+            super().__init__()
+            self.release_started = threading.Event()
+            self.release_finished = threading.Event()
+
+        def release_routing_table(self, request_id):
+            self.release_started.set()
+            time.sleep(0.05)
+            try:
+                return super().release_routing_table(request_id)
+            finally:
+                self.release_finished.set()
+
+    async def exercise():
+        handler = RequestHandler()
+        manager = SlowReleaseManager()
+        handler.set_scheduler_manage(manager)
+        handler.stubs["node-a"] = StaticStub([b'{"choices":[]}'])
+
+        async def observe_release():
+            while not manager.release_started.is_set():
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
+            return not manager.release_finished.is_set()
+
+        response, loop_progressed_during_release = await asyncio.gather(
+            handler.v1_chat_completions(
+                {"messages": [{"role": "user", "content": "hello"}]},
+                "slow-release-request",
+                1.0,
+            ),
+            observe_release(),
+        )
+        return response, loop_progressed_during_release
+
+    response, loop_progressed_during_release = asyncio.run(exercise())
+
+    assert response.status_code == 200
+    assert loop_progressed_during_release is True
+
+
 def test_forward_request_returns_openai_error_when_pipelines_are_busy():
     handler = RequestHandler()
     handler.MAX_ROUTING_RETRY = 1
