@@ -122,8 +122,8 @@ def test_build_skippy_package_bundle_skips_source_tensor_scan(tmp_path, monkeypa
         plan_id="skippy-q4-k-m-v1",
         quantization="Q4_K_M",
         dtype="bfloat16",
-        runtime_release="mesh-llm/v0.74.0",
-        runtime_abi_version="0.1.32",
+        runtime_release="mesh-llm/v0.75.1",
+        runtime_abi_version="0.1.35",
         providers=(ExecutionProviderKind.CUDA, ExecutionProviderKind.METAL),
     )
 

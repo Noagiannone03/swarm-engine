@@ -100,8 +100,8 @@ def checkpoint_executor():
     instance.execution_plan = SimpleNamespace(
         plan_id="skippy-qwen3-q4",
         package_source_sha256=hashlib.sha256(b"weights").hexdigest(),
-        runtime_release="mesh-llm/v0.74.0",
-        runtime_abi_version="0.1.32",
+        runtime_release="mesh-llm/v0.75.1",
+        runtime_abi_version="0.1.35",
         exact_state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
     )
     instance.model_manifest = SimpleNamespace(

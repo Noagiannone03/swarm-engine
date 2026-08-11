@@ -245,8 +245,8 @@ def _verified(tmp_path):
         parts.append(path)
     return SimpleNamespace(
         plan=SimpleNamespace(
-            runtime_release="mesh-llm/v0.74.0",
-            runtime_abi_version="0.1.32",
+            runtime_release="mesh-llm/v0.75.1",
+            runtime_abi_version="0.1.35",
             format="gguf-layer-package",
             shared_metadata_path="metadata.gguf",
             cache_type_k="f16",
@@ -293,7 +293,7 @@ def test_runner_reuses_native_stage_and_typed_activations(tmp_path):
         SamplingParams(temperature=0, min_p=0.1),
     )
 
-    assert native.loaded == (tmp_path, "0.74.0", "0.1.32", "vulkan")
+    assert native.loaded == (tmp_path, "0.75.1", "0.1.35", "vulkan")
     assert native.stage.kwargs["selected_backend_device"] == "Vulkan0"
     assert native.stage.kwargs["load_mode"] == "layer_package"
     assert prefill.predicted_token is None
@@ -481,8 +481,8 @@ def test_direct_gguf_runner_uses_runtime_slice_without_a_package(tmp_path):
     source.write_bytes(b"gguf")
     verified = SimpleNamespace(
         plan=SimpleNamespace(
-            runtime_release="mesh-llm/v0.74.0",
-            runtime_abi_version="0.1.32",
+            runtime_release="mesh-llm/v0.75.1",
+            runtime_abi_version="0.1.35",
             format="gguf-direct",
             cache_type_k="f16",
             cache_type_v="f16",
@@ -511,14 +511,14 @@ def test_direct_gguf_runner_uses_runtime_slice_without_a_package(tmp_path):
 
 
 def test_runtime_discovery_is_exact_and_ambiguous_installations_fail(tmp_path, monkeypatch):
-    def write_runtime(name, *, abi="0.1.32"):
+    def write_runtime(name, *, abi="0.1.35"):
         root = tmp_path / name
         root.mkdir()
         (root / "manifest.json").write_text(
             json.dumps(
                 {
                     "runtime": {
-                        "mesh_version": "0.74.0",
+                        "mesh_version": "0.75.1",
                         "skippy_abi": abi,
                         "backend": {"kind": "vulkan"},
                     }
@@ -534,8 +534,8 @@ def test_runtime_discovery_is_exact_and_ambiguous_installations_fail(tmp_path, m
 
     assert (
         discover_skippy_native_runtime(
-            mesh_release="0.74.0",
-            runtime_abi="0.1.32",
+            mesh_release="0.75.1",
+            runtime_abi="0.1.35",
             backend="vulkan",
         )
         == expected.resolve()
@@ -545,8 +545,8 @@ def test_runtime_discovery_is_exact_and_ambiguous_installations_fail(tmp_path, m
     write_runtime("duplicate")
     with pytest.raises(RuntimeError, match="multiple bundled"):
         discover_skippy_native_runtime(
-            mesh_release="0.74.0",
-            runtime_abi="0.1.32",
+            mesh_release="0.75.1",
+            runtime_abi="0.1.35",
             backend="vulkan",
         )
 
@@ -566,8 +566,8 @@ def test_runtime_discovery_covers_installed_product_layout(tmp_path, monkeypatch
         json.dumps(
             {
                 "runtime": {
-                    "mesh_version": "0.74.0",
-                    "skippy_abi": "0.1.32",
+                    "mesh_version": "0.75.1",
+                    "skippy_abi": "0.1.35",
                     "backend": {"kind": "metal"},
                 }
             }
@@ -580,8 +580,8 @@ def test_runtime_discovery_covers_installed_product_layout(tmp_path, monkeypatch
 
     assert (
         discover_skippy_native_runtime(
-            mesh_release="0.74.0",
-            runtime_abi="0.1.32",
+            mesh_release="0.75.1",
+            runtime_abi="0.1.35",
             backend="metal",
         )
         == bundle.resolve()

@@ -25,10 +25,14 @@ use skippy_runtime::{
     parse_cache_type,
 };
 
-/// Stable Mesh release audited for Fabi's first Skippy product integration.
-pub const SKIPPY_MESH_RELEASE: &str = "0.74.0";
+/// Stable Mesh release audited for Fabi's stage-local tensor and KV memory.
+///
+/// Mesh 0.75.1 composes the Skippy stage range with llama.cpp's runtime-memory
+/// filters. Earlier releases filtered model tensors but still allocated the
+/// dense KV cache for every transformer layer.
+pub const SKIPPY_MESH_RELEASE: &str = "0.75.1";
 /// Exact native ABI exported by the pinned release.
-pub const SKIPPY_RUNTIME_ABI: &str = "0.1.32";
+pub const SKIPPY_RUNTIME_ABI: &str = "0.1.35";
 const FABI_INTEGRITY_MANIFEST: &str = "fabi-integrity.json";
 
 #[derive(Debug, Deserialize)]
@@ -1031,8 +1035,8 @@ mod tests {
             format!(
                 r#"{{
   "schema_version": 1,
-  "mesh_release": "0.74.0",
-  "skippy_abi": "0.1.32",
+  "mesh_release": "0.75.1",
+  "skippy_abi": "0.1.35",
   "runtime_id": "runtime-id",
   "backend": "metal",
   "files": [
@@ -1059,8 +1063,8 @@ mod tests {
             &root,
             "runtime-id",
             &declared,
-            "0.74.0",
-            "0.1.32",
+            "0.75.1",
+            "0.1.35",
             "metal",
         )
         .unwrap();
@@ -1071,8 +1075,8 @@ mod tests {
             &root,
             "runtime-id",
             &declared,
-            "0.74.0",
-            "0.1.32",
+            "0.75.1",
+            "0.1.35",
             "metal",
         )
         .unwrap_err();

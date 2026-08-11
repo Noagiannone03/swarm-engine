@@ -1083,8 +1083,8 @@ def _parser() -> argparse.ArgumentParser:
     attach_skippy.add_argument("--package-repository-id", required=True)
     attach_skippy.add_argument("--package-revision")
     attach_skippy.add_argument("--plan-id", required=True)
-    attach_skippy.add_argument("--runtime-release", default="mesh-llm/v0.74.0")
-    attach_skippy.add_argument("--runtime-abi-version", default="0.1.32")
+    attach_skippy.add_argument("--runtime-release", default="mesh-llm/v0.75.1")
+    attach_skippy.add_argument("--runtime-abi-version", default="0.1.35")
     attach_skippy.add_argument(
         "--exact-state-kind",
         choices=[
@@ -1121,8 +1121,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     attach_skippy_direct.add_argument("--plan-id", required=True)
     attach_skippy_direct.add_argument("--quantization", required=True)
-    attach_skippy_direct.add_argument("--runtime-release", default="mesh-llm/v0.74.0")
-    attach_skippy_direct.add_argument("--runtime-abi-version", default="0.1.32")
+    attach_skippy_direct.add_argument("--runtime-release", default="mesh-llm/v0.75.1")
+    attach_skippy_direct.add_argument("--runtime-abi-version", default="0.1.35")
     attach_skippy_direct.add_argument(
         "--exact-state-kind",
         choices=[
