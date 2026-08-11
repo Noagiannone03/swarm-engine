@@ -30,6 +30,10 @@ services:
       FABI_NETWORK_IDENTITY_PATH: ${FABI_QWEN3_4B_NETWORK_IDENTITY_PATH:-/opt/parallax-runtime/network/scheduler.key}
       FABI_CATALOG_DHT_MODE: "server"
       FABI_CATALOG_DHT_LISTEN_ADDRESS: /ip4/0.0.0.0/tcp/19191
+      # Join the shared root2 catalogue instead of forming a scheduler-local
+      # DHT island.  Workers discover model membership through the same two
+      # stable bootstrap servers regardless of the selected model.
+      FABI_CATALOG_DHT_BOOTSTRAPS: '["/ip4/37.59.98.16/tcp/19192/p2p/12D3KooWMQrc1rWXwaeQcshtANiw9FyyGWmfqAnVsStGRqsJ54Yi","/ip4/37.59.98.16/tcp/19193/p2p/12D3KooWG8jJaC1upci3eDZ7XSobTPC5hT6bdqFGzzptH8q7b1eG"]'
       FABI_CATALOG_DHT_IDENTITY_PATH: /opt/parallax-runtime/network/scheduler-catalog.key
       FABI_MODEL_REGISTRY_ROOT: /run/fabi-registry/bootstrap-root.json
       FABI_MODEL_REGISTRY_METADATA_URL: https://server.undefinedstudio.fr/fabi-swarm-registry-v3/metadata/
@@ -38,7 +42,7 @@ services:
       FABI_ROUTE_PERMIT_DB: /opt/parallax-runtime/swarm-v3/route-permits.sqlite3
       FABI_SWARM_V3_MODE: active
       FABI_SWARM_V3_EPOCH_DB: "/opt/parallax-runtime/swarm-v3/control.sqlite3"
-      FABI_SWARM_V3_SCHEDULER_STATE_DIR: /opt/parallax-runtime/swarm-v3/registry-authority-7ef69b40
+      FABI_SWARM_V3_SCHEDULER_STATE_DIR: /opt/parallax-runtime/swarm-v3/registry-authority-c0fe1ff1
       FABI_FORCE_RELAY: "0"
     network_mode: host
     volumes:

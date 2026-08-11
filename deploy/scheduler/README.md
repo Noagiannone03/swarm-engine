@@ -66,6 +66,13 @@ labels, TUF root, route-authority key, catalogue identity and persistent state
 mounts instead of relying on variables inherited from an unrelated compose
 service.
 
+The scheduler listens on catalogue port `19191` but also bootstraps into the
+shared root2 DHT through `19192` and `19193`. This is intentional: each model
+keeps an independent route authority and inference endpoint while all clients
+and schedulers observe one authenticated catalogue topology. Starting a second
+model must therefore add a model route, not create an isolated discovery
+island.
+
 An existing laboratory must name its already-provisioned state volume and
 identity path explicitly during promotion. This preserves the Iroh EndpointId
 and fencing ledger while still selecting the candidate image by immutable tag:
