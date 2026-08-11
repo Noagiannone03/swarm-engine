@@ -67,7 +67,7 @@ mounts instead of relying on variables inherited from an unrelated compose
 service.
 
 The scheduler listens on catalogue port `19191` but also bootstraps into the
-shared root2 DHT through `19192` and `19193`. This is intentional: each model
+shared catalogue DHT through `19192` and `19193`. This is intentional: each model
 keeps an independent route authority and inference endpoint while all clients
 and schedulers observe one authenticated catalogue topology. Starting a second
 model must therefore add a model route, not create an isolated discovery
@@ -90,7 +90,7 @@ Fresh laboratories may omit those two state overrides and receive a new named
 volume and scheduler identity. Private relay and route-authority bytes remain
 root-owned bind mounts; they are never placed in Compose environment values.
 
-The direct-GGUF/Skippy product qualification uses a separate Qwen3-0.6B swarm
+The Skippy product qualification uses a separate Qwen3-0.6B swarm
 so it cannot mutate the qualified Qwen3-4B control state:
 
 ```shell
@@ -123,3 +123,30 @@ PARALLAX_PREFERRED_CONTEXT_TOKENS=32768
 
 The scheduler publishes its selected tier, and a worker is not READY until its
 runtime-measured KV pages satisfy that contract.
+
+The multi-node selective-package qualification uses Qwen3-32B without forced
+spans:
+
+```shell
+FABI_QWEN3_32B_SCHEDULER_IMAGE=local/parallax-scheduler:<short-commit-sha> \
+docker compose \
+  -f docker-compose.lab-iroh-qwen3-32b.yml \
+  up -d --no-deps parallax-scheduler-qwen3-32b
+```
+
+The service defaults to `fabi.swarm=false` while its client runtime and TUF
+root are being staged. Promote it only after those pins are installed:
+
+```shell
+FABI_QWEN3_32B_SCHEDULER_IMAGE=local/parallax-scheduler:<short-commit-sha> \
+FABI_QWEN3_32B_DISCOVERABLE=true \
+docker compose \
+  -f docker-compose.lab-iroh-qwen3-32b.yml \
+  up -d --no-deps --force-recreate parallax-scheduler-qwen3-32b
+```
+
+It owns HTTP `3027`, transport `18162`, catalogue `19194`, a dedicated state
+volume and a persistent Iroh identity. The signed model contract references a
+64-layer Mesh/Skippy package; workers download only the layers selected by the
+autonomous placement algorithm. `PARALLAX_INIT_NODES=3` expresses the minimum
+laboratory topology but does not inject spans or bypass memory/KV admission.

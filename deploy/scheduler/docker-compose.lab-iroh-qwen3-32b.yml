@@ -1,21 +1,23 @@
 services:
-  parallax-scheduler-qwen3-0-6b:
-    image: ${FABI_QWEN3_0_6B_SCHEDULER_IMAGE:-local/parallax-scheduler:iroh-qualified}
-    container_name: parallax-scheduler-qwen3-0-6b-v3
+  parallax-scheduler-qwen3-32b:
+    image: ${FABI_QWEN3_32B_SCHEDULER_IMAGE:-local/parallax-scheduler:iroh-qualified}
+    container_name: parallax-scheduler-qwen3-32b-v3
     restart: unless-stopped
     labels:
-      fabi.swarm: "true"
-      fabi.swarm.id: qwen3-0-6b-v3
-      fabi.swarm.model: Qwen/Qwen3-0.6B
-      fabi.swarm.name: Fabi V3 (Qwen3-0.6B)
-      fabi.swarm.url: https://server.undefinedstudio.fr/fabi-scheduler/qwen3-0-6b-v3
+      # Keep a candidate invisible until its runtime/root pins are installed on
+      # clients. Promotion is explicit and does not mutate model identity.
+      fabi.swarm: "${FABI_QWEN3_32B_DISCOVERABLE:-false}"
+      fabi.swarm.id: qwen3-32b-v3
+      fabi.swarm.model: Qwen/Qwen3-32B
+      fabi.swarm.name: Fabi V3 (Qwen3-32B)
+      fabi.swarm.url: https://server.undefinedstudio.fr/fabi-scheduler/qwen3-32b-v3
     environment:
-      PARALLAX_HTTP_PORT: "3026"
-      PARALLAX_TCP_PORT: "18161"
-      PARALLAX_UDP_PORT: "18161"
-      PARALLAX_MODEL: "Qwen/Qwen3-0.6B"
-      PARALLAX_WORKERS: "2"
-      PARALLAX_INIT_NODES: "2"
+      PARALLAX_HTTP_PORT: "3027"
+      PARALLAX_TCP_PORT: "18162"
+      PARALLAX_UDP_PORT: "18162"
+      PARALLAX_MODEL: "Qwen/Qwen3-32B"
+      PARALLAX_WORKERS: "3"
+      PARALLAX_INIT_NODES: "3"
       PARALLAX_EXTRA_ARGS: --use-relay -u
       PARALLAX_STRATEGY: "dp"
       PARALLAX_ROUTING_STRATEGY: "dp"
@@ -27,10 +29,10 @@ services:
       FABI_NETWORK_TRANSPORT: "iroh"
       FABI_RELAY_URL: "https://server.undefinedstudio.fr:4443"
       FABI_RELAY_TOKEN_FILE: "/run/secrets/fabi-iroh-relay-token"
-      FABI_NETWORK_IDENTITY_PATH: ${FABI_QWEN3_0_6B_NETWORK_IDENTITY_PATH:-/opt/parallax-runtime/network/scheduler.key}
+      FABI_NETWORK_IDENTITY_PATH: ${FABI_QWEN3_32B_NETWORK_IDENTITY_PATH:-/opt/parallax-runtime/network/scheduler.key}
       FABI_CATALOG_DHT_MODE: "server"
-      FABI_CATALOG_DHT_LISTEN_ADDRESS: /ip4/0.0.0.0/tcp/19193
-      FABI_CATALOG_DHT_BOOTSTRAPS: '["/ip4/37.59.98.16/tcp/19191/p2p/12D3KooWB1VciohMDGP6qC5m1tDRbCMfjQ14LWx12FsWyJtnWEsn","/ip4/37.59.98.16/tcp/19192/p2p/12D3KooWMQrc1rWXwaeQcshtANiw9FyyGWmfqAnVsStGRqsJ54Yi"]'
+      FABI_CATALOG_DHT_LISTEN_ADDRESS: /ip4/0.0.0.0/tcp/19194
+      FABI_CATALOG_DHT_BOOTSTRAPS: '["/ip4/37.59.98.16/tcp/19192/p2p/12D3KooWMQrc1rWXwaeQcshtANiw9FyyGWmfqAnVsStGRqsJ54Yi","/ip4/37.59.98.16/tcp/19193/p2p/12D3KooWG8jJaC1upci3eDZ7XSobTPC5hT6bdqFGzzptH8q7b1eG"]'
       FABI_CATALOG_DHT_IDENTITY_PATH: /opt/parallax-runtime/network/scheduler-catalog.key
       FABI_MODEL_REGISTRY_ROOT: /run/fabi-registry/bootstrap-root.json
       FABI_MODEL_REGISTRY_METADATA_URL: https://server.undefinedstudio.fr/fabi-swarm-registry-v3/root3/metadata/
@@ -38,19 +40,19 @@ services:
       FABI_ROUTE_CAPABILITY_PRIVATE_KEY: /run/secrets/fabi-route-capability-key
       FABI_ROUTE_PERMIT_DB: /opt/parallax-runtime/swarm-v3/route-permits.sqlite3
       FABI_SWARM_V3_MODE: active
-      FABI_SWARM_V3_EPOCH_DB: "/opt/parallax-runtime/swarm-v3/control.sqlite3"
+      FABI_SWARM_V3_EPOCH_DB: /opt/parallax-runtime/swarm-v3/control.sqlite3
       FABI_SWARM_V3_SCHEDULER_STATE_DIR: /opt/parallax-runtime/swarm-v3/registry-authority-322767d6
       FABI_FORCE_RELAY: "0"
     network_mode: host
     volumes:
       - parallax-cache:/root/.cache
-      - parallax-state-qwen3-0-6b-v3:/opt/parallax-runtime
+      - parallax-state-qwen3-32b-v3:/opt/parallax-runtime
       - ${FABI_MODEL_REGISTRY_ROOT_PATH:-/home/debian/bootstrap-root-root3.json}:/run/fabi-registry/bootstrap-root.json:ro
       - /etc/fabi-iroh-relay/relay.env:/run/secrets/fabi-iroh-relay-token:ro
-      - ${FABI_QWEN3_0_6B_ROUTE_KEY_PATH:-/etc/fabi-route-authority/qwen3-4b-v3-generation-1.key}:/run/secrets/fabi-route-capability-key:ro
+      - ${FABI_QWEN3_32B_ROUTE_KEY_PATH:-/etc/fabi-route-authority/qwen3-4b-v3-generation-1.key}:/run/secrets/fabi-route-capability-key:ro
 
 volumes:
   parallax-cache:
     name: ${FABI_SHARED_MODEL_CACHE_VOLUME:-parallax-cache}
-  parallax-state-qwen3-0-6b-v3:
-    name: ${FABI_QWEN3_0_6B_STATE_VOLUME:-parallax-state-qwen3-0-6b-v3}
+  parallax-state-qwen3-32b-v3:
+    name: ${FABI_QWEN3_32B_STATE_VOLUME:-parallax-state-qwen3-32b-v3}

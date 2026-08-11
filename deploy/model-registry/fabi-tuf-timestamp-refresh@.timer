@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the Fabi TUF timestamp for authority %i before expiry
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:15:00
+Persistent=true
+RandomizedDelaySec=5min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

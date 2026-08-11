@@ -25,7 +25,7 @@ $accountTokenFile = if ($env:FABI_ACCOUNT_TOKEN_FILE) {
 $registryRoot = if ($env:FABI_MODEL_REGISTRY_ROOT) {
   $env:FABI_MODEL_REGISTRY_ROOT
 } else {
-  Join-Path $state "trust\model-registry-root-c0fe1ff1c8a45b286056f05d83e38039b8dd3e743e4d3e739177108b7d44285b.json"
+  Join-Path $state "trust\model-registry-root-322767d6181161a6a6d1457849b1780870c59abe527b0e1775ddd914e6ed5d7a.json"
 }
 $catalogBootstraps = if ($env:FABI_CATALOG_DHT_BOOTSTRAPS) {
   $env:FABI_CATALOG_DHT_BOOTSTRAPS
@@ -86,8 +86,8 @@ $env:FABI_SWARM_V3_MODE = if ($env:FABI_SWARM_V3_MODE) { $env:FABI_SWARM_V3_MODE
 $env:FABI_SWARM_V3_PLACEMENT = if ($env:FABI_SWARM_V3_PLACEMENT) { $env:FABI_SWARM_V3_PLACEMENT } else { "autonomous" }
 $env:FABI_SWARM_V3_COORDINATION_MODE = "client"
 $env:FABI_MODEL_REGISTRY_ROOT = $registryRoot
-$env:FABI_MODEL_REGISTRY_METADATA_URL = if ($env:FABI_MODEL_REGISTRY_METADATA_URL) { $env:FABI_MODEL_REGISTRY_METADATA_URL } else { "https://server.undefinedstudio.fr/fabi-swarm-registry-v3/metadata/" }
-$env:FABI_MODEL_REGISTRY_TARGETS_URL = if ($env:FABI_MODEL_REGISTRY_TARGETS_URL) { $env:FABI_MODEL_REGISTRY_TARGETS_URL } else { "https://server.undefinedstudio.fr/fabi-swarm-registry-v3/targets/" }
+$env:FABI_MODEL_REGISTRY_METADATA_URL = if ($env:FABI_MODEL_REGISTRY_METADATA_URL) { $env:FABI_MODEL_REGISTRY_METADATA_URL } else { "https://server.undefinedstudio.fr/fabi-swarm-registry-v3/root3/metadata/" }
+$env:FABI_MODEL_REGISTRY_TARGETS_URL = if ($env:FABI_MODEL_REGISTRY_TARGETS_URL) { $env:FABI_MODEL_REGISTRY_TARGETS_URL } else { "https://server.undefinedstudio.fr/fabi-swarm-registry-v3/root3/targets/" }
 $env:FABI_CATALOG_DHT_MODE = if ($env:FABI_CATALOG_DHT_MODE) { $env:FABI_CATALOG_DHT_MODE } else { "client" }
 $env:FABI_CATALOG_DHT_BOOTSTRAPS = $catalogBootstraps
 $env:FABI_CATALOG_DHT_IDENTITY_PATH = if ($env:FABI_CATALOG_DHT_IDENTITY_PATH) { $env:FABI_CATALOG_DHT_IDENTITY_PATH } else { Join-Path $networkState "worker-catalog.key" }

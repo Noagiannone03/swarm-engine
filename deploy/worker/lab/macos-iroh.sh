@@ -20,7 +20,7 @@ else
   scheduler_endpoint="$(<"$scheduler_pointer")"
 fi
 account_token_file="${FABI_ACCOUNT_TOKEN_FILE:-$HOME/.config/fabi/account-token}"
-registry_root="${FABI_MODEL_REGISTRY_ROOT:-$state/trust/model-registry-root-c0fe1ff1c8a45b286056f05d83e38039b8dd3e743e4d3e739177108b7d44285b.json}"
+registry_root="${FABI_MODEL_REGISTRY_ROOT:-$state/trust/model-registry-root-322767d6181161a6a6d1457849b1780870c59abe527b0e1775ddd914e6ed5d7a.json}"
 catalog_bootstraps="${FABI_CATALOG_DHT_BOOTSTRAPS:-[
   \"/ip4/37.59.98.16/tcp/19192/p2p/12D3KooWMQrc1rWXwaeQcshtANiw9FyyGWmfqAnVsStGRqsJ54Yi\",
   \"/ip4/37.59.98.16/tcp/19193/p2p/12D3KooWG8jJaC1upci3eDZ7XSobTPC5hT6bdqFGzzptH8q7b1eG\"
@@ -63,8 +63,8 @@ export FABI_SWARM_V3_MODE="${FABI_SWARM_V3_MODE:-active}"
 export FABI_SWARM_V3_PLACEMENT="${FABI_SWARM_V3_PLACEMENT:-autonomous}"
 export FABI_SWARM_V3_COORDINATION_MODE="client"
 export FABI_MODEL_REGISTRY_ROOT="$registry_root"
-export FABI_MODEL_REGISTRY_METADATA_URL="${FABI_MODEL_REGISTRY_METADATA_URL:-https://server.undefinedstudio.fr/fabi-swarm-registry-v3/metadata/}"
-export FABI_MODEL_REGISTRY_TARGETS_URL="${FABI_MODEL_REGISTRY_TARGETS_URL:-https://server.undefinedstudio.fr/fabi-swarm-registry-v3/targets/}"
+export FABI_MODEL_REGISTRY_METADATA_URL="${FABI_MODEL_REGISTRY_METADATA_URL:-https://server.undefinedstudio.fr/fabi-swarm-registry-v3/root3/metadata/}"
+export FABI_MODEL_REGISTRY_TARGETS_URL="${FABI_MODEL_REGISTRY_TARGETS_URL:-https://server.undefinedstudio.fr/fabi-swarm-registry-v3/root3/targets/}"
 export FABI_CATALOG_DHT_MODE="${FABI_CATALOG_DHT_MODE:-client}"
 export FABI_CATALOG_DHT_BOOTSTRAPS="$catalog_bootstraps"
 export FABI_CATALOG_DHT_IDENTITY_PATH="${FABI_CATALOG_DHT_IDENTITY_PATH:-$state/network/worker-catalog.key}"

@@ -19,6 +19,12 @@ The service follows the TUF role separation:
 avoids synchronized refresh traffic when the same units are deployed on
 multiple registry mirrors.
 
+The templated `fabi-tuf-timestamp-refresh@.service` and `.timer` variants let
+an operator stage a new independent TUF root alongside the currently served
+authority. Each instance has a separate credential directory, repository,
+container name and lock. This is required for a fail-safe root migration: the
+old timestamp continues to refresh until every qualified client has moved.
+
 ## Provisioning
 
 Build an operator image from the exact reviewed engine commit. The image must
@@ -64,3 +70,24 @@ fabi-swarm-registry verify-remote \
 Alert on any failed service execution and on remaining timestamp or snapshot
 validity. The timer is not a replacement for monitoring or the full snapshot
 publication ceremony.
+
+For a parallel authority named `root3`, install the templated units and put its
+three instance files under `/etc/fabi-tuf-timestamp/root3/`:
+
+```console
+sudo install -d -m 0700 /etc/fabi-tuf-timestamp/root3
+sudo install -m 0600 timestamp.pem /etc/fabi-tuf-timestamp/root3/timestamp.pem
+sudo install -m 0600 timestamp.passphrase \
+  /etc/fabi-tuf-timestamp/root3/timestamp.passphrase
+sudo install -m 0644 refresh.env /etc/fabi-tuf-timestamp/root3/refresh.env
+sudo install -m 0644 fabi-tuf-timestamp-refresh@.service /etc/systemd/system/
+sudo install -m 0644 fabi-tuf-timestamp-refresh@.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fabi-tuf-timestamp-refresh@root3.timer
+sudo systemctl start fabi-tuf-timestamp-refresh@root3.service
+```
+
+Do not stop the previous authority's timer during this staging phase. As with
+the single-authority unit, only the timestamp key and its passphrase are copied
+to the mirror; the offline root, targets and snapshot keys never leave the
+operator host.
