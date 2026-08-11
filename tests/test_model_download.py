@@ -225,7 +225,12 @@ def test_cached_v3_index_follows_current_catalog_and_ignores_historical_targets(
     tmp_path, monkeypatch
 ):
     state_dir = tmp_path / "registry"
-    targets = state_dir / "targets"
+    root_path = tmp_path / "root.json"
+    root_bytes = b"independent-test-root"
+    root_path.write_bytes(root_bytes)
+    from swarm_protocol.registry import trusted_registry_cache_dir
+
+    targets = trusted_registry_cache_dir(state_dir, root_bytes) / "targets"
     targets.mkdir(parents=True)
     historical = _registry_bundle(b"old-tokenizer")
     current = _registry_bundle(b"current-tokenizer")
@@ -245,6 +250,7 @@ def test_cached_v3_index_follows_current_catalog_and_ignores_historical_targets(
     (targets / "catalog.json").write_bytes(catalog.canonical_bytes())
     monkeypatch.setenv("FABI_SWARM_V3_MODE", "active")
     monkeypatch.setenv("FABI_SWARM_V3_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("FABI_MODEL_REGISTRY_ROOT", str(root_path))
 
     selected = model_download._cached_v3_artifact_index("test/model", REVISION)
 

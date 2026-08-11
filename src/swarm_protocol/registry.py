@@ -52,6 +52,28 @@ _ROUTE_AUTHORITIES_TARGET_PATH = "route-authorities.json"
 RevocationIdentifierHex = Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
 
 
+def trusted_registry_cache_dir(state_dir: Path, bootstrap_root: bytes) -> Path:
+    """Return the cache namespace owned by one immutable trust anchor.
+
+    ``python-tuf`` treats ``metadata_dir`` as the durable trusted state for one
+    repository.  Reusing that directory with an unrelated bootstrap root makes
+    the new client correctly reject cached timestamp/snapshot metadata signed
+    by the previous authority.  Fabi can intentionally publish an independent
+    registry root between qualified releases, so the root digest is part of the
+    local cache identity.  In-band, dual-signed TUF root rotations keep using
+    this directory because their original bootstrap anchor is unchanged.
+
+    The digest covers the exact immutable bytes pinned by the product.  A
+    semantically identical but differently encoded root therefore gets a fresh
+    cache, which is conservative and cannot weaken rollback protection.
+    """
+
+    if not bootstrap_root:
+        raise ValueError("trusted registry requires non-empty bootstrap root bytes")
+    authority_id = hashlib.sha256(bootstrap_root).hexdigest()
+    return state_dir / "authorities" / authority_id
+
+
 class ModelCatalogEntry(ContractModel):
     """Human model identity mapped to one immutable execution contract."""
 
@@ -748,8 +770,9 @@ class TrustedModelRegistry:
     ) -> None:
         if not bootstrap_root:
             raise ValueError("trusted registry requires non-empty bootstrap root bytes")
-        self.metadata_dir = state_dir / "metadata"
-        self.target_dir = state_dir / "targets"
+        self.cache_dir = trusted_registry_cache_dir(state_dir, bootstrap_root)
+        self.metadata_dir = self.cache_dir / "metadata"
+        self.target_dir = self.cache_dir / "targets"
         self.metadata_base_url = metadata_base_url
         self.target_base_url = target_base_url
         self.bootstrap_root = bootstrap_root

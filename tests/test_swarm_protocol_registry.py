@@ -142,7 +142,7 @@ def test_tuf_registry_authenticates_bundle_and_survives_root_rotation(tmp_path):
     with _serve(repository) as base_url:
         client = _client(tmp_path / "client", base_url, root_bytes)
         assert client.fetch(bundle.model_swarm_id) == bundle
-        projected_root = tmp_path / "client" / "metadata" / "root.json"
+        projected_root = client.metadata_dir / "root.json"
         assert not projected_root.is_symlink()
         assert projected_root.read_bytes() == root_bytes
         assert client.resolve("test/model", immutable_revision=REVISION) == bundle
@@ -157,6 +157,28 @@ def test_tuf_registry_authenticates_bundle_and_survives_root_rotation(tmp_path):
         assert client.fetch(bundle.model_swarm_id) == bundle
         assert not projected_root.is_symlink()
         assert projected_root.read_bytes() == (repository / "metadata" / "2.root.json").read_bytes()
+
+
+def test_tuf_registry_isolates_independent_bootstrap_authorities(tmp_path):
+    first_repository = tmp_path / "first-repository"
+    second_repository = tmp_path / "second-repository"
+    bundle = _bundle()
+    first_root = TufRegistryPublisher(first_repository, _signers()).initialize((bundle,))
+    second_root = TufRegistryPublisher(second_repository, _signers()).initialize((bundle,))
+    assert first_root != second_root
+
+    state_dir = tmp_path / "shared-client-state"
+    with _serve(first_repository) as first_url, _serve(second_repository) as second_url:
+        first = _client(state_dir, first_url, first_root)
+        second = _client(state_dir, second_url, second_root)
+        assert first.fetch(bundle.model_swarm_id) == bundle
+        assert second.fetch(bundle.model_swarm_id) == bundle
+
+    assert first.cache_dir != second.cache_dir
+    assert first.metadata_dir.joinpath("timestamp.json").is_file()
+    assert second.metadata_dir.joinpath("timestamp.json").is_file()
+    assert first.metadata_dir.joinpath("root.json").read_bytes() == first_root
+    assert second.metadata_dir.joinpath("root.json").read_bytes() == second_root
 
 
 def test_tuf_registry_authenticates_route_authority_rotation_and_revocations(tmp_path):

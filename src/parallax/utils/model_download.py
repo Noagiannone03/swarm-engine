@@ -393,7 +393,17 @@ def _cached_v3_artifact_index(
             str(Path.home() / ".fabi" / "swarm-v3" / "registry"),
         )
     )
-    target_dir = state_dir / "targets"
+    root_path = os.environ.get("FABI_MODEL_REGISTRY_ROOT", "").strip()
+    if not root_path:
+        raise RuntimeError("autonomous executor has no pinned registry root")
+    try:
+        bootstrap_root = Path(root_path).read_bytes()
+    except OSError as exc:
+        raise RuntimeError("autonomous executor cannot read its pinned registry root") from exc
+
+    from swarm_protocol.registry import trusted_registry_cache_dir
+
+    target_dir = trusted_registry_cache_dir(state_dir, bootstrap_root) / "targets"
     if not target_dir.is_dir():
         return None
 
