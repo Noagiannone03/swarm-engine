@@ -1,5 +1,7 @@
 import functools
 import hashlib
+import json
+import shutil
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -27,6 +29,7 @@ from swarm_protocol import (
     TufRegistryPublisher,
     TufTimestampRefresher,
     artifact_collection_hash,
+    synchronize_repository_timestamp,
 )
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -304,6 +307,75 @@ def test_full_publish_advances_timestamp_after_independent_refreshes(tmp_path):
     timestamp = __import__("json").loads((repository / "metadata" / "timestamp.json").read_bytes())
     assert timestamp["signed"]["version"] == 4
     assert timestamp["signed"]["meta"]["snapshot.json"]["version"] == 2
+
+
+def test_offline_publish_synchronizes_the_authenticated_online_timestamp(tmp_path):
+    operator_repository = tmp_path / "operator"
+    online_repository = tmp_path / "online"
+    signers = _signers()
+    bundle = _bundle()
+    now = datetime.now(timezone.utc)
+    publisher = TufRegistryPublisher(operator_repository, signers)
+    publisher.initialize((bundle,), now=now)
+    shutil.copytree(operator_repository, online_repository)
+
+    assert TufTimestampRefresher(online_repository, signers.timestamp).refresh(
+        now=now + timedelta(minutes=1)
+    ) == 2
+    version, changed = synchronize_repository_timestamp(
+        operator_repository,
+        (online_repository / "metadata" / "timestamp.json").read_bytes(),
+        now=now + timedelta(minutes=2),
+    )
+    assert (version, changed) == (2, True)
+
+    # The full offline publish now advances beyond the real online version.
+    assert publisher.publish((bundle,), now=now + timedelta(minutes=3)) == 2
+    timestamp = json.loads((operator_repository / "metadata" / "timestamp.json").read_bytes())
+    assert timestamp["signed"]["version"] == 3
+    assert timestamp["signed"]["meta"]["snapshot.json"]["version"] == 2
+
+
+def test_timestamp_synchronization_rejects_same_version_equivocation(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    signers = _signers()
+    now = datetime.now(timezone.utc)
+    TufRegistryPublisher(first, signers).initialize((_bundle(),), now=now)
+    shutil.copytree(first, second)
+    assert TufTimestampRefresher(first, signers.timestamp).refresh(
+        now=now + timedelta(minutes=1)
+    ) == 2
+    assert TufTimestampRefresher(second, signers.timestamp).refresh(
+        now=now + timedelta(minutes=2)
+    ) == 2
+
+    with pytest.raises(ValueError, match="equivocation"):
+        synchronize_repository_timestamp(
+            first,
+            (second / "metadata" / "timestamp.json").read_bytes(),
+            now=now + timedelta(minutes=3),
+        )
+
+
+def test_timestamp_synchronization_never_imports_an_unknown_snapshot(tmp_path):
+    operator_repository = tmp_path / "operator"
+    online_repository = tmp_path / "online"
+    signers = _signers()
+    now = datetime.now(timezone.utc)
+    TufRegistryPublisher(operator_repository, signers).initialize((_bundle(),), now=now)
+    shutil.copytree(operator_repository, online_repository)
+    TufRegistryPublisher(online_repository, signers).publish(
+        (_bundle(tokenizer_bytes=b"new revision"),),
+        now=now + timedelta(minutes=1),
+    )
+
+    with pytest.raises(ValueError, match="unavailable snapshot version 2"):
+        synchronize_repository_timestamp(
+            operator_repository,
+            (online_repository / "metadata" / "timestamp.json").read_bytes(),
+            now=now + timedelta(minutes=2),
+        )
 
 
 def test_registry_bundle_rejects_manifest_index_substitution():

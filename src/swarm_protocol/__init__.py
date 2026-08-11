@@ -116,6 +116,7 @@ from swarm_protocol.registry import (
     TufRegistryPublisher,
     TufTimestampRefresher,
     model_target_path,
+    synchronize_repository_timestamp,
 )
 from swarm_protocol.request_agent import (
     IssuedAdmission,
@@ -256,6 +257,7 @@ __all__ = [
     "TrustedModelRegistry",
     "TufRegistryPublisher",
     "TufTimestampRefresher",
+    "synchronize_repository_timestamp",
     "VerifiedExecutionSpan",
     "VerifiedExecutionStage",
     "VerifiedSkippySpan",

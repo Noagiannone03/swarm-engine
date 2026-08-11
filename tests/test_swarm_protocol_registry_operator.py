@@ -38,6 +38,7 @@ from swarm_protocol.registry_operator import (
     load_staging_timestamp_signers,
     publish_staging_registry,
     read_passphrase_file,
+    sync_online_timestamp,
 )
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -439,6 +440,16 @@ def test_timestamp_signer_can_refresh_without_other_private_roles(tmp_path):
     timestamp = __import__("json").loads((repository / "metadata" / "timestamp.json").read_bytes())
     assert timestamp["signed"]["version"] == 2
     assert timestamp["signed"]["meta"]["snapshot.json"]["version"] == 1
+
+
+def test_online_timestamp_sync_requires_credential_free_https(tmp_path):
+    with pytest.raises(ValueError, match="credential-free HTTPS"):
+        sync_online_timestamp(tmp_path, "http://registry.invalid/metadata/timestamp.json")
+    with pytest.raises(ValueError, match="credential-free HTTPS"):
+        sync_online_timestamp(
+            tmp_path,
+            "https://user:secret@registry.invalid/metadata/timestamp.json",
+        )
 
 
 def test_passphrase_file_must_be_private_and_nonempty(tmp_path):

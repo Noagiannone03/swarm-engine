@@ -46,6 +46,7 @@ from swarm_protocol.model_manifest import artifact_collection_hash
 
 _SERIALIZER = JSONSerializer(compact=True, validate=True)
 _MAX_BUNDLE_BYTES = 32 * 1024 * 1024
+_MAX_TIMESTAMP_BYTES = 16 * 1024
 _TOP_LEVEL_ROLES = ("root", "targets", "snapshot", "timestamp")
 _CATALOG_TARGET_PATH = "catalog.json"
 _ROUTE_AUTHORITIES_TARGET_PATH = "route-authorities.json"
@@ -642,6 +643,90 @@ class TufRegistryPublisher:
         if not isinstance(metadata.signed, Root):
             raise ValueError("latest root metadata does not contain a TUF root role")
         return metadata
+
+
+def synchronize_repository_timestamp(
+    repository_dir: Path,
+    payload: bytes,
+    *,
+    now: datetime | None = None,
+) -> tuple[int, bool]:
+    """Import a newer online timestamp without weakening offline state.
+
+    The online timestamp signer legitimately advances ``timestamp.json`` between
+    full offline publications.  Before the offline publisher chooses its next
+    version, it must learn that authenticated monotonic version.  Only the
+    timestamp for the exact snapshot already present in the operator repository
+    is accepted: this function never imports targets, snapshots, roots or keys.
+    """
+
+    if not payload or len(payload) > _MAX_TIMESTAMP_BYTES:
+        raise ValueError(f"online timestamp must contain 1..{_MAX_TIMESTAMP_BYTES} bytes")
+    metadata_dir = repository_dir / "metadata"
+    current_path = metadata_dir / "timestamp.json"
+    current_payload = current_path.read_bytes()
+    remote = Metadata.from_bytes(payload)
+    current = Metadata.from_bytes(current_payload)
+    if not isinstance(remote.signed, Timestamp):
+        raise ValueError("online metadata is not a TUF timestamp")
+    if not isinstance(current.signed, Timestamp):
+        raise ValueError("local timestamp.json is not TUF timestamp metadata")
+
+    roots: list[Metadata[Root]] = []
+    versioned_roots: list[tuple[int, Path]] = []
+    for path in metadata_dir.glob("*.root.json"):
+        try:
+            versioned_roots.append((int(path.name.split(".", 1)[0]), path))
+        except ValueError:
+            continue
+    for _, path in sorted(versioned_roots, reverse=True):
+        root = Metadata.from_file(str(path))
+        if isinstance(root.signed, Root):
+            roots.append(root)
+    if not roots:
+        raise FileNotFoundError("TUF registry has no versioned root metadata")
+
+    def verify_role(role: str, metadata: Metadata) -> None:
+        for root in roots:
+            try:
+                root.signed.verify_delegate(role, metadata.signed_bytes, metadata.signatures)
+                return
+            except (UnsignedMetadataError, ValueError):
+                continue
+        raise ValueError(f"online {role} is not authenticated by retained TUF roots")
+
+    verify_role("timestamp", current)
+    verify_role("timestamp", remote)
+    if remote.signed.is_expired(_utc_now(now)):
+        raise ValueError("online timestamp is expired")
+    if remote.signed.version < current.signed.version:
+        raise ValueError(
+            f"online timestamp rollback: {remote.signed.version} < {current.signed.version}"
+        )
+    if remote.signed.version == current.signed.version:
+        if remote.signed_bytes != current.signed_bytes or remote.signatures != current.signatures:
+            raise ValueError("online timestamp equivocation at the current version")
+        return current.signed.version, False
+
+    snapshot_version = remote.signed.snapshot_meta.version
+    snapshot_path = metadata_dir / f"{snapshot_version}.snapshot.json"
+    if not snapshot_path.is_file():
+        raise ValueError(
+            f"online timestamp references unavailable snapshot version {snapshot_version}"
+        )
+    snapshot_payload = snapshot_path.read_bytes()
+    snapshot = Metadata.from_bytes(snapshot_payload)
+    if not isinstance(snapshot.signed, Snapshot):
+        raise ValueError("referenced local metadata is not a TUF snapshot")
+    if snapshot.signed.version != snapshot_version:
+        raise ValueError("referenced local snapshot version is inconsistent")
+    verify_role("snapshot", snapshot)
+    expected = MetaFile.from_data(snapshot_version, snapshot_payload, ["sha256"])
+    if remote.signed.snapshot_meta.to_dict() != expected.to_dict():
+        raise ValueError("online timestamp does not authenticate the exact local snapshot")
+
+    _atomic_write(current_path, remote.to_bytes(_SERIALIZER))
+    return remote.signed.version, True
 
 
 class TufTimestampRefresher:

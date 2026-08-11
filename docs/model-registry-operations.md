@@ -152,6 +152,23 @@ fabi-swarm-registry publish \
   --passphrase-file /private/operator/secrets/registry.passphrase
 ```
 
+If the online timestamp refresher has run since the previous offline publish,
+synchronize its public state first. The command accepts only credential-free
+HTTPS, verifies the timestamp against the retained root history, rejects
+rollback/equivocation/expiry, and requires it to authenticate the exact
+versioned snapshot already present in the offline repository:
+
+```console
+fabi-swarm-registry sync-online-timestamp \
+  --repository-dir /srv/fabi-registry-v3 \
+  --timestamp-url https://example.invalid/fabi-swarm-registry-v3/metadata/timestamp.json
+```
+
+This imports only `timestamp.json`; it never downloads a root, snapshot,
+targets file, model target or private key. A subsequent `publish` therefore
+increments from the real online timestamp version instead of creating two
+different metadata documents with the same rollback-sensitive version.
+
 The timestamp role is deliberately short-lived. Refresh it from an automated
 operator before half of its 24-hour validity has elapsed:
 

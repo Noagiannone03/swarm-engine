@@ -21,7 +21,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Mapping, Sequence
+from urllib.parse import urlsplit
 
+import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
     BestAvailableEncryption,
@@ -58,6 +60,7 @@ from swarm_protocol.registry import (
     TrustedModelRegistry,
     TufRegistryPublisher,
     TufTimestampRefresher,
+    synchronize_repository_timestamp,
 )
 from swarm_protocol.skippy_package_import import (
     attach_skippy_direct_gguf,
@@ -70,6 +73,7 @@ _MAX_SECRET_BYTES = 4096
 _MAX_BUNDLE_BYTES = 32 * 1024 * 1024
 _MAX_PORTABLE_INVENTORY_BYTES = 32 * 1024 * 1024
 _MAX_ROUTE_AUTHORITY_BYTES = 1024 * 1024
+_MAX_ONLINE_TIMESTAMP_BYTES = 16 * 1024
 _DEFAULT_ROUTE_AUTHORITY_VALIDITY_DAYS = 90
 _DEFAULT_ROUTE_AUTHORITY_CLOCK_SKEW_SECONDS = 300
 
@@ -953,6 +957,28 @@ def publish_staging_registry(
     return version, bundles
 
 
+def sync_online_timestamp(repository_dir: Path, timestamp_url: str) -> tuple[int, bool]:
+    """Fetch and import the authenticated online timestamp for an offline publish."""
+
+    parsed = urlsplit(timestamp_url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("online timestamp URL must be credential-free HTTPS")
+    with httpx.Client(follow_redirects=False, timeout=15.0) as client:
+        with client.stream("GET", timestamp_url, headers={"accept": "application/json"}) as response:
+            response.raise_for_status()
+            declared = response.headers.get("content-length")
+            if declared is not None and int(declared) > _MAX_ONLINE_TIMESTAMP_BYTES:
+                raise ValueError("online timestamp exceeds the 16 KiB operator limit")
+            chunks: list[bytes] = []
+            size = 0
+            for chunk in response.iter_bytes():
+                size += len(chunk)
+                if size > _MAX_ONLINE_TIMESTAMP_BYTES:
+                    raise ValueError("online timestamp exceeds the 16 KiB operator limit")
+                chunks.append(chunk)
+    return synchronize_repository_timestamp(repository_dir, b"".join(chunks))
+
+
 def _passphrase(args: argparse.Namespace, *, confirm: bool) -> bytes:
     if args.passphrase_file is not None:
         return read_passphrase_file(args.passphrase_file)
@@ -1179,6 +1205,10 @@ def _parser() -> argparse.ArgumentParser:
     refresh_timestamp.add_argument("--key-dir", type=Path, required=True)
     refresh_timestamp.add_argument("--passphrase-file", type=Path)
 
+    sync_timestamp = commands.add_parser("sync-online-timestamp")
+    sync_timestamp.add_argument("--repository-dir", type=Path, required=True)
+    sync_timestamp.add_argument("--timestamp-url", required=True)
+
     verify = commands.add_parser("verify-remote")
     verify.add_argument("--bootstrap-root", type=Path, required=True)
     verify.add_argument("--metadata-url", required=True)
@@ -1390,6 +1420,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ).refresh()
         result = {
             "status": "timestamp_refreshed",
+            "version": version,
+            "repository": str(args.repository_dir),
+        }
+    elif args.command == "sync-online-timestamp":
+        version, changed = sync_online_timestamp(args.repository_dir, args.timestamp_url)
+        result = {
+            "status": "online_timestamp_synchronized" if changed else "online_timestamp_current",
             "version": version,
             "repository": str(args.repository_dir),
         }
