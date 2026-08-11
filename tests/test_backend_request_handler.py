@@ -4,6 +4,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import anyio
 from fastapi.testclient import TestClient
 
 import backend.main as backend_main
@@ -489,6 +490,21 @@ def test_blocking_route_release_does_not_stall_the_asyncio_event_loop():
 
     assert response.status_code == 200
     assert loop_progressed_during_release is True
+
+
+def test_route_release_is_shielded_from_anyio_level_cancellation():
+    handler = RequestHandler()
+    scheduler_manage = ForwardingSchedulerManage()
+    handler.set_scheduler_manage(scheduler_manage)
+
+    async def cancel_then_release():
+        with anyio.CancelScope() as cancelled_scope:
+            cancelled_scope.cancel()
+            await handler._release_route("cancelled-scope-request")
+
+    anyio.run(cancel_then_release)
+
+    assert scheduler_manage.released == ["cancelled-scope-request"]
 
 
 def test_forward_request_returns_openai_error_when_pipelines_are_busy():

@@ -74,17 +74,24 @@ class RequestHandler:
     async def _release_route(self, request_id: str) -> None:
         release = getattr(self.scheduler_manage, "release_routing_table", None)
         if release is not None:
-            try:
-                await asyncio.to_thread(release, str(request_id))
-            except Exception:
-                # Route/permit cleanup is idempotent and their signed TTLs
-                # still fail closed. A transient authority outage during
-                # cleanup must not corrupt an already committed OpenAI stream.
-                logger.warning(
-                    "Unable to acknowledge route release for request %s",
-                    request_id,
-                    exc_info=True,
-                )
+            # Starlette cancels the response-body task when its HTTP peer
+            # disconnects. Under AnyIO's level-cancellation semantics, every
+            # subsequent await is cancelled again unless finalization is
+            # shielded. Route release revokes both the worker fence and the
+            # account-scoped permit, so it must finish even when the stream
+            # that owns it has just been cancelled.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await asyncio.to_thread(release, str(request_id))
+                except Exception:
+                    # Route/permit cleanup is idempotent and their signed TTLs
+                    # still fail closed. A transient authority outage during
+                    # cleanup must not corrupt an already committed OpenAI stream.
+                    logger.warning(
+                        "Unable to acknowledge route release for request %s",
+                        request_id,
+                        exc_info=True,
+                    )
 
     @staticmethod
     def _abort_backend_request(stub, backend_request: Dict) -> None:
