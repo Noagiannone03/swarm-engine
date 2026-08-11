@@ -370,7 +370,7 @@ def test_existing_skippy_plan_is_certified_without_rebuilding_its_artifacts():
         )
 
 
-def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
+def _package_import_fixture(tmp_path):
     contents, populated_index, populated_model = _fixture()
     execution_roles = {
         ArtifactRole.EXECUTION_LAYER,
@@ -390,6 +390,8 @@ def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
     base_bundle = ModelRegistryBundle(manifest=base_model, artifact_index=base_index)
     package_path = tmp_path / "model-package.json"
     package_path.write_bytes(contents["model-package.json"])
+    metadata_path = tmp_path / "metadata.gguf"
+    metadata_path.write_bytes(contents["shared/metadata.gguf"])
 
     siblings = []
     for artifact in populated_index.artifacts:
@@ -403,6 +405,26 @@ def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
         model_info=lambda *args, **kwargs: SimpleNamespace(sha="9" * 40, siblings=siblings)
     )
 
+    def downloader(**kwargs):
+        if kwargs["filename"] == "model-package.json":
+            return str(package_path)
+        if kwargs["filename"] == "shared/metadata.gguf":
+            return str(metadata_path)
+        raise AssertionError(f"unexpected package download: {kwargs['filename']}")
+
+    geometry = SimpleNamespace(
+        activation_width=1024,
+        context_length=32768,
+        kv_bytes_per_token=512,
+        layer_count=2,
+        static_bytes_by_layer=(),
+    )
+    return base_bundle, api, downloader, geometry
+
+
+def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
+    base_bundle, api, downloader, geometry = _package_import_fixture(tmp_path)
+
     attached = attach_skippy_package(
         base_bundle,
         package_repository_id="meshllm/Qwen3-0.6B-Q4_K_M-layers",
@@ -412,7 +434,8 @@ def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
         runtime_abi_version="0.1.32",
         exact_state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
         api=api,
-        downloader=lambda **kwargs: str(package_path),
+        downloader=downloader,
+        geometry_inspector=lambda path, cache_k, cache_v: geometry,
     )
 
     plan = attached.artifact_index.execution_plans[0]
@@ -421,6 +444,75 @@ def test_existing_hub_layer_package_is_imported_at_immutable_revision(tmp_path):
     assert plan.package_repository_id == "meshllm/Qwen3-0.6B-Q4_K_M-layers"
     assert len(plan.layer_paths) == 2
     assert attached.manifest.execution_plan_hash == execution_plan_hash(attached.artifact_index)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("layer_count", 3, "layer geometry"),
+        ("activation_width", 2048, "activation width"),
+        ("context_length", 16384, "context is smaller"),
+        ("kv_bytes_per_token", 1024, "KV geometry"),
+    ),
+)
+def test_layer_package_import_rejects_runtime_geometry_mismatch(tmp_path, field, value, message):
+    base_bundle, api, downloader, geometry = _package_import_fixture(tmp_path)
+    geometry = SimpleNamespace(**{**vars(geometry), field: value})
+
+    with pytest.raises(ValueError, match=message):
+        attach_skippy_package(
+            base_bundle,
+            package_repository_id="meshllm/Qwen3-0.6B-Q4_K_M-layers",
+            package_revision="main",
+            plan_id="skippy-q4-k-m-v1",
+            runtime_release="mesh-llm/v0.74.0",
+            runtime_abi_version="0.1.32",
+            api=api,
+            downloader=downloader,
+            geometry_inspector=lambda path, cache_k, cache_v: geometry,
+        )
+
+
+def test_layer_package_import_hashes_downloaded_metadata_before_inspection(tmp_path):
+    base_bundle, api, downloader, geometry = _package_import_fixture(tmp_path)
+    corrupted = tmp_path / "corrupted-metadata.gguf"
+    corrupted.write_bytes(b"x" * len(b"metadata"))
+
+    def corrupted_downloader(**kwargs):
+        if kwargs["filename"] == "shared/metadata.gguf":
+            return str(corrupted)
+        return downloader(**kwargs)
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        attach_skippy_package(
+            base_bundle,
+            package_repository_id="meshllm/Qwen3-0.6B-Q4_K_M-layers",
+            package_revision="main",
+            plan_id="skippy-q4-k-m-v1",
+            runtime_release="mesh-llm/v0.74.0",
+            runtime_abi_version="0.1.32",
+            api=api,
+            downloader=corrupted_downloader,
+            geometry_inspector=lambda path, cache_k, cache_v: geometry,
+        )
+
+
+def test_layer_package_import_rejects_requested_quantization_mismatch(tmp_path):
+    base_bundle, api, downloader, geometry = _package_import_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="quantization differs"):
+        attach_skippy_package(
+            base_bundle,
+            package_repository_id="meshllm/Qwen3-0.6B-Q4_K_M-layers",
+            package_revision="main",
+            plan_id="skippy-q4-k-m-v1",
+            runtime_release="mesh-llm/v0.74.0",
+            runtime_abi_version="0.1.32",
+            expected_quantization="Q8_0",
+            api=api,
+            downloader=downloader,
+            geometry_inspector=lambda path, cache_k, cache_v: geometry,
+        )
 
 
 def test_direct_gguf_needs_no_layer_package_and_loads_as_runtime_slice(tmp_path):

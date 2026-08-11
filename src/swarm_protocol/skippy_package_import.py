@@ -215,6 +215,58 @@ def _inspect_direct_geometry(paths: list[Path], cache_type_k: str, cache_type_v:
     )
 
 
+def _inspect_package_geometry(path: Path, cache_type_k: str, cache_type_v: str) -> _Geometry:
+    try:
+        import fabi_network_native
+    except (ImportError, OSError) as exc:  # pragma: no cover - product wheel integration
+        raise RuntimeError("the qualified Fabi native wheel is required to inspect GGUF") from exc
+    return fabi_network_native.inspect_skippy_package_geometry(
+        path,
+        cache_type_k,
+        cache_type_v,
+    )
+
+
+def _logical_activation_width(manifest: ModelManifest) -> int:
+    dtype_bytes = {"bfloat16": 2, "float16": 2, "float32": 4}.get(manifest.dtype)
+    if dtype_bytes is None or manifest.activation_bytes_per_token % dtype_bytes:
+        raise ValueError("logical model has unsupported activation geometry")
+    return manifest.activation_bytes_per_token // dtype_bytes
+
+
+def _validate_geometry_against_manifest(
+    geometry: _Geometry,
+    manifest: ModelManifest,
+    *,
+    label: str,
+) -> None:
+    if int(geometry.layer_count) != manifest.num_layers:
+        raise ValueError(f"{label} layer geometry differs from the logical model")
+    if int(geometry.context_length) < manifest.model_max_context_tokens:
+        raise ValueError(f"{label} context is smaller than the logical model contract")
+    if int(geometry.kv_bytes_per_token) != sum(manifest.kv_bytes_per_token_by_layer):
+        raise ValueError(f"{label} KV geometry differs from the logical model contract")
+    if int(geometry.activation_width) != _logical_activation_width(manifest):
+        raise ValueError(f"{label} activation width differs from the logical model contract")
+
+
+def _verify_downloaded_artifact(path: Path, *, size: int, sha256: str, label: str) -> None:
+    if not path.is_file():
+        raise ValueError(f"downloaded {label} is not a regular file")
+    if path.stat().st_size != size:
+        raise ValueError(f"downloaded {label} size differs from its package manifest")
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != sha256:
+        raise ValueError(f"downloaded {label} SHA-256 differs from its package manifest")
+
+
+def _normalized_quantization(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())
+
+
 def _direct_source_hash(descriptors: list[ArtifactDescriptor]) -> str:
     digest = hashlib.sha256(b"fabi/skippy-direct-source/v1\0")
     for descriptor in sorted(descriptors, key=lambda item: item.path):
@@ -316,19 +368,11 @@ def attach_skippy_direct_gguf(
     geometry = geometry_inspector(local_paths, "f16", "f16")
     manifest = base_bundle.manifest
     static_bytes = tuple(int(value) for value in geometry.static_bytes_by_layer)
-    if int(geometry.layer_count) != manifest.num_layers or len(static_bytes) != manifest.num_layers:
+    _validate_geometry_against_manifest(geometry, manifest, label="direct GGUF")
+    if len(static_bytes) != manifest.num_layers:
         raise ValueError("direct GGUF layer geometry differs from the logical model")
     if any(value <= 0 for value in static_bytes):
         raise ValueError("direct GGUF has incomplete per-layer tensor geometry")
-    if int(geometry.context_length) < manifest.model_max_context_tokens:
-        raise ValueError("direct GGUF context is smaller than the logical model contract")
-    if int(geometry.kv_bytes_per_token) != sum(manifest.kv_bytes_per_token_by_layer):
-        raise ValueError("direct GGUF KV geometry differs from the logical model contract")
-    dtype_bytes = {"bfloat16": 2, "float16": 2, "float32": 4}.get(manifest.dtype)
-    if dtype_bytes is None or manifest.activation_bytes_per_token % dtype_bytes:
-        raise ValueError("logical model has unsupported activation geometry")
-    if int(geometry.activation_width) != manifest.activation_bytes_per_token // dtype_bytes:
-        raise ValueError("direct GGUF activation width differs from the logical model contract")
     plan = SkippyExecutionPlan(
         plan_id=plan_id,
         format="gguf-direct",
@@ -393,11 +437,13 @@ def attach_skippy_package(
     plan_id: str,
     runtime_release: str,
     runtime_abi_version: str,
+    expected_quantization: str | None = None,
     providers: tuple[ExecutionProviderKind, ...] = _DEFAULT_PROVIDERS,
     exact_state_kind: SkippyExactStateKind = SkippyExactStateKind.DISABLED,
     token: bool | str | None = None,
     api: HfApi | None = None,
     downloader: Callable[..., str] = hf_hub_download,
+    geometry_inspector: Callable[[Path, str, str], _Geometry] = _inspect_package_geometry,
 ) -> ModelRegistryBundle:
     """Resolve, validate, and bind one public Skippy package to a Fabi bundle."""
 
@@ -484,12 +530,41 @@ def attach_skippy_package(
             )
         )
 
+    metadata_path, metadata_size, metadata_sha256 = shared_entries["metadata"]
+    local_metadata_path = Path(
+        downloader(
+            repo_id=package_repository_id,
+            filename=metadata_path,
+            revision=immutable_revision,
+            token=token,
+        )
+    )
+    _verify_downloaded_artifact(
+        local_metadata_path,
+        size=metadata_size,
+        sha256=metadata_sha256,
+        label="Skippy package metadata",
+    )
+    geometry = geometry_inspector(local_metadata_path, "f16", "f16")
+    _validate_geometry_against_manifest(
+        geometry,
+        base_bundle.manifest,
+        label="Skippy package GGUF",
+    )
+
     quantization = package_model_id.rpartition(":")[2]
     if not quantization or quantization == package_model_id:
         distribution_id = source.get("distribution_id")
         quantization = str(distribution_id or "").strip()
     if not quantization:
         raise ValueError("Skippy package does not identify its quantization/distribution")
+    if expected_quantization is not None:
+        expected = _normalized_quantization(expected_quantization)
+        actual = _normalized_quantization(quantization)
+        if not expected or (actual != expected and not actual.endswith(expected)):
+            raise ValueError(
+                "Skippy package quantization differs from the requested execution contract"
+            )
     plan = SkippyExecutionPlan(
         plan_id=plan_id,
         format="gguf-layer-package",

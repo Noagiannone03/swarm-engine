@@ -6,6 +6,7 @@ import stat
 import threading
 from contextlib import contextmanager
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -28,6 +29,7 @@ from swarm_protocol.registry_operator import (
     _bundle_summary,
     attach_portable_execution,
     attach_portable_execution_file,
+    build_skippy_package_bundle_file,
     generate_passphrase_file,
     generate_route_authority,
     generate_staging_keys,
@@ -88,6 +90,60 @@ def _bundle() -> ModelRegistryBundle:
 
 def _write_bundle(path, bundle):
     path.write_bytes(bundle.canonical_bytes())
+
+
+def test_build_skippy_package_bundle_skips_source_tensor_scan(tmp_path, monkeypatch):
+    base = _bundle()
+    calls = {}
+
+    def fake_build(model_id, **kwargs):
+        calls["build"] = (model_id, kwargs)
+        return SimpleNamespace(manifest=base.manifest, artifact_index=base.artifact_index)
+
+    def fake_attach(bundle, **kwargs):
+        calls["attach"] = (bundle, kwargs)
+        return bundle
+
+    monkeypatch.setattr(
+        "swarm_protocol.registry_operator.build_hub_model_bundle",
+        fake_build,
+    )
+    monkeypatch.setattr(
+        "swarm_protocol.registry_operator.attach_skippy_package",
+        fake_attach,
+    )
+    output = tmp_path / "skippy-package.json"
+    result = build_skippy_package_bundle_file(
+        output,
+        model_id="Qwen/Qwen3-30B-A3B",
+        revision="a" * 40,
+        package_repository_id="meshllm/Qwen3-30B-A3B-Q4_K_M-layers",
+        package_revision="b" * 40,
+        plan_id="skippy-q4-k-m-v1",
+        quantization="Q4_K_M",
+        dtype="bfloat16",
+        runtime_release="mesh-llm/v0.74.0",
+        runtime_abi_version="0.1.32",
+        providers=(ExecutionProviderKind.CUDA, ExecutionProviderKind.METAL),
+    )
+
+    assert result == base
+    assert ModelRegistryBundle.model_validate_json(output.read_bytes()) == base
+    assert calls["build"] == (
+        "Qwen/Qwen3-30B-A3B",
+        {
+            "revision": "a" * 40,
+            "quantization": "Q4_K_M",
+            "dtype": "bfloat16",
+            "token": None,
+            "include_weight_profile": False,
+            "include_selective_weight_index": False,
+        },
+    )
+    assert calls["attach"][0] == base
+    assert calls["attach"][1]["package_repository_id"] == ("meshllm/Qwen3-30B-A3B-Q4_K_M-layers")
+    assert calls["attach"][1]["package_revision"] == "b" * 40
+    assert calls["attach"][1]["expected_quantization"] == "Q4_K_M"
 
 
 def _portable_inventory(root):

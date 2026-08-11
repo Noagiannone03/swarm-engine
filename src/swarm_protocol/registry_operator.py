@@ -371,6 +371,60 @@ def build_hub_bundle_file(
     return bundle
 
 
+def build_skippy_package_bundle_file(
+    output: Path,
+    *,
+    model_id: str,
+    revision: str | None,
+    package_repository_id: str,
+    package_revision: str | None,
+    plan_id: str,
+    quantization: str,
+    dtype: str,
+    runtime_release: str,
+    runtime_abi_version: str,
+    providers: tuple[ExecutionProviderKind, ...],
+    exact_state_kind: SkippyExactStateKind = SkippyExactStateKind.DISABLED,
+    token: bool | str | None = None,
+) -> ModelRegistryBundle:
+    """Build a signed-model candidate directly around a Skippy layer package.
+
+    Package-backed execution does not consume the source checkpoint tensors.  Resolve and hash
+    only the source repository's architecture/tokenizer files plus its immutable weight-file
+    descriptors, then let the Skippy package provide the exact executable layer geometry.  This
+    deliberately avoids the expensive SafeTensors range index and weight-profile scan used by
+    the legacy checkpoint executor.
+    """
+
+    resolved = build_hub_model_bundle(
+        model_id,
+        revision=revision,
+        quantization=quantization,
+        dtype=dtype,
+        token=token,
+        include_weight_profile=False,
+        include_selective_weight_index=False,
+    )
+    base_bundle = ModelRegistryBundle(
+        manifest=resolved.manifest,
+        artifact_index=resolved.artifact_index,
+    )
+    bundle = attach_skippy_package(
+        base_bundle,
+        package_repository_id=package_repository_id,
+        package_revision=package_revision,
+        plan_id=plan_id,
+        runtime_release=runtime_release,
+        runtime_abi_version=runtime_abi_version,
+        expected_quantization=quantization,
+        providers=providers,
+        exact_state_kind=exact_state_kind,
+        token=token,
+    )
+    _atomic_write_public(output, bundle.canonical_bytes() + b"\n")
+    return bundle
+
+
 def _expect_exact_fields(
     value: Mapping[str, object],
     expected: set[str],
@@ -971,6 +1025,41 @@ def _parser() -> argparse.ArgumentParser:
         help="use the token from the normal Hugging Face credential store",
     )
 
+    build_skippy = commands.add_parser("build-skippy-package-bundle")
+    build_skippy.add_argument("--model-id", required=True)
+    build_skippy.add_argument("--revision")
+    build_skippy.add_argument("--package-repository-id", required=True)
+    build_skippy.add_argument("--package-revision")
+    build_skippy.add_argument("--plan-id", required=True)
+    build_skippy.add_argument("--quantization", required=True)
+    build_skippy.add_argument("--dtype", required=True)
+    build_skippy.add_argument("--runtime-release", required=True)
+    build_skippy.add_argument("--runtime-abi-version", required=True)
+    build_skippy.add_argument(
+        "--exact-state-kind",
+        choices=[
+            SkippyExactStateKind.DISABLED.value,
+            SkippyExactStateKind.DENSE_ATTENTION_KV.value,
+        ],
+        default=SkippyExactStateKind.DISABLED.value,
+        help="operator-qualified continuation state; dense KV requires live qualification",
+    )
+    build_skippy.add_argument(
+        "--provider",
+        action="append",
+        required=True,
+        choices=[
+            ExecutionProviderKind.CPU.value,
+            ExecutionProviderKind.CUDA.value,
+            ExecutionProviderKind.METAL.value,
+            ExecutionProviderKind.ROCM.value,
+            ExecutionProviderKind.VULKAN.value,
+        ],
+        help="qualified native backend; repeat for every tested backend",
+    )
+    build_skippy.add_argument("--use-hf-token", action="store_true")
+    build_skippy.add_argument("--output", type=Path, required=True)
+
     attach = commands.add_parser("attach-portable-execution")
     attach.add_argument("--bundle", type=Path, required=True)
     attach.add_argument("--inventory", type=Path, required=True)
@@ -1138,6 +1227,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             token=True if args.use_hf_token else None,
         )
         result = {"status": "built", **_bundle_summary(bundle), "output": str(args.output)}
+    elif args.command == "build-skippy-package-bundle":
+        bundle = build_skippy_package_bundle_file(
+            args.output,
+            model_id=args.model_id,
+            revision=args.revision,
+            package_repository_id=args.package_repository_id,
+            package_revision=args.package_revision,
+            plan_id=args.plan_id,
+            quantization=args.quantization,
+            dtype=args.dtype,
+            runtime_release=args.runtime_release,
+            runtime_abi_version=args.runtime_abi_version,
+            providers=tuple(
+                sorted(
+                    {ExecutionProviderKind(value) for value in args.provider},
+                    key=lambda provider: provider.value,
+                )
+            ),
+            exact_state_kind=SkippyExactStateKind(args.exact_state_kind),
+            token=True if args.use_hf_token else None,
+        )
+        result = {
+            "status": "skippy_package_bundle_built",
+            **_bundle_summary(bundle),
+            "output": str(args.output),
+        }
     elif args.command == "attach-portable-execution":
         providers = (
             tuple(ExecutionProviderKind(value) for value in args.provider)
