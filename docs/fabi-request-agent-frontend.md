@@ -107,6 +107,15 @@ that dies while replaying can itself be replaced at a still newer epoch.
 Without another feasible DHT route, the stream ends with a typed OpenAI error;
 Fabi never invents a continuation.
 
+The deterministic integration harness covers both failure boundaries.  In the
+decode case it commits one token on epoch 1, loses epoch 2 with a transport
+error after that replacement has replayed the committed prefix, and completes
+on epoch 3.  It asserts that the SQLite journal contains the exact two-token
+sequence, the client sees the first token once, failed workers accumulate in
+the exclusion fence, the original contribution permit is reused, and each
+replacement route has a strictly newer epoch.  This is protocol evidence, not
+a substitute for the pending native Mac/RTX/RunPod process-kill qualification.
+
 Exact replay is currently admitted only for greedy sampling and the bounded
 parameter subset implemented in `swarm_protocol.recovery`. Portable RNG state
 between MLX, vLLM and SGLang is not yet a wire contract, so sampled requests

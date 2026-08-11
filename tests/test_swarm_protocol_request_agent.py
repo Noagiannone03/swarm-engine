@@ -369,6 +369,68 @@ def test_request_agent_cold_replan_bans_failed_workers_and_reuses_permit():
     assert authority.released == [PERMIT]
 
 
+def test_request_agent_cold_replan_accumulates_fences_across_two_failed_routes():
+    model = manifest()
+    store = discovery(model)
+    publish_complete_worker(
+        store,
+        model,
+        worker_id="worker-y",
+        endpoint_id="77" * 32,
+    )
+    publish_complete_worker(
+        store,
+        model,
+        worker_id="worker-z",
+        endpoint_id="88" * 32,
+    )
+    authority = FakeAuthority()
+    coordinators = []
+
+    def coordinator_factory(transport, authorizer, renewal_authorizer):
+        coordinator = FakeCoordinator(transport, authorizer, renewal_authorizer)
+        coordinators.append(coordinator)
+        return coordinator
+
+    runtime = RequestAgentRouteRuntime(
+        transport=CryptoTransport(),
+        discovery=store,
+        registry=SimpleNamespace(fetch=lambda _model_id: SimpleNamespace(manifest=model)),
+        authority=authority,
+        epoch_allocator=InMemoryEpochAllocator(),
+        coordinator_factory=coordinator_factory,
+        clock_ms=lambda: 1_000,
+        start_maintenance_thread=False,
+    )
+    request = RequestContract(
+        request_id="request",
+        model_swarm_id=model.model_swarm_id,
+        prompt_tokens=1_000,
+        reserved_output_tokens=200,
+        recovery_level=RecoveryLevel.RESTARTABLE,
+    )
+
+    initial = runtime.reserve(request)
+    first = runtime.replan_cold("request", failed_epoch=initial.committed.plan.epoch)
+    second = runtime.replan_cold("request", failed_epoch=first.committed.plan.epoch)
+
+    initial_worker = initial.committed.plan.stages[0].worker_id
+    first_worker = first.committed.plan.stages[0].worker_id
+    second_worker = second.committed.plan.stages[0].worker_id
+    assert len({initial_worker, first_worker, second_worker}) == 3
+    assert first.excluded_worker_ids == frozenset({initial_worker})
+    assert second.excluded_worker_ids == frozenset({initial_worker, first_worker})
+    assert initial.committed.plan.epoch < first.committed.plan.epoch < second.committed.plan.epoch
+    assert first.permit.permit_id == initial.permit.permit_id
+    assert second.permit.permit_id == initial.permit.permit_id
+    assert len(authority.permits) == 1
+    assert len(authority.capabilities) == 3
+    assert coordinators[0].released == [initial.committed.plan.route_id]
+    assert coordinators[1].released == [first.committed.plan.route_id]
+    assert runtime.release_request("request") is True
+    assert authority.released == [PERMIT]
+
+
 def test_request_agent_retains_failed_permit_until_clean_replan_error_is_released():
     model = manifest()
     authority = FakeAuthority()

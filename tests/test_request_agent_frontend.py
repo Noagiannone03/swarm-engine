@@ -205,6 +205,21 @@ class FailoverStub(FakeCompletionStub):
         return FakeResponse(self.replay_chunks)
 
 
+class FailingReplayStub(FailoverStub):
+    """Replay stream that loses its transport after a deterministic prefix."""
+
+    def replay_generation(self, request):
+        self.replay_requests.append(request)
+        chunks = self.replay_chunks
+
+        class _FailingReplayResponse(FakeResponse):
+            def __iter__(self):
+                yield from chunks
+                raise ConnectionError("replacement worker disappeared during replay")
+
+        return _FailingReplayResponse(())
+
+
 class FakeRuntime:
     def __init__(self):
         manifest = SimpleNamespace(
@@ -358,6 +373,47 @@ class FailoverRuntime:
 
     def close(self):
         self.active.clear()
+
+
+class RepeatedFailoverRuntime(FailoverRuntime):
+    """Deterministic three-route harness for a failure during cold replay."""
+
+    def __init__(self, primary_stub, first_replacement_stub, second_replacement_stub):
+        super().__init__(primary_stub, first_replacement_stub)
+        self.transport.stubs["88" * 32] = second_replacement_stub
+
+    def replan_cold(self, request_id, *, failed_epoch):
+        current = self.active[request_id]
+        assert failed_epoch == current.committed.plan.epoch
+        next_epoch = failed_epoch + 1
+        if next_epoch == 2:
+            worker_id = "worker-replacement-one"
+            endpoint_id = "77" * 32
+        elif next_epoch == 3:
+            worker_id = "worker-replacement-two"
+            endpoint_id = "88" * 32
+        else:  # pragma: no cover - the test owns exactly two replacements
+            raise RuntimeError("no additional replacement route")
+        request = SimpleNamespace(
+            request_id=request_id,
+            model_swarm_id=current.committed.plan.model_swarm_id,
+            prompt_tokens=current.committed.plan.prompt_tokens,
+            required_context_tokens=current.committed.plan.required_context_tokens,
+        )
+        plan = self._plan(
+            request,
+            worker_id=worker_id,
+            endpoint_id=endpoint_id,
+            route_id=f"route-replacement-{next_epoch}-{request_id}",
+            epoch=next_epoch,
+        )
+        replacement = SimpleNamespace(
+            committed=SimpleNamespace(plan=plan),
+            recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
+        )
+        self.active[request_id] = replacement
+        self.replans.append((request_id, failed_epoch))
+        return replacement
 
 
 class FakeRecoveryCheckpoints:
@@ -682,6 +738,101 @@ def test_local_request_agent_recovers_when_primary_dies_during_prefill(tmp_path)
     assert snapshot is not None
     assert snapshot.state == RecoveryState.COMPLETED
     assert snapshot.committed_output_token_ids == (41,)
+    journal.close()
+
+
+def test_local_request_agent_replans_again_when_replacement_dies_during_replay(tmp_path):
+    primary = FailoverStub(
+        chat_chunks=(
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}],'
+            b'"prompt_token_ids":[10,20,30]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n',
+        )
+    )
+    first_replacement = FailingReplayStub(
+        replay_chunks=(
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}],'
+            b'"prompt_token_ids":[10,20,30]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n',
+        )
+    )
+    second_replacement = FailoverStub(
+        replay_chunks=(
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}],'
+            b'"prompt_token_ids":[10,20,30]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+            b'"token_ids":[40],"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":" continued"},'
+            b'"token_ids":[41],"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n",
+        )
+    )
+    runtime = RepeatedFailoverRuntime(
+        primary,
+        first_replacement,
+        second_replacement,
+    )
+    journal = SqliteRecoveryJournal(tmp_path / "recovery.sqlite3")
+    manager = RequestAgentOpenAIManager(
+        runtime,
+        MODEL_SWARM_ID,
+        tokenizer=FakeTokenizer(),
+        model_context_limit=8192,
+        completion_service_type=object,
+        recovery_journal=journal,
+    )
+    app = create_request_agent_app(manager, api_credential=API_CREDENTIAL)
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            headers=AUTH_HEADERS,
+            json={
+                "model": "fabi-swarm",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_completion_tokens": 8,
+                "stream": True,
+                "temperature": 0,
+            },
+        ) as response:
+            body = b"".join(response.iter_bytes())
+
+    request_id = response.headers["x-request-id"]
+    snapshot = journal.get(request_id)
+    assert response.status_code == 200
+    assert body.count(b'"content":"partial"') == 1
+    assert body.count(b'"content":" continued"') == 1
+    assert body.endswith(b"data: [DONE]\n\n")
+    assert runtime.replans == [(request_id, 1), (request_id, 2)]
+    assert first_replacement.replay_requests[0]["committed_output_token_ids"] == [40]
+    assert second_replacement.replay_requests[0]["committed_output_token_ids"] == [40]
+    assert snapshot is not None
+    assert snapshot.state == RecoveryState.COMPLETED
+    assert snapshot.epoch == 3
+    assert snapshot.route_ids == (
+        f"route-primary-{request_id}",
+        f"route-replacement-2-{request_id}",
+        f"route-replacement-3-{request_id}",
+    )
+    assert snapshot.committed_output_token_ids == (40, 41)
+    phase_events, gap = manager.request_phases.read_after(0)
+    assert gap is False
+    phases = [event.phase for event in phase_events if event.request_id == request_id]
+    assert phases == [
+        "planning",
+        "prefilling",
+        "decoding",
+        "recovering",
+        "replaying",
+        "decoding",
+        "recovering",
+        "replaying",
+        "decoding",
+        "completed",
+    ]
     journal.close()
 
 
