@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 
 import anyio
+import pytest
 from fastapi.testclient import TestClient
 
 import backend.main as backend_main
@@ -505,6 +506,49 @@ def test_route_release_is_shielded_from_anyio_level_cancellation():
     anyio.run(cancel_then_release)
 
     assert scheduler_manage.released == ["cancelled-scope-request"]
+
+
+def test_cancelling_route_admission_releases_a_commit_that_finishes_late():
+    class BlockingRouteManager(V3ForwardingSchedulerManage):
+        def __init__(self):
+            super().__init__()
+            self.reserve_started = threading.Event()
+            self.allow_commit = threading.Event()
+
+        def get_routing_table(self, *args, **kwargs):
+            self.reserve_started.set()
+            assert self.allow_commit.wait(timeout=5)
+            return super().get_routing_table(*args, **kwargs)
+
+    async def exercise():
+        handler = RequestHandler()
+        manager = BlockingRouteManager()
+        handler.set_scheduler_manage(manager)
+        handler.stubs["node-a"] = StaticStub([b'{"choices":[]}'])
+
+        request = asyncio.create_task(
+            handler.v1_chat_completions(
+                {"messages": [{"role": "user", "content": "hello"}], "stream": True},
+                "cancelled-during-route-admission",
+                1.0,
+            )
+        )
+        assert await asyncio.to_thread(manager.reserve_started.wait, 5)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+        # The executor thread is deliberately allowed to commit only after its
+        # HTTP owner has gone.  The compensating release waits behind the same
+        # request lock and must fence that late route without relying on TTL.
+        manager.allow_commit.set()
+        async with asyncio.timeout(5):
+            while manager.released != ["cancelled-during-route-admission"]:
+                await asyncio.sleep(0.01)
+        assert manager.active_routes == set()
+        assert handler._pending_route_releases == set()
+
+    asyncio.run(exercise())
 
 
 def test_forward_request_returns_openai_error_when_pipelines_are_busy():

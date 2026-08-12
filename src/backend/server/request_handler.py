@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from functools import partial
 from typing import Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
@@ -62,6 +63,11 @@ class RequestHandler:
     def __init__(self):
         self.scheduler_manage = None
         self.stubs = {}
+        # A synchronous route reservation keeps running after its awaiting
+        # asyncio task is cancelled.  Keep the compensating release tasks
+        # strongly referenced until they have fenced whatever the worker
+        # thread may commit (Python only keeps weak references to Tasks).
+        self._pending_route_releases: set[asyncio.Task] = set()
 
     def set_scheduler_manage(self, scheduler_manage):
         self.scheduler_manage = scheduler_manage
@@ -92,6 +98,69 @@ class RequestHandler:
                         request_id,
                         exc_info=True,
                     )
+
+    def _schedule_route_release(
+        self,
+        request_id: str,
+        route_task: asyncio.Task | None = None,
+    ) -> None:
+        """Fence a route that may still be committing in a worker thread.
+
+        ``asyncio.to_thread`` cannot stop the underlying function.  When its
+        Task is supplied, wait for that worker to finish before releasing so
+        this remains correct even for route managers that do not serialize
+        ``reserve`` and ``release`` under the same request lock.  The cleanup
+        runs outside the cancelled HTTP task, keeping Stop responsive; the
+        signed TTL is only a final fallback, not the normal mechanism.
+        """
+
+        async def release_after_route_operation() -> None:
+            with anyio.CancelScope(shield=True):
+                if route_task is not None:
+                    try:
+                        await asyncio.shield(route_task)
+                    except BaseException:
+                        # A failed admission owns no route, but release is
+                        # idempotent and also clears a partial/late commit.
+                        pass
+                await self._release_route(str(request_id))
+
+        task = asyncio.create_task(
+            release_after_route_operation(),
+            name=f"release-cancelled-route:{request_id}",
+        )
+        self._pending_route_releases.add(task)
+        task.add_done_callback(self._pending_route_releases.discard)
+
+    async def _get_routing_table_cancellation_safe(
+        self,
+        request_id: str,
+        received_ts: int,
+        required_context_tokens: int,
+        *,
+        prompt_tokens: int,
+        reserved_output_tokens: int,
+        recovery_level: RecoveryLevel,
+    ):
+        """Run blocking route admission without orphaning a late commit."""
+
+        operation = partial(
+            self.scheduler_manage.get_routing_table,
+            request_id,
+            received_ts,
+            required_context_tokens,
+            prompt_tokens=prompt_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            recovery_level=recovery_level,
+        )
+        route_task = asyncio.create_task(asyncio.to_thread(operation))
+        try:
+            # Do not let cancellation mark the executor Future cancelled: the
+            # OS thread cannot be stopped and its result may own a route.
+            return await asyncio.shield(route_task)
+        except asyncio.CancelledError:
+            self._schedule_route_release(str(request_id), route_task)
+            raise
 
     @staticmethod
     def _abort_backend_request(stub, backend_request: Dict) -> None:
@@ -465,8 +534,7 @@ class RequestHandler:
                         "preferred_recovery_level",
                         lambda _request: RecoveryLevel.RESTARTABLE,
                     )(request_data)
-                    routing_table = await asyncio.to_thread(
-                        self.scheduler_manage.get_routing_table,
+                    routing_table = await self._get_routing_table_cancellation_safe(
                         request_id,
                         received_ts,
                         required_context_tokens,
@@ -1076,6 +1144,13 @@ class RequestHandler:
                                     )
                         finally:
                             await self._release_route(request_id)
+            except asyncio.CancelledError:
+                # Cancellation can also land after route admission but before
+                # the StreamingResponse generator takes ownership.  Release
+                # asynchronously so Stop stays responsive while the worker
+                # fence is still guaranteed to follow the cancelled route.
+                self._schedule_route_release(str(request_id))
+                raise
             except ClientDisconnectedError:
                 logger.info("Client disconnected before request %s completed", request_id)
                 return Response(status_code=499)
