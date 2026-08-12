@@ -25,6 +25,10 @@ dependencies = [
   "numpy>=1.26",
   "pyzmq>=25.0",
   "psutil>=5.9.5",
+  # NVIDIA's maintained NVML binding is the authoritative global-memory
+  # signal on Windows/WDDM, where cudaMemGetInfo can ignore allocations made
+  # by other processes. It is pure Python and imported only for CUDA workers.
+  "nvidia-ml-py==13.610.43",
   "requests",
   "httpx[socks]>=0.26.0",
   "aiohttp",

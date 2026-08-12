@@ -40,6 +40,85 @@ from parallax_utils.logging_config import get_logger, set_log_level
 logger = get_logger(__name__)
 
 _SKIPPY_CAPACITY_DEVICE: dict[str, Any] | None = None
+_SKIPPY_NVIDIA_MEMORY_PROBE: "NvidiaMemoryProbe | None" = None
+
+
+class NvidiaMemoryProbe:
+    """Read global NVIDIA device memory through the maintained NVML binding.
+
+    Skippy/llama.cpp exposes ``cudaMemGetInfo`` through its backend device
+    properties.  That is an allocation signal for the current CUDA context,
+    but on Windows/WDDM it can exclude memory owned by other processes.  NVML
+    is the system-wide source behind ``nvidia-smi``.  Resolve the same physical
+    adapter by PCI address and keep the handle for inexpensive live samples.
+    """
+
+    def __init__(
+        self,
+        pynvml_module: Any,
+        handle: Any,
+        *,
+        pci_bus_id: str,
+        expected_total_bytes: int,
+    ) -> None:
+        self._pynvml = pynvml_module
+        self._handle = handle
+        self.pci_bus_id = pci_bus_id
+        self.expected_total_bytes = max(0, int(expected_total_bytes))
+        initial = self.sample()
+        tolerance = max(64 * 1024**2, self.expected_total_bytes // 100)
+        if (
+            self.expected_total_bytes > 0
+            and abs(initial[1] - self.expected_total_bytes) > tolerance
+        ):
+            raise RuntimeError(
+                "Skippy and NVML resolved different CUDA devices: "
+                f"skippy_total={self.expected_total_bytes}, nvml_total={initial[1]}, "
+                f"pci_bus_id={pci_bus_id}"
+            )
+
+    @classmethod
+    def open(cls, *, pci_bus_id: str | None, expected_total_bytes: int) -> "NvidiaMemoryProbe":
+        if not pci_bus_id:
+            raise RuntimeError("Skippy CUDA device has no PCI identity for NVML matching")
+        try:
+            import pynvml
+        except (ImportError, OSError) as exc:
+            raise RuntimeError("qualified CUDA runtime has no NVIDIA NVML telemetry") from exc
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByPciBusId(pci_bus_id)
+            return cls(
+                pynvml,
+                handle,
+                pci_bus_id=pci_bus_id,
+                expected_total_bytes=expected_total_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001 - vendor API boundary
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:  # noqa: BLE001 - preserve the original NVML error
+                pass
+            raise RuntimeError(f"NVML could not resolve Skippy CUDA device {pci_bus_id!r}") from exc
+
+    def sample(self) -> tuple[int, int]:
+        """Return current global free/total bytes, preferring NVML v2."""
+
+        version = getattr(self._pynvml, "nvmlMemory_v2", None)
+        try:
+            memory = self._pynvml.nvmlDeviceGetMemoryInfo(
+                self._handle,
+                version=version,
+            )
+        except self._pynvml.NVMLError:
+            # Drivers predating nvmlDeviceGetMemoryInfo_v2 still provide the
+            # original API. Its ``free`` field is already safe for admission.
+            memory = self._pynvml.nvmlDeviceGetMemoryInfo(self._handle)
+        total = max(0, int(memory.total))
+        free = min(total, max(0, int(memory.free)))
+        if total <= 0:
+            raise RuntimeError("NVML reported no CUDA device memory")
+        return free, total
 
 
 def _skippy_backend_for_device(device: str) -> str:
@@ -63,7 +142,7 @@ def _skippy_backend_device(device: str) -> str:
 
 
 def _initialize_skippy_runtime(device: str) -> str:
-    global _SKIPPY_CAPACITY_DEVICE
+    global _SKIPPY_CAPACITY_DEVICE, _SKIPPY_NVIDIA_MEMORY_PROBE
 
     from parallax.server.skippy_stage_runner import (
         SKIPPY_MESH_RELEASE,
@@ -94,21 +173,23 @@ def _initialize_skippy_runtime(device: str) -> str:
         if selected in {native_device.name, native_device.device_id}
     ]
     if len(matches) != 1:
-        raise RuntimeError(
-            f"Skippy capacity probe could not uniquely resolve {selected!r}"
-        )
+        raise RuntimeError(f"Skippy capacity probe could not uniquely resolve {selected!r}")
     native_device = matches[0]
     _SKIPPY_CAPACITY_DEVICE = {
         "name": str(native_device.name),
-        "device_id": (
-            str(native_device.device_id) if native_device.device_id else None
-        ),
+        "device_id": (str(native_device.device_id) if native_device.device_id else None),
         "kind": str(native_device.kind),
         "memory_free": int(native_device.memory_free),
         "memory_total": int(native_device.memory_total),
         "caps": int(native_device.caps),
         "execution_device": device,
     }
+    _SKIPPY_NVIDIA_MEMORY_PROBE = None
+    if device_kind(device) is DeviceKind.CUDA:
+        _SKIPPY_NVIDIA_MEMORY_PROBE = NvidiaMemoryProbe.open(
+            pci_bus_id=_SKIPPY_CAPACITY_DEVICE["device_id"],
+            expected_total_bytes=_SKIPPY_CAPACITY_DEVICE["memory_total"],
+        )
     return device
 
 
@@ -120,12 +201,15 @@ def _skippy_node_hardware(node_id: str | None, execution_device: str) -> dict[st
     observed = _SKIPPY_CAPACITY_DEVICE
     total = int(observed["memory_total"])
     available = min(total, int(observed["memory_free"]))
-    if total <= 0 or available <= 0:
-        raise RuntimeError("Skippy backend reported no usable device memory")
-    unified = observed["kind"] == "integrated_gpu" or device_kind(
-        execution_device
-    ) in {DeviceKind.METAL, DeviceKind.CPU}
+    if total <= 0:
+        raise RuntimeError("Skippy backend reported no device memory")
+    unified = observed["kind"] == "integrated_gpu" or device_kind(execution_device) in {
+        DeviceKind.METAL,
+        DeviceKind.CPU,
+    }
     if unified:
+        if available <= 0:
+            raise RuntimeError("Skippy backend reported no usable device memory")
         import psutil
 
         system = psutil.virtual_memory()
@@ -137,6 +221,15 @@ def _skippy_node_hardware(node_id: str | None, execution_device: str) -> dict[st
         usable = min(available, max(0, system_available - reserve))
         system_reserve = reserve
     else:
+        memory_source = "skippy_backend"
+        if device_kind(execution_device) is DeviceKind.CUDA:
+            if _SKIPPY_NVIDIA_MEMORY_PROBE is None:
+                raise RuntimeError("CUDA capacity requires initialized NVML telemetry")
+            available, nvml_total = _SKIPPY_NVIDIA_MEMORY_PROBE.sample()
+            total = nvml_total
+            memory_source = "nvidia_nvml"
+        elif available <= 0:
+            raise RuntimeError("Skippy backend reported no usable device memory")
         reserve = configured_cuda_reserve_bytes(total)
         usable = max(0, available - reserve)
         system_available = None
@@ -156,7 +249,9 @@ def _skippy_node_hardware(node_id: str | None, execution_device: str) -> dict[st
         "device": execution_device,
         "skippy_backend_device": observed["device_id"] or observed["name"],
         "skippy_backend_caps": observed["caps"],
+        "device_memory_source": ("os_available+skippy_backend" if unified else memory_source),
     }
+
 
 DEFAULT_CAPACITY_SAMPLE_SECONDS = 1.0
 DEFAULT_CAPACITY_RISE_SAMPLES = 3
@@ -194,9 +289,7 @@ class StableCapacityTracker:
             self._rise_floor = None
             self._rise_count = 0
         elif value > previous:
-            self._rise_floor = (
-                value if self._rise_floor is None else min(self._rise_floor, value)
-            )
+            self._rise_floor = value if self._rise_floor is None else min(self._rise_floor, value)
             self._rise_count += 1
             if self._rise_count >= self.rise_samples:
                 self._stable_bytes = self._rise_floor
@@ -226,9 +319,7 @@ def _configured_sample_seconds() -> float:
 
 
 def _configured_rise_samples() -> int:
-    raw = os.environ.get(
-        "FABI_CAPACITY_RISE_SAMPLES", str(DEFAULT_CAPACITY_RISE_SAMPLES)
-    ).strip()
+    raw = os.environ.get("FABI_CAPACITY_RISE_SAMPLES", str(DEFAULT_CAPACITY_RISE_SAMPLES)).strip()
     try:
         value = int(raw)
     except ValueError as exc:
@@ -238,9 +329,7 @@ def _configured_rise_samples() -> int:
     return value
 
 
-def _initialize_backend_runtime(
-    gpu_backend: str, execution_device: str | None = None
-) -> str:
+def _initialize_backend_runtime(gpu_backend: str, execution_device: str | None = None) -> str:
     """Initialize the same device runtime imported by the future executor."""
 
     if execution_device is None:

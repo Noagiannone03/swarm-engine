@@ -76,9 +76,7 @@ def test_directml_capacity_probe_honors_explicit_device(monkeypatch):
         lambda name: imported.append(name),
     )
 
-    selected = runtime_capacity._initialize_backend_runtime(
-        "onnxruntime", "directml:2"
-    )
+    selected = runtime_capacity._initialize_backend_runtime("onnxruntime", "directml:2")
 
     assert selected == "directml:2"
     assert imported == ["parallax.server.executor.onnx_executor"]
@@ -99,11 +97,76 @@ def test_skippy_capacity_uses_native_backend_memory_without_estimation(monkeypat
             "execution_device": "cuda:0",
         },
     )
+    monkeypatch.setattr(
+        runtime_capacity,
+        "_SKIPPY_NVIDIA_MEMORY_PROBE",
+        SimpleNamespace(sample=lambda: (3 * gib, 16 * gib)),
+    )
 
     hardware = runtime_capacity._skippy_node_hardware("worker-1", "cuda:0")
 
-    assert hardware["device_available_memory_bytes"] == 10 * gib
+    assert hardware["device_available_memory_bytes"] == 3 * gib
     assert hardware["device_reserve_bytes"] == 512 * 1024**2
-    assert hardware["usable_memory_bytes"] == 10 * gib - 512 * 1024**2
+    assert hardware["usable_memory_bytes"] == 3 * gib - 512 * 1024**2
     assert hardware["skippy_backend_device"] == "CUDA0"
     assert hardware["skippy_backend_caps"] == 7
+    assert hardware["device_memory_source"] == "nvidia_nvml"
+
+
+def test_skippy_cuda_capacity_refreshes_nvml_instead_of_stale_wddm_value(monkeypatch):
+    gib = 1024**3
+    samples = iter(((3 * gib, 16 * gib), (2 * gib, 16 * gib)))
+    monkeypatch.setattr(
+        runtime_capacity,
+        "_SKIPPY_CAPACITY_DEVICE",
+        {
+            "name": "NVIDIA RTX",
+            "device_id": "0000:01:00.0",
+            "kind": "gpu",
+            # cudaMemGetInfo can keep reporting this optimistic value on WDDM.
+            "memory_free": 14 * gib,
+            "memory_total": 16 * gib,
+            "caps": 7,
+            "execution_device": "cuda:0",
+        },
+    )
+    monkeypatch.setattr(
+        runtime_capacity,
+        "_SKIPPY_NVIDIA_MEMORY_PROBE",
+        SimpleNamespace(sample=lambda: next(samples)),
+    )
+
+    first = runtime_capacity._skippy_node_hardware("worker-1", "cuda:0")
+    second = runtime_capacity._skippy_node_hardware("worker-1", "cuda:0")
+
+    assert first["device_available_memory_bytes"] == 3 * gib
+    assert second["device_available_memory_bytes"] == 2 * gib
+    assert second["usable_memory_bytes"] == 2 * gib - 512 * 1024**2
+
+
+def test_nvidia_memory_probe_rejects_wrong_physical_device():
+    gib = 1024**3
+
+    class FakeNvmlError(Exception):
+        pass
+
+    fake = SimpleNamespace(
+        NVMLError=FakeNvmlError,
+        nvmlMemory_v2=2,
+        nvmlDeviceGetMemoryInfo=lambda _handle, version=None: SimpleNamespace(
+            free=3 * gib,
+            total=8 * gib,
+        ),
+    )
+
+    try:
+        runtime_capacity.NvidiaMemoryProbe(
+            fake,
+            object(),
+            pci_bus_id="0000:01:00.0",
+            expected_total_bytes=16 * gib,
+        )
+    except RuntimeError as exc:
+        assert "different CUDA devices" in str(exc)
+    else:
+        raise AssertionError("mismatched Skippy/NVML device identity was accepted")
