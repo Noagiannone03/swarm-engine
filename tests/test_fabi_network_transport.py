@@ -15,6 +15,7 @@ class FakeNode:
     def __init__(self) -> None:
         self.started = None
         self.bootstrapped = False
+        self.bootstrap_error = None
         self.stopped = False
 
     def start_catalog_dht(
@@ -40,6 +41,8 @@ class FakeNode:
 
     def catalog_bootstrap(self):
         self.bootstrapped = True
+        if self.bootstrap_error is not None:
+            raise self.bootstrap_error
 
     def catalog_key(self, kind, model_swarm_id, worker_id, region_id, publisher=None):
         return f"{kind}:{model_swarm_id}:{worker_id}:{region_id}:{publisher}"
@@ -179,6 +182,35 @@ def test_catalogue_bootstrap_interval_is_configurable_and_positive(monkeypatch):
     with pytest.raises(ValueError, match="positive integer"):
         IrohTransport.from_environment("worker")
     assert FakeRuntime.instances[-1].closed
+
+
+def test_catalogue_initial_timeout_keeps_periodic_recovery_alive(monkeypatch, caplog):
+    base_environment(monkeypatch)
+    monkeypatch.setenv("FABI_CATALOG_DHT_MODE", "client")
+    monkeypatch.setenv("FABI_CATALOG_DHT_BOOTSTRAPS", "/dns/bootstrap/tcp/4242")
+
+    original_init = FakeRuntime.__init__
+
+    def init_with_transient_bootstrap_failure(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._node.bootstrap_error = RuntimeError("the request timed out")
+
+    monkeypatch.setattr(FakeRuntime, "__init__", init_with_transient_bootstrap_failure)
+
+    with caplog.at_level("WARNING", logger="fabi_network.transport"):
+        transport = IrohTransport.from_environment("worker")
+    runtime = FakeRuntime.instances[0]
+    try:
+        assert runtime._node.bootstrapped
+        assert runtime._node.started["bootstrap_interval_seconds"] == 30
+        assert transport.catalog_discovery is not None
+        assert not runtime.closed
+        assert "keeping the DHT alive" in caplog.text
+    finally:
+        transport.close()
+
+    assert runtime._node.stopped
+    assert runtime.closed
 
 
 def test_automatic_relay_enrollment_removes_client_relay_token(monkeypatch):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 from pathlib import Path
@@ -14,6 +15,7 @@ from swarm_protocol.dht_discovery import DhtDiscoveryStore
 
 IROH_TRANSPORT = "iroh"
 LATTICA_TRANSPORT = "lattica"
+_LOGGER = logging.getLogger(__name__)
 
 
 def configured_transport() -> str:
@@ -217,7 +219,21 @@ class IrohTransport:
             _positive_env_int("FABI_CATALOG_DHT_BOOTSTRAP_INTERVAL_SECONDS", 30),
         )
         if bootstraps:
-            self.runtime._node.catalog_bootstrap()
+            # rust-libp2p automatically bootstraps when a known peer enters
+            # the routing table and keeps doing so at the configured periodic
+            # interval.  The explicit first attempt gives a healthy network a
+            # fast path, but a transiently unreachable bootstrap must not tear
+            # down the Iroh endpoint and force the whole worker into a restart
+            # loop.  Publication and lookup callers already retry while the
+            # catalogue converges.
+            try:
+                self.runtime._node.catalog_bootstrap()
+            except RuntimeError as error:
+                _LOGGER.warning(
+                    "Initial catalogue bootstrap failed; keeping the DHT alive for "
+                    "automatic and periodic recovery: %s",
+                    error,
+                )
         self.catalog_peer_id = str(peer_id)
         self.catalog_listen_address = str(bound_address)
         configured_publishers = _trusted_demand_publishers()
