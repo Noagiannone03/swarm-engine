@@ -65,15 +65,23 @@ class NvidiaMemoryProbe:
         self._handle = handle
         self.pci_bus_id = pci_bus_id
         self.expected_total_bytes = max(0, int(expected_total_bytes))
-        initial = self.sample()
+        _free, nvml_total, nvml_reserved = self._sample_memory()
         tolerance = max(64 * 1024**2, self.expected_total_bytes // 100)
-        if (
-            self.expected_total_bytes > 0
-            and abs(initial[1] - self.expected_total_bytes) > tolerance
+        # NVML v2 reports physical FB memory in ``total`` and exposes the
+        # driver/firmware carve-out separately in ``reserved``. CUDA and
+        # Skippy report the allocatable total after that carve-out. Accept
+        # either representation while still rejecting a different adapter.
+        comparable_totals = {
+            nvml_total,
+            max(0, nvml_total - nvml_reserved),
+        }
+        if self.expected_total_bytes > 0 and all(
+            abs(total - self.expected_total_bytes) > tolerance for total in comparable_totals
         ):
             raise RuntimeError(
                 "Skippy and NVML resolved different CUDA devices: "
-                f"skippy_total={self.expected_total_bytes}, nvml_total={initial[1]}, "
+                f"skippy_total={self.expected_total_bytes}, nvml_total={nvml_total}, "
+                f"nvml_reserved={nvml_reserved}, "
                 f"pci_bus_id={pci_bus_id}"
             )
 
@@ -101,8 +109,8 @@ class NvidiaMemoryProbe:
                 pass
             raise RuntimeError(f"NVML could not resolve Skippy CUDA device {pci_bus_id!r}") from exc
 
-    def sample(self) -> tuple[int, int]:
-        """Return current global free/total bytes, preferring NVML v2."""
+    def _sample_memory(self) -> tuple[int, int, int]:
+        """Return current global free/total/reserved bytes, preferring NVML v2."""
 
         version = getattr(self._pynvml, "nvmlMemory_v2", None)
         try:
@@ -116,8 +124,15 @@ class NvidiaMemoryProbe:
             memory = self._pynvml.nvmlDeviceGetMemoryInfo(self._handle)
         total = max(0, int(memory.total))
         free = min(total, max(0, int(memory.free)))
+        reserved = min(total, max(0, int(getattr(memory, "reserved", 0))))
         if total <= 0:
             raise RuntimeError("NVML reported no CUDA device memory")
+        return free, total, reserved
+
+    def sample(self) -> tuple[int, int]:
+        """Return current global free/physical-total bytes."""
+
+        free, total, _reserved = self._sample_memory()
         return free, total
 
 

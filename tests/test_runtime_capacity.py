@@ -170,3 +170,30 @@ def test_nvidia_memory_probe_rejects_wrong_physical_device():
         assert "different CUDA devices" in str(exc)
     else:
         raise AssertionError("mismatched Skippy/NVML device identity was accepted")
+
+
+def test_nvidia_memory_probe_accepts_nvml_system_reserved_difference():
+    gib = 1024**3
+    reserved = 570 * 1024**2
+
+    class FakeNvmlError(Exception):
+        pass
+
+    fake = SimpleNamespace(
+        NVMLError=FakeNvmlError,
+        nvmlMemory_v2=2,
+        nvmlDeviceGetMemoryInfo=lambda _handle, version=None: SimpleNamespace(
+            free=48 * gib - reserved,
+            total=48 * gib,
+            reserved=reserved,
+        ),
+    )
+
+    probe = runtime_capacity.NvidiaMemoryProbe(
+        fake,
+        object(),
+        pci_bus_id="0000:ce:00.0",
+        expected_total_bytes=48 * gib - reserved,
+    )
+
+    assert probe.sample() == (48 * gib - reserved, 48 * gib)
