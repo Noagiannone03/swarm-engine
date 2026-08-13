@@ -152,6 +152,7 @@ def committed(plan: RoutePlan, expires_at_ms: int) -> CommittedRoute:
                 expires_at_ms=expires_at_ms,
             ),
         ),
+        route_plan_digest="a" * 64,
     )
 
 
@@ -217,9 +218,7 @@ class FakeDemandObserver:
         self.admissions.append((request_id, manifest.model_swarm_id, required_context_tokens))
 
     def record_no_route(self, request_id, manifest, *, required_context_tokens):
-        self.rejections.append(
-            (request_id, manifest.model_swarm_id, required_context_tokens)
-        )
+        self.rejections.append((request_id, manifest.model_swarm_id, required_context_tokens))
 
     def record_completion(self, request_id):
         self.completions.append(request_id)

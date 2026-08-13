@@ -266,3 +266,70 @@ def test_fence_consumes_only_after_successful_durable_settlement() -> None:
     )
     assert plan.committed_tokens == (42, 43, 44, 45)
     assert fence.pending_count(candidate.request_id) == 0
+
+
+def test_durable_bridge_commits_before_return_and_checks_exact_boundary() -> None:
+    fence = SpeculativeWindowFence()
+    candidate = window(base_committed_position=0, input_position=100)
+    reply = response(candidate)
+    fence.admit(candidate)
+    durable = {candidate.request_id: []}
+    observations = []
+
+    def committed_position(request_id):
+        return len(durable[request_id]) if request_id in durable else None
+
+    def commit_tokens(plan):
+        observations.append(("commit", plan.committed_tokens))
+        durable[plan.request_id].extend(plan.committed_tokens)
+
+    plan = fence.settle_response_durably(
+        reply,
+        max_commit_tokens=8,
+        committed_position=committed_position,
+        commit_tokens=commit_tokens,
+    )
+    observations.append(("publish", plan.committed_tokens))
+    assert observations == [
+        ("commit", (42, 43, 44, 45)),
+        ("publish", (42, 43, 44, 45)),
+    ]
+    assert durable[candidate.request_id] == [42, 43, 44, 45]
+
+
+def test_durable_bridge_fails_closed_on_boundary_rng_and_partial_commit() -> None:
+    scenarios = (
+        (
+            window(base_committed_position=1, input_position=100),
+            lambda _request_id: 0,
+            lambda _plan: None,
+            "durable boundary",
+        ),
+        (
+            window(
+                base_committed_position=0,
+                input_position=100,
+                sampling=SpeculativeSampling(seed=9, temperature=0.5),
+            ),
+            lambda _request_id: 0,
+            lambda _plan: None,
+            "greedy sampling",
+        ),
+        (
+            window(base_committed_position=0, input_position=100),
+            lambda _request_id: 0,
+            lambda _plan: None,
+            "advance exactly",
+        ),
+    )
+    for candidate, position, commit, message in scenarios:
+        fence = SpeculativeWindowFence()
+        fence.admit(candidate)
+        with pytest.raises(ValueError, match=message):
+            fence.settle_response_durably(
+                response(candidate),
+                max_commit_tokens=8,
+                committed_position=position,
+                commit_tokens=commit,
+            )
+        assert fence.pending_count(candidate.request_id) == 1

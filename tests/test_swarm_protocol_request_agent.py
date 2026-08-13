@@ -162,7 +162,7 @@ class FakeCoordinator:
             crypto=self.transport,
         )
         assert self.authorizer(signed).signed_plan == signed
-        return CommittedRoute(plan=plan, leases=())
+        return CommittedRoute(plan=plan, leases=(), route_plan_digest="a" * 64)
 
     def renew(self, route, *, ttl_ms):
         assert ttl_ms > 0

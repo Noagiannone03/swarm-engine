@@ -375,6 +375,49 @@ class SpeculativeWindowFence:
                 del self._pending[key]
             return settled
 
+    def settle_response_durably(
+        self,
+        response: SpeculativeVerifyResponse,
+        *,
+        max_commit_tokens: int,
+        committed_position: Callable[[str], int | None],
+        commit_tokens: Callable[[SpeculativeSettlementPlan], None],
+        defer_full_accept_bonus: bool = False,
+    ) -> SpeculativeSettlementPlan:
+        """Atomically bridge one fenced greedy response to a durable journal.
+
+        This returns unpublished target tokens. The future SSE encoder may use
+        them only after this method returns. Seeded/non-greedy settlement stays
+        fail-closed until the protocol carries exact per-token RNG positions.
+        """
+
+        def commit(
+            window: SpeculativeVerifyWindow,
+            verified: SpeculativeVerifyResponse,
+        ) -> SpeculativeSettlementPlan:
+            if window.sampling.temperature != 0:
+                raise ValueError(
+                    "durable speculative settlement requires greedy sampling until RNG fencing"
+                )
+            before = committed_position(window.request_id)
+            if before is None:
+                raise ValueError("speculative request has no durable journal")
+            if before != window.base_committed_position:
+                raise ValueError("speculative window does not start at the durable boundary")
+            plan = window.settlement_plan(
+                verified,
+                max_commit_tokens=max_commit_tokens,
+                defer_full_accept_bonus=defer_full_accept_bonus,
+            )
+            commit_tokens(plan)
+            after = committed_position(window.request_id)
+            expected = before + len(plan.committed_tokens)
+            if after != expected:
+                raise ValueError("durable speculative commit did not advance exactly")
+            return plan
+
+        return self.settle_response(response, commit)
+
     def fence(self, request_id: str, *, newer_epoch: int) -> None:
         with self._request_lock(request_id):
             with self._lock:

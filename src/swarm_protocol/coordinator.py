@@ -28,7 +28,7 @@ from swarm_protocol.execution_rpc import (
     route_admission_to_wire,
     route_renewal_to_wire,
 )
-from swarm_protocol.route_authority import RouteAdmissionEnvelope
+from swarm_protocol.route_authority import RouteAdmissionEnvelope, route_plan_digest
 
 
 class RouteReservationError(RuntimeError):
@@ -47,6 +47,7 @@ RouteRenewalAuthorizer = Callable[[SignedControlMessage], RouteAdmissionEnvelope
 class CommittedRoute:
     plan: RoutePlan
     leases: tuple[ReservationLease, ...]
+    route_plan_digest: str
 
 
 def _system_clock_ms() -> int:
@@ -282,7 +283,11 @@ class RouteReservationCoordinator:
         # COMMIT deliberately does not extend the short PREPARE deadline.
         # Acquire the long-lived session lease on every stage before the data
         # plane is allowed to see the route.
-        committed_route = CommittedRoute(plan=plan, leases=committed_leases)
+        committed_route = CommittedRoute(
+            plan=plan,
+            leases=committed_leases,
+            route_plan_digest=route_plan_digest(signed_plan),
+        )
         try:
             return self.renew(committed_route, ttl_ms=self.session_ttl_ms)
         except Exception as exc:
@@ -319,7 +324,11 @@ class RouteReservationCoordinator:
             )
             for stage, raw in renewed
         )
-        return CommittedRoute(plan=route.plan, leases=leases)
+        return CommittedRoute(
+            plan=route.plan,
+            leases=leases,
+            route_plan_digest=route.route_plan_digest,
+        )
 
     def release(self, route: CommittedRoute) -> None:
         self._send_command(

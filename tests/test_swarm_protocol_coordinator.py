@@ -260,6 +260,7 @@ def test_coordinator_commits_and_releases_every_stage():
         ReservationState.COMMITTED,
         ReservationState.COMMITTED,
     ]
+    assert len(committed.route_plan_digest) == 64
     assert {lease.expires_at_ms for lease in committed.leases} == {61_000}
     assert transport.stubs[HEAD_ENDPOINT].native_timeouts == [5.0, 5.0, 5.0]
     assert transport.stubs[TAIL_ENDPOINT].native_timeouts == [5.0, 5.0, 5.0]
@@ -371,12 +372,15 @@ def test_client_coordinator_reserves_a_complete_route_with_one_bounded_capabilit
     )
 
     committed = coordinator.reserve(route(now[0]))
+    digest = committed.route_plan_digest
+    renewed = coordinator.renew(committed, ttl_ms=5_000)
+    assert renewed.route_plan_digest == digest
 
-    assert [lease.state for lease in committed.leases] == [
+    assert [lease.state for lease in renewed.leases] == [
         ReservationState.COMMITTED,
         ReservationState.COMMITTED,
     ]
-    coordinator.release(committed)
+    coordinator.release(renewed)
     assert all(
         lease.state == ReservationState.RELEASED
         for admission in (head, tail)

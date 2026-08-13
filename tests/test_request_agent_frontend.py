@@ -250,7 +250,7 @@ class FakeRuntime:
             stages=(SimpleNamespace(worker_id="worker-head", endpoint_id=ENDPOINT_ID),),
         )
         reservation = SimpleNamespace(
-            committed=SimpleNamespace(plan=plan),
+            committed=SimpleNamespace(plan=plan, route_plan_digest="a" * 64),
             recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
         )
         self.active[request.request_id] = reservation
@@ -329,7 +329,7 @@ class FailoverRuntime:
             epoch=1,
         )
         reservation = SimpleNamespace(
-            committed=SimpleNamespace(plan=plan),
+            committed=SimpleNamespace(plan=plan, route_plan_digest="a" * 64),
             recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
         )
         self.active[request.request_id] = reservation
@@ -352,7 +352,7 @@ class FailoverRuntime:
             epoch=2,
         )
         replacement = SimpleNamespace(
-            committed=SimpleNamespace(plan=plan),
+            committed=SimpleNamespace(plan=plan, route_plan_digest="b" * 64),
             recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
         )
         self.active[request_id] = replacement
@@ -408,7 +408,7 @@ class RepeatedFailoverRuntime(FailoverRuntime):
             epoch=next_epoch,
         )
         replacement = SimpleNamespace(
-            committed=SimpleNamespace(plan=plan),
+            committed=SimpleNamespace(plan=plan, route_plan_digest="a" * 64),
             recovery_policy=RouteRecoveryPolicy.REPLAN_COLD,
         )
         self.active[request_id] = replacement

@@ -431,6 +431,7 @@ class RequestAgentOpenAIManager:
         return {
             "route_id": plan.route_id,
             "epoch": plan.epoch,
+            "route_plan_digest": reservation.committed.route_plan_digest,
             "recovery_policy": reservation.recovery_policy.value,
         }
 
@@ -1042,14 +1043,10 @@ def _bound_base_url(server: uvicorn.Server, configured_host: str) -> str:
     """Return the actual loopback URL after Uvicorn has bound its listener."""
 
     listeners = [
-        listener
-        for asyncio_server in server.servers
-        for listener in (asyncio_server.sockets or ())
+        listener for asyncio_server in server.servers for listener in (asyncio_server.sockets or ())
     ]
     if len(listeners) != 1:
-        raise RuntimeError(
-            f"Request Agent expected exactly one listener, found {len(listeners)}"
-        )
+        raise RuntimeError(f"Request Agent expected exactly one listener, found {len(listeners)}")
     address = listeners[0].getsockname()
     if not isinstance(address, tuple) or len(address) < 2:
         raise RuntimeError("Request Agent listener is not a TCP socket")
@@ -1068,14 +1065,17 @@ def _write_ready_file(path: Path, *, base_url: str) -> None:
     path = path.expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    payload = json.dumps(
-        {
-            "schema_version": 1,
-            "pid": os.getpid(),
-            "base_url": base_url,
-        },
-        separators=(",", ":"),
-    ).encode() + b"\n"
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pid": os.getpid(),
+                "base_url": base_url,
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
     descriptor: int | None = None
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
