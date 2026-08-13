@@ -167,6 +167,12 @@ from swarm_protocol.speculative import (
     SpeculativeVerifyWindow,
     SpeculativeWindowFence,
 )
+from swarm_protocol.speculative_control import (
+    AdaptiveSpeculativeController,
+    SpeculativeControllerDecision,
+    SpeculativeControllerReason,
+    SpeculativeCostObservation,
+)
 from swarm_protocol.worker_placement import (
     AutonomousPeerTopology,
     AutonomousWorkerPlacement,
@@ -269,6 +275,10 @@ __all__ = [
     "SpeculativeVerifyResponse",
     "SpeculativeVerifyWindow",
     "SpeculativeWindowFence",
+    "AdaptiveSpeculativeController",
+    "SpeculativeControllerDecision",
+    "SpeculativeControllerReason",
+    "SpeculativeCostObservation",
     "SpanLease",
     "SpanState",
     "StaleCatalogRecord",
