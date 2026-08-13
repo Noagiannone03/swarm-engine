@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 from enum import Enum
-from typing import Annotated, Self
+from typing import Annotated, Callable, Self, TypeVar
 
 from pydantic import Field, model_validator
 
@@ -28,6 +28,7 @@ MAX_SPECULATIVE_RESPONSE_BYTES = 16 * 1024 * 1024
 
 TokenId = Annotated[int, Field(ge=0, le=2**31 - 1)]
 BoundedId = Annotated[str, Field(min_length=1, max_length=255)]
+SettlementValue = TypeVar("SettlementValue")
 
 
 class SpeculativeStrategy(str, Enum):
@@ -71,6 +72,7 @@ class SpeculativeVerifyWindow(ContractModel):
     base_committed_position: NonNegativeInt
     input_position: NonNegativeInt
     starts_epoch: bool
+    prior_boundary_prediction: TokenId | None = None
     input_tokens: Annotated[
         tuple[TokenId, ...], Field(min_length=1, max_length=MAX_SPECULATIVE_INPUT_TOKENS)
     ]
@@ -95,6 +97,10 @@ class SpeculativeVerifyWindow(ContractModel):
         expected_inputs = len(self.proposal_tokens) + int(self.starts_epoch)
         if len(self.input_tokens) != expected_inputs:
             raise ValueError("verification inputs do not match the proposal window layout")
+        if self.starts_epoch and self.prior_boundary_prediction is not None:
+            raise ValueError("epoch-start verification cannot carry a prior boundary prediction")
+        if not self.starts_epoch and self.prior_boundary_prediction is None:
+            raise ValueError("continuation verification requires a prior boundary prediction")
         if self.input_position < self.base_committed_position:
             raise ValueError("verification input precedes the durable committed position")
         if self.input_position + len(self.input_tokens) > self.reserved_context_tokens:
@@ -127,6 +133,98 @@ class SpeculativeVerifyWindow(ContractModel):
         response_bytes = len(response.model_dump_json().encode("utf-8"))
         if response_bytes > self.max_response_bytes:
             raise ValueError("speculative response exceeds the reserved wire budget")
+
+    def target_predictions(
+        self,
+        response: SpeculativeVerifyResponse,
+    ) -> tuple[int, ...]:
+        """Compose proposal-aligned target predictions exactly like Mesh 0.75.1.
+
+        An epoch-start traversal predicts every proposal and one free boundary
+        token. A continuation traversal predicts proposals 2..K and the free
+        token; its proposal-1 prediction is the prior window's fenced boundary.
+        """
+
+        self.verify_response(response)
+        if self.starts_epoch:
+            return response.predicted_tokens
+        boundary = self.prior_boundary_prediction
+        if boundary is None:  # pragma: no cover - guarded by model validation
+            raise ValueError("continuation verification has no prior boundary prediction")
+        return (boundary, *response.predicted_tokens)
+
+    def settlement_plan(
+        self,
+        response: SpeculativeVerifyResponse,
+        *,
+        max_commit_tokens: int,
+        defer_full_accept_bonus: bool = False,
+    ) -> SpeculativeSettlementPlan:
+        """Build an unpublished exact-token settlement plan.
+
+        The caller must durably commit ``committed_tokens`` before exposing
+        their corresponding SSE bytes. Keeping the full-accept bonus deferred
+        allows a following pipelined window to use it as its fenced boundary.
+        """
+
+        if max_commit_tokens <= 0 or max_commit_tokens > MAX_SPECULATIVE_INPUT_TOKENS:
+            raise ValueError("speculative settlement commit budget is out of bounds")
+        predictions = self.target_predictions(response)
+        if len(predictions) != len(self.proposal_tokens) + 1:
+            raise ValueError("target predictions do not cover proposal settlement")
+
+        committed: list[int] = []
+        accepted = 0
+        rejected = False
+        reached_stop = False
+        reached_output_limit = False
+        stop_tokens = set(self.sampling.stop_token_ids)
+        for proposal, predicted in zip(
+            self.proposal_tokens,
+            predictions[:-1],
+            strict=True,
+        ):
+            if len(committed) >= max_commit_tokens:
+                reached_output_limit = True
+                break
+            committed.append(predicted)
+            reached_stop = predicted in stop_tokens
+            if predicted != proposal:
+                rejected = True
+                break
+            accepted += 1
+            if reached_stop:
+                break
+
+        next_boundary_prediction = None
+        fully_accepted = accepted == len(self.proposal_tokens)
+        if fully_accepted and not reached_stop:
+            if len(committed) >= max_commit_tokens:
+                reached_output_limit = True
+            elif defer_full_accept_bonus and predictions[-1] not in stop_tokens:
+                next_boundary_prediction = predictions[-1]
+            else:
+                bonus = predictions[-1]
+                committed.append(bonus)
+                reached_stop = bonus in stop_tokens
+
+        if not committed:
+            raise ValueError("speculative settlement cannot commit an empty token span")
+        return SpeculativeSettlementPlan(
+            request_id=self.request_id,
+            route_id=self.route_id,
+            epoch=self.epoch,
+            route_plan_digest=self.route_plan_digest,
+            window_id=self.window_id,
+            base_committed_position=self.base_committed_position,
+            verified_position=response.verified_position,
+            accepted_proposal_tokens=accepted,
+            committed_tokens=tuple(committed),
+            rejected=rejected,
+            reached_stop=reached_stop,
+            reached_output_limit=reached_output_limit,
+            next_boundary_prediction=next_boundary_prediction,
+        )
 
 
 class SpeculativeStageMetrics(ContractModel):
@@ -170,6 +268,36 @@ class SpeculativeVerifyResponse(ContractModel):
         return self
 
 
+class SpeculativeSettlementPlan(ContractModel):
+    """Unpublished target tokens ready for one durable Request Agent commit."""
+
+    protocol_version: int = PROTOCOL_VERSION
+    request_id: NonEmpty
+    route_id: NonEmpty
+    epoch: NonNegativeInt
+    route_plan_digest: HashHex
+    window_id: PositiveInt
+    base_committed_position: NonNegativeInt
+    verified_position: PositiveInt
+    accepted_proposal_tokens: Annotated[int, Field(ge=0, le=MAX_SPECULATIVE_PROPOSAL_TOKENS)]
+    committed_tokens: Annotated[
+        tuple[TokenId, ...], Field(min_length=1, max_length=MAX_SPECULATIVE_INPUT_TOKENS)
+    ]
+    rejected: bool
+    reached_stop: bool
+    reached_output_limit: bool
+    next_boundary_prediction: TokenId | None = None
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> Self:
+        if self.protocol_version != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version: {self.protocol_version}")
+        terminal = self.rejected or self.reached_stop or self.reached_output_limit
+        if terminal and self.next_boundary_prediction is not None:
+            raise ValueError("terminal speculative settlement cannot retain a boundary")
+        return self
+
+
 class SpeculativeWindowFence:
     """Request-local replay guard for uncommitted verification responses.
 
@@ -180,62 +308,86 @@ class SpeculativeWindowFence:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._request_locks: dict[str, threading.RLock] = {}
         self._bindings: dict[str, tuple[str, int, str]] = {}
         self._minimum_epoch: dict[str, int] = {}
         self._last_window_id: dict[str, int] = {}
         self._pending: dict[tuple[str, int], SpeculativeVerifyWindow] = {}
 
     def admit(self, window: SpeculativeVerifyWindow) -> None:
-        with self._lock:
-            if window.epoch < self._minimum_epoch.get(window.request_id, 0):
-                raise ValueError("speculative window epoch is stale")
-            binding = self._bindings.get(window.request_id)
-            if binding is not None:
-                route_id, epoch, digest = binding
-                if window.epoch < epoch:
+        with self._request_lock(window.request_id):
+            with self._lock:
+                if window.epoch < self._minimum_epoch.get(window.request_id, 0):
                     raise ValueError("speculative window epoch is stale")
-                if window.epoch == epoch and (
-                    window.route_id != route_id or window.route_plan_digest != digest
-                ):
-                    raise ValueError("speculative window changed route without a new epoch")
-                if window.epoch > epoch:
-                    self._drop_pending(window.request_id)
-            last_window_id = self._last_window_id.get(window.request_id, 0)
-            if window.window_id <= last_window_id:
-                raise ValueError("speculative window id is not strictly increasing")
-            self._bindings[window.request_id] = (
-                window.route_id,
-                window.epoch,
-                window.route_plan_digest,
-            )
-            self._last_window_id[window.request_id] = window.window_id
-            self._pending[(window.request_id, window.window_id)] = window
+                binding = self._bindings.get(window.request_id)
+                if binding is not None:
+                    route_id, epoch, digest = binding
+                    if window.epoch < epoch:
+                        raise ValueError("speculative window epoch is stale")
+                    if window.epoch == epoch and (
+                        window.route_id != route_id or window.route_plan_digest != digest
+                    ):
+                        raise ValueError("speculative window changed route without a new epoch")
+                    if window.epoch > epoch:
+                        self._drop_pending(window.request_id)
+                last_window_id = self._last_window_id.get(window.request_id, 0)
+                if window.window_id <= last_window_id:
+                    raise ValueError("speculative window id is not strictly increasing")
+                self._bindings[window.request_id] = (
+                    window.route_id,
+                    window.epoch,
+                    window.route_plan_digest,
+                )
+                self._last_window_id[window.request_id] = window.window_id
+                self._pending[(window.request_id, window.window_id)] = window
 
     def accept_response(self, response: SpeculativeVerifyResponse) -> SpeculativeVerifyWindow:
-        with self._lock:
-            key = (response.request_id, response.window_id)
-            window = self._pending.get(key)
-            if window is None:
-                raise ValueError("speculative response is stale, duplicate, or unknown")
-            binding = self._bindings.get(response.request_id)
-            if binding != (response.route_id, response.epoch, response.route_plan_digest):
-                raise ValueError("speculative response was fenced by a route change")
-            window.verify_response(response)
-            del self._pending[key]
-            return window
+        return self.settle_response(response, lambda window, _response: window)
+
+    def settle_response(
+        self,
+        response: SpeculativeVerifyResponse,
+        settle: Callable[[SpeculativeVerifyWindow, SpeculativeVerifyResponse], SettlementValue],
+    ) -> SettlementValue:
+        """Consume a response only after its caller-provided durable settlement.
+
+        The callback runs under the request-local fence, without blocking
+        settlement for unrelated requests. If it raises, the
+        response remains pending and may be retried after the durable store has
+        established whether anything committed. No other window can replan or
+        consume the same response during that transaction.
+        """
+
+        with self._request_lock(response.request_id):
+            with self._lock:
+                key = (response.request_id, response.window_id)
+                window = self._pending.get(key)
+                if window is None:
+                    raise ValueError("speculative response is stale, duplicate, or unknown")
+                binding = self._bindings.get(response.request_id)
+                if binding != (response.route_id, response.epoch, response.route_plan_digest):
+                    raise ValueError("speculative response was fenced by a route change")
+                window.verify_response(response)
+            settled = settle(window, response)
+            with self._lock:
+                if self._pending.get(key) is not window:
+                    raise ValueError("speculative response changed during durable settlement")
+                del self._pending[key]
+            return settled
 
     def fence(self, request_id: str, *, newer_epoch: int) -> None:
-        with self._lock:
-            binding = self._bindings.get(request_id)
-            current_epoch = max(
-                self._minimum_epoch.get(request_id, 0),
-                -1 if binding is None else binding[1],
-            )
-            if newer_epoch <= current_epoch:
-                raise ValueError("speculative fence epoch must move forward")
-            self._drop_pending(request_id)
-            self._bindings.pop(request_id, None)
-            self._minimum_epoch[request_id] = newer_epoch
+        with self._request_lock(request_id):
+            with self._lock:
+                binding = self._bindings.get(request_id)
+                current_epoch = max(
+                    self._minimum_epoch.get(request_id, 0),
+                    -1 if binding is None else binding[1],
+                )
+                if newer_epoch <= current_epoch:
+                    raise ValueError("speculative fence epoch must move forward")
+                self._drop_pending(request_id)
+                self._bindings.pop(request_id, None)
+                self._minimum_epoch[request_id] = newer_epoch
 
     def pending_count(self, request_id: str) -> int:
         with self._lock:
@@ -245,3 +397,7 @@ class SpeculativeWindowFence:
         for key in tuple(self._pending):
             if key[0] == request_id:
                 del self._pending[key]
+
+    def _request_lock(self, request_id: str) -> threading.RLock:
+        with self._lock:
+            return self._request_locks.setdefault(str(request_id), threading.RLock())
