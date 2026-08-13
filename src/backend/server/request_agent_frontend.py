@@ -60,6 +60,7 @@ from swarm_protocol.request_agent import (
 )
 from swarm_protocol.request_status import RequestPhaseFeed
 from swarm_protocol.routing import RoutePlanningError
+from swarm_protocol.speculative import SpeculativeSettlementPlan, SpeculativeVerifyResponse
 
 _MAX_OPENAI_REQUEST_BYTES = 16 * 1024 * 1024
 # Petals' client routing state uses a 60-second DHT refresh period. This cache
@@ -567,10 +568,13 @@ class RequestAgentOpenAIManager:
                     position=current.committed_position,
                     token_id=token_id,
                 )
+        self._observe_committed_checkpoint(str(request_id))
+
+    def _observe_committed_checkpoint(self, request_id: str) -> None:
         checkpoints = self.recovery_checkpoints
         if checkpoints is not None:
-            snapshot = self.recovery_journal.get(str(request_id))
-            reservation = self._active_reservation(str(request_id))
+            snapshot = self.recovery_journal.get(request_id)
+            reservation = self._active_reservation(request_id)
             if snapshot is not None and reservation is not None:
                 try:
                     checkpoints.observe_committed(snapshot, reservation.committed.plan)
@@ -580,6 +584,45 @@ class RequestAgentOpenAIManager:
                         request_id,
                         exc_info=True,
                     )
+
+    def settle_speculative_response(
+        self,
+        response: SpeculativeVerifyResponse,
+        *,
+        max_commit_tokens: int,
+        defer_full_accept_bonus: bool = False,
+    ) -> SpeculativeSettlementPlan:
+        """Commit verified target tokens before any caller may encode SSE.
+
+        The executor-facing RPC remains dormant. This bridge only connects an
+        already authenticated, fenced response to the same crash-durable token
+        journal used by target-only generation. Returning the unpublished plan
+        is the publication boundary: callers must not emit its tokens earlier.
+        """
+
+        fence = getattr(self.runtime, "speculative_fence", None)
+        if fence is None:
+            raise RuntimeError("Request Agent runtime has no speculative response fence")
+        commit_batch = getattr(self.recovery_journal, "commit_tokens", None)
+        if commit_batch is None:
+            raise RuntimeError("speculative settlement requires an atomic batch journal")
+
+        def commit_unpublished(plan: SpeculativeSettlementPlan) -> None:
+            commit_batch(
+                plan.request_id,
+                epoch=plan.epoch,
+                position=plan.base_committed_position,
+                token_ids=plan.committed_tokens,
+            )
+            self._observe_committed_checkpoint(plan.request_id)
+
+        return fence.settle_response_durably(
+            response,
+            max_commit_tokens=max_commit_tokens,
+            committed_position=self.recovery_journal.committed_position,
+            commit_tokens=commit_unpublished,
+            defer_full_accept_bonus=defer_full_accept_bonus,
+        )
 
     def finish_generation_journal(
         self,

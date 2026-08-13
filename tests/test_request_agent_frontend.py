@@ -28,10 +28,17 @@ from backend.server.request_agent_frontend import (
     _verified_frontend_assets,
     create_request_agent_app,
 )
-from swarm_protocol.contracts import ArtifactRole
+from swarm_protocol.contracts import ArtifactRole, RecoveryLevel, RequestContract
 from fabi_network.capability import RouteRecoveryPolicy
 from swarm_protocol.recovery import RecoveryState
 from swarm_protocol.recovery_sqlite import SqliteRecoveryJournal
+from swarm_protocol.speculative import (
+    SpeculativeSampling,
+    SpeculativeStrategy,
+    SpeculativeVerifyResponse,
+    SpeculativeVerifyWindow,
+    SpeculativeWindowFence,
+)
 
 MODEL_SWARM_ID = "11" * 32
 ENDPOINT_ID = "22" * 32
@@ -688,6 +695,74 @@ def test_local_request_agent_replans_replays_and_resumes_exactly_once(tmp_path):
         "decoding",
         "completed",
     ]
+    journal.close()
+
+
+def test_speculative_target_tokens_are_durable_before_frontend_publication(tmp_path):
+    runtime = FailoverRuntime(FailoverStub(), FailoverStub())
+    runtime.speculative_fence = SpeculativeWindowFence()
+    journal = SqliteRecoveryJournal(tmp_path / "recovery.sqlite3")
+    manager = RequestAgentOpenAIManager(
+        runtime,
+        MODEL_SWARM_ID,
+        tokenizer=FakeTokenizer(),
+        model_context_limit=8192,
+        completion_service_type=object,
+        recovery_journal=journal,
+    )
+    request = RequestContract(
+        request_id="speculative-request",
+        model_swarm_id=MODEL_SWARM_ID,
+        prompt_tokens=3,
+        reserved_output_tokens=8,
+        recovery_level=RecoveryLevel.RESTARTABLE,
+    )
+    reservation = runtime.reserve(request)
+    plan = reservation.committed.plan
+    started = manager.begin_generation_journal_before_prefill(
+        request.request_id,
+        prompt_token_ids=(10, 20, 30),
+        request_data={"stream": True, "temperature": 0},
+    )
+    manager.commit_generation_prefill(request.request_id, epoch=plan.epoch)
+    window = SpeculativeVerifyWindow(
+        request_id=request.request_id,
+        route_id=plan.route_id,
+        epoch=plan.epoch,
+        route_plan_digest=reservation.committed.route_plan_digest,
+        window_id=1,
+        base_committed_position=0,
+        input_position=len(started.spec.prompt_token_ids),
+        starts_epoch=True,
+        input_tokens=(30, 40),
+        proposal_tokens=(40,),
+        strategy=SpeculativeStrategy.NGRAM_SUFFIX,
+        proposer_id="mesh-longest-suffix",
+        proposer_version="0.75.1",
+        sampling=SpeculativeSampling(seed=0, temperature=0),
+        reserved_context_tokens=plan.required_context_tokens,
+    )
+    runtime.speculative_fence.admit(window)
+    response = SpeculativeVerifyResponse(
+        request_id=request.request_id,
+        route_id=plan.route_id,
+        epoch=plan.epoch,
+        route_plan_digest=reservation.committed.route_plan_digest,
+        window_id=window.window_id,
+        input_position=window.input_position,
+        input_token_count=len(window.input_tokens),
+        verified_position=window.input_position + len(window.input_tokens),
+        predicted_tokens=(40, 41),
+    )
+
+    unpublished = manager.settle_speculative_response(response, max_commit_tokens=8)
+    durable = journal.get(request.request_id)
+
+    assert unpublished.committed_tokens == (40, 41)
+    assert durable is not None
+    assert durable.committed_output_token_ids == unpublished.committed_tokens
+    assert runtime.speculative_fence.pending_count(request.request_id) == 0
+    manager.close()
     journal.close()
 
 
