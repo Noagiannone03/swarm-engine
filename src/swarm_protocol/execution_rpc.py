@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from lattica import rpc_method
 
 from fabi_network.rpc import authenticated_rpc_peer_id
 from swarm_protocol.control import SignedControlMessage
 from swarm_protocol.execution import WorkerExecutionAdmission
 from swarm_protocol.route_authority import RouteAdmissionEnvelope
+from swarm_protocol.speculative import SpeculativeVerifyResponse, SpeculativeVerifyWindow
 
 
 def control_message_to_wire(message: SignedControlMessage) -> dict[str, object]:
@@ -63,3 +66,31 @@ class WorkerExecutionControlService:
             caller_endpoint_id=authenticated_rpc_peer_id(),
         )
         return None if response is None else control_message_to_wire(response)
+
+
+class WorkerSpeculativeVerifyService:
+    """Dormant bounded RPC for unpublished target-model verification."""
+
+    def __init__(
+        self,
+        admission: WorkerExecutionAdmission,
+        verify_window: Callable[[SpeculativeVerifyWindow], SpeculativeVerifyResponse],
+    ) -> None:
+        self.admission = admission
+        self._verify_window = verify_window
+
+    @rpc_method
+    def verify(self, message: dict[str, object]) -> dict[str, object]:
+        window = SpeculativeVerifyWindow.model_validate(message)
+        self.admission.authorize_speculative_verify(
+            request_id=window.request_id,
+            route_id=window.route_id,
+            epoch=window.epoch,
+            route_plan_digest=window.route_plan_digest,
+            caller_endpoint_id=authenticated_rpc_peer_id(),
+        )
+        response = self._verify_window(window)
+        if not isinstance(response, SpeculativeVerifyResponse):
+            response = SpeculativeVerifyResponse.model_validate(response)
+        window.verify_response(response)
+        return response.model_dump(mode="json")

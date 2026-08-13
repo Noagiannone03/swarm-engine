@@ -459,7 +459,8 @@ class WorkerExecutionAdmission:
         request_id: str,
         route_id: str,
         epoch: int,
-        routing_table: tuple[str, ...],
+        routing_table: tuple[str, ...] | None,
+        route_plan_digest: str | None = None,
     ) -> AuthorizedRoutePlan:
         with self._lock:
             authorized = self._routes_by_route_id.get(route_id)
@@ -471,7 +472,11 @@ class WorkerExecutionAdmission:
             plan.request_id != request_id
             or plan.epoch != epoch
             or highest_epoch != epoch
-            or tuple(stage.worker_id for stage in plan.stages) != routing_table
+            or (
+                routing_table is not None
+                and tuple(stage.worker_id for stage in plan.stages) != routing_table
+            )
+            or (route_plan_digest is not None and authorized.route_plan_digest != route_plan_digest)
         ):
             raise ExecutionAdmissionError("data-plane route fence does not match its signed plan")
         return authorized
@@ -482,7 +487,8 @@ class WorkerExecutionAdmission:
         request_id: str,
         route_id: str,
         epoch: int,
-        routing_table: tuple[str, ...],
+        routing_table: tuple[str, ...] | None,
+        route_plan_digest: str | None = None,
     ) -> RoutePlan:
         now_ms = self._now_ms()
         _, table = self._ready_contract(now_ms)
@@ -491,6 +497,7 @@ class WorkerExecutionAdmission:
             route_id=route_id,
             epoch=epoch,
             routing_table=routing_table,
+            route_plan_digest=route_plan_digest,
         )
         plan = authorized.plan
         reservation = table.get(f"{route_id}:{self.worker_id}")
@@ -556,6 +563,34 @@ class WorkerExecutionAdmission:
         )
         if caller_endpoint_id != authorized.coordinator_endpoint_id:
             raise PermissionError("route control did not come from the request coordinator")
+
+    def authorize_speculative_verify(
+        self,
+        *,
+        request_id: str,
+        route_id: str,
+        epoch: int,
+        route_plan_digest: str,
+        caller_endpoint_id: str,
+    ) -> None:
+        """Authorize one digest-fenced verify window from the coordinator."""
+
+        self._authorize_plan(
+            request_id=request_id,
+            route_id=route_id,
+            epoch=epoch,
+            routing_table=None,
+            route_plan_digest=route_plan_digest,
+        )
+        authorized = self._lookup_authorized_route(
+            request_id=request_id,
+            route_id=route_id,
+            epoch=epoch,
+            routing_table=None,
+            route_plan_digest=route_plan_digest,
+        )
+        if caller_endpoint_id != authorized.coordinator_endpoint_id:
+            raise PermissionError("speculative verify did not come from the route coordinator")
 
     def authorize_forward(
         self,

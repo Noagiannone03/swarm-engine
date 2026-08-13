@@ -432,6 +432,14 @@ def test_data_plane_requires_committed_route_exact_fence_and_authenticated_hop()
         routing_table=routing_table,
         caller_endpoint_id=COORDINATOR_ENDPOINT,
     )
+    digest = route_plan_digest(signed_plan(route))
+    admission.authorize_speculative_verify(
+        request_id=route.request_id,
+        route_id=route.route_id,
+        epoch=route.epoch,
+        route_plan_digest=digest,
+        caller_endpoint_id=COORDINATOR_ENDPOINT,
+    )
 
     with pytest.raises(PermissionError, match="coordinator"):
         admission.authorize_frontend(
@@ -439,6 +447,22 @@ def test_data_plane_requires_committed_route_exact_fence_and_authenticated_hop()
             route_id=route.route_id,
             epoch=route.epoch,
             routing_table=routing_table,
+            caller_endpoint_id=ATTACKER_ENDPOINT,
+        )
+    with pytest.raises(ExecutionAdmissionError, match="fence"):
+        admission.authorize_speculative_verify(
+            request_id=route.request_id,
+            route_id=route.route_id,
+            epoch=route.epoch,
+            route_plan_digest="f" * 64,
+            caller_endpoint_id=COORDINATOR_ENDPOINT,
+        )
+    with pytest.raises(PermissionError, match="coordinator"):
+        admission.authorize_speculative_verify(
+            request_id=route.request_id,
+            route_id=route.route_id,
+            epoch=route.epoch,
+            route_plan_digest=digest,
             caller_endpoint_id=ATTACKER_ENDPOINT,
         )
     with pytest.raises(ExecutionAdmissionError, match="fence"):
