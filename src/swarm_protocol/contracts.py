@@ -101,6 +101,9 @@ class SkippyRuntimeFeature(str, Enum):
     BACKEND_DEVICES = "backend_devices"
     EXACT_KV_PAGE = "exact_kv_page"
     EXACT_RECURRENT_STATE = "exact_recurrent_state"
+    VERIFY_WINDOW = "verify_window"
+    VERIFY_CHECKPOINT = "verify_checkpoint"
+    SESSION_TRIM = "session_trim"
 
 
 class SkippyExactStateKind(str, Enum):
@@ -276,6 +279,23 @@ class ModelExecutionPlan(ContractModel):
         return self
 
 
+class SkippyNgramSpeculativeCapability(ContractModel):
+    """Explicit signed opt-in for the first lossless speculative strategy."""
+
+    strategy: Literal["ngram-suffix"] = "ngram-suffix"
+    proposer_id: Literal["mesh-longest-suffix"] = "mesh-longest-suffix"
+    proposer_version: Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
+    runtime_abi_version: Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
+    max_proposal_tokens: Annotated[int, Field(gt=0, le=64)]
+    sampling_modes: tuple[Literal["greedy"], ...] = ("greedy",)
+
+    @model_validator(mode="after")
+    def validate_capability(self) -> Self:
+        if self.sampling_modes != ("greedy",):
+            raise ValueError("N-gram speculation is certified only for greedy sampling")
+        return self
+
+
 class SkippyExecutionPlan(ContractModel):
     """Signed GGUF stage plan executed by a feature-probed Skippy runtime.
 
@@ -309,6 +329,7 @@ class SkippyExecutionPlan(ContractModel):
     # expose state-export symbols.
     exact_state_kind: SkippyExactStateKind = SkippyExactStateKind.DISABLED
     exact_state_certification_hash: HashHex | None = None
+    speculative_ngram_suffix: SkippyNgramSpeculativeCapability | None = None
     activation_width: PositiveInt
     # Skippy's staged ABI currently emits token-major F32 activation frames.
     # Keep the wire geometry in the signed plan: it is a routing input and must
@@ -369,6 +390,20 @@ class SkippyExecutionPlan(ContractModel):
                 and SkippyRuntimeFeature.EXACT_RECURRENT_STATE not in self.required_runtime_features
             ):
                 raise ValueError("recurrent Skippy state requires recurrent-state support")
+        if self.speculative_ngram_suffix is not None:
+            required_speculative_features = {
+                SkippyRuntimeFeature.VERIFY_WINDOW,
+                SkippyRuntimeFeature.VERIFY_CHECKPOINT,
+                SkippyRuntimeFeature.SESSION_TRIM,
+            }
+            missing = required_speculative_features - set(self.required_runtime_features)
+            if missing:
+                raise ValueError(
+                    "signed N-gram speculation requires runtime features "
+                    f"{sorted(feature.value for feature in missing)}"
+                )
+            if self.speculative_ngram_suffix.runtime_abi_version != self.runtime_abi_version:
+                raise ValueError("speculative capability ABI does not match the execution plan")
         if self.activation_bytes_per_token != self.activation_width * 4:
             raise ValueError("Skippy F32 activation geometry does not match activation width")
         if self.format == "gguf-direct":

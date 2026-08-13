@@ -181,6 +181,8 @@ def _execution_plan_contract_payload(plan: object) -> dict[str, object]:
         # merely upgrading a reader forks every existing model swarm.
         payload.pop("exact_state_kind", None)
         payload.pop("exact_state_certification_hash", None)
+    if isinstance(plan, SkippyExecutionPlan) and plan.speculative_ngram_suffix is None:
+        payload.pop("speculative_ngram_suffix", None)
     return payload
 
 

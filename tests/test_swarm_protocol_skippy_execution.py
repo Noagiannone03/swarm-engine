@@ -13,6 +13,7 @@ from swarm_protocol.contracts import (
     ModelManifest,
     SkippyExactStateKind,
     SkippyExecutionPlan,
+    SkippyNgramSpeculativeCapability,
     SkippyRuntimeFeature,
 )
 from swarm_protocol.model_manifest import (
@@ -34,6 +35,7 @@ from swarm_protocol.skippy_package_import import (
     attach_skippy_direct_gguf,
     attach_skippy_package,
     certify_skippy_exact_state,
+    certify_skippy_ngram_speculation,
 )
 
 
@@ -337,6 +339,7 @@ def test_legacy_skippy_plan_without_exact_state_fields_keeps_its_identity():
     plan = raw["artifact_index"]["execution_plans"][0]
     plan.pop("exact_state_kind")
     plan.pop("exact_state_certification_hash")
+    plan.pop("speculative_ngram_suffix")
 
     loaded = ModelRegistryBundle.model_validate(raw)
 
@@ -368,6 +371,115 @@ def test_existing_skippy_plan_is_certified_without_rebuilding_its_artifacts():
             plan_id=plan.plan_id,
             state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
         )
+
+
+def test_ngram_speculation_requires_explicit_greedy_abi_and_native_features():
+    _, index, _ = _fixture()
+    payload = index.execution_plans[0].model_dump(mode="json")
+    capability = SkippyNgramSpeculativeCapability(
+        proposer_version="0.75.1",
+        runtime_abi_version=payload["runtime_abi_version"],
+        max_proposal_tokens=8,
+    )
+    payload["speculative_ngram_suffix"] = capability.model_dump(mode="json")
+
+    with pytest.raises(ValueError, match="runtime features"):
+        SkippyExecutionPlan.model_validate(payload)
+
+    payload["required_runtime_features"] = sorted(
+        [
+            *payload["required_runtime_features"],
+            SkippyRuntimeFeature.SESSION_TRIM.value,
+            SkippyRuntimeFeature.VERIFY_CHECKPOINT.value,
+            SkippyRuntimeFeature.VERIFY_WINDOW.value,
+        ]
+    )
+    assert SkippyExecutionPlan.model_validate(payload).speculative_ngram_suffix == capability
+
+    payload["speculative_ngram_suffix"]["runtime_abi_version"] = "0.1.34"
+    with pytest.raises(ValueError, match="ABI"):
+        SkippyExecutionPlan.model_validate(payload)
+    payload["speculative_ngram_suffix"]["runtime_abi_version"] = payload["runtime_abi_version"]
+    payload["speculative_ngram_suffix"]["sampling_modes"] = []
+    with pytest.raises(ValueError, match="greedy"):
+        SkippyExecutionPlan.model_validate(payload)
+
+
+def test_existing_skippy_plan_gets_signed_ngram_capability_without_artifact_rebuild():
+    _, index, model = _fixture()
+    source = ModelRegistryBundle(manifest=model, artifact_index=index)
+
+    certified = certify_skippy_ngram_speculation(
+        source,
+        plan_id="skippy-q4-k-m-v1",
+        max_proposal_tokens=8,
+        proposer_version="0.75.1",
+    )
+
+    plan = certified.artifact_index.execution_plans[0]
+    assert isinstance(plan, SkippyExecutionPlan)
+    assert plan.speculative_ngram_suffix == SkippyNgramSpeculativeCapability(
+        proposer_version="0.75.1",
+        runtime_abi_version=plan.runtime_abi_version,
+        max_proposal_tokens=8,
+    )
+    assert {
+        SkippyRuntimeFeature.SESSION_TRIM,
+        SkippyRuntimeFeature.VERIFY_CHECKPOINT,
+        SkippyRuntimeFeature.VERIFY_WINDOW,
+    } <= set(plan.required_runtime_features)
+    assert certified.artifact_index.artifacts == source.artifact_index.artifacts
+    assert certified.model_swarm_id != source.model_swarm_id
+    with pytest.raises(ValueError, match="already speculation certified"):
+        certify_skippy_ngram_speculation(
+            certified,
+            plan_id=plan.plan_id,
+            max_proposal_tokens=8,
+            proposer_version="0.75.1",
+        )
+
+
+def test_ngram_and_warm_state_certifications_compose_in_either_order():
+    _, index, model = _fixture()
+    source = ModelRegistryBundle(manifest=model, artifact_index=index)
+
+    warm_first = certify_skippy_exact_state(
+        source,
+        plan_id="skippy-q4-k-m-v1",
+        state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
+    )
+    warm_then_ngram = certify_skippy_ngram_speculation(
+        warm_first,
+        plan_id="skippy-q4-k-m-v1",
+        max_proposal_tokens=8,
+        proposer_version="0.75.1",
+    )
+    warm_then_ngram_plan = warm_then_ngram.artifact_index.execution_plans[0]
+    assert warm_then_ngram_plan.exact_state_certification_hash == (
+        skippy_exact_state_certification_hash(
+            warm_then_ngram.manifest,
+            warm_then_ngram_plan,
+        )
+    )
+
+    ngram_first = certify_skippy_ngram_speculation(
+        source,
+        plan_id="skippy-q4-k-m-v1",
+        max_proposal_tokens=8,
+        proposer_version="0.75.1",
+    )
+    ngram_then_warm = certify_skippy_exact_state(
+        ngram_first,
+        plan_id="skippy-q4-k-m-v1",
+        state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
+    )
+    ngram_then_warm_plan = ngram_then_warm.artifact_index.execution_plans[0]
+    assert ngram_then_warm_plan.exact_state_certification_hash == (
+        skippy_exact_state_certification_hash(
+            ngram_then_warm.manifest,
+            ngram_then_warm_plan,
+        )
+    )
 
 
 def _package_import_fixture(tmp_path):

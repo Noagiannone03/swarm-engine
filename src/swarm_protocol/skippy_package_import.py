@@ -18,6 +18,7 @@ from swarm_protocol.contracts import (
     ModelManifest,
     SkippyExactStateKind,
     SkippyExecutionPlan,
+    SkippyNgramSpeculativeCapability,
     SkippyRuntimeFeature,
 )
 from swarm_protocol.model_manifest import (
@@ -103,6 +104,71 @@ def certify_skippy_exact_state(
     if selected.exact_state_kind is not SkippyExactStateKind.DISABLED:
         raise ValueError(f"Skippy execution plan {plan_id!r} is already exact-state certified")
     certified = _certify_exact_state(bundle.manifest, selected, state_kind)
+    plans = tuple(
+        certified if plan.plan_id == plan_id else plan
+        for plan in bundle.artifact_index.execution_plans
+    )
+    index = ModelArtifactIndex.model_validate(
+        {**bundle.artifact_index.model_dump(mode="json"), "execution_plans": plans}
+    )
+    manifest = ModelManifest.model_validate(
+        {
+            **bundle.manifest.model_dump(mode="json"),
+            "execution_plan_hash": execution_plan_hash(index),
+        }
+    )
+    return ModelRegistryBundle(manifest=manifest, artifact_index=index)
+
+
+def certify_skippy_ngram_speculation(
+    bundle: ModelRegistryBundle,
+    *,
+    plan_id: str,
+    max_proposal_tokens: int,
+    proposer_version: str,
+) -> ModelRegistryBundle:
+    """Explicitly sign one greedy, request-local Mesh suffix capability."""
+
+    matches = tuple(
+        plan for plan in bundle.artifact_index.execution_plans if plan.plan_id == plan_id
+    )
+    if len(matches) != 1 or not isinstance(matches[0], SkippyExecutionPlan):
+        raise ValueError(f"bundle has no unique Skippy execution plan {plan_id!r}")
+    selected = matches[0]
+    if selected.speculative_ngram_suffix is not None:
+        raise ValueError(f"Skippy execution plan {plan_id!r} is already speculation certified")
+    features = tuple(
+        sorted(
+            {
+                *selected.required_runtime_features,
+                SkippyRuntimeFeature.VERIFY_WINDOW,
+                SkippyRuntimeFeature.VERIFY_CHECKPOINT,
+                SkippyRuntimeFeature.SESSION_TRIM,
+            },
+            key=lambda feature: feature.value,
+        )
+    )
+    certified = selected.model_copy(
+        update={
+            "required_runtime_features": features,
+            "speculative_ngram_suffix": SkippyNgramSpeculativeCapability(
+                proposer_version=proposer_version,
+                runtime_abi_version=selected.runtime_abi_version,
+                max_proposal_tokens=max_proposal_tokens,
+            ),
+        }
+    )
+    if selected.exact_state_kind is not SkippyExactStateKind.DISABLED:
+        unsigned = certified.model_copy(update={"exact_state_certification_hash": None})
+        certified = unsigned.model_copy(
+            update={
+                "exact_state_certification_hash": skippy_exact_state_certification_hash(
+                    bundle.manifest,
+                    unsigned,
+                )
+            }
+        )
+    certified = SkippyExecutionPlan.model_validate(certified.model_dump(mode="json"))
     plans = tuple(
         certified if plan.plan_id == plan_id else plan
         for plan in bundle.artifact_index.execution_plans
