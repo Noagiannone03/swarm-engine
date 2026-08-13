@@ -154,6 +154,17 @@ from swarm_protocol.skippy_execution import (
     skippy_span_static_bytes,
     verify_skippy_execution_span,
 )
+from swarm_protocol.speculative import (
+    MAX_SPECULATIVE_INPUT_TOKENS,
+    MAX_SPECULATIVE_PROPOSAL_TOKENS,
+    MAX_SPECULATIVE_RESPONSE_BYTES,
+    SpeculativeSampling,
+    SpeculativeStageMetrics,
+    SpeculativeStrategy,
+    SpeculativeVerifyResponse,
+    SpeculativeVerifyWindow,
+    SpeculativeWindowFence,
+)
 from swarm_protocol.worker_placement import (
     AutonomousPeerTopology,
     AutonomousWorkerPlacement,
@@ -248,6 +259,12 @@ __all__ = [
     "SkippyExactStateKind",
     "SkippyExecutionPlan",
     "SkippyRuntimeFeature",
+    "SpeculativeSampling",
+    "SpeculativeStageMetrics",
+    "SpeculativeStrategy",
+    "SpeculativeVerifyResponse",
+    "SpeculativeVerifyWindow",
+    "SpeculativeWindowFence",
     "SpanLease",
     "SpanState",
     "StaleCatalogRecord",
@@ -294,4 +311,7 @@ __all__ = [
     "verify_execution_span",
     "verify_skippy_execution_span",
     "verify_worker_span",
+    "MAX_SPECULATIVE_INPUT_TOKENS",
+    "MAX_SPECULATIVE_PROPOSAL_TOKENS",
+    "MAX_SPECULATIVE_RESPONSE_BYTES",
 ]
