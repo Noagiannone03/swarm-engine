@@ -156,6 +156,37 @@ def test_fence_rejects_window_id_replay_and_same_epoch_route_change() -> None:
     assert fence.accept_response(response(replacement)) == replacement
 
 
+def test_lifecycle_fence_is_idempotent_and_retirement_rejects_late_work() -> None:
+    fence = SpeculativeWindowFence()
+    candidate = window(window_id=1)
+    fence.admit(candidate)
+
+    assert fence.fence_at_least(candidate.request_id, newer_epoch=8)
+    assert not fence.fence_at_least(candidate.request_id, newer_epoch=8)
+    assert fence.pending_count(candidate.request_id) == 0
+    with pytest.raises(ValueError, match="stale"):
+        fence.accept_response(response(candidate))
+
+    replacement = window(
+        window_id=2,
+        epoch=8,
+        route_id="route-b",
+        digest=DIGEST_B,
+    )
+    fence.admit(replacement)
+    fence.retire(candidate.request_id)
+    assert fence.pending_count(candidate.request_id) == 0
+    with pytest.raises(ValueError, match="retired"):
+        fence.admit(
+            window(
+                window_id=3,
+                epoch=9,
+                route_id="route-c",
+                digest="c" * 64,
+            )
+        )
+
+
 def test_settlement_commits_exact_target_prefix_and_mismatch_correction() -> None:
     candidate = window()
     full = candidate.settlement_plan(response(candidate), max_commit_tokens=8)

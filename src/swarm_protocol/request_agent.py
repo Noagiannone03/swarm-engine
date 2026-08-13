@@ -32,6 +32,7 @@ from swarm_protocol.epochs import EpochAllocator
 from swarm_protocol.registry import ModelRegistryBundle, TrustedModelRegistry
 from swarm_protocol.route_authority import RouteAdmissionEnvelope
 from swarm_protocol.routing import ExactRoutePlanner, PlannedRoute, RoutePlanningError
+from swarm_protocol.speculative import SpeculativeWindowFence
 
 _MAX_AUTHORITY_RESPONSE_BYTES = 1024 * 1024
 _DISCOVERY_SNAPSHOT_CACHE_MS = 60_000
@@ -523,6 +524,7 @@ class RequestAgentRouteRuntime:
         start_maintenance_thread: bool = True,
         close_transport: bool = False,
         state_dir: Path | None = None,
+        speculative_fence: SpeculativeWindowFence | None = None,
     ) -> None:
         if prepare_ttl_ms <= 0 or plan_ttl_ms <= prepare_ttl_ms:
             raise ValueError("plan TTL must exceed the positive prepare TTL")
@@ -567,6 +569,7 @@ class RequestAgentRouteRuntime:
             self._coordinator_factory = coordinator_factory
         self._close_transport = close_transport
         self.state_dir = None if state_dir is None else Path(state_dir)
+        self.speculative_fence = speculative_fence or SpeculativeWindowFence()
         self._request_locks: dict[str, _RequestLockEntry] = {}
         self._reservations: dict[str, _ManagedReservation] = {}
         self._recoverable_requests: dict[str, _RecoverableRequest] = {}
@@ -835,6 +838,10 @@ class RequestAgentRouteRuntime:
                     raise RuntimeError(
                         f"failed epoch {failed_epoch} differs from active epoch {active_plan.epoch}"
                     )
+                self.speculative_fence.fence_at_least(
+                    request_id,
+                    newer_epoch=failed_epoch + 1,
+                )
                 excluded_worker_ids = active.excluded_worker_ids | frozenset(
                     stage.worker_id for stage in active_plan.stages
                 )
@@ -877,6 +884,11 @@ class RequestAgentRouteRuntime:
             if recoverable.recovery_policy != RouteRecoveryPolicy.REPLAN_COLD:
                 raise RuntimeError("failed route was not admitted for cold replanning")
 
+            self.speculative_fence.fence_at_least(
+                request_id,
+                newer_epoch=failed_epoch + 1,
+            )
+
             renewed_permit = recoverable.permit
             try:
                 self._emit_phase(request_id, "planning")
@@ -885,6 +897,7 @@ class RequestAgentRouteRuntime:
                     force_refresh=True,
                 )
                 epoch = self.epoch_allocator.next_epoch()
+                self.speculative_fence.fence_at_least(request_id, newer_epoch=epoch)
                 self._emit_phase(request_id, "authorizing")
                 renewed_permit = self.authority.keepalive_permit(
                     recoverable.permit.permit_id,
@@ -1180,6 +1193,8 @@ class RequestAgentRouteRuntime:
             with self._lock:
                 current = self._reservations.pop(request_id, None)
                 recoverable = self._recoverable_requests.pop(request_id, None)
+            if current is not None or recoverable is not None:
+                self.speculative_fence.retire(request_id)
             if current is not None:
                 active = current.reservation
                 try:
@@ -1392,6 +1407,10 @@ class RequestAgentRouteRuntime:
     ) -> None:
         """Fence locally first, then clean up the remote route best-effort."""
 
+        self.speculative_fence.fence_at_least(
+            request_id,
+            newer_epoch=managed.reservation.committed.plan.epoch + 1,
+        )
         with self._lock:
             if self._reservations.get(request_id) is not managed:
                 return

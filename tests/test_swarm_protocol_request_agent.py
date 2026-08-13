@@ -32,6 +32,11 @@ from swarm_protocol.request_agent import (
     RoutePermitGrant,
 )
 from swarm_protocol.route_authority import RouteAdmissionEnvelope
+from swarm_protocol.speculative import (
+    SpeculativeSampling,
+    SpeculativeStrategy,
+    SpeculativeVerifyWindow,
+)
 
 COORDINATOR = "11" * 32
 WORKER = "22" * 32
@@ -182,6 +187,25 @@ class FakeCoordinator:
     def release(self, route):
         self.released.append(route.plan.route_id)
 
+
+def speculative_window(reservation, *, window_id=1):
+    return SpeculativeVerifyWindow(
+        request_id=reservation.committed.plan.request_id,
+        route_id=reservation.committed.plan.route_id,
+        epoch=reservation.committed.plan.epoch,
+        route_plan_digest=reservation.committed.route_plan_digest,
+        window_id=window_id,
+        base_committed_position=0,
+        input_position=0,
+        starts_epoch=True,
+        input_tokens=(41, 42),
+        proposal_tokens=(42,),
+        strategy=SpeculativeStrategy.NGRAM_SUFFIX,
+        proposer_id="mesh-longest-suffix",
+        proposer_version="0.75.1",
+        sampling=SpeculativeSampling(seed=0, temperature=0),
+        reserved_context_tokens=reservation.committed.plan.required_context_tokens,
+    )
 
 def discovery(model):
     store = InMemoryDiscoveryStore(clock_ms=lambda: 1_000)
@@ -343,6 +367,8 @@ def test_request_agent_cold_replan_bans_failed_workers_and_reuses_permit():
         recovery_level=RecoveryLevel.RESTARTABLE,
     )
     initial = runtime.reserve(request)
+    pending = speculative_window(initial)
+    runtime.speculative_fence.admit(pending)
 
     replacement = runtime.replan_cold("request", failed_epoch=initial.committed.plan.epoch)
 
@@ -351,6 +377,7 @@ def test_request_agent_cold_replan_bans_failed_workers_and_reuses_permit():
     assert replacement.committed.plan.epoch > initial.committed.plan.epoch
     assert replacement.permit.permit_id == initial.permit.permit_id
     assert replacement.excluded_worker_ids == frozenset({"worker"})
+    assert runtime.speculative_fence.pending_count(request.request_id) == 0
     assert len(authority.permits) == 1
     assert len(authority.capabilities) == 2
     assert coordinators[0].released == [initial.committed.plan.route_id]
@@ -367,6 +394,17 @@ def test_request_agent_cold_replan_bans_failed_workers_and_reuses_permit():
     ]
     assert runtime.release_request("request") is True
     assert authority.released == [PERMIT]
+    with pytest.raises(ValueError, match="retired"):
+        runtime.speculative_fence.admit(
+            pending.model_copy(
+                update={
+                    "route_id": replacement.committed.plan.route_id,
+                    "epoch": replacement.committed.plan.epoch,
+                    "route_plan_digest": replacement.committed.route_plan_digest,
+                    "window_id": 2,
+                }
+            )
+        )
 
 
 def test_request_agent_cold_replan_accumulates_fences_across_two_failed_routes():
@@ -690,6 +728,7 @@ def test_request_agent_retries_transient_renewal_only_inside_safe_window():
 
 def test_request_agent_fails_closed_before_lease_retry_can_cross_expiry():
     runtime, reservation, authority, coordinator, steady_clock = lease_runtime()
+    runtime.speculative_fence.admit(speculative_window(reservation))
 
     steady_clock.now_ms = 49
     runtime.maintain_once()
@@ -699,6 +738,7 @@ def test_request_agent_fails_closed_before_lease_retry_can_cross_expiry():
     assert coordinator.released == [reservation.committed.plan.route_id]
     assert authority.released == []
     assert runtime.status()["cold_replans"][0]["failed_epoch"] == 1
+    assert runtime.speculative_fence.pending_count("lease-request") == 0
     runtime.release_request("lease-request")
     assert authority.released == [PERMIT]
     failure = runtime.status()["recent_failures"][0]

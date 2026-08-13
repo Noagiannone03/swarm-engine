@@ -313,10 +313,13 @@ class SpeculativeWindowFence:
         self._minimum_epoch: dict[str, int] = {}
         self._last_window_id: dict[str, int] = {}
         self._pending: dict[tuple[str, int], SpeculativeVerifyWindow] = {}
+        self._retired: set[str] = set()
 
     def admit(self, window: SpeculativeVerifyWindow) -> None:
         with self._request_lock(window.request_id):
             with self._lock:
+                if window.request_id in self._retired:
+                    raise ValueError("speculative request is retired")
                 if window.epoch < self._minimum_epoch.get(window.request_id, 0):
                     raise ValueError("speculative window epoch is stale")
                 binding = self._bindings.get(window.request_id)
@@ -419,18 +422,48 @@ class SpeculativeWindowFence:
         return self.settle_response(response, commit)
 
     def fence(self, request_id: str, *, newer_epoch: int) -> None:
+        if not self.fence_at_least(request_id, newer_epoch=newer_epoch):
+            raise ValueError("speculative fence epoch must move forward")
+
+    def fence_at_least(self, request_id: str, *, newer_epoch: int) -> bool:
+        """Fence every older window, idempotently, before route recovery.
+
+        Request lifecycle code can observe the same failure through more than
+        one path (lease invalidation, explicit cold replan, then cleanup).  The
+        first observer advances the request fence; later observers are safe
+        no-ops instead of reopening or weakening that fence.
+        """
+
+        request_id = str(request_id)
+        if newer_epoch < 0:
+            raise ValueError("speculative fence epoch must be non-negative")
         with self._request_lock(request_id):
             with self._lock:
+                if request_id in self._retired:
+                    return False
                 binding = self._bindings.get(request_id)
                 current_epoch = max(
                     self._minimum_epoch.get(request_id, 0),
                     -1 if binding is None else binding[1],
                 )
                 if newer_epoch <= current_epoch:
-                    raise ValueError("speculative fence epoch must move forward")
+                    return False
                 self._drop_pending(request_id)
                 self._bindings.pop(request_id, None)
                 self._minimum_epoch[request_id] = newer_epoch
+                return True
+
+    def retire(self, request_id: str) -> None:
+        """Permanently reject late work after release, abort, or completion."""
+
+        request_id = str(request_id)
+        with self._request_lock(request_id):
+            with self._lock:
+                self._drop_pending(request_id)
+                self._bindings.pop(request_id, None)
+                self._minimum_epoch.pop(request_id, None)
+                self._last_window_id.pop(request_id, None)
+                self._retired.add(request_id)
 
     def pending_count(self, request_id: str) -> int:
         with self._lock:
