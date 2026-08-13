@@ -42,6 +42,16 @@ class SkippyForwardResult:
 
 
 @dataclass(frozen=True)
+class SkippyVerifyResult:
+    """Unpublished target predictions for one native verification window."""
+
+    base_position: int
+    verified_position: int
+    activation: NativeActivationFrame | None
+    predicted_tokens: tuple[int, ...] | None
+
+
+@dataclass(frozen=True)
 class SkippyKvPage:
     """Exact Mesh KV page plus the native layout descriptor required to restore it."""
 
@@ -461,6 +471,55 @@ class SkippyRuntimeStageRunner:
             ),
             predicted_token=predicted_token,
         )
+
+    def verify_tokens(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        activation: NativeActivationFrame | None,
+        sampling_params: SamplingParams | None,
+    ) -> SkippyVerifyResult:
+        """Run exact target verification without committing or publishing tokens."""
+
+        if not token_ids:
+            raise ValueError("Skippy verification window is empty")
+        native_input = _to_native_frame(self.native, activation)
+        kwargs = {} if sampling_params is None else _sampling_kwargs(sampling_params)
+        output = self.stage.verify_tokens(request_id, token_ids, native_input, **kwargs)
+        predicted_tokens = (
+            None
+            if output.predicted_tokens is None
+            else tuple(int(token) for token in output.predicted_tokens)
+        )
+        return SkippyVerifyResult(
+            base_position=int(output.base_position),
+            verified_position=int(output.verified_position),
+            activation=_from_native_frame(
+                output.activation,
+                terminal_sample=predicted_tokens is not None,
+            ),
+            predicted_tokens=predicted_tokens,
+        )
+
+    def retire_verify_checkpoint(
+        self,
+        request_id: str,
+        *,
+        token_start: int,
+        token_count: int,
+    ) -> None:
+        """Finalize native recovery state only after the durable logical commit."""
+
+        if token_start < 0 or token_count <= 0:
+            raise ValueError("Skippy verification checkpoint range is invalid")
+        self.stage.retire_verify_checkpoint(request_id, token_start, token_count)
+
+    def trim_session(self, request_id: str, *, committed_position: int) -> None:
+        """Rollback speculative native KV to the durable committed position."""
+
+        if committed_position < 0:
+            raise ValueError("Skippy committed position is negative")
+        self.stage.trim_session(request_id, committed_position)
 
     def release(self, request_id: str) -> None:
         self.stage.drop_session(request_id)

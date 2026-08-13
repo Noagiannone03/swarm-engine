@@ -5,8 +5,8 @@ use std::{
 
 use fabi_skippy_runtime::{
     NativeDeviceInfo, SkippyPackageGeometry, SkippyStage, StageActivationFrame, StageForwardOutput,
-    StageKvPage, StageLoadMode, StageOpenOptions, StageSamplingConfig, inspect_package_geometry,
-    inspect_source_geometry, load_verified_native_runtime,
+    StageKvPage, StageLoadMode, StageOpenOptions, StageSamplingConfig, StageVerifyOutput,
+    inspect_package_geometry, inspect_source_geometry, load_verified_native_runtime,
 };
 use pyo3::{
     exceptions::PyRuntimeError,
@@ -506,6 +506,38 @@ impl PySkippyForwardOutput {
     }
 }
 
+#[pyclass(name = "SkippyVerifyOutput", frozen)]
+pub(crate) struct PySkippyVerifyOutput {
+    #[pyo3(get)]
+    base_position: u64,
+    #[pyo3(get)]
+    verified_position: u64,
+    #[pyo3(get)]
+    predicted_tokens: Option<Vec<i32>>,
+    activation: PySkippyActivationFrame,
+}
+
+impl From<StageVerifyOutput> for PySkippyVerifyOutput {
+    fn from(value: StageVerifyOutput) -> Self {
+        Self {
+            base_position: value.base_position,
+            verified_position: value.verified_position,
+            predicted_tokens: value.predicted_tokens,
+            activation: PySkippyActivationFrame {
+                inner: value.activation,
+            },
+        }
+    }
+}
+
+#[pymethods]
+impl PySkippyVerifyOutput {
+    #[getter]
+    fn activation(&self) -> PySkippyActivationFrame {
+        self.activation.clone()
+    }
+}
+
 #[pyclass(name = "SkippyStage")]
 pub(crate) struct PySkippyStage {
     inner: Arc<Mutex<SkippyStage>>,
@@ -695,6 +727,96 @@ impl PySkippyStage {
         .map_err(py_error)
     }
 
+    #[pyo3(signature = (
+        session_id,
+        token_ids,
+        input=None,
+        *,
+        sample=false,
+        seed=0,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        repeat_penalty=1.0,
+        penalty_last_n=-1,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_tokens(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        token_ids: Vec<i32>,
+        input: Option<PyRef<'_, PySkippyActivationFrame>>,
+        sample: bool,
+        seed: u32,
+        temperature: f32,
+        top_p: f32,
+        top_k: i32,
+        min_p: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+        repeat_penalty: f32,
+        penalty_last_n: i32,
+    ) -> PyResult<PySkippyVerifyOutput> {
+        let inner = Arc::clone(&self.inner);
+        let input = input.map(|frame| frame.inner.clone());
+        let sampling = sample.then_some(StageSamplingConfig {
+            seed,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            presence_penalty,
+            frequency_penalty,
+            repeat_penalty,
+            penalty_last_n,
+        });
+        py.detach(move || {
+            inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Skippy stage lock poisoned"))?
+                .verify_tokens(&session_id, &token_ids, input.as_ref(), sampling.as_ref())
+        })
+        .map(Into::into)
+        .map_err(py_error)
+    }
+
+    fn retire_verify_checkpoint(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        token_start: u64,
+        token_count: u64,
+    ) -> PyResult<()> {
+        let inner = Arc::clone(&self.inner);
+        py.detach(move || {
+            inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Skippy stage lock poisoned"))?
+                .retire_verify_checkpoint(&session_id, token_start, token_count)
+        })
+        .map_err(py_error)
+    }
+
+    fn trim_session(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        committed_position: u64,
+    ) -> PyResult<()> {
+        let inner = Arc::clone(&self.inner);
+        py.detach(move || {
+            inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Skippy stage lock poisoned"))?
+                .trim_session(&session_id, committed_position)
+        })
+        .map_err(py_error)
+    }
+
     fn prefill_tokens(
         &self,
         py: Python<'_>,
@@ -866,6 +988,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PySkippyKvPage>()?;
     module.add_class::<PySkippyKvPageBuilder>()?;
     module.add_class::<PySkippyForwardOutput>()?;
+    module.add_class::<PySkippyVerifyOutput>()?;
     module.add_class::<PySkippyStage>()?;
     Ok(())
 }

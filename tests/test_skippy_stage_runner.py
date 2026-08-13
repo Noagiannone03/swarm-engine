@@ -131,6 +131,9 @@ class _FakeStage:
         self.calls = []
         self.prefill_token_calls = []
         self.dropped = []
+        self.session_positions = {}
+        self.retired_checkpoints = []
+        self.trimmed_positions = []
 
     def _output(self, token_ids, input_frame, sample):
         self.calls.append((list(token_ids), input_frame, sample))
@@ -154,8 +157,28 @@ class _FakeStage:
         return self._output(token_ids, input_frame, kwargs.get("sample", False))
 
     def decode(self, request_id, token_id, input_frame, **kwargs):
-        del request_id
+        self.session_positions[request_id] = self.session_positions.get(request_id, 0) + 1
         return self._output([token_id], input_frame, kwargs.get("sample", False))
+
+    def verify_tokens(self, request_id, token_ids, input_frame, **kwargs):
+        base = self.session_positions.get(request_id, 0)
+        verified = base + len(token_ids)
+        self.session_positions[request_id] = verified
+        sample = kwargs.get("sample", False)
+        output = self._output(token_ids, input_frame, sample)
+        return SimpleNamespace(
+            base_position=base,
+            verified_position=verified,
+            predicted_tokens=[token + 100 for token in token_ids] if sample else None,
+            activation=output.activation,
+        )
+
+    def retire_verify_checkpoint(self, request_id, token_start, token_count):
+        self.retired_checkpoints.append((request_id, token_start, token_count))
+
+    def trim_session(self, request_id, committed_position):
+        self.session_positions[request_id] = committed_position
+        self.trimmed_positions.append((request_id, committed_position))
 
     def prefill_tokens(self, request_id, token_ids):
         self.prefill_token_calls.append((request_id, list(token_ids)))
@@ -303,6 +326,47 @@ def test_runner_reuses_native_stage_and_typed_activations(tmp_path):
     assert isinstance(native.stage.calls[-1][1], _FakeActivation)
     runner.release("request-1")
     assert native.stage.dropped == ["request-1"]
+
+
+def test_runner_exposes_unpublished_verification_and_explicit_settlement(tmp_path):
+    native = _FakeNative()
+    runner = SkippyRuntimeStageRunner(
+        _verified(tmp_path),
+        device="vulkan:0",
+        model_layer_count=2,
+        max_context_tokens=32768,
+        max_sessions=2,
+        native_module=native,
+        runtime_root=tmp_path,
+    )
+
+    result = runner.verify_tokens(
+        "request-spec",
+        [11, 12, 13],
+        None,
+        SamplingParams(temperature=0),
+    )
+
+    assert result.base_position == 0
+    assert result.verified_position == 3
+    assert result.predicted_tokens == (111, 112, 113)
+    assert result.activation is None
+    assert native.stage.retired_checkpoints == []
+    runner.trim_session("request-spec", committed_position=1)
+    assert native.stage.trimmed_positions == [("request-spec", 1)]
+
+    second = runner.verify_tokens(
+        "request-spec",
+        [21, 22],
+        None,
+        SamplingParams(temperature=0),
+    )
+    runner.retire_verify_checkpoint(
+        "request-spec",
+        token_start=second.base_position,
+        token_count=second.verified_position - second.base_position,
+    )
+    assert native.stage.retired_checkpoints == [("request-spec", 1, 2)]
 
 
 def test_runner_round_trips_exact_native_kv_descriptor(tmp_path):

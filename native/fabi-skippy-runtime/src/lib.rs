@@ -598,6 +598,19 @@ pub struct StageForwardOutput {
     pub activation: StageActivationFrame,
 }
 
+/// Native result for one speculative verification window.
+///
+/// The caller must either retire the exact checkpoint after a full commit or
+/// trim the session to its durable committed position. Nothing in this bridge
+/// publishes tokens or infers acceptance on the worker's behalf.
+#[derive(Clone, Debug)]
+pub struct StageVerifyOutput {
+    pub base_position: u64,
+    pub verified_position: u64,
+    pub predicted_tokens: Option<Vec<i32>>,
+    pub activation: StageActivationFrame,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageLoadMode {
     LayerPackage,
@@ -888,6 +901,83 @@ impl SkippyStage {
             predicted_token: sampling.map(|_| predicted_token),
             activation: StageActivationFrame { inner: activation },
         })
+    }
+
+    /// Advance a fenced candidate window through this stage in one native pass.
+    ///
+    /// This deliberately exposes only Mesh's exact target verification. Draft
+    /// proposal, accepted-prefix settlement and publication remain Request Agent
+    /// responsibilities so stale workers can never make tokens visible.
+    pub fn verify_tokens(
+        &mut self,
+        session_id: &str,
+        token_ids: &[i32],
+        input: Option<&StageActivationFrame>,
+        sampling: Option<&StageSamplingConfig>,
+    ) -> Result<StageVerifyOutput> {
+        ensure!(!token_ids.is_empty(), "Skippy verification window is empty");
+        let base_position = self.session_token_count(session_id)?;
+        let native_sampling = sampling.map(StageSamplingConfig::to_native);
+        let (predicted_tokens, native_mtp_draft, activation) =
+            self.session(session_id)?.verify_tokens_frame_sampled(
+                token_ids,
+                native_sampling.as_ref(),
+                input.map(|frame| &frame.inner),
+                0,
+                0,
+            )?;
+        ensure!(
+            native_mtp_draft.is_none(),
+            "Skippy returned an undeclared MTP draft"
+        );
+        if sampling.is_some() {
+            ensure!(
+                predicted_tokens.len() == token_ids.len(),
+                "Skippy target predictions do not cover the verification window"
+            );
+        }
+        let verified_position = self.session_token_count(session_id)?;
+        let expected_position = base_position
+            .checked_add(u64::try_from(token_ids.len()).context("token count exceeds u64")?)
+            .context("verification position overflows")?;
+        ensure!(
+            verified_position == expected_position,
+            "Skippy verification advanced to an unexpected position"
+        );
+        Ok(StageVerifyOutput {
+            base_position,
+            verified_position,
+            predicted_tokens: sampling.map(|_| predicted_tokens),
+            activation: StageActivationFrame { inner: activation },
+        })
+    }
+
+    /// Retire Mesh's recovery checkpoint after the exact window is durable.
+    pub fn retire_verify_checkpoint(
+        &mut self,
+        session_id: &str,
+        token_start: u64,
+        token_count: u64,
+    ) -> Result<()> {
+        ensure!(token_count > 0, "verification checkpoint is empty");
+        let token_end = token_start
+            .checked_add(token_count)
+            .context("verification checkpoint range overflows")?;
+        ensure!(
+            token_end <= self.session_token_count(session_id)?,
+            "verification checkpoint exceeds the session position"
+        );
+        self.session(session_id)?
+            .retire_verify_checkpoint(token_start, token_count)
+    }
+
+    /// Rewind native KV state to the last durable committed token position.
+    pub fn trim_session(&mut self, session_id: &str, committed_position: u64) -> Result<()> {
+        ensure!(
+            committed_position <= self.session_token_count(session_id)?,
+            "cannot trim Skippy session beyond its current position"
+        );
+        self.session(session_id)?.trim_session(committed_position)
     }
 
     pub fn reset_session(&mut self, session_id: &str) -> Result<()> {
