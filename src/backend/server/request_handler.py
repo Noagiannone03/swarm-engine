@@ -115,22 +115,29 @@ class RequestHandler:
         """
 
         async def release_after_route_operation() -> None:
-            with anyio.CancelScope(shield=True):
-                if route_task is not None:
-                    try:
-                        await asyncio.shield(route_task)
-                    except BaseException:
-                        # A failed admission owns no route, but release is
-                        # idempotent and also clears a partial/late commit.
-                        pass
-                await self._release_route(str(request_id))
+            try:
+                with anyio.CancelScope(shield=True):
+                    if route_task is not None:
+                        try:
+                            await asyncio.shield(route_task)
+                        except BaseException:
+                            # A failed admission owns no route, but release is
+                            # idempotent and also clears a partial/late commit.
+                            pass
+                    await self._release_route(str(request_id))
+            finally:
+                # A done callback runs on the following loop turn. Removing
+                # the current task here makes cleanup completion observable
+                # atomically with the release itself on every event loop.
+                current = asyncio.current_task()
+                if current is not None:
+                    self._pending_route_releases.discard(current)
 
         task = asyncio.create_task(
             release_after_route_operation(),
             name=f"release-cancelled-route:{request_id}",
         )
         self._pending_route_releases.add(task)
-        task.add_done_callback(self._pending_route_releases.discard)
 
     async def _get_routing_table_cancellation_safe(
         self,
