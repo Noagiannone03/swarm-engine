@@ -11,6 +11,7 @@ from parallax.server.backend_capabilities import require_executor_backend
 from parallax.utils.model_artifact_cache import ModelArtifactStorageError
 from parallax.utils.shared_state import SharedState
 from parallax.utils.utils import get_current_device
+from parallax_utils.fabi_events import emit as emit_fabi_event
 from parallax_utils.logging_config import get_logger, set_log_level
 
 logger = get_logger(__name__)
@@ -135,6 +136,14 @@ def run_executor_process(args, shared_state=None, conn=None):
     set_log_level(args.log_level)
     executor = None
     try:
+        if getattr(args, "tp_rank", 0) == 0:
+            emit_fabi_event(
+                "weights_load_start",
+                start_layer=getattr(args, "start_layer", None),
+                end_layer=getattr(args, "end_layer", None),
+                context_tokens=getattr(args, "planned_context_tokens", None),
+                allocation_epoch=getattr(args, "allocation_epoch", None),
+            )
         executor = create_from_args(args, shared_state, conn)
         executor.run_loop()
     except KeyboardInterrupt:

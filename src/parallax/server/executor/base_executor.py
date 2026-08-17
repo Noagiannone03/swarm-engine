@@ -52,6 +52,7 @@ from parallax.server.request import (
 from parallax.server.scheduler import Scheduler
 from parallax.utils.shared_state import SharedState
 from parallax.utils.utils import get_current_device, get_device_dtype, get_zmq_socket
+from parallax_utils.fabi_events import emit as emit_fabi_event
 from parallax_utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -238,6 +239,16 @@ class BaseExecutor:
                 self._send_engine_core_ready_response(dtype)
         if self.shared_state is not None:
             self.shared_state.set_status(ServerState.READY.value)
+
+        if self.tp_rank == 0:
+            kv_capacity_tokens, kv_block_size = self._runtime_kv_cache_geometry()
+            emit_fabi_event(
+                "weights_load_done",
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                context_tokens=kv_capacity_tokens,
+                kv_block_size=kv_block_size,
+            )
 
         # Log executor ready status
         logger.info(

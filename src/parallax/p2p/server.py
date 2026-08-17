@@ -52,6 +52,7 @@ from parallax.utils.weight_refit_utils import (
     parse_safetensors_from_memory,
     release_disk_storage,
 )
+from parallax_utils.fabi_events import emit as emit_fabi_event
 from parallax_utils.logging_config import get_logger, set_log_level
 from swarm_protocol.contracts import (
     BackendKind,
@@ -1361,6 +1362,13 @@ class GradientServer:
             ),
             frontend_alive=False,
         )
+        emit_fabi_event(
+            "allocated",
+            start_layer=span.start,
+            end_layer=span.end,
+            context_tokens=context_tokens,
+            placement_generation=generation,
+        )
         logger.warning(
             "Protocol-v3 placement generation %d is reloading layers [%d, %d) at %d tokens",
             generation,
@@ -1903,6 +1911,17 @@ class GradientServer:
             logger.error("Failed to build network transport")
             exit(1)
 
+        try:
+            worker_peer_id = (
+                self.iroh_transport.peer_id()
+                if self.iroh_transport is not None
+                else self.lattica.peer_id()
+            )
+        except Exception:
+            worker_peer_id = None
+        if worker_peer_id:
+            emit_fabi_event("peer_id", peer_id=str(worker_peer_id))
+
         if self.scheduler_addr is not None:  # central scheduler mode
             try:
                 if self.iroh_transport is not None:
@@ -1913,6 +1932,10 @@ class GradientServer:
                     self.scheduler_stub = RPCConnectionHandler(self.lattica, None, None).get_stub(
                         self.scheduler_peer_id
                     )
+                emit_fabi_event(
+                    "joining_scheduler",
+                    scheduler_peer_id=self.scheduler_peer_id,
+                )
                 self._qualify_iroh_scheduler()
                 node_info = self.get_node_info()
                 if node_info == {}:
@@ -1944,6 +1967,14 @@ class GradientServer:
                 elif self.swarm_v3_placement_mode == "autonomous":
                     self.block_start_index = None
                     self.block_end_index = None
+                if self.block_start_index is not None and self.block_end_index is not None:
+                    emit_fabi_event(
+                        "allocated",
+                        start_layer=self.block_start_index,
+                        end_layer=self.block_end_index,
+                        context_tokens=response.get("planned_context_tokens"),
+                        allocation_epoch=response.get("allocation_epoch"),
+                    )
                 self.model_name = response.get("model_name")
                 self.model_revision = response.get("model_revision")
                 self.tp_size = response.get("tp_size")

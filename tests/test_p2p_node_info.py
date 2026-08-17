@@ -150,7 +150,7 @@ def test_forward_admission_uses_signed_authority_id_not_engine_request_id(monkey
     assert socket.messages == [[b"forward", request.SerializeToString()]]
 
 
-def test_autonomous_span_reload_fences_ingress_and_updates_shared_generation():
+def test_autonomous_span_reload_fences_ingress_and_updates_shared_generation(monkeypatch):
     server = GradientServer(
         recv_from_peer_addr="",
         send_to_peer_addr="",
@@ -168,6 +168,11 @@ def test_autonomous_span_reload_fences_ingress_and_updates_shared_generation():
             values.update(changes)
 
     spans = []
+    events = []
+    monkeypatch.setattr(
+        "parallax.p2p.server.emit_fabi_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
     server._shared_state = State()
     server.swarm_v3_execution_admission = object()
     server.connection_handler = SimpleNamespace(
@@ -188,6 +193,17 @@ def test_autonomous_span_reload_fences_ingress_and_updates_shared_generation():
     assert values["_layer_allocation_changed"] is True
     assert values["swarm_v3_placement_generation"] == 7
     assert values["swarm_v3_placement_phase"] == "building"
+    assert events == [
+        (
+            "allocated",
+            {
+                "start_layer": 2,
+                "end_layer": 4,
+                "context_tokens": 16_384,
+                "placement_generation": 7,
+            },
+        )
+    ]
 
 
 def test_empty_legacy_response_cannot_demote_autonomous_worker():
