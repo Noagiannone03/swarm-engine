@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -293,6 +294,52 @@ def _download_package_snapshot(**kwargs) -> Path:
     return Path(snapshot_download(**kwargs))
 
 
+def _snapshot_progress_tqdm_class(
+    progress_callback: Callable[[int, int], None],
+) -> type:
+    """Build a Hugging Face progress class reporting completed snapshot files.
+
+    ``snapshot_download`` uses the same tqdm class for its byte-level download
+    bars and for the outer ``Fetching N files`` bar.  Only the latter represents
+    stable package progress, so filename/byte bars are deliberately ignored.
+    Telemetry is best-effort and can never fail materialization.
+    """
+
+    from huggingface_hub.utils import tqdm as huggingface_tqdm
+
+    class SnapshotProgressTqdm(huggingface_tqdm):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            description = str(kwargs.get("desc") or "")
+            total = kwargs.get("total")
+            self._fabi_file_counter = description.startswith("Fetching ") and isinstance(total, int)
+            self._fabi_files_done = int(kwargs.get("initial") or 0)
+            self._fabi_files_total = int(total) if self._fabi_file_counter else 0
+            self._fabi_progress_lock = threading.Lock()
+            super().__init__(*args, **kwargs)
+            if self._fabi_file_counter:
+                self._fabi_notify()
+
+        def _fabi_notify(self) -> None:
+            try:
+                progress_callback(self._fabi_files_done, self._fabi_files_total)
+            except Exception:
+                # UI telemetry must never interrupt an authenticated download.
+                pass
+
+        def update(self, n: int | float = 1) -> bool | None:
+            result = super().update(n)
+            if self._fabi_file_counter:
+                with self._fabi_progress_lock:
+                    self._fabi_files_done = min(
+                        self._fabi_files_total,
+                        self._fabi_files_done + max(0, int(n)),
+                    )
+                    self._fabi_notify()
+            return result
+
+    return SnapshotProgressTqdm
+
+
 def materialize_skippy_execution_span(
     artifact_index: ModelArtifactIndex,
     manifest: ModelManifest,
@@ -303,6 +350,7 @@ def materialize_skippy_execution_span(
     local_files_only: bool = False,
     token: bool | str | None = None,
     max_workers: int = 4,
+    progress_callback: Callable[[int, int], None] | None = None,
     snapshot_downloader: Callable[..., Path] = _download_package_snapshot,
 ) -> VerifiedSkippySpan:
     """Download and verify only the package parts required by one worker span."""
@@ -311,16 +359,17 @@ def materialize_skippy_execution_span(
         raise ValueError("Skippy snapshot download workers must be positive")
     plan = select_skippy_execution_plan(artifact_index, device=device, plan_id=plan_id)
     required = required_skippy_descriptors(artifact_index, plan, manifest, span)
-    root = Path(
-        snapshot_downloader(
-            repo_id=plan.package_repository_id,
-            revision=plan.package_revision,
-            allow_patterns=[descriptor.path for descriptor in required],
-            local_files_only=local_files_only,
-            token=token,
-            max_workers=max_workers,
-        )
-    )
+    download_kwargs: dict[str, Any] = {
+        "repo_id": plan.package_repository_id,
+        "revision": plan.package_revision,
+        "allow_patterns": [descriptor.path for descriptor in required],
+        "local_files_only": local_files_only,
+        "token": token,
+        "max_workers": max_workers,
+    }
+    if progress_callback is not None:
+        download_kwargs["tqdm_class"] = _snapshot_progress_tqdm_class(progress_callback)
+    root = Path(snapshot_downloader(**download_kwargs))
     return verify_skippy_execution_span(
         root,
         artifact_index,

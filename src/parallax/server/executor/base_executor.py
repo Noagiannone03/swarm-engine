@@ -242,13 +242,19 @@ class BaseExecutor:
 
         if self.tp_rank == 0:
             kv_capacity_tokens, kv_block_size = self._runtime_kv_cache_geometry()
-            emit_fabi_event(
-                "weights_load_done",
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                context_tokens=kv_capacity_tokens,
-                kv_block_size=kv_block_size,
-            )
+            event_fields = {
+                "start_layer": self.start_layer,
+                "end_layer": self.end_layer,
+                "context_tokens": kv_capacity_tokens,
+                "kv_block_size": kv_block_size,
+            }
+            files_total = getattr(self, "_fabi_weights_files_total", 0)
+            if files_total > 0:
+                event_fields.update(
+                    files_done=getattr(self, "_fabi_weights_files_done", files_total),
+                    files_total=files_total,
+                )
+            emit_fabi_event("weights_load_done", **event_fields)
 
         # Log executor ready status
         logger.info(

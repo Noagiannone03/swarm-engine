@@ -16,6 +16,7 @@ from parallax.server.skippy_stage_runner import (
     SkippyRuntimeStageRunner,
 )
 from parallax_utils.logging_config import get_logger
+from parallax_utils.fabi_events import emit as emit_fabi_event
 from swarm_protocol.contracts import LayerSpan, SkippyExactStateKind
 from swarm_protocol.kv_snapshot import KvSnapshotCompatibility
 from swarm_protocol.recovery import token_sequence_checksum
@@ -134,6 +135,21 @@ class SkippyExecutor(BaseExecutor):
         )
         if context_limit <= 0 or context_limit > bundle.manifest.model_max_context_tokens:
             raise ValueError("Skippy context exceeds the signed model limit")
+
+        self._fabi_weights_files_done = 0
+        self._fabi_weights_files_total = 0
+
+        def report_download_progress(files_done: int, files_total: int) -> None:
+            self._fabi_weights_files_done = files_done
+            self._fabi_weights_files_total = files_total
+            emit_fabi_event(
+                "weights_load_progress",
+                start_layer=start_layer,
+                end_layer=end_layer,
+                files_done=files_done,
+                files_total=files_total,
+            )
+
         verified = materialize_skippy_execution_span(
             bundle.artifact_index,
             bundle.manifest,
@@ -141,6 +157,7 @@ class SkippyExecutor(BaseExecutor):
             device=device,
             plan_id=execution_plan_id,
             local_files_only=use_hfcache,
+            progress_callback=report_download_progress,
         )
         if context_limit > verified.plan.model_max_context_tokens:
             raise ValueError("Skippy context exceeds the signed execution-plan limit")

@@ -244,6 +244,58 @@ def test_skippy_span_downloads_only_owned_layers_and_boundary(tmp_path):
     )
 
 
+def test_skippy_snapshot_reports_completed_file_count(tmp_path):
+    contents, index, model = _fixture()
+    _write_contents(tmp_path, contents)
+    progress = []
+
+    def snapshot_downloader(**kwargs):
+        progress_bar = kwargs["tqdm_class"](
+            total=len(kwargs["allow_patterns"]),
+            desc=f"Fetching {len(kwargs['allow_patterns'])} files",
+            disable=True,
+        )
+        progress_bar.update(1)
+        progress_bar.update(2)
+        progress_bar.close()
+        return tmp_path
+
+    materialize_skippy_execution_span(
+        index,
+        model,
+        LayerSpan(start=0, end=1),
+        device="vulkan:0",
+        progress_callback=lambda done, total: progress.append((done, total)),
+        snapshot_downloader=snapshot_downloader,
+    )
+
+    assert progress == [(0, 4), (1, 4), (3, 4)]
+
+
+def test_skippy_snapshot_ignores_progress_callback_failure(tmp_path):
+    contents, index, model = _fixture()
+    _write_contents(tmp_path, contents)
+
+    def snapshot_downloader(**kwargs):
+        progress_bar = kwargs["tqdm_class"](
+            total=len(kwargs["allow_patterns"]),
+            desc=f"Fetching {len(kwargs['allow_patterns'])} files",
+            disable=True,
+        )
+        progress_bar.update(1)
+        progress_bar.close()
+        return tmp_path
+
+    materialize_skippy_execution_span(
+        index,
+        model,
+        LayerSpan(start=0, end=1),
+        device="vulkan:0",
+        progress_callback=lambda _done, _total: (_ for _ in ()).throw(RuntimeError("UI")),
+        snapshot_downloader=snapshot_downloader,
+    )
+
+
 def test_skippy_final_span_gets_embeddings_and_output(tmp_path):
     contents, index, model = _fixture()
     _write_contents(tmp_path, contents)
