@@ -1102,7 +1102,17 @@ def _bound_base_url(server: uvicorn.Server, configured_host: str) -> str:
     return f"http://{host}:{port}"
 
 
-def _write_ready_file(path: Path, *, base_url: str) -> None:
+def _canonical_launch_id(value: str) -> str:
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError) as error:
+        raise ValueError("launch id must be a canonical UUIDv4") from error
+    if parsed.version != 4 or str(parsed) != value:
+        raise ValueError("launch id must be a canonical UUIDv4")
+    return value
+
+
+def _write_ready_file(path: Path, *, base_url: str, launch_id: str) -> None:
     """Atomically publish the process endpoint without exposing credentials."""
 
     path = path.expanduser().resolve()
@@ -1111,7 +1121,8 @@ def _write_ready_file(path: Path, *, base_url: str) -> None:
     payload = (
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
+                "launch_id": launch_id,
                 "pid": os.getpid(),
                 "base_url": base_url,
             },
@@ -1141,16 +1152,26 @@ def _write_ready_file(path: Path, *, base_url: str) -> None:
 class _ReadyFileServer(uvicorn.Server):
     """Uvicorn server that publishes readiness only after the socket is bound."""
 
-    def __init__(self, config: uvicorn.Config, *, ready_file: Path | None) -> None:
+    def __init__(
+        self,
+        config: uvicorn.Config,
+        *,
+        ready_file: Path | None,
+        launch_id: str | None,
+    ) -> None:
         super().__init__(config)
         self._ready_file = ready_file.expanduser().resolve() if ready_file else None
+        if self._ready_file is not None and launch_id is None:
+            raise ValueError("a ready file requires a launch id")
+        self._launch_id = launch_id
 
     async def startup(self, sockets: list[socket.socket] | None = None) -> None:
         await super().startup(sockets=sockets)
-        if self.started and self._ready_file is not None:
+        if self.started and self._ready_file is not None and self._launch_id is not None:
             _write_ready_file(
                 self._ready_file,
                 base_url=_bound_base_url(self, self.config.host),
+                launch_id=self._launch_id,
             )
 
     async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
@@ -1175,8 +1196,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--port must be between 0 and 65535")
     if args.port == 0 and args.ready_file is None:
         parser.error("--port 0 requires --ready-file")
+    launch_id: str | None = None
     if args.ready_file is not None:
         args.ready_file.expanduser().resolve().unlink(missing_ok=True)
+        try:
+            launch_id = _canonical_launch_id(
+                os.environ.get("FABI_REQUEST_AGENT_LAUNCH_ID", "").strip()
+            )
+        except ValueError as error:
+            parser.error(f"FABI_REQUEST_AGENT_LAUNCH_ID {error}")
     model_swarm_id = os.environ.get("FABI_REQUEST_AGENT_MODEL_SWARM_ID", "").strip()
     if len(model_swarm_id) != 64 or any(
         character not in "0123456789abcdef" for character in model_swarm_id
@@ -1199,7 +1227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         port=args.port,
         access_log=False,
     )
-    _ReadyFileServer(config, ready_file=args.ready_file).run()
+    _ReadyFileServer(config, ready_file=args.ready_file, launch_id=launch_id).run()
     return 0
 
 

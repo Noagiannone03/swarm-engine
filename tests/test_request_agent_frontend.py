@@ -21,6 +21,7 @@ from backend.server.request_agent_frontend import (
     RequestAgentOpenAIManager,
     _ReadyFileServer,
     _bound_base_url,
+    _canonical_launch_id,
     _encode_status_sse,
     _loopback_host,
     _with_sse_keepalive,
@@ -931,18 +932,28 @@ def test_local_request_agent_rejects_invalid_json_and_non_loopback_bind():
         _loopback_host("0.0.0.0")
 
 
+def test_request_agent_launch_id_is_canonical_uuid4():
+    launch_id = "b3432c02-0493-43a5-838c-b793617c6753"
+    assert _canonical_launch_id(launch_id) == launch_id
+    for invalid in ("", launch_id.upper(), "00000000-0000-1000-8000-000000000000"):
+        with pytest.raises(ValueError, match="canonical UUIDv4"):
+            _canonical_launch_id(invalid)
+
+
 def test_request_agent_ready_file_uses_actual_bound_port_and_owner_only_mode(tmp_path):
     listener = SimpleNamespace(getsockname=lambda: ("127.0.0.1", 43127))
     server = SimpleNamespace(
         servers=[SimpleNamespace(sockets=[listener])],
     )
     ready_file = tmp_path / "request-agent.json"
+    launch_id = "b3432c02-0493-43a5-838c-b793617c6753"
 
     base_url = _bound_base_url(server, "127.0.0.1")
-    _write_ready_file(ready_file, base_url=base_url)
+    _write_ready_file(ready_file, base_url=base_url, launch_id=launch_id)
 
     assert json.loads(ready_file.read_text()) == {
-        "schema_version": 1,
+        "schema_version": 2,
+        "launch_id": launch_id,
         "pid": os.getpid(),
         "base_url": "http://127.0.0.1:43127",
     }
@@ -974,6 +985,7 @@ def test_request_agent_server_publishes_bound_port_only_while_serving(tmp_path):
     server = _ReadyFileServer(
         uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"),
         ready_file=ready_file,
+        launch_id="b3432c02-0493-43a5-838c-b793617c6753",
     )
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
