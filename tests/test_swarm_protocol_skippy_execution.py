@@ -2,6 +2,7 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from swarm_protocol.contracts import (
@@ -270,6 +271,119 @@ def test_skippy_snapshot_reports_completed_file_count(tmp_path):
     )
 
     assert progress == [(0, 4), (1, 4), (3, 4)]
+
+
+def test_skippy_snapshot_progress_stays_monotone_across_retries(tmp_path):
+    contents, index, model = _fixture()
+    _write_contents(tmp_path, contents)
+    progress = []
+
+    def snapshot_downloader(**kwargs):
+        first = kwargs["tqdm_class"](
+            total=len(kwargs["allow_patterns"]),
+            desc=f"Fetching {len(kwargs['allow_patterns'])} files",
+            disable=True,
+        )
+        first.update(2)
+        first.close()
+        retried = kwargs["tqdm_class"](
+            total=len(kwargs["allow_patterns"]),
+            desc=f"Fetching {len(kwargs['allow_patterns'])} files",
+            disable=True,
+        )
+        retried.update(1)
+        retried.update(2)
+        retried.close()
+        return tmp_path
+
+    materialize_skippy_execution_span(
+        index,
+        model,
+        LayerSpan(start=0, end=1),
+        device="vulkan:0",
+        progress_callback=lambda done, total: progress.append((done, total)),
+        snapshot_downloader=snapshot_downloader,
+    )
+
+    assert progress == [(0, 4), (2, 4), (3, 4)]
+
+
+def test_skippy_snapshot_retries_transient_network_failure(tmp_path, monkeypatch):
+    contents, index, model = _fixture()
+    _write_contents(tmp_path, contents)
+    attempts = []
+    sleeps = []
+
+    def snapshot_downloader(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) < 3:
+            raise httpx.ConnectError("temporary DNS failure")
+        return tmp_path
+
+    monkeypatch.setattr("swarm_protocol.skippy_execution.time.sleep", sleeps.append)
+
+    materialize_skippy_execution_span(
+        index,
+        model,
+        LayerSpan(start=0, end=1),
+        device="vulkan:0",
+        snapshot_downloader=snapshot_downloader,
+    )
+
+    assert len(attempts) == 3
+    assert attempts[0] == attempts[1] == attempts[2]
+    assert sleeps == [1, 2]
+
+
+def test_skippy_snapshot_does_not_retry_non_network_failure(tmp_path, monkeypatch):
+    _, index, model = _fixture()
+    attempts = 0
+    sleeps = []
+
+    def snapshot_downloader(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("signed package is invalid")
+
+    monkeypatch.setattr("swarm_protocol.skippy_execution.time.sleep", sleeps.append)
+
+    with pytest.raises(ValueError, match="signed package is invalid"):
+        materialize_skippy_execution_span(
+            index,
+            model,
+            LayerSpan(start=0, end=1),
+            device="vulkan:0",
+            snapshot_downloader=snapshot_downloader,
+        )
+
+    assert attempts == 1
+    assert sleeps == []
+
+
+def test_skippy_snapshot_stops_after_network_retry_budget(tmp_path, monkeypatch):
+    _, index, model = _fixture()
+    attempts = 0
+    sleeps = []
+
+    def snapshot_downloader(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("DNS remains unavailable")
+
+    monkeypatch.setattr("swarm_protocol.skippy_execution._HUB_SNAPSHOT_RETRIES", 2)
+    monkeypatch.setattr("swarm_protocol.skippy_execution.time.sleep", sleeps.append)
+
+    with pytest.raises(httpx.ConnectError, match="DNS remains unavailable"):
+        materialize_skippy_execution_span(
+            index,
+            model,
+            LayerSpan(start=0, end=1),
+            device="vulkan:0",
+            snapshot_downloader=snapshot_downloader,
+        )
+
+    assert attempts == 3
+    assert sleeps == [1, 2]
 
 
 def test_skippy_snapshot_ignores_progress_callback_failure(tmp_path):

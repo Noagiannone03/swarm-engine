@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+import httpx
+import requests
 
 from parallax.server.backend_capabilities import DeviceKind, device_kind
 from swarm_protocol.artifact_verification import verify_artifact
@@ -20,6 +25,15 @@ from swarm_protocol.contracts import (
 )
 
 _MAX_PACKAGE_MANIFEST_BYTES = 16 * 1024 * 1024
+_HUB_SNAPSHOT_RETRIES = 8
+_HUB_NETWORK_ERRORS = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
 _DEVICE_PROVIDERS = {
     DeviceKind.CPU: ExecutionProviderKind.CPU,
     DeviceKind.CUDA: ExecutionProviderKind.CUDA,
@@ -27,6 +41,8 @@ _DEVICE_PROVIDERS = {
     DeviceKind.ROCM: ExecutionProviderKind.ROCM,
     DeviceKind.VULKAN: ExecutionProviderKind.VULKAN,
 }
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -307,6 +323,11 @@ def _snapshot_progress_tqdm_class(
 
     from huggingface_hub.utils import tqdm as huggingface_tqdm
 
+    progress_lock = threading.Lock()
+    reported_done = 0
+    reported_total = 0
+    has_reported = False
+
     class SnapshotProgressTqdm(huggingface_tqdm):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             description = str(kwargs.get("desc") or "")
@@ -320,8 +341,20 @@ def _snapshot_progress_tqdm_class(
                 self._fabi_notify()
 
         def _fabi_notify(self) -> None:
+            nonlocal reported_done, reported_total, has_reported
             try:
-                progress_callback(self._fabi_files_done, self._fabi_files_total)
+                with progress_lock:
+                    previous = (reported_done, reported_total)
+                    reported_total = max(reported_total, self._fabi_files_total)
+                    reported_done = min(
+                        reported_total,
+                        max(reported_done, self._fabi_files_done),
+                    )
+                    progress = (reported_done, reported_total)
+                    if has_reported and progress == previous:
+                        return
+                    has_reported = True
+                progress_callback(*progress)
             except Exception:
                 # UI telemetry must never interrupt an authenticated download.
                 pass
@@ -338,6 +371,31 @@ def _snapshot_progress_tqdm_class(
             return result
 
     return SnapshotProgressTqdm
+
+
+def _download_snapshot_with_backoff(
+    snapshot_downloader: Callable[..., Path],
+    download_kwargs: dict[str, Any],
+) -> Path:
+    """Resume one immutable Hub snapshot across transient transport outages."""
+
+    for attempt in range(_HUB_SNAPSHOT_RETRIES + 1):
+        try:
+            return Path(snapshot_downloader(**download_kwargs))
+        except _HUB_NETWORK_ERRORS as exc:
+            if attempt == _HUB_SNAPSHOT_RETRIES:
+                raise
+            delay = min(2**attempt, 30)
+            logger.warning(
+                "Hub snapshot download failed (%s); preserving cache and retrying in %ds "
+                "(%d/%d)",
+                type(exc).__name__,
+                delay,
+                attempt + 1,
+                _HUB_SNAPSHOT_RETRIES,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable Hub snapshot retry state")
 
 
 def materialize_skippy_execution_span(
@@ -369,7 +427,7 @@ def materialize_skippy_execution_span(
     }
     if progress_callback is not None:
         download_kwargs["tqdm_class"] = _snapshot_progress_tqdm_class(progress_callback)
-    root = Path(snapshot_downloader(**download_kwargs))
+    root = _download_snapshot_with_backoff(snapshot_downloader, download_kwargs)
     return verify_skippy_execution_span(
         root,
         artifact_index,
