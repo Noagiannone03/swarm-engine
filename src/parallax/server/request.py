@@ -318,10 +318,14 @@ class IntermediateRequest(Request):
         # Shape:
         #   prefill: (prompt_len, hidden_dim)
         #   decode: (1, hidden_dim)
-        # For data sent from Last Peer to First Peer, this can also be a single token_id
-        # wrapped in a numpy array, e.g., np.array([token_id]).
-        if not self.is_finished and hidden_states is None:
-            raise ValueError(f"hidden_states cannot be None for unfinished request {request_id}.")
+        # For data sent from Last Peer to First Peer, the sampled token is the payload.
+        # Tensor backends may still wrap it as a one-element tensor; native backends use
+        # the presence-aware ``next_token_id`` protobuf field and omit hidden states.
+        if not self.is_finished and hidden_states is None and next_token_id is None:
+            raise ValueError(
+                "hidden_states cannot be None for an unfinished request without a "
+                f"sampled token ({request_id})."
+            )
 
         self.current_position = current_position
         self.hidden_states = hidden_states

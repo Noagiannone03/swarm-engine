@@ -39,6 +39,30 @@ def test_skippy_activation_round_trips_without_tensor_runtime_imports():
     assert restored.hidden_states == activation
 
 
+@pytest.mark.parametrize("token_id", [0, 42])
+def test_native_terminal_token_round_trips_without_fake_activation(token_id):
+    request = IntermediateRequest(
+        request_id="request-terminal-token",
+        input_ids=[1, 2],
+        current_position=3,
+        status=RequestStatus.DECODING,
+        hidden_states=None,
+        next_token_id=token_id,
+        routing_table=["worker-head"],
+    )
+
+    encoded = request_to_proto([request], device="metal")
+    [restored] = proto_to_request(encoded, device="metal")
+
+    assert encoded.reqs[0].HasField("next_token_id")
+    assert encoded.reqs[0].next_token_id == token_id
+    assert encoded.reqs[0].hidden_states == b""
+    assert not encoded.reqs[0].HasField("native_activation")
+    assert restored.status is RequestStatus.DECODING
+    assert restored.next_token_id == token_id
+    assert restored.hidden_states is None
+
+
 def test_skippy_activation_rejects_payload_over_protocol_limit(monkeypatch):
     monkeypatch.setattr(message_util, "_MAX_NATIVE_ACTIVATION_BYTES", 3)
 

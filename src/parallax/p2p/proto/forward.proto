@@ -33,7 +33,7 @@ message Req {
   repeated int32 input_ids = 4;
   SamplingParams sampling_params = 5;
 
-  int32 next_token_id = 6;
+  optional int32 next_token_id = 6;  // Presence distinguishes token 0 from no sampled token
   bytes hidden_states = 7;
   string lora_path = 8;
   optional float token_prob = 9;  // Probability value for the sampled token

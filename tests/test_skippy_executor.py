@@ -3,13 +3,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from parallax.p2p.message_util import NativeActivationFrame
+from parallax.p2p.message_util import (
+    NativeActivationFrame,
+    proto_to_request,
+    request_to_proto,
+)
 from parallax.server.executor.base_executor import ExecutorBatchCancelled
 from parallax.server.executor.skippy_executor import (
     SkippyExecutor,
     _local_prefill_chunk_tokens,
     _SkippyResumeMarker,
 )
+from parallax.server.request import IntermediateRequest, RequestStatus
 from swarm_protocol.contracts import SkippyExactStateKind
 from swarm_protocol.kv_snapshot import KvSnapshotIncompatible
 from swarm_protocol.recovery import token_sequence_checksum
@@ -227,11 +232,44 @@ def test_intermediate_stage_rejects_missing_native_activation():
 def test_final_token_contract_rejects_non_integer_values():
     instance = SkippyExecutor.__new__(SkippyExecutor)
 
-    assert instance._gen_token_id_from_hidden(7) == (7, [7])
+    assert instance._gen_token_id_from_hidden(7) == (7, None)
     with pytest.raises(TypeError, match="exactly one integer"):
         instance._gen_token_id_from_hidden(True)
     with pytest.raises(TypeError, match="exactly one integer"):
         instance._gen_token_id_from_hidden([7])
+
+
+def test_final_stage_token_zero_crosses_native_wire_without_tensor_serialization():
+    instance = executor(
+        first=False,
+        last=True,
+        result=SimpleNamespace(activation=None, predicted_token=0),
+    )
+    request = IntermediateRequest(
+        request_id="request-terminal-zero",
+        input_ids=[10, 11],
+        current_position=2,
+        status=RequestStatus.DECODING,
+        hidden_states=activation(4, 8),
+        next_token_id=11,
+        routing_table=["worker-head"],
+    )
+
+    [outbound] = instance.prepare_next_batch_requests(
+        [request],
+        {"hidden_states": [0], "probs": None},
+        context_lengths=[1],
+    )
+    encoded = request_to_proto([outbound], device="metal")
+    [restored] = proto_to_request(encoded, device="metal")
+
+    assert outbound.hidden_states is None
+    assert outbound.next_token_id == 0
+    assert encoded.reqs[0].HasField("next_token_id")
+    assert encoded.reqs[0].hidden_states == b""
+    assert restored.status is RequestStatus.DECODING
+    assert restored.hidden_states is None
+    assert restored.next_token_id == 0
 
 
 def test_shared_abort_marker_prevents_entering_native_execution():

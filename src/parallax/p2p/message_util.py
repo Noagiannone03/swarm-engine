@@ -52,9 +52,7 @@ class NativeActivationFrame:
         if not self.payload:
             raise ValueError("native activation payload must not be empty")
         if len(self.payload) > _MAX_NATIVE_ACTIVATION_BYTES:
-            raise ValueError(
-                "native activation payload exceeds the 512 MiB protocol limit"
-            )
+            raise ValueError("native activation payload exceeds the 512 MiB protocol limit")
 
 
 def _native_activation_to_proto(
@@ -166,7 +164,7 @@ def proto_to_request(
     for proto_req in proto_request.reqs:
         current_position = len(proto_req.input_ids) + proto_req.output_length
 
-        next_token_id = proto_req.next_token_id
+        next_token_id = proto_req.next_token_id if proto_req.HasField("next_token_id") else None
 
         hidden_states = None
         if proto_req.HasField("native_activation"):
@@ -175,7 +173,7 @@ def proto_to_request(
             hidden_states = bytes_to_tensor(proto_req.hidden_states, device)
 
         status = None
-        if hidden_states is None:
+        if hidden_states is None and next_token_id is None:
             status = RequestStatus.FINISHED_EOS
         elif proto_request.forward_mode == forward_pb2.ForwardMode.EXTEND:
             status = RequestStatus.PREFILLING

@@ -399,7 +399,10 @@ class SkippyExecutor(BaseExecutor):
     def _gen_token_id_from_hidden(self, hidden_states: Any) -> Tuple[int, Any]:
         if isinstance(hidden_states, bool) or not isinstance(hidden_states, int):
             raise TypeError("Skippy final stage must return exactly one integer token")
-        return hidden_states, [hidden_states]
+        # Native routes carry the sampled token in the presence-aware protobuf scalar.
+        # Sending a Python list through ``hidden_states`` would route it into tensor
+        # serialization, which is deliberately forbidden for native activation frames.
+        return hidden_states, None
 
     def _release_request(self, rid: str) -> None:
         native_request_id = self._authority_by_engine_request.pop(rid, rid)
