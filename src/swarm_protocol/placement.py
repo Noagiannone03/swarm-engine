@@ -17,6 +17,7 @@ from swarm_protocol.context_placement import (
     MemoryPlacementPoint,
 )
 from swarm_protocol.contracts import (
+    EffectiveSpanMode,
     LayerSpan,
     ModelManifest,
     SpanLease,
@@ -369,6 +370,14 @@ class _ContextSupply:
     suffix_boundaries: frozenset[int]
 
 
+@dataclass(frozen=True)
+class _FixedRouteRepair:
+    worker_id: str
+    span: LayerSpan
+    topology_score: tuple[int, int, int]
+    changed_layers: int
+
+
 class AutonomousPlacementPolicy:
     """Choose a locally feasible span without creating a voluntary coverage hole.
 
@@ -388,11 +397,7 @@ class AutonomousPlacementPolicy:
     ) -> None:
         if not 0 <= minimum_improvement < 1:
             raise ValueError("minimum improvement must be in [0, 1)")
-        if (
-            movement_cooldown_ms < 0
-            or maximum_candidates <= 0
-            or maximum_exact_candidates <= 0
-        ):
+        if movement_cooldown_ms < 0 or maximum_candidates <= 0 or maximum_exact_candidates <= 0:
             raise ValueError("cooldown must be non-negative and candidate bound positive")
         self.minimum_improvement = minimum_improvement
         self.movement_cooldown_ms = movement_cooldown_ms
@@ -712,6 +717,318 @@ class AutonomousPlacementPolicy:
                     changed = True
         return frozenset(prefix), frozenset(suffix)
 
+    def choose_fixed_route_repair(
+        self,
+        *,
+        offer: WorkerOffer,
+        offers: tuple[WorkerOffer, ...],
+        manifest: ModelManifest,
+        leases: tuple[SpanLease, ...],
+        current_span: LayerSpan | None,
+        current_context_tokens: int | None,
+        route_context_tokens: int,
+        current_reservations: int,
+        serving_route_exists: bool,
+        membership_stable: bool = True,
+        kv_block_size: int,
+        span_static_bytes: SpanStaticBytes | None = None,
+    ) -> PlacementDecision | None:
+        """Elect one deterministic, coverage-safe fixed-boundary repair.
+
+        Eventually consistent cold joins can independently maximize their
+        local envelope and leave overlapping fixed spans. Once membership is
+        quiescent and no route exists, every worker derives the same improving
+        replacement set from the signed snapshot and only the globally elected
+        worker reloads. A replacement may contract, translate or expand a span,
+        but it cannot reduce any layer's READY coverage. Repair stays worker-
+        owned and does not create an O(N²) probe mesh or a scheduler assignment.
+        """
+
+        if serving_route_exists or current_span is None or current_context_tokens is None:
+            return None
+        if route_context_tokens <= 0:
+            raise ValueError("route context must be positive")
+        if current_reservations < 0:
+            raise ValueError("reservation count must be non-negative")
+        if kv_block_size <= 0:
+            raise ValueError("KV block size must be positive")
+
+        offer_by_worker = {item.worker_id: item for item in offers}
+        relevant = tuple(
+            lease
+            for lease in leases
+            if lease.model_swarm_id == manifest.model_swarm_id
+            and lease.max_context_tokens >= route_context_tokens
+            and lease.worker_id in offer_by_worker
+        )
+        if not relevant or any(
+            lease.effective_span_mode is not EffectiveSpanMode.FIXED for lease in relevant
+        ):
+            return None
+        ready = tuple(lease for lease in relevant if lease.state is SpanState.READY)
+        transitions = tuple(lease for lease in relevant if lease.state is not SpanState.READY)
+        edge_counts: dict[tuple[int, int], int] = {}
+        outgoing: dict[int, set[int]] = {}
+        incoming: dict[int, set[int]] = {}
+        for lease in ready:
+            edge = (lease.hosted_span.start, lease.hosted_span.end)
+            edge_counts[edge] = edge_counts.get(edge, 0) + 1
+            outgoing.setdefault(edge[0], set()).add(edge[1])
+            incoming.setdefault(edge[1], set()).add(edge[0])
+
+        def route_boundaries() -> tuple[frozenset[int], frozenset[int]]:
+            prefix = {0}
+            for start in range(manifest.num_layers):
+                if start not in prefix:
+                    continue
+                prefix.update(
+                    end for end in outgoing.get(start, ()) if edge_counts.get((start, end), 0) > 0
+                )
+            suffix = {manifest.num_layers}
+            for end in range(manifest.num_layers, 0, -1):
+                if end not in suffix:
+                    continue
+                suffix.update(
+                    start for start in incoming.get(end, ()) if edge_counts.get((start, end), 0) > 0
+                )
+            return frozenset(prefix), frozenset(suffix)
+
+        def topology_score() -> tuple[int, int, int]:
+            prefix, suffix = route_boundaries()
+            complete = int(manifest.num_layers in prefix)
+            return complete, max(prefix), manifest.num_layers - min(suffix)
+
+        baseline_score = topology_score()
+        if baseline_score[0]:
+            # Boundaries already compose. Link qualification may still be in
+            # flight, but moving weights cannot improve that network state.
+            return None
+
+        # Do not fight a cold join or an already elected repair that is about
+        # to complete the route. Unrelated BUILDING replicas cannot starve a
+        # broken pipeline in a large, continuously changing swarm.
+        for lease in transitions:
+            edge = (lease.hosted_span.start, lease.hosted_span.end)
+            edge_counts[edge] = edge_counts.get(edge, 0) + 1
+            outgoing.setdefault(edge[0], set()).add(edge[1])
+            incoming.setdefault(edge[1], set()).add(edge[0])
+        if topology_score() > baseline_score:
+            return PlacementDecision(
+                action=PlacementAction.KEEP,
+                span=current_span,
+                required_memory_bytes=0,
+                score=None,
+                reason="fixed_route_repair_waiting_for_inflight_route",
+                context_tokens=current_context_tokens,
+            )
+        for lease in transitions:
+            edge_counts[(lease.hosted_span.start, lease.hosted_span.end)] -= 1
+
+        coverage = [0] * manifest.num_layers
+        boundary_candidates = {0, manifest.num_layers}
+        for lease in ready:
+            boundary_candidates.add(lease.hosted_span.start)
+            boundary_candidates.add(lease.hosted_span.end)
+            for layer in range(lease.hosted_span.start, lease.hosted_span.end):
+                coverage[layer] += 1
+        ordered_boundaries = tuple(sorted(boundary_candidates))
+        required_cache: dict[tuple[int, int, int, int], int | None] = {}
+        repair_cache: dict[tuple[object, ...], _FixedRouteRepair | None] = {}
+
+        repairs: list[_FixedRouteRepair] = []
+        for lease in ready:
+            peer_offer = offer_by_worker[lease.worker_id]
+            granularity = peer_offer.execution_granularity_layers
+            hosted = lease.hosted_span
+            hosted_edge = (hosted.start, hosted.end)
+            repair_key = (
+                hosted.start,
+                hosted.end,
+                edge_counts[hosted_edge] > 1,
+                peer_offer.stable_memory_envelope_bytes,
+                granularity,
+                WorkerRole.FRONTEND in peer_offer.supported_roles,
+                lease.max_context_tokens,
+                lease.kv_geometry.block_size_tokens,
+            )
+            if repair_key in repair_cache:
+                cached = repair_cache[repair_key]
+                if cached is not None:
+                    repairs.append(
+                        _FixedRouteRepair(
+                            worker_id=lease.worker_id,
+                            span=cached.span,
+                            topology_score=cached.topology_score,
+                            changed_layers=cached.changed_layers,
+                        )
+                    )
+                continue
+            edge_counts[hosted_edge] -= 1
+            prefix_without, suffix_without = route_boundaries()
+            prefix_max = max(prefix_without)
+            suffix_min = min(suffix_without)
+            forward_max = list(range(manifest.num_layers + 1))
+            for start in range(manifest.num_layers - 1, -1, -1):
+                forward_max[start] = max(
+                    (
+                        forward_max[end]
+                        for end in outgoing.get(start, ())
+                        if edge_counts.get((start, end), 0) > 0
+                    ),
+                    default=start,
+                )
+            backward_min = list(range(manifest.num_layers + 1))
+            for end in range(1, manifest.num_layers + 1):
+                backward_min[end] = min(
+                    (
+                        backward_min[start]
+                        for start in incoming.get(end, ())
+                        if edge_counts.get((start, end), 0) > 0
+                    ),
+                    default=end,
+                )
+            unique_layers = tuple(
+                layer for layer in range(hosted.start, hosted.end) if coverage[layer] == 1
+            )
+            unique_start = min(unique_layers, default=None)
+            unique_end = max(unique_layers, default=None)
+            worker_repairs: list[_FixedRouteRepair] = []
+            for start in ordered_boundaries:
+                if start >= manifest.num_layers or start % granularity:
+                    continue
+                if start == 0 and WorkerRole.FRONTEND not in peer_offer.supported_roles:
+                    continue
+                for end in ordered_boundaries:
+                    if end <= start or end % granularity:
+                        continue
+                    target = LayerSpan(start=start, end=end)
+                    if target == hosted:
+                        continue
+                    if unique_start is not None and not (
+                        target.start <= unique_start and target.end > unique_end
+                    ):
+                        continue
+                    required_key = (
+                        target.start,
+                        target.end,
+                        lease.max_context_tokens,
+                        lease.kv_geometry.block_size_tokens,
+                    )
+                    if required_key not in required_cache:
+                        required_cache[required_key] = self._required_memory_bytes(
+                            manifest,
+                            target,
+                            context_tokens=lease.max_context_tokens,
+                            kv_block_size=lease.kv_geometry.block_size_tokens,
+                            span_static_bytes=span_static_bytes,
+                        )
+                    required = required_cache[required_key]
+                    if required is None or required > peer_offer.stable_memory_envelope_bytes:
+                        continue
+                    candidate_prefix_max = prefix_max
+                    complete = 0
+                    if start in prefix_without:
+                        candidate_prefix_max = max(candidate_prefix_max, forward_max[end])
+                        complete = int(forward_max[end] == manifest.num_layers)
+                    candidate_suffix_min = suffix_min
+                    if end in suffix_without:
+                        candidate_suffix_min = min(candidate_suffix_min, backward_min[start])
+                    score = (
+                        complete,
+                        candidate_prefix_max,
+                        manifest.num_layers - candidate_suffix_min,
+                    )
+                    if score <= baseline_score:
+                        continue
+                    overlap = max(
+                        0,
+                        min(hosted.end, target.end) - max(hosted.start, target.start),
+                    )
+                    worker_repairs.append(
+                        _FixedRouteRepair(
+                            worker_id=lease.worker_id,
+                            span=target,
+                            topology_score=score,
+                            changed_layers=hosted.length + target.length - 2 * overlap,
+                        )
+                    )
+            edge_counts[hosted_edge] += 1
+            if worker_repairs:
+                best = min(
+                    worker_repairs,
+                    key=lambda item: (
+                        -item.topology_score[0],
+                        -item.topology_score[1],
+                        -item.topology_score[2],
+                        item.changed_layers,
+                        item.span.start,
+                        item.span.end,
+                    ),
+                )
+                repair_cache[repair_key] = best
+                repairs.append(best)
+            else:
+                repair_cache[repair_key] = None
+
+        if not repairs:
+            return None
+        if not membership_stable:
+            return PlacementDecision(
+                action=PlacementAction.KEEP,
+                span=current_span,
+                required_memory_bytes=0,
+                score=None,
+                reason="fixed_route_repair_waiting_for_stable_membership",
+                context_tokens=current_context_tokens,
+            )
+        elected = min(
+            repairs,
+            key=lambda item: (
+                -item.topology_score[0],
+                -item.topology_score[1],
+                -item.topology_score[2],
+                item.changed_layers,
+                item.worker_id,
+                item.span.start,
+                item.span.end,
+            ),
+        )
+        if elected.worker_id != offer.worker_id:
+            return PlacementDecision(
+                action=PlacementAction.KEEP,
+                span=current_span,
+                required_memory_bytes=0,
+                score=None,
+                reason=f"fixed_route_repair_elected:{elected.worker_id}",
+                context_tokens=current_context_tokens,
+            )
+        if current_reservations:
+            return PlacementDecision(
+                action=PlacementAction.KEEP,
+                span=current_span,
+                required_memory_bytes=0,
+                score=None,
+                reason="active_reservations_must_drain_before_fixed_route_repair",
+                context_tokens=current_context_tokens,
+            )
+        required = self._required_memory_bytes(
+            manifest,
+            elected.span,
+            context_tokens=current_context_tokens,
+            kv_block_size=kv_block_size,
+            span_static_bytes=span_static_bytes,
+        )
+        if required is None or required > offer.stable_memory_envelope_bytes:
+            return None
+        return PlacementDecision(
+            action=PlacementAction.MOVE,
+            span=elected.span,
+            required_memory_bytes=required,
+            score=None,
+            reason="elected_fixed_route_boundary_repair",
+            context_tokens=current_context_tokens,
+        )
+
     @staticmethod
     def _preserves_coverage(
         *,
@@ -1020,8 +1337,7 @@ class AutonomousPlacementPolicy:
             planned_coverage = supply.layer_coverage
             planned_session_coverage = supply.session_coverage
             completes_route = (
-                span.start in supply.prefix_boundaries
-                and span.end in supply.suffix_boundaries
+                span.start in supply.prefix_boundaries and span.end in supply.suffix_boundaries
             )
             if completes_route:
                 replicas_before = min(planned_coverage)

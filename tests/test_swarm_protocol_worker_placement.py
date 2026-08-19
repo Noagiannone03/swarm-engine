@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import swarm_protocol.worker_placement as worker_placement_module
+
 from swarm_protocol import (
     AutonomousPlacementPolicy,
     AutonomousWorkerPlacement,
@@ -527,8 +529,8 @@ def test_ready_worker_holds_last_verified_target_when_demand_is_missing():
 
 def test_worker_placement_repairs_disconnected_coverage_from_a_redundant_span():
     manifest = model()
-    current = advertisement(manifest, "current", 0, 2)
-    replica = advertisement(manifest, "replica", 0, 2)
+    current = advertisement(manifest, "current", 0, 2, context_tokens=10)
+    replica = advertisement(manifest, "replica", 0, 2, context_tokens=10)
     snapshot = DiscoverySnapshot(
         captured_at_ms=NOW,
         manifests=(manifest,),
@@ -549,6 +551,7 @@ def test_worker_placement_repairs_disconnected_coverage_from_a_redundant_span():
         current_context_tokens=10,
         policy=AutonomousPlacementPolicy(movement_cooldown_ms=0),
         demand_region_id="eu-west",
+        fixed_route_repair_stability_s=0,
     )
 
     deadline = time.monotonic() + 1
@@ -565,10 +568,111 @@ def test_worker_placement_repairs_disconnected_coverage_from_a_redundant_span():
             context_tokens=10,
         )
 
-    assert status["decision"] == "trusted_context_demand_selected_new_target"
+    assert status["decision"] == "elected_fixed_route_boundary_repair"
     assert status["phase"] == "building"
     assert status["target_span"] == [2, 4]
     assert reloads == [(LayerSpan(start=2, end=4), 10, 1)]
+
+
+def test_worker_controller_serializes_overlapping_fixed_route_repair_before_demand():
+    manifest = model()
+    head = advertisement(manifest, "a-head", 0, 2, context_tokens=10)
+    middle = advertisement(manifest, "b-middle", 1, 3, context_tokens=10)
+    tail = advertisement(manifest, "c-tail", 3, 4, context_tokens=10)
+    snapshot = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(tail.offer, middle.offer, head.offer),
+        leases=(middle.lease, head.lease, tail.lease),
+        links=(),
+    )
+    reloads = []
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(snapshot),
+        admission=FakeAdmission(),
+        state_publisher=FakePublisher(),
+        reload_target=lambda span, context, generation: reloads.append((span, context, generation)),
+        current_span=head.lease.hosted_span,
+        current_context_tokens=10,
+        policy=AutonomousPlacementPolicy(),
+        demand_region_id="eu-west",
+        fixed_route_repair_stability_s=0,
+    )
+
+    deadline = time.monotonic() + 1
+    status = controller.observe(advertisement=head, manifest=manifest, context_tokens=10)
+    while status["decision"] == "waiting_catalog" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        status = controller.observe(
+            advertisement=head,
+            manifest=manifest,
+            context_tokens=10,
+        )
+
+    assert status["decision"] == "elected_fixed_route_boundary_repair"
+    assert status["phase"] == "building"
+    assert status["target_span"] == [0, 1]
+    assert reloads == [(LayerSpan(start=0, end=1), 10, 1)]
+
+
+def test_fixed_route_stability_ignores_churn_outside_execution_family(monkeypatch):
+    manifest = model()
+    matching = advertisement(manifest, "matching", 0, 2, context_tokens=10)
+    peer = advertisement(manifest, "peer", 1, 4, context_tokens=10)
+    other_backend = advertisement(
+        manifest,
+        "other-backend",
+        0,
+        4,
+        context_tokens=10,
+        backend=BackendKind.SKIPPY,
+    )
+    first = DiscoverySnapshot(
+        captured_at_ms=NOW,
+        manifests=(manifest,),
+        offers=(matching.offer, peer.offer, other_backend.offer),
+        leases=(matching.lease, peer.lease, other_backend.lease),
+        links=(),
+    )
+    controller = AutonomousWorkerPlacement(
+        catalog=FakeCatalog(first),
+        admission=FakeAdmission(),
+        state_publisher=FakePublisher(),
+        reload_target=lambda *_args: None,
+        current_span=matching.lease.hosted_span,
+        current_context_tokens=10,
+        fixed_route_repair_stability_s=6,
+    )
+    ticks = iter((100.0, 107.0, 108.0))
+    monkeypatch.setattr(worker_placement_module.time, "monotonic", lambda: next(ticks))
+
+    assert not controller._fixed_route_membership_is_stable(first, matching.offer)
+
+    unrelated_churn = DiscoverySnapshot(
+        captured_at_ms=NOW + 1,
+        manifests=(manifest,),
+        offers=(
+            matching.offer,
+            peer.offer,
+            other_backend.offer.model_copy(update={"stable_memory_envelope_bytes": 999}),
+        ),
+        leases=(matching.lease, peer.lease, other_backend.lease),
+        links=(),
+    )
+    assert controller._fixed_route_membership_is_stable(unrelated_churn, matching.offer)
+
+    matching_change = DiscoverySnapshot(
+        captured_at_ms=NOW + 2,
+        manifests=(manifest,),
+        offers=unrelated_churn.offers,
+        leases=(
+            matching.lease,
+            peer.lease.model_copy(update={"hosted_span": LayerSpan(start=2, end=4)}),
+            other_backend.lease,
+        ),
+        links=(),
+    )
+    assert not controller._fixed_route_membership_is_stable(matching_change, matching.offer)
 
 
 def test_cold_worker_announces_building_before_executor_reload():

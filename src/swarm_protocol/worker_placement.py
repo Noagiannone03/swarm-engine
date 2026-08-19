@@ -42,6 +42,7 @@ from swarm_protocol.routing import ExactRoutePlanner, RoutePlanningError
 logger = logging.getLogger(__name__)
 
 _TRANSITION_REFRESH_INTERVAL_SECONDS = 15.0
+_FIXED_ROUTE_REPAIR_STABILITY_SECONDS = 6.0
 
 
 class PlacementCatalog(Protocol):
@@ -262,6 +263,7 @@ class AutonomousWorkerPlacement:
         policy: AutonomousPlacementPolicy | None = None,
         topology_observer: Callable[[DiscoverySnapshot], None] | None = None,
         transition_refresh_interval_s: float = _TRANSITION_REFRESH_INTERVAL_SECONDS,
+        fixed_route_repair_stability_s: float = _FIXED_ROUTE_REPAIR_STABILITY_SECONDS,
         demand_region_id: str | None = None,
         span_static_bytes: SpanStaticBytes | None = None,
         materialization_identity_hashes: tuple[str, ...] | None = None,
@@ -271,6 +273,8 @@ class AutonomousWorkerPlacement:
     ) -> None:
         if transition_refresh_interval_s <= 0:
             raise ValueError("transition refresh interval must be positive")
+        if fixed_route_repair_stability_s < 0:
+            raise ValueError("fixed route repair stability interval cannot be negative")
         self._catalog = catalog
         self._admission = admission
         self._state_publisher = state_publisher
@@ -295,6 +299,11 @@ class AutonomousWorkerPlacement:
         self._transition_advertisement: ModelMemberAdvertisement | None = None
         self._transition_renewal_thread: threading.Thread | None = None
         self._transition_refresh_interval_s = transition_refresh_interval_s
+        self._fixed_route_repair_stability_s = fixed_route_repair_stability_s
+        self._repair_topology_fingerprint: tuple[object, ...] | None = None
+        self._repair_topology_stable_since = 0.0
+        self._repair_topology_observations = 0
+        self._repair_topology_last_capture: int | None = None
         self._transition_publish_lock = threading.RLock()
         self._error: dict[str, str] | None = None
         self._context_tokens: int | None = None
@@ -551,29 +560,47 @@ class AutonomousWorkerPlacement:
             context_tokens=context_tokens,
             exclude_worker_id=advertisement.offer.worker_id,
         )
-        decision = PlacementDecision(
-            action=PlacementAction.KEEP,
-            span=state.current_span,
-            required_memory_bytes=0,
-            score=None,
-            reason="holding_last_ready_target_without_valid_context_demand",
-            context_tokens=state.current_context_tokens,
-        )
-        decision = self._select_context_demand(
-            baseline=decision,
+        decision = self._policy.choose_fixed_route_repair(
             offer=advertisement.offer,
+            offers=snapshot.offers,
             manifest=manifest,
             leases=compatible_leases,
-            context_tokens=context_tokens,
-            kv_block_size=advertisement.lease.kv_geometry.block_size_tokens,
             current_span=state.current_span,
+            current_context_tokens=state.current_context_tokens,
+            route_context_tokens=context_tokens,
             current_reservations=active_reservations,
-            cold_start=False,
-            last_moved_at_ms=self._last_moved_at_ms,
             serving_route_exists=serving_route_exists,
-            serving_route_survives_movement=serving_route_survives_movement,
-            now_ms=time.time_ns() // 1_000_000,
+            membership_stable=self._fixed_route_membership_is_stable(
+                snapshot,
+                advertisement.offer,
+            ),
+            kv_block_size=advertisement.lease.kv_geometry.block_size_tokens,
+            span_static_bytes=self._span_static_bytes,
         )
+        if decision is None:
+            decision = PlacementDecision(
+                action=PlacementAction.KEEP,
+                span=state.current_span,
+                required_memory_bytes=0,
+                score=None,
+                reason="holding_last_ready_target_without_valid_context_demand",
+                context_tokens=state.current_context_tokens,
+            )
+            decision = self._select_context_demand(
+                baseline=decision,
+                offer=advertisement.offer,
+                manifest=manifest,
+                leases=compatible_leases,
+                context_tokens=context_tokens,
+                kv_block_size=advertisement.lease.kv_geometry.block_size_tokens,
+                current_span=state.current_span,
+                current_reservations=active_reservations,
+                cold_start=False,
+                last_moved_at_ms=self._last_moved_at_ms,
+                serving_route_exists=serving_route_exists,
+                serving_route_survives_movement=serving_route_survives_movement,
+                now_ms=time.time_ns() // 1_000_000,
+            )
         if decision.action in {PlacementAction.JOIN, PlacementAction.MOVE}:
             with self._transition_publish_lock:
                 if decision.context_tokens is None:
@@ -919,6 +946,67 @@ class AutonomousWorkerPlacement:
                 # missing link will keep route admission fail-closed and a
                 # later refresh retries topology publication.
                 logger.warning("Autonomous topology projection failed", exc_info=True)
+
+    def _repair_topology(
+        self,
+        snapshot: DiscoverySnapshot,
+        offer: WorkerOffer,
+    ) -> tuple[object, ...]:
+        """Return stable facts for one executable family, excluding renewals."""
+
+        compatible = self._compatible_placement_leases(snapshot, offer)
+        worker_ids = {lease.worker_id for lease in compatible}
+        offers = tuple(
+            sorted(
+                (
+                    offer.worker_id,
+                    offer.backend.value,
+                    offer.stable_memory_envelope_bytes,
+                    offer.execution_granularity_layers,
+                    tuple(sorted(role.value for role in offer.supported_roles)),
+                )
+                for offer in snapshot.offers
+                if offer.worker_id in worker_ids
+            )
+        )
+        leases = tuple(
+            sorted(
+                (
+                    lease.model_swarm_id,
+                    lease.worker_id,
+                    lease.hosted_span.start,
+                    lease.hosted_span.end,
+                    lease.effective_span_mode.value,
+                    lease.state.value,
+                    lease.max_context_tokens,
+                    lease.execution_plan_identity_hash,
+                )
+                for lease in compatible
+            )
+        )
+        return offers, leases
+
+    def _fixed_route_membership_is_stable(
+        self,
+        snapshot: DiscoverySnapshot,
+        offer: WorkerOffer,
+    ) -> bool:
+        if self._fixed_route_repair_stability_s == 0:
+            return True
+        with self._lock:
+            fingerprint = self._repair_topology(snapshot, offer)
+            now = time.monotonic()
+            if fingerprint != self._repair_topology_fingerprint:
+                self._repair_topology_fingerprint = fingerprint
+                self._repair_topology_stable_since = now
+                self._repair_topology_observations = 1
+            elif snapshot.captured_at_ms != self._repair_topology_last_capture:
+                self._repair_topology_observations += 1
+            self._repair_topology_last_capture = snapshot.captured_at_ms
+            return (
+                self._repair_topology_observations >= 2
+                and now - self._repair_topology_stable_since >= self._fixed_route_repair_stability_s
+            )
 
     def _select_context_demand(
         self,

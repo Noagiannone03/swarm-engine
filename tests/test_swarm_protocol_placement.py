@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from itertools import permutations
+
 import pytest
 
 from swarm_protocol import (
@@ -241,6 +243,405 @@ def test_fixed_cold_workers_form_a_complete_route_when_tail_arrives_first():
     assert head.span == LayerSpan(start=0, end=2)
     assert head.score is not None
     assert head.score.completes_fixed_route == 1
+
+
+def test_fixed_route_overlap_elects_exactly_one_deterministic_repair():
+    model = manifest()
+    policy = AutonomousPlacementPolicy()
+    workers = (
+        offer("a-head", frontend=True),
+        offer("b-middle", frontend=False),
+        offer("c-tail", frontend=False),
+    )
+    spans = {
+        "a-head": LayerSpan(start=0, end=2),
+        "b-middle": LayerSpan(start=1, end=3),
+        "c-tail": LayerSpan(start=3, end=4),
+    }
+    leases = tuple(
+        lease(
+            model,
+            worker.worker_id,
+            spans[worker.worker_id].start,
+            spans[worker.worker_id].end,
+            max_context_tokens=10,
+        )
+        for worker in workers
+    )
+
+    for lease_order in permutations(leases):
+        decisions = {
+            worker.worker_id: policy.choose_fixed_route_repair(
+                offer=worker,
+                offers=tuple(reversed(workers)),
+                manifest=model,
+                leases=lease_order,
+                current_span=spans[worker.worker_id],
+                current_context_tokens=10,
+                route_context_tokens=10,
+                current_reservations=0,
+                serving_route_exists=False,
+                kv_block_size=1,
+            )
+            for worker in workers
+        }
+        movers = [
+            (worker_id, decision.span)
+            for worker_id, decision in decisions.items()
+            if decision is not None and decision.action is PlacementAction.MOVE
+        ]
+        assert movers == [("a-head", LayerSpan(start=0, end=1))]
+        assert decisions["b-middle"].reason == "fixed_route_repair_elected:a-head"
+        assert decisions["c-tail"].reason == "fixed_route_repair_elected:a-head"
+
+
+@pytest.mark.parametrize(
+    ("spans", "expected_worker", "expected_span"),
+    (
+        (
+            {
+                "eac4-mini": LayerSpan(start=0, end=16),
+                "c4a8-rtx": LayerSpan(start=15, end=52),
+                "993a-local": LayerSpan(start=52, end=63),
+            },
+            "c4a8-rtx",
+            LayerSpan(start=16, end=52),
+        ),
+        (
+            {
+                "eac4-mini": LayerSpan(start=0, end=16),
+                "c4a8-rtx": LayerSpan(start=16, end=53),
+                "993a-local": LayerSpan(start=52, end=63),
+            },
+            "993a-local",
+            LayerSpan(start=53, end=64),
+        ),
+    ),
+)
+def test_fixed_route_repair_converges_live_64_layer_overlaps(
+    spans: dict[str, LayerSpan],
+    expected_worker: str,
+    expected_span: LayerSpan,
+):
+    base = manifest()
+    model = base.model_copy(
+        update={
+            "num_layers": 64,
+            "kv_bytes_per_token_by_layer": (10,) * 64,
+            "weight_bytes_by_layer": (100,) * 64,
+        }
+    )
+    workers = (
+        offer("eac4-mini", memory_bytes=4_000, frontend=True),
+        offer("c4a8-rtx", memory_bytes=8_000, frontend=False),
+        offer("993a-local", memory_bytes=4_000, frontend=False),
+    )
+    leases = tuple(
+        lease(
+            model,
+            worker.worker_id,
+            spans[worker.worker_id].start,
+            spans[worker.worker_id].end,
+            max_context_tokens=10,
+        )
+        for worker in workers
+    )
+
+    for lease_order in permutations(leases):
+        decisions = tuple(
+            AutonomousPlacementPolicy().choose_fixed_route_repair(
+                offer=worker,
+                offers=tuple(reversed(workers)),
+                manifest=model,
+                leases=lease_order,
+                current_span=spans[worker.worker_id],
+                current_context_tokens=10,
+                route_context_tokens=10,
+                current_reservations=0,
+                serving_route_exists=False,
+                kv_block_size=1,
+            )
+            for worker in workers
+        )
+        movers = tuple(
+            (worker.worker_id, decision.span)
+            for worker, decision in zip(workers, decisions, strict=True)
+            if decision is not None and decision.action is PlacementAction.MOVE
+        )
+        assert movers == ((expected_worker, expected_span),)
+
+
+def test_fixed_route_repair_monotonically_converges_initial_live_double_defect():
+    base = manifest()
+    model = base.model_copy(
+        update={
+            "num_layers": 64,
+            "kv_bytes_per_token_by_layer": (10,) * 64,
+            "weight_bytes_by_layer": (100,) * 64,
+        }
+    )
+    workers = (
+        offer("eac4-mini", memory_bytes=4_000, frontend=True),
+        offer("c4a8-rtx", memory_bytes=8_000, frontend=False),
+        offer("993a-local", memory_bytes=4_000, frontend=False),
+    )
+    spans = {
+        "eac4-mini": LayerSpan(start=0, end=16),
+        "c4a8-rtx": LayerSpan(start=15, end=52),
+        "993a-local": LayerSpan(start=52, end=63),
+    }
+    expected_steps = (
+        ("c4a8-rtx", LayerSpan(start=16, end=52)),
+        ("993a-local", LayerSpan(start=52, end=64)),
+    )
+
+    for expected in expected_steps:
+        leases = tuple(
+            lease(
+                model,
+                worker.worker_id,
+                spans[worker.worker_id].start,
+                spans[worker.worker_id].end,
+                max_context_tokens=10,
+            )
+            for worker in workers
+        )
+        decisions = tuple(
+            AutonomousPlacementPolicy().choose_fixed_route_repair(
+                offer=worker,
+                offers=tuple(reversed(workers)),
+                manifest=model,
+                leases=tuple(reversed(leases)),
+                current_span=spans[worker.worker_id],
+                current_context_tokens=10,
+                route_context_tokens=10,
+                current_reservations=0,
+                serving_route_exists=False,
+                kv_block_size=1,
+            )
+            for worker in workers
+        )
+        movers = tuple(
+            (worker.worker_id, decision.span)
+            for worker, decision in zip(workers, decisions, strict=True)
+            if decision is not None and decision.action is PlacementAction.MOVE
+        )
+        assert movers == (expected,)
+        spans[expected[0]] = expected[1]
+
+    final_leases = tuple(
+        lease(
+            model,
+            worker.worker_id,
+            spans[worker.worker_id].start,
+            spans[worker.worker_id].end,
+            max_context_tokens=10,
+        )
+        for worker in workers
+    )
+    assert (
+        AutonomousPlacementPolicy().choose_fixed_route_repair(
+            offer=workers[0],
+            offers=workers,
+            manifest=model,
+            leases=final_leases,
+            current_span=spans[workers[0].worker_id],
+            current_context_tokens=10,
+            route_context_tokens=10,
+            current_reservations=0,
+            serving_route_exists=False,
+            kv_block_size=1,
+        )
+        is None
+    )
+
+
+def test_fixed_route_repair_waits_for_stable_view_but_not_unrelated_building_replica():
+    model = manifest()
+    policy = AutonomousPlacementPolicy()
+    workers = (
+        offer("a-head", frontend=True),
+        offer("b-middle", frontend=False),
+        offer("c-tail", frontend=False),
+        offer("z-building", frontend=True),
+    )
+    spans = {
+        "a-head": LayerSpan(start=0, end=2),
+        "b-middle": LayerSpan(start=1, end=3),
+        "c-tail": LayerSpan(start=3, end=4),
+        "z-building": LayerSpan(start=3, end=4),
+    }
+    leases = tuple(
+        lease(
+            model,
+            worker.worker_id,
+            spans[worker.worker_id].start,
+            spans[worker.worker_id].end,
+            state=(SpanState.BUILDING if worker.worker_id == "z-building" else SpanState.READY),
+            max_context_tokens=10,
+        )
+        for worker in workers
+    )
+    arguments = {
+        "offer": workers[0],
+        "offers": workers,
+        "manifest": model,
+        "leases": leases,
+        "current_span": spans["a-head"],
+        "current_context_tokens": 10,
+        "route_context_tokens": 10,
+        "current_reservations": 0,
+        "serving_route_exists": False,
+        "kv_block_size": 1,
+    }
+
+    unstable = policy.choose_fixed_route_repair(**arguments, membership_stable=False)
+    assert unstable is not None
+    assert unstable.action is PlacementAction.KEEP
+    assert unstable.reason == "fixed_route_repair_waiting_for_stable_membership"
+
+    stable = policy.choose_fixed_route_repair(**arguments, membership_stable=True)
+    assert stable is not None
+    assert stable.action is PlacementAction.MOVE
+    assert stable.span == LayerSpan(start=0, end=1)
+
+
+def test_fixed_route_repair_waits_for_transition_and_active_reservations():
+    model = manifest()
+    policy = AutonomousPlacementPolicy()
+    head = offer("a-head", frontend=True)
+    middle = offer("b-middle", frontend=False)
+    tail = offer("c-tail", frontend=False)
+    workers = (head, middle, tail)
+    spans = (
+        lease(model, "a-head", 0, 2, max_context_tokens=10),
+        lease(model, "b-middle", 2, 3, state=SpanState.BUILDING, max_context_tokens=10),
+        lease(model, "c-tail", 3, 4, max_context_tokens=10),
+    )
+
+    waiting = policy.choose_fixed_route_repair(
+        offer=head,
+        offers=workers,
+        manifest=model,
+        leases=spans,
+        current_span=LayerSpan(start=0, end=2),
+        current_context_tokens=10,
+        route_context_tokens=10,
+        current_reservations=0,
+        serving_route_exists=False,
+        kv_block_size=1,
+    )
+    assert waiting is not None
+    assert waiting.action is PlacementAction.KEEP
+    assert waiting.reason == "fixed_route_repair_waiting_for_inflight_route"
+
+    ready = (
+        lease(model, "a-head", 0, 2, max_context_tokens=10),
+        lease(model, "b-middle", 1, 3, max_context_tokens=10),
+        lease(model, "c-tail", 3, 4, max_context_tokens=10),
+    )
+    reserved = policy.choose_fixed_route_repair(
+        offer=head,
+        offers=workers,
+        manifest=model,
+        leases=ready,
+        current_span=LayerSpan(start=0, end=2),
+        current_context_tokens=10,
+        route_context_tokens=10,
+        current_reservations=1,
+        serving_route_exists=False,
+        kv_block_size=1,
+    )
+    assert reserved is not None
+    assert reserved.action is PlacementAction.KEEP
+    assert reserved.reason == "active_reservations_must_drain_before_fixed_route_repair"
+
+
+def test_fixed_route_repair_does_not_move_weights_while_only_links_are_pending():
+    model = manifest()
+    policy = AutonomousPlacementPolicy()
+    head = offer("head", frontend=True)
+    tail = offer("tail", frontend=False)
+    leases = (
+        lease(model, "head", 0, 2, max_context_tokens=10),
+        lease(model, "tail", 2, 4, max_context_tokens=10),
+    )
+
+    assert (
+        policy.choose_fixed_route_repair(
+            offer=head,
+            offers=(head, tail),
+            manifest=model,
+            leases=leases,
+            current_span=LayerSpan(start=0, end=2),
+            current_context_tokens=10,
+            route_context_tokens=10,
+            current_reservations=0,
+            serving_route_exists=False,
+            kv_block_size=1,
+        )
+        is None
+    )
+
+
+def test_fixed_route_repair_elects_one_worker_across_128_replicas():
+    base = manifest()
+    model = base.model_copy(
+        update={
+            "num_layers": 64,
+            "kv_bytes_per_token_by_layer": (10,) * 64,
+            "weight_bytes_by_layer": (100,) * 64,
+        }
+    )
+    policy = AutonomousPlacementPolicy()
+    heads = tuple(
+        offer(f"head-{index:03d}", memory_bytes=10_000, frontend=True) for index in range(64)
+    )
+    tails = tuple(
+        offer(f"tail-{index:03d}", memory_bytes=10_000, frontend=False) for index in range(64)
+    )
+    workers = heads + tails
+    spans = {
+        worker.worker_id: (
+            LayerSpan(start=0, end=33)
+            if worker.worker_id.startswith("head-")
+            else LayerSpan(start=32, end=64)
+        )
+        for worker in workers
+    }
+    leases = tuple(
+        lease(
+            model,
+            worker.worker_id,
+            spans[worker.worker_id].start,
+            spans[worker.worker_id].end,
+            max_context_tokens=10,
+        )
+        for worker in reversed(workers)
+    )
+
+    decisions = {}
+    for worker in (heads[0], heads[1], tails[0]):
+        decision = policy.choose_fixed_route_repair(
+            offer=worker,
+            offers=tuple(reversed(workers)),
+            manifest=model,
+            leases=leases,
+            current_span=spans[worker.worker_id],
+            current_context_tokens=10,
+            route_context_tokens=10,
+            current_reservations=0,
+            serving_route_exists=False,
+            kv_block_size=1,
+        )
+        decisions[worker.worker_id] = decision
+
+    assert decisions["head-000"].action is PlacementAction.MOVE
+    assert decisions["head-000"].span == LayerSpan(start=0, end=32)
+    assert decisions["head-001"].action is PlacementAction.KEEP
+    assert decisions["head-001"].reason == "fixed_route_repair_elected:head-000"
+    assert decisions["tail-000"].action is PlacementAction.KEEP
+    assert decisions["tail-000"].reason == "fixed_route_repair_elected:head-000"
 
 
 def test_first_frontend_worker_establishes_ingress_when_catalogue_is_empty():
