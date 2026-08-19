@@ -200,6 +200,12 @@ def skippy_exact_state_certification_hash(manifest: ModelManifest, plan: object)
         raise TypeError("exact-state certification requires a Skippy execution plan")
     if plan.exact_state_kind is SkippyExactStateKind.DISABLED:
         raise ValueError("disabled Skippy exact state cannot be certified")
+    execution = plan.model_dump(mode="json", exclude={"exact_state_certification_hash"})
+    if plan.speculative_ngram_suffix is None:
+        # Exact-state certifications predate the optional speculative suffix.
+        # Keep its neutral value wire-identical to the field being absent so a
+        # newer reader can still validate already-published certified plans.
+        execution.pop("speculative_ngram_suffix", None)
     payload = {
         "state_kind": plan.exact_state_kind.value,
         "model": {
@@ -213,10 +219,10 @@ def skippy_exact_state_certification_hash(manifest: ModelManifest, plan: object)
             "prefill_contract_hash": manifest.prefill_contract_hash,
             "wire_protocol_version": manifest.wire_protocol_version,
         },
-        # Exclude only the digest being computed. This deliberately binds all
-        # current and future plan fields, including artifacts, geometry,
-        # providers, quantization and runtime feature probes.
-        "execution": plan.model_dump(mode="json", exclude={"exact_state_certification_hash"}),
+        # Bind the complete effective plan, including any non-neutral
+        # speculative capability, artifacts, geometry, providers,
+        # quantization and runtime feature probes.
+        "execution": execution,
     }
     return _canonical_hash("fabi/skippy-exact-state-certification/v1", payload)
 

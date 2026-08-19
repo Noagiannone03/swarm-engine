@@ -18,6 +18,7 @@ from swarm_protocol.contracts import (
     SkippyRuntimeFeature,
 )
 from swarm_protocol.model_manifest import (
+    _canonical_hash,
     artifact_collection_hash,
     execution_plan_hash,
     execution_plan_identity_hash,
@@ -539,6 +540,44 @@ def test_existing_skippy_plan_is_certified_without_rebuilding_its_artifacts():
         )
 
 
+def test_exact_state_certification_preserves_pre_speculation_wire_identity():
+    _, index, model = _fixture()
+    certified = certify_skippy_exact_state(
+        ModelRegistryBundle(manifest=model, artifact_index=index),
+        plan_id="skippy-q4-k-m-v1",
+        state_kind=SkippyExactStateKind.DENSE_ATTENTION_KV,
+    )
+    plan = certified.artifact_index.execution_plans[0]
+    assert isinstance(plan, SkippyExecutionPlan)
+
+    legacy_execution = plan.model_dump(
+        mode="json",
+        exclude={"exact_state_certification_hash", "speculative_ngram_suffix"},
+    )
+    expected = _canonical_hash(
+        "fabi/skippy-exact-state-certification/v1",
+        {
+            "state_kind": plan.exact_state_kind.value,
+            "model": {
+                "model_id": certified.manifest.model_id,
+                "immutable_revision": certified.manifest.immutable_revision,
+                "architecture_graph_hash": certified.manifest.architecture_graph_hash,
+                "tokenizer_hash": certified.manifest.tokenizer_hash,
+                "weight_collection_hash": certified.manifest.weight_collection_hash,
+                "rope_context_contract_hash": certified.manifest.rope_context_contract_hash,
+                "attention_kv_contract_hash": certified.manifest.attention_kv_contract_hash,
+                "prefill_contract_hash": certified.manifest.prefill_contract_hash,
+                "wire_protocol_version": certified.manifest.wire_protocol_version,
+            },
+            "execution": legacy_execution,
+        },
+    )
+
+    assert plan.speculative_ngram_suffix is None
+    assert plan.exact_state_certification_hash == expected
+    assert b'"speculative_ngram_suffix"' not in certified.canonical_bytes()
+
+
 def test_ngram_speculation_requires_explicit_greedy_abi_and_native_features():
     _, index, _ = _fixture()
     payload = index.execution_plans[0].model_dump(mode="json")
@@ -627,6 +666,11 @@ def test_ngram_and_warm_state_certifications_compose_in_either_order():
             warm_then_ngram_plan,
         )
     )
+    assert (
+        warm_then_ngram_plan.exact_state_certification_hash
+        != warm_first.artifact_index.execution_plans[0].exact_state_certification_hash
+    )
+    assert b'"speculative_ngram_suffix"' in warm_then_ngram.canonical_bytes()
 
     ngram_first = certify_skippy_ngram_speculation(
         source,

@@ -271,8 +271,23 @@ class ModelRegistryBundle(ContractModel):
         return self.manifest.model_swarm_id
 
     def canonical_bytes(self) -> bytes:
+        from swarm_protocol.contracts import SkippyExecutionPlan
+
+        payload = self.model_dump(mode="json")
+        serialized_plans = payload["artifact_index"]["execution_plans"]
+        for plan, serialized in zip(
+            self.artifact_index.execution_plans,
+            serialized_plans,
+            strict=True,
+        ):
+            if isinstance(plan, SkippyExecutionPlan) and plan.speculative_ngram_suffix is None:
+                # The optional speculative contract was added after existing
+                # TUF targets had been signed. Its neutral value must remain
+                # byte-identical to an absent field when those bundles are
+                # loaded and republished by a newer operator.
+                serialized.pop("speculative_ngram_suffix", None)
         return json.dumps(
-            self.model_dump(mode="json"),
+            payload,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
