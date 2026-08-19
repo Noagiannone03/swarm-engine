@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Fabi TUF metadata expiry for authority %i
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

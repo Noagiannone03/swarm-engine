@@ -5,6 +5,7 @@ import os
 import stat
 import threading
 from contextlib import contextmanager
+from datetime import timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -18,9 +19,11 @@ from swarm_protocol import (
     ModelArtifactIndex,
     ModelManifest,
     ModelRegistryBundle,
+    RegistryExpiryPolicy,
     RouteAuthorityKey,
     RouteAuthorityKeyset,
     TrustedModelRegistry,
+    TufRegistryPublisher,
     artifact_collection_hash,
 )
 from swarm_protocol.model_manifest import execution_plan_hash
@@ -36,6 +39,7 @@ from swarm_protocol.registry_operator import (
     initialize_staging_registry,
     load_staging_keys,
     load_staging_timestamp_signers,
+    main as registry_operator_main,
     publish_staging_registry,
     read_passphrase_file,
     sync_online_timestamp,
@@ -440,6 +444,38 @@ def test_timestamp_signer_can_refresh_without_other_private_roles(tmp_path):
     timestamp = __import__("json").loads((repository / "metadata" / "timestamp.json").read_bytes())
     assert timestamp["signed"]["version"] == 2
     assert timestamp["signed"]["meta"]["snapshot.json"]["version"] == 1
+
+
+def test_metadata_inspection_cli_exits_nonzero_for_offline_renewal(tmp_path, capsys):
+    repository = tmp_path / "repository"
+    signers = generate_staging_keys(tmp_path / "keys", PASSPHRASE)
+    bootstrap = tmp_path / "bootstrap-root.json"
+    bootstrap.write_bytes(
+        TufRegistryPublisher(
+            repository,
+            signers,
+            expiry=RegistryExpiryPolicy(snapshot=timedelta(hours=1)),
+        ).initialize((_bundle(),))
+    )
+
+    exit_code = registry_operator_main(
+        [
+            "inspect-metadata",
+            "--repository-dir",
+            str(repository),
+            "--bootstrap-root",
+            str(bootstrap),
+            "--offline-warning-hours",
+            "2",
+        ]
+    )
+
+    assert exit_code == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "offline_renewal_required"
+    assert next(role for role in result["roles"] if role["role"] == "snapshot")[
+        "renewal_required"
+    ]
 
 
 def test_online_timestamp_sync_requires_credential_free_https(tmp_path):

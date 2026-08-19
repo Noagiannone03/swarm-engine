@@ -349,11 +349,193 @@ class RegistryExpiryPolicy:
     timestamp: timedelta = timedelta(days=1)
 
 
+@dataclass(frozen=True)
+class RegistryMetadataRoleStatus:
+    """Authenticated expiry state for one top-level TUF role."""
+
+    role: str
+    version: int
+    expires_at: datetime
+    seconds_remaining: int
+    expired: bool
+    renewal_required: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "role": self.role,
+            "version": self.version,
+            "expires_at": self.expires_at.isoformat().replace("+00:00", "Z"),
+            "seconds_remaining": self.seconds_remaining,
+            "expired": self.expired,
+            "renewal_required": self.renewal_required,
+        }
+
+
+@dataclass(frozen=True)
+class RegistryMetadataStatus:
+    """Fail-closed repository health derived only from authenticated metadata."""
+
+    status: str
+    checked_at: datetime
+    roles: tuple[RegistryMetadataRoleStatus, ...]
+
+    @property
+    def requires_attention(self) -> bool:
+        return self.status != "healthy"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "checked_at": self.checked_at.isoformat().replace("+00:00", "Z"),
+            "roles": [role.as_dict() for role in self.roles],
+        }
+
+
 def _utc_now(now: datetime | None) -> datetime:
     value = now or datetime.now(timezone.utc)
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("TUF publication time must be timezone-aware")
     return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def inspect_repository_metadata(
+    repository_dir: Path,
+    bootstrap_root: bytes,
+    *,
+    now: datetime | None = None,
+    offline_warning: timedelta = timedelta(days=3),
+    timestamp_warning: timedelta = timedelta(hours=8),
+) -> RegistryMetadataStatus:
+    """Authenticate a local TUF repository and report actionable expiry state.
+
+    The immutable bootstrap root is supplied out of band, just as it is for a
+    runtime client. Every subsequent root rotation, top-level signature and
+    timestamp/snapshot hash edge is verified before any expiry is reported.
+    The online timestamp has its own short warning window so a healthy 24-hour
+    timestamp never masks an approaching offline snapshot ceremony.
+    """
+
+    if not bootstrap_root:
+        raise ValueError("metadata inspection requires non-empty bootstrap root bytes")
+    if offline_warning < timedelta(0) or timestamp_warning < timedelta(0):
+        raise ValueError("metadata warning windows must not be negative")
+
+    current = _utc_now(now)
+    metadata_dir = repository_dir / "metadata"
+    trusted_root = Metadata.from_bytes(bootstrap_root)
+    if not isinstance(trusted_root.signed, Root):
+        raise ValueError("bootstrap metadata does not contain a TUF root role")
+    trusted_root.signed.verify_delegate(
+        "root",
+        trusted_root.signed_bytes,
+        trusted_root.signatures,
+    )
+
+    root_versions: list[int] = []
+    for path in metadata_dir.glob("*.root.json"):
+        try:
+            root_versions.append(int(path.name.split(".", 1)[0]))
+        except ValueError:
+            continue
+    if not root_versions:
+        raise FileNotFoundError("TUF registry has no versioned root metadata")
+    latest_root_version = max(root_versions)
+    if latest_root_version < trusted_root.signed.version:
+        raise ValueError("repository root version precedes the trusted bootstrap root")
+
+    for version in range(trusted_root.signed.version + 1, latest_root_version + 1):
+        path = metadata_dir / f"{version}.root.json"
+        if not path.is_file():
+            raise ValueError(f"TUF root rotation chain is missing version {version}")
+        replacement = Metadata.from_file(str(path))
+        if not isinstance(replacement.signed, Root):
+            raise ValueError(f"versioned root {version} does not contain a TUF root role")
+        if replacement.signed.version != version:
+            raise ValueError(f"versioned root filename and payload disagree at version {version}")
+        trusted_root.signed.verify_delegate(
+            "root",
+            replacement.signed_bytes,
+            replacement.signatures,
+        )
+        replacement.signed.verify_delegate(
+            "root",
+            replacement.signed_bytes,
+            replacement.signatures,
+        )
+        trusted_root = replacement
+
+    timestamp_payload = (metadata_dir / "timestamp.json").read_bytes()
+    timestamp = Metadata.from_bytes(timestamp_payload)
+    if not isinstance(timestamp.signed, Timestamp):
+        raise ValueError("timestamp.json does not contain TUF timestamp metadata")
+    trusted_root.signed.verify_delegate(
+        "timestamp",
+        timestamp.signed_bytes,
+        timestamp.signatures,
+    )
+
+    snapshot_version = timestamp.signed.snapshot_meta.version
+    snapshot_payload = (metadata_dir / f"{snapshot_version}.snapshot.json").read_bytes()
+    snapshot = Metadata.from_bytes(snapshot_payload)
+    if not isinstance(snapshot.signed, Snapshot):
+        raise ValueError("timestamp references metadata that is not a TUF snapshot")
+    if snapshot.signed.version != snapshot_version:
+        raise ValueError("timestamp and snapshot versions disagree")
+    trusted_root.signed.verify_delegate(
+        "snapshot",
+        snapshot.signed_bytes,
+        snapshot.signatures,
+    )
+    expected_snapshot = MetaFile.from_data(snapshot_version, snapshot_payload, ["sha256"])
+    if timestamp.signed.snapshot_meta.to_dict() != expected_snapshot.to_dict():
+        raise ValueError("timestamp does not authenticate the exact referenced snapshot")
+
+    try:
+        targets_meta = snapshot.signed.meta["targets.json"]
+    except KeyError as exc:
+        raise ValueError("snapshot does not reference top-level targets metadata") from exc
+    targets_version = targets_meta.version
+    targets_payload = (metadata_dir / f"{targets_version}.targets.json").read_bytes()
+    targets = Metadata.from_bytes(targets_payload)
+    if not isinstance(targets.signed, Targets):
+        raise ValueError("snapshot references metadata that is not a TUF targets role")
+    if targets.signed.version != targets_version:
+        raise ValueError("snapshot and targets versions disagree")
+    trusted_root.signed.verify_delegate(
+        "targets",
+        targets.signed_bytes,
+        targets.signatures,
+    )
+    expected_targets = MetaFile.from_data(targets_version, targets_payload, ["sha256"])
+    if targets_meta.to_dict() != expected_targets.to_dict():
+        raise ValueError("snapshot does not authenticate the exact referenced targets")
+
+    authenticated = (
+        ("root", trusted_root.signed, offline_warning),
+        ("targets", targets.signed, offline_warning),
+        ("snapshot", snapshot.signed, offline_warning),
+        ("timestamp", timestamp.signed, timestamp_warning),
+    )
+    roles = tuple(
+        RegistryMetadataRoleStatus(
+            role=role,
+            version=metadata.version,
+            expires_at=metadata.expires,
+            seconds_remaining=int((metadata.expires - current).total_seconds()),
+            expired=metadata.is_expired(current),
+            renewal_required=metadata.expires <= current + warning,
+        )
+        for role, metadata, warning in authenticated
+    )
+    if any(role.expired for role in roles):
+        status = "expired"
+    elif any(role.renewal_required for role in roles if role.role != "timestamp"):
+        status = "offline_renewal_required"
+    elif next(role for role in roles if role.role == "timestamp").renewal_required:
+        status = "timestamp_refresh_required"
+    else:
+        status = "healthy"
+    return RegistryMetadataStatus(status=status, checked_at=current, roles=roles)
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:

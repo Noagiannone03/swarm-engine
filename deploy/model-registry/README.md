@@ -67,9 +67,13 @@ fabi-swarm-registry verify-remote \
   --model-swarm-id MODEL_SWARM_ID
 ```
 
-Alert on any failed service execution and on remaining timestamp or snapshot
-validity. The timer is not a replacement for monitoring or the full snapshot
-publication ceremony.
+The separate metadata checker authenticates the complete chain from an
+out-of-band bootstrap root and exits nonzero when the timestamp has less than
+eight hours left or any offline role has less than 72 hours left. This makes an
+approaching snapshot ceremony visible as a failed systemd unit without placing
+the snapshot key on the mirror. Alert on any failed refresh or metadata-check
+execution. The timers are not a replacement for the full snapshot publication
+ceremony.
 
 For a parallel authority named `root3`, install the templated units and put its
 three instance files under `/etc/fabi-tuf-timestamp/root3/`:
@@ -82,12 +86,21 @@ sudo install -m 0600 timestamp.passphrase \
 sudo install -m 0644 refresh.env /etc/fabi-tuf-timestamp/root3/refresh.env
 sudo install -m 0644 fabi-tuf-timestamp-refresh@.service /etc/systemd/system/
 sudo install -m 0644 fabi-tuf-timestamp-refresh@.timer /etc/systemd/system/
+sudo install -m 0644 fabi-tuf-metadata-check@.service /etc/systemd/system/
+sudo install -m 0644 fabi-tuf-metadata-check@.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now fabi-tuf-timestamp-refresh@root3.timer
+sudo systemctl enable --now fabi-tuf-metadata-check@root3.timer
 sudo systemctl start fabi-tuf-timestamp-refresh@root3.service
+sudo systemctl start fabi-tuf-metadata-check@root3.service
 ```
 
 Do not stop the previous authority's timer during this staging phase. As with
 the single-authority unit, only the timestamp key and its passphrase are copied
 to the mirror; the offline root, targets and snapshot keys never leave the
 operator host.
+
+Before the 72-hour warning becomes active, synchronize the current online
+timestamp into the offline operator repository, perform the reviewed targets
+and snapshot publication, deploy versioned metadata first and `timestamp.json`
+last, then verify the public HTTPS repository from the pinned bootstrap root.

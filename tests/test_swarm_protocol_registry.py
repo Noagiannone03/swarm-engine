@@ -29,6 +29,7 @@ from swarm_protocol import (
     TufRegistryPublisher,
     TufTimestampRefresher,
     artifact_collection_hash,
+    inspect_repository_metadata,
     synchronize_repository_timestamp,
 )
 
@@ -307,6 +308,66 @@ def test_full_publish_advances_timestamp_after_independent_refreshes(tmp_path):
     timestamp = __import__("json").loads((repository / "metadata" / "timestamp.json").read_bytes())
     assert timestamp["signed"]["version"] == 4
     assert timestamp["signed"]["meta"]["snapshot.json"]["version"] == 2
+
+
+def test_metadata_inspection_authenticates_roles_and_warns_before_offline_expiry(tmp_path):
+    repository = tmp_path / "repository"
+    signers = _signers()
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    root_bytes = TufRegistryPublisher(repository, signers).initialize((_bundle(),), now=now)
+
+    healthy = inspect_repository_metadata(repository, root_bytes, now=now + timedelta(hours=1))
+    assert healthy.status == "healthy"
+    assert healthy.requires_attention is False
+    assert [role.role for role in healthy.roles] == ["root", "targets", "snapshot", "timestamp"]
+
+    TufTimestampRefresher(repository, signers.timestamp).refresh(
+        now=now + timedelta(days=5, hours=12)
+    )
+    warning = inspect_repository_metadata(
+        repository,
+        root_bytes,
+        now=now + timedelta(days=5, hours=13),
+    )
+    assert warning.status == "offline_renewal_required"
+    assert warning.requires_attention is True
+    assert next(role for role in warning.roles if role.role == "snapshot").renewal_required
+    assert not next(role for role in warning.roles if role.role == "timestamp").renewal_required
+
+
+def test_metadata_inspection_rejects_snapshot_hash_substitution(tmp_path):
+    repository = tmp_path / "repository"
+    signers = _signers()
+    root_bytes = TufRegistryPublisher(repository, signers).initialize((_bundle(),))
+    snapshot_path = repository / "metadata" / "1.snapshot.json"
+    snapshot_path.write_bytes(snapshot_path.read_bytes() + b" ")
+
+    with pytest.raises(ValueError, match="exact referenced snapshot"):
+        inspect_repository_metadata(repository, root_bytes)
+
+
+def test_metadata_inspection_follows_rotation_from_pinned_bootstrap_root(tmp_path):
+    repository = tmp_path / "repository"
+    old_signers = _signers(root_threshold=2)
+    publisher = TufRegistryPublisher(repository, old_signers)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    bootstrap_root = publisher.initialize((_bundle(),), now=now)
+    new_signers = _signers(root_threshold=2)
+    publisher.rotate_root(new_signers, now=now + timedelta(minutes=1))
+    TufRegistryPublisher(repository, new_signers).publish(
+        (_bundle(),),
+        now=now + timedelta(minutes=2),
+    )
+
+    status = inspect_repository_metadata(
+        repository,
+        bootstrap_root,
+        now=now + timedelta(minutes=3),
+    )
+
+    assert status.status == "healthy"
+    assert next(role for role in status.roles if role.role == "root").version == 2
+    assert next(role for role in status.roles if role.role == "snapshot").version == 2
 
 
 def test_offline_publish_synchronizes_the_authenticated_online_timestamp(tmp_path):

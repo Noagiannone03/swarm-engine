@@ -19,6 +19,7 @@ import secrets
 import stat
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.parse import urlsplit
@@ -60,6 +61,7 @@ from swarm_protocol.registry import (
     TrustedModelRegistry,
     TufRegistryPublisher,
     TufTimestampRefresher,
+    inspect_repository_metadata,
     synchronize_repository_timestamp,
 )
 from swarm_protocol.skippy_package_import import (
@@ -1209,6 +1211,12 @@ def _parser() -> argparse.ArgumentParser:
     sync_timestamp.add_argument("--repository-dir", type=Path, required=True)
     sync_timestamp.add_argument("--timestamp-url", required=True)
 
+    inspect_metadata = commands.add_parser("inspect-metadata")
+    inspect_metadata.add_argument("--repository-dir", type=Path, required=True)
+    inspect_metadata.add_argument("--bootstrap-root", type=Path, required=True)
+    inspect_metadata.add_argument("--offline-warning-hours", type=float, default=72.0)
+    inspect_metadata.add_argument("--timestamp-warning-hours", type=float, default=8.0)
+
     verify = commands.add_parser("verify-remote")
     verify.add_argument("--bootstrap-root", type=Path, required=True)
     verify.add_argument("--metadata-url", required=True)
@@ -1228,6 +1236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _parser().parse_args(argv)
+    exit_code = 0
     if args.command == "generate-passphrase":
         generate_passphrase_file(args.output)
         result = {"status": "generated", "output": str(args.output)}
@@ -1430,6 +1439,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "version": version,
             "repository": str(args.repository_dir),
         }
+    elif args.command == "inspect-metadata":
+        status = inspect_repository_metadata(
+            args.repository_dir,
+            args.bootstrap_root.read_bytes(),
+            offline_warning=timedelta(hours=args.offline_warning_hours),
+            timestamp_warning=timedelta(hours=args.timestamp_warning_hours),
+        )
+        result = status.as_dict()
+        if status.requires_attention:
+            exit_code = 2
     else:
         registry = TrustedModelRegistry(
             args.state_dir,
@@ -1449,7 +1468,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = {"status": "verified", **_bundle_summary(bundle)}
 
     print(json.dumps(result, sort_keys=True))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
